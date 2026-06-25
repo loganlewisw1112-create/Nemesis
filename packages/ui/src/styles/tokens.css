@@ -1,0 +1,49 @@
+:root {
+  --bg: #0a0b0f;
+  --bg-elevated: #12141c;
+  --bg-card: #181b26;
+  --border: #2a2f3d;
+  --text: #e8eaef;
+  --text-muted: #8b93a7;
+  --accent: #6366f1;
+  --accent-glow: rgba(99, 102, 241, 0.3);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --demo-banner: #7c2d12;
+  --font: 'Segoe UI', system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+/* ── Animation tokens ────────────────── */
+:root {
+  --dur-fast: 120ms;
+  --dur-normal: 220ms;
+  --dur-slow: 380ms;
+}
+
+button {
+  transition: background var(--dur-fast), transform 80ms, filter var(--dur-fast), box-shadow var(--dur-fast);
+}
+button:hover:not(:disabled) { filter: brightness(1.13); }
+button:active:not(:disabled) { transform: scale(0.96); }
+
+/* Chart line draw animation */
+@keyframes chartDraw {
+  from { stroke-dashoffset: 9999; }
+  to   { stroke-dashoffset: 0; }
+}
+
+/* Chart live-point pulse */
+@keyframes chartPulse {
+  0%   { r: 3; opacity: 0.9; }
+  70%  { r: 7; opacity: 0.2; }
+  100% { r: 7; opacity: 0; }
+}

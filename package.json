@@ -1,0 +1,35 @@
+{
+  "name": "nemesis",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NEMESIS — Kalshi-native desktop trading command center",
+  "license": "MIT",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @nemesis/desktop",
+    "build": "npm run build --workspaces --if-present",
+    "test": "vitest run",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test:e2e": "npm run build -w @nemesis/desktop && npm run test:e2e -w @nemesis/desktop",
+    "package": "npm run package -w @nemesis/desktop"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "happy-dom": "^20.10.6",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "vite": {
+      "esbuild": "0.28.1"
+    }
+  }
+}

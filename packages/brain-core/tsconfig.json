@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "noEmit": true,
+    "paths": {
+      "@nemesis/bridge-contracts": ["../bridge-contracts/src"]
+    }
+  },
+  "include": ["src/**/*"]
+}

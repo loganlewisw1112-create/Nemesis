@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "noEmit": true,
+    "paths": {
+      "@nemesis/bridge-contracts": ["../../packages/bridge-contracts/src"],
+      "@nemesis/brain-core": ["../../packages/brain-core/src"],
+      "@nemesis/connectors": ["../../packages/connectors/src"],
+      "@nemesis/core": ["../../packages/core/src"],
+      "@nemesis/ui": ["../../packages/ui/src"],
+      "@nemesis/simulation-core": ["../../packages/simulation-core/src"]
+    }
+  },
+  "include": ["src/**/*", "electron/**/*"]
+}

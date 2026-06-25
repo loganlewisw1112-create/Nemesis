@@ -1,0 +1,64 @@
+{
+  "name": "@nemesis/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "npx tsc --noEmit",
+    "test:e2e": "playwright test",
+    "package": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "@nemesis/bridge-contracts": "*",
+    "@nemesis/capital": "*",
+    "@nemesis/charts": "*",
+    "@nemesis/connectors": "*",
+    "@nemesis/core": "*",
+    "@nemesis/execution": "*",
+    "@nemesis/journal": "*",
+    "@nemesis/pods": "*",
+    "@nemesis/ui": "*",
+    "framer-motion": "^12.41.0",
+    "prop-types": "^15.8.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-simple-maps": "^3.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^42.5.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.11",
+    "vite-plugin-electron": "^0.28.8",
+    "vite-plugin-electron-renderer": "^0.14.6"
+  },
+  "build": {
+    "appId": "cc.nemesis.trader",
+    "productName": "NEMESIS",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
