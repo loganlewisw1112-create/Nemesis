@@ -9,3 +9,5 @@ export * from './auditLog.js';
 export * from './paperOrders.js';
 export * from './liveOrderAdapter.js';
 export * from './settlement.js';
+export * from './autoCloseEngine.js';
+export * from './profitabilityBenchmark.js';

@@ -13,6 +13,9 @@ export interface FillMetadata {
   depthLevels?: number;
   abortReason?: string;
   mode: 'paper' | 'live';
+  autoCloseDecisionId?: string;
+  autoCloseReason?: string;
+  autoCloseAction?: AutoCloseAction;
 }
 
 export interface PaperPosition {
@@ -48,6 +51,9 @@ export interface PaperTrade {
   abortReason?: string;
   mode?: 'paper' | 'live';
   playbook?: string;
+  autoCloseDecisionId?: string;
+  autoCloseReason?: string;
+  autoCloseAction?: AutoCloseAction;
 }
 
 export interface PaperPortfolio {
@@ -69,6 +75,79 @@ export interface PaperOrder {
   createdAt: number;
   status: 'working' | 'filled' | 'cancelled';
 }
+
+export type AutoCloseAction = 'hold' | 'trim' | 'close';
+
+export interface AutoCloseSettings {
+  enabled: boolean;
+  paperOnly: true;
+  minAgeMs: number;
+  minTicks: number;
+  firstTrimProfitPct: number;
+  firstTrimGivebackPct: number;
+  firstTrimFraction: number;
+  finalCloseProfitPct: number;
+  finalCloseGivebackPct: number;
+  emergencyEdgeExit: number;
+  geaExitConfidence: number;
+  staleSignalMs: number;
+  badLiquiditySlippagePp: number;
+  maxBridgeLatencyMs: number;
+}
+
+export interface AutoCloseState {
+  positionId: string;
+  peakPnlUsd: number;
+  peakPnlPct: number;
+  peakEdge: number;
+  peakMark: number;
+  peakAt: number;
+  tickCount: number;
+  trimmedContracts: number;
+  lastDecisionAt: number;
+  lastMark: number;
+  lastEdge: number;
+}
+
+export interface AutoCloseDecision {
+  id: string;
+  positionId: string;
+  ticker: string;
+  action: AutoCloseAction;
+  contracts: number;
+  confidence: number;
+  reason: string;
+  currentPnlUsd: number;
+  currentPnlPct: number;
+  peakPnlUsd: number;
+  peakPnlPct: number;
+  currentEdge: number;
+  peakEdge: number;
+  givebackPct: number;
+  triggeredAt: number;
+}
+
+export interface AutoCloseStateSnapshot {
+  autoCloseStateByPosition: Record<string, AutoCloseState>;
+  autoCloseDecisions: AutoCloseDecision[];
+}
+
+export const DEFAULT_AUTO_CLOSE_SETTINGS: AutoCloseSettings = {
+  enabled: false,
+  paperOnly: true,
+  minAgeMs: 30_000,
+  minTicks: 3,
+  firstTrimProfitPct: 0.12,
+  firstTrimGivebackPct: 0.25,
+  firstTrimFraction: 0.5,
+  finalCloseProfitPct: 0.18,
+  finalCloseGivebackPct: 0.35,
+  emergencyEdgeExit: 0,
+  geaExitConfidence: 0.85,
+  staleSignalMs: 90_000,
+  badLiquiditySlippagePp: 0.07,
+  maxBridgeLatencyMs: 2_000,
+};
 
 import type { ShutdownCounters } from '../guardrails/engine.js';
 

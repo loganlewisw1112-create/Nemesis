@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import type { ThesisCard } from '@nemesis/core';
+import type { AutoCloseDecision, ThesisCard } from '@nemesis/core';
 
 let _audioCtx: AudioContext | null = null;
 function getAudioCtx(): AudioContext {
@@ -53,6 +53,7 @@ export interface PaperSlice {
   workingOrders?: WorkingOrder[];
   dailyPnl?: number;
   activeRegimes?: string[];
+  autoCloseDecisions?: AutoCloseDecision[];
 }
 
 function pnlPct(pos: PaperPos, mark: number): number {
@@ -87,8 +88,29 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
   // Position & portfolio checks (runs whenever paper or theses update)
   useEffect(() => {
     if (!paper) return;
-    const { portfolio, marks, workingOrders = [], dailyPnl = 0, activeRegimes = [] } = paper;
+    const { portfolio, marks, workingOrders = [], dailyPnl = 0, activeRegimes = [], autoCloseDecisions = [] } = paper;
     const prev = prevPaper.current;
+
+    for (const d of autoCloseDecisions) {
+      if (Date.now() - d.triggeredAt > 10 * 60_000) continue;
+      const edgeGone = d.reason.toLowerCase().includes('edge gone');
+      const geaExit = d.reason.toLowerCase().includes('gea exit');
+      const title = d.action === 'trim'
+        ? 'Auto-trimmed near peak'
+        : geaExit
+          ? 'GEA exit confirmed'
+          : edgeGone
+            ? 'Emergency close: edge gone'
+            : 'Auto-closed after edge decay';
+      push({
+        id: `auto-close:${d.id}`,
+        type: 'close',
+        severity: edgeGone ? 'warn' : 'success',
+        title,
+        body: `${d.ticker} ×${d.contracts} · current ${(d.currentPnlPct * 100).toFixed(1)}% · peak ${(d.peakPnlPct * 100).toFixed(1)}%`,
+        positionId: d.positionId,
+      });
+    }
 
     for (const pos of portfolio.positions) {
       const card = theses.find((c) => c.ticker === pos.ticker);

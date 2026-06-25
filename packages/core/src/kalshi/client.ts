@@ -107,7 +107,10 @@ async function kalshiFetch<T>(
         };
         const res = opts.fetchFn
           ? await fetchFn(url, { headers })
-          : await resilientFetch(url, { headers, label: `Kalshi ${path}`, retries: 1, timeoutMs: 10_000 });
+          // retries:0 → one attempt per outer loop iteration, 10 s abort.
+          // Worst case: 3 bases × 3 outer attempts × 10 s = 90 s (was 180 s with
+          // retries:1).  App-level timeouts in main.ts cap real blocking to ≤20 s.
+          : await resilientFetch(url, { headers, label: `Kalshi ${path}`, retries: 0, timeoutMs: 10_000 });
         if (!res.ok) {
           lastError = new Error(`Kalshi API ${res.status}: ${path}`);
           if (res.status >= 500 && attempt < 2) {

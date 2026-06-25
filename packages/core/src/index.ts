@@ -10,3 +10,4 @@ export * from './paper/types.js';
 export * from './paper/pnl.js';
 export * from './discovery/types.js';
 export * from './discovery/executableTier.js';
+export * from './profitability/opportunityScore.js';

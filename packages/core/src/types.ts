@@ -1,3 +1,5 @@
+import { DEFAULT_AUTO_CLOSE_SETTINGS, type AutoCloseSettings } from './paper/types.js';
+
 export const KALSHI_WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
 
 export interface KalshiMarket {
@@ -70,6 +72,7 @@ export interface GuardrailSettings {
   useProductionApi?: boolean;
   humanQuizPassed?: boolean;
   backtestPassed?: boolean;
+  autoClose?: AutoCloseSettings;
 }
 
 export const DEFAULT_GUARDRAILS: GuardrailSettings = {
@@ -84,6 +87,7 @@ export const DEFAULT_GUARDRAILS: GuardrailSettings = {
   useProductionApi: false,
   humanQuizPassed: false,
   backtestPassed: false,
+  autoClose: { ...DEFAULT_AUTO_CLOSE_SETTINGS },
 };
 
 export type ThesisStatus =

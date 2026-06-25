@@ -14,9 +14,10 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { WebSocketServer, WebSocket as WsSocket, type RawData } from 'ws';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { validateBridgeMessage, type BridgeStatus, type NemesisBridgeMessage } from '@nemesis/bridge-contracts';
+import { validateBridgeMessage, type BridgeStatus, type ExitRecommendation, type NemesisBridgeMessage, type RecommendationPacket } from '@nemesis/bridge-contracts';
 import {
   DEFAULT_GUARDRAILS,
+  DEFAULT_AUTO_CLOSE_SETTINGS,
   DEFAULT_PAPER_CASH,
   fetchOrderbook,
   normalizeMarketPrice,
@@ -35,12 +36,17 @@ import {
   isRiskSettingOverride,
   rankThesesWithTiers,
   minNetEdgeForTier,
+  scoreOpportunityForCard,
+  type AutoCloseDecision,
+  type AutoCloseSettings,
+  type AutoCloseState,
   type DiscoverySettings,
   type GuardrailSettings,
   type ThesisCard,
   type KalshiMarket,
   type PriceTick,
   type PaperPortfolio,
+  type PaperPosition,
   type SessionStats,
   type PaperOrder,
   type GeoMarket,
@@ -62,11 +68,17 @@ import {
   reconcileLiveBook,
   createLiveOrderRequest,
   submitLiveOrder,
+  evaluateAutoClosePosition,
+  updateAutoCloseState,
+  ProfitabilityBenchmark,
+  type AutoCloseExitSignal,
   type LiveCredentials,
 } from '@nemesis/execution';
 import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
 import { DiscoveryOrchestrator } from './discovery.js';
+import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
+import { createGeaSpawnPlan } from './geaSpawn.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.setPath('userData', process.env.NEMESIS_E2E_USER_DATA);
@@ -81,6 +93,7 @@ const SESSION_STATS_PATH = path.join(DATA_DIR, 'session-stats.json');
 const PAPER_ORDERS_PATH = path.join(DATA_DIR, 'paper-orders.json');
 const AUDIT_PATH = path.join(DATA_DIR, 'audit-log.json');
 const DISCOVERY_SETTINGS_PATH = path.join(DATA_DIR, 'discovery-settings.json');
+const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
 
 const MAX_TICKS = 120;
 const PAPER_OK = new Set(['tradeable', 'qualified', 'watch-only']);
@@ -100,14 +113,22 @@ const journal = new JournalStore();
 const quarantine = new StrategyQuarantine();
 let settings: GuardrailSettings = { ...DEFAULT_GUARDRAILS };
 let theses: ThesisCard[] = [];
+let geaTheses: ThesisCard[] = [];
 let reviewOnly = false;
 let marketsCache: KalshiMarket[] = [];
+let geaMarkets: KalshiMarket[] = [];
 const paperDesk = new PaperDesk(DEFAULT_PAPER_CASH);
 const paperOrderBook = new PaperOrderBook();
 const auditLog = new AuditLog();
+const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
 const tickHistory = new Map<string, PriceTick[]>();
+const autoCloseStates = new Map<string, AutoCloseState>();
+const latestExitSignals = new Map<string, AutoCloseExitSignal>();
 let watchedTicker: string | null = null;
 let activeRegimes: string[] = [];
+let autoCloseDecisions: AutoCloseDecision[] = [];
+let autoCloseRunning = false;
+let autoCloseQueued = false;
 let sessionStatsData: SessionStats = {
   dayStart: Date.now(),
   dailyPnl: 0,
@@ -179,10 +200,29 @@ function tickApiHealthDegraded() {
   if (shutdown.apiDegradedMinutes !== before) saveSessionStats();
 }
 
+function normalizeGuardrailSettings(raw: Partial<GuardrailSettings> = {}): GuardrailSettings {
+  const autoClose = {
+    ...DEFAULT_AUTO_CLOSE_SETTINGS,
+    ...(settings.autoClose ?? {}),
+    ...(raw.autoClose ?? {}),
+  };
+  return {
+    ...DEFAULT_GUARDRAILS,
+    ...raw,
+    autoClose,
+  };
+}
+
+function autoCloseSettings(): AutoCloseSettings {
+  return { ...DEFAULT_AUTO_CLOSE_SETTINGS, ...(settings.autoClose ?? {}) };
+}
+
 function loadSettings() {
   ensureDataDir();
   if (fs.existsSync(SETTINGS_PATH)) {
-    settings = { ...DEFAULT_GUARDRAILS, ...JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')) };
+    settings = normalizeGuardrailSettings(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')));
+  } else {
+    settings = normalizeGuardrailSettings(settings);
   }
 }
 
@@ -326,6 +366,33 @@ function saveAuditLog() {
   fs.writeFileSync(AUDIT_PATH, JSON.stringify(auditLog.list(), null, 2));
 }
 
+function loadAutoCloseState() {
+  ensureDataDir();
+  if (!fs.existsSync(AUTO_CLOSE_PATH)) return;
+  try {
+    const saved = JSON.parse(fs.readFileSync(AUTO_CLOSE_PATH, 'utf8')) as {
+      states?: AutoCloseState[];
+      decisions?: AutoCloseDecision[];
+    };
+    autoCloseStates.clear();
+    for (const state of saved.states ?? []) {
+      if (state.positionId) autoCloseStates.set(state.positionId, state);
+    }
+    autoCloseDecisions = (saved.decisions ?? []).slice(0, 40);
+  } catch {
+    autoCloseStates.clear();
+    autoCloseDecisions = [];
+  }
+}
+
+function saveAutoCloseState() {
+  ensureDataDir();
+  fs.writeFileSync(AUTO_CLOSE_PATH, JSON.stringify({
+    states: [...autoCloseStates.values()],
+    decisions: autoCloseDecisions.slice(0, 40),
+  }, null, 2));
+}
+
 function isSameDay(ts: number): boolean {
   const a = new Date(ts);
   const b = new Date();
@@ -427,6 +494,236 @@ async function fetchBookForCard(card: ThesisCard) {
   }
 }
 
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function fallbackCardForPosition(pos: PaperPosition, mark = pos.entryPrice): ThesisCard {
+  return {
+    id: pos.thesisId,
+    ticker: pos.ticker,
+    title: pos.title,
+    category: pos.category ?? 'paper',
+    playbook: pos.playbook as ThesisCard['playbook'],
+    status: 'tradeable',
+    side: pos.side,
+    marketPrice: mark,
+    impliedPrice: mark,
+    grossEdge: 0,
+    netEdge: 0,
+    spread: 0.02,
+    depthUsd: 100,
+    predictability: 0.5,
+    feeEstimate: 0,
+    signalReason: 'paper position fallback',
+    externalSummary: '',
+    createdAt: pos.openedAt,
+    updatedAt: Date.now(),
+    freshnessMs: Date.now() - pos.openedAt,
+    edgeHistory: [],
+    drivers: [],
+    invalidations: [],
+  };
+}
+
+function cardForPosition(pos: PaperPosition): ThesisCard | undefined {
+  return theses.find((t) => t.ticker === pos.ticker) ?? geaTheses.find((t) => t.ticker === pos.ticker);
+}
+
+function positionMark(pos: PaperPosition, card = cardForPosition(pos)): number {
+  if (!card) return getMarkPrices().get(pos.ticker) ?? pos.entryPrice;
+  return card.side === pos.side ? card.marketPrice : 1 - card.marketPrice;
+}
+
+function autoCloseSnapshot() {
+  const openIds = new Set(paperDesk.snapshot().positions.map((p) => p.id));
+  let changed = false;
+  for (const id of [...autoCloseStates.keys()]) {
+    if (!openIds.has(id)) {
+      autoCloseStates.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) saveAutoCloseState();
+
+  const autoCloseStateByPosition: Record<string, AutoCloseState> = {};
+  for (const [id, state] of autoCloseStates) autoCloseStateByPosition[id] = state;
+  return {
+    autoCloseStateByPosition,
+    autoCloseDecisions: autoCloseDecisions.slice(0, 20),
+    profitabilityBenchmark: profitabilityBenchmark.report(),
+  };
+}
+
+function exitSignalFromRecommendation(packet: ExitRecommendation): AutoCloseExitSignal {
+  const baseConfidence =
+    packet.action === 'exit' ? 0.9 :
+    packet.action === 'trim' ? 0.86 :
+    packet.action === 'add-only-on-pullback' ? 0.55 :
+    0.35;
+  const edgePressure = packet.current_edge <= 0 ? 0.08 : packet.captured_edge > packet.current_edge ? 0.03 : 0;
+  return {
+    ticker: packet.ticker,
+    action: packet.action,
+    confidence: clamp01(baseConfidence + edgePressure),
+    currentEdge: packet.current_edge,
+    capturedEdge: packet.captured_edge,
+    reason: packet.reason,
+    issuedAt: packet.issued_at,
+  };
+}
+
+function recordBenchmarkSample(
+  strategy: 'baseline' | 'upgraded',
+  pos: PaperPosition,
+  contracts: number,
+  pnl = 0,
+  slippageUsd = 0,
+  closeRegretUsd = 0,
+) {
+  const feePortion = pos.contracts > 0 ? (pos.fees * contracts) / pos.contracts : 0;
+  profitabilityBenchmark.record(strategy, {
+    id: `${strategy}:${pos.id}:${Date.now()}`,
+    riskUsd: pos.entryPrice * contracts + feePortion,
+    netPnlUsd: pnl,
+    maxDrawdownUsd: Math.max(0, -pnl),
+    closeRegretUsd,
+    slippageUsd,
+    falseExit: strategy === 'upgraded' && pnl < 0,
+  });
+}
+
+async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseDecision): Promise<boolean> {
+  if (decision.action === 'hold' || decision.contracts < 1) return false;
+  if (settings.killSwitchActive) return false;
+  const card = cardForPosition(pos);
+  const mark = positionMark(pos, card);
+  const closeCard = card ?? fallbackCardForPosition(pos, mark);
+  const qty = Math.min(pos.contracts, decision.contracts);
+  const book = await fetchBookForCard(closeCard);
+  const result = simulatePaperClose(
+    paperDesk,
+    pos.id,
+    book,
+    pos.side,
+    mark,
+    qty,
+    settings,
+    {
+      autoCloseDecisionId: decision.id,
+      autoCloseReason: decision.reason,
+      autoCloseAction: decision.action,
+    },
+  );
+  const state = autoCloseStates.get(pos.id);
+  if (state) {
+    state.lastDecisionAt = decision.triggeredAt;
+    if (result.ok && decision.action === 'trim') {
+      state.trimmedContracts += qty;
+    }
+  }
+
+  if (!result.ok) {
+    auditLog.append({
+      action: 'paper_abort',
+      ticker: pos.ticker,
+      detail: `auto-${decision.action} failed: ${result.error ?? 'unknown'}`,
+      ok: false,
+    });
+    saveAuditLog();
+    saveAutoCloseState();
+    return false;
+  }
+
+  autoCloseDecisions = [{ ...decision, contracts: qty }, ...autoCloseDecisions].slice(0, 40);
+  recordBenchmarkSample(
+    'upgraded',
+    pos,
+    qty,
+    result.pnl ?? 0,
+    result.fillQuality?.implementationShortfall ?? 0,
+    Math.max(0, decision.peakPnlUsd - decision.currentPnlUsd),
+  );
+  sessionStatsData.tradeCount += 1;
+  auditLog.append({
+    action: 'paper_close',
+    ticker: pos.ticker,
+    detail: `auto-${decision.action}: ${decision.reason}; pnl ${result.pnl?.toFixed(2)}`,
+    ok: true,
+  });
+  savePaperPortfolio();
+  saveAutoCloseState();
+  saveAuditLog();
+  saveSessionStats();
+  return true;
+}
+
+async function evaluateAutoClosePositions(_trigger: string) {
+  if (autoCloseRunning) {
+    autoCloseQueued = true;
+    return;
+  }
+  autoCloseRunning = true;
+  let executed = false;
+  try {
+    const now = Date.now();
+    const openIds = new Set<string>();
+    for (const pos of paperDesk.snapshot().positions) {
+      openIds.add(pos.id);
+      const card = cardForPosition(pos);
+      const mark = positionMark(pos, card);
+      const tickCount = Math.max(tickHistory.get(pos.ticker)?.length ?? 0, autoCloseStates.get(pos.id)?.tickCount ?? 0);
+      const currentEdge = card?.netEdge ?? latestExitSignals.get(pos.ticker)?.currentEdge ?? 0;
+      const nextState = updateAutoCloseState({
+        position: pos,
+        mark,
+        currentEdge,
+        tickCount,
+        now,
+        prior: autoCloseStates.get(pos.id),
+      });
+      autoCloseStates.set(pos.id, nextState);
+
+      const decision = evaluateAutoClosePosition({
+        position: pos,
+        mark,
+        currentEdge,
+        tickCount,
+        now,
+        state: nextState,
+        settings: autoCloseSettings(),
+        exitSignal: latestExitSignals.get(pos.ticker),
+        freshnessMs: card?.freshnessMs,
+        slippagePp: card?.slippagePp ?? card?.spread,
+      });
+
+      if (decision.action === 'hold') continue;
+      if (nextState.lastDecisionAt && now - nextState.lastDecisionAt < 10_000) continue;
+      nextState.lastDecisionAt = now;
+      autoCloseStates.set(pos.id, nextState);
+      const ok = await executeAutoCloseDecision(pos, decision);
+      executed = executed || ok;
+    }
+
+    let pruned = false;
+    for (const id of [...autoCloseStates.keys()]) {
+      if (!openIds.has(id)) {
+        autoCloseStates.delete(id);
+        pruned = true;
+      }
+    }
+    if (pruned || paperDesk.snapshot().positions.length > 0) saveAutoCloseState();
+  } finally {
+    autoCloseRunning = false;
+  }
+  if (executed) broadcastPaperUpdate();
+  if (autoCloseQueued) {
+    autoCloseQueued = false;
+    void evaluateAutoClosePositions('queued');
+  }
+}
+
 function computeRegimeState(spread: number, depthUsd: number, freshnessMs: number, sourceDisagree: boolean) {
   refreshDailyPnl();
   const regime = detectNoTradeRegimes({
@@ -462,7 +759,7 @@ function finalizeThesis(card: ThesisCard): ThesisCard {
 
 function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
   let changed = false;
-  theses = theses.map((t) => {
+  const updateCard = (t: ThesisCard) => {
     if (t.ticker !== ticker) return t;
     changed = true;
     const marketPrice = t.side === 'yes' ? yesPrice : 1 - yesPrice;
@@ -477,15 +774,14 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
       updatedAt: Date.now(),
       edgeHistory: [...t.edgeHistory.slice(-19), edge.netEdge],
     };
-  });
+  };
+  theses = theses.map(updateCard);
+  geaTheses = geaTheses.map(updateCard);
   if (changed) {
     const card = theses.find((t) => t.ticker === ticker);
     recordTick(ticker, yesPrice, spread, card?.netEdge ?? 0);
-    broadcast('markets:update', {
-      markets: marketsCache,
-      theses: rankTheses(theses),
-      connectors: registry.getAll(),
-    });
+    publishMarketState();
+    void evaluateAutoClosePositions('quote');
     broadcastPaperUpdate();
   }
 }
@@ -510,6 +806,7 @@ function processWorkingOrders() {
         savePaperPortfolio();
         savePaperOrders();
         sessionStatsData.tradeCount += 1;
+        void evaluateAutoClosePositions('working-order-fill');
         broadcastPaperUpdate();
       }
     })();
@@ -532,6 +829,7 @@ function broadcastPaperUpdate() {
     workingOrders: paperOrderBook.working(),
     dailyPnl: sessionStatsData.dailyPnl,
     activeRegimes,
+    ...autoCloseSnapshot(),
   });
 }
 
@@ -546,11 +844,13 @@ async function refreshWatchedTicker() {
     const yesPrice = (yesBid + yesAsk) / 2;
     const spread = Math.abs(yesAsk - yesBid) || card.spread;
     recordTick(watchedTicker, yesPrice, spread, card.netEdge);
+    void evaluateAutoClosePositions('watched-ticker');
     broadcastPaperUpdate();
   } catch {
     const jitter = (Math.random() - 0.5) * 0.02;
     const yesPrice = Math.max(0.01, Math.min(0.99, card.marketPrice + jitter));
     recordTick(watchedTicker, yesPrice, card.spread, card.netEdge);
+    void evaluateAutoClosePositions('watched-ticker-fallback');
     broadcastPaperUpdate();
   }
 }
@@ -559,6 +859,54 @@ function broadcast(channel: string, data: unknown) {
   for (const w of [mainWindow, ...widgetWindows]) {
     if (w && !w.isDestroyed()) w.webContents.send(channel, data);
   }
+}
+
+function mergeGeaMarkets(markets: KalshiMarket[]): KalshiMarket[] {
+  let merged = markets;
+  for (const market of geaMarkets) {
+    if (!merged.some((m) => m.ticker === market.ticker)) {
+      merged = [market, ...merged];
+    }
+  }
+  return merged;
+}
+
+function replaceGeaTheses(base: ThesisCard[]): ThesisCard[] {
+  const withoutGea = base.filter((card) => !card.id.startsWith('gea-'));
+  return rankThesesForUi([...geaTheses, ...withoutGea]);
+}
+
+function publishMarketState(extra: Record<string, unknown> = {}) {
+  broadcast('markets:update', {
+    markets: marketsCache,
+    theses: rankThesesForUi(theses),
+    connectors: registry.getAll(),
+    discovery: discovery.getState(),
+    gates: evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false),
+    ...extra,
+  });
+  broadcastDiscovery();
+  broadcastWorldEvents();
+}
+
+function applyBridgeRecommendation(packet: RecommendationPacket) {
+  const market = marketsCache.find((m) => m.ticker === packet.ticker)
+    ?? geaMarkets.find((m) => m.ticker === packet.ticker);
+  geaMarkets = upsertRecommendationMarket(geaMarkets, packet, market);
+  marketsCache = mergeGeaMarkets(marketsCache);
+  geaTheses = upsertRecommendationThesis(geaTheses, packet, market);
+  theses = replaceGeaTheses(theses);
+  kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
+  publishMarketState();
+  void evaluateAutoClosePositions('bridge-entry');
+  broadcastPaperUpdate();
+  broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
+}
+
+function applyBridgeExitRecommendation(packet: ExitRecommendation) {
+  latestExitSignals.set(packet.ticker, exitSignalFromRecommendation(packet));
+  void evaluateAutoClosePositions('bridge-exit');
+  broadcastPaperUpdate();
 }
 
 function applyDepthToCard(card: ThesisCard): ThesisCard {
@@ -576,52 +924,69 @@ function applyDepthToCard(card: ThesisCard): ThesisCard {
 }
 
 function rankThesesForUi(cards: ThesisCard[]): ThesisCard[] {
-  return discovery.settings.depthVerifyEnabled ? rankThesesWithTiers(cards) : rankTheses(cards);
+  const base = discovery.settings.depthVerifyEnabled ? rankThesesWithTiers(cards) : rankTheses(cards);
+  return base
+    .map((card, index) => ({
+      card,
+      index,
+      score: scoreOpportunityForCard(card, {
+        bridgeLatencyMs: card.id.startsWith('gea-') && bridgeStatus.lastSeenAt
+          ? Date.now() - bridgeStatus.lastSeenAt
+          : undefined,
+      }).score,
+    }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((row) => row.card);
 }
 
 async function refreshMarkets() {
   try {
-    if (discovery.getUniverse().length === 0) {
+    // Only hit the API when we have absolutely no market data.
+    // marketsCache is always populated first (either real data or fixtures), so
+    // this branch only fires on the very first call when both sources are empty.
+    if (discovery.getUniverse().length === 0 && marketsCache.length === 0) {
       await discovery.refreshUniverse();
     }
-    await discovery.runDepthPass();
-    marketsCache = discovery.getUniverse();
-    await buildThesesFromMarkets(discovery.getMarketsForSignals());
-    broadcast('markets:update', {
-      markets: marketsCache,
-      theses: rankThesesForUi(theses),
-      connectors: registry.getAll(),
-      discovery: discovery.getState(),
-      gates: evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false),
-    });
-    broadcastDiscovery();
-    broadcastWorldEvents();
+    // Prefer live universe; fall back to whatever marketsCache holds (fixtures or
+    // a stale snapshot) so tickets are never held hostage by a slow API.
+    if (discovery.getUniverse().length > 0) {
+      marketsCache = mergeGeaMarkets(discovery.getUniverse());
+    }
+    const signalMarkets = discovery.getUniverse().length > 0
+      ? discovery.getMarketsForSignals()
+      : marketsCache;
+    await buildThesesFromMarkets(signalMarkets);
+    publishMarketState();
     broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
+    void evaluateAutoClosePositions('market-refresh');
+    // Depth pass runs in background after tickets are shown; next refresh() uses results
+    void discovery.runDepthPass();
   } catch (e) {
     registry.recordError('kalshi-rest', e instanceof Error ? e.message : String(e));
     if (marketsCache.length === 0) {
       marketsCache = FIXTURE_MARKETS;
       discovery.seedFixtureDepth(FIXTURE_MARKETS);
     }
+    marketsCache = mergeGeaMarkets(marketsCache);
     await buildThesesFromMarkets(marketsCache);
-    broadcast('markets:update', {
-      markets: marketsCache,
-      theses: rankThesesForUi(theses),
-      offline: true,
-      connectors: registry.getAll(),
-      discovery: discovery.getState(),
-    });
-    broadcastDiscovery();
+    publishMarketState({ offline: true });
+    void evaluateAutoClosePositions('market-refresh-offline');
   }
 }
 
 async function refreshUniverseLoop() {
   try {
-    await discovery.refreshUniverse();
-    marketsCache = discovery.getUniverse();
+    // Cap at 20 s so the loop never blocks for 60–180 s on a slow connection.
+    await Promise.race([
+      discovery.refreshUniverse(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('universe loop timeout')), 20_000)
+      ),
+    ]);
+    marketsCache = mergeGeaMarkets(discovery.getUniverse());
     broadcastDiscovery();
   } catch {
-    /* keep cached universe */
+    /* keep cached universe — next cycle will retry */
   }
 }
 
@@ -760,7 +1125,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
     const withTier = built.filter((c) => c.executableTier != null);
     built = withTier.length > 0 ? withTier : built;
   }
-  theses = rankThesesForUi(built);
+  theses = replaceGeaTheses(built);
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
 
   for (const c of theses) {
@@ -877,8 +1242,12 @@ function setupBridgeServer() {
         if (valid.type === 'brain:recommendation') {
           bridgeStatus.brainRole = (valid.payload as { brain_role: BridgeStatus['brainRole'] }).brain_role;
           broadcastBridgeStatus();
+          applyBridgeRecommendation(valid.payload as RecommendationPacket);
           broadcast('bridge:recommendation', valid.payload);
-        } else if (valid.type === 'brain:no-trade' || valid.type === 'brain:exit') {
+        } else if (valid.type === 'brain:exit') {
+          applyBridgeExitRecommendation(valid.payload as ExitRecommendation);
+          broadcast('bridge:recommendation', valid.payload);
+        } else if (valid.type === 'brain:no-trade') {
           broadcast('bridge:recommendation', valid.payload);
         } else if (valid.type === 'bridge:ping') {
           const pong: NemesisBridgeMessage = { type: 'bridge:pong', payload: {}, seq: ++bridgeSeq };
@@ -911,34 +1280,44 @@ function spawnGlobalEventAlpha() {
   const repoRoot = path.resolve(__dirname, '..', '..', '..');
   const geaRoot = path.resolve(__dirname, '..', '..', 'global-event-alpha');
   const builtMain = path.join(geaRoot, 'dist-electron', 'main.js');
+  const geaPath = process.env.NEMESIS_GEA_PATH;
+  const plan = createGeaSpawnPlan({
+    platform: process.platform,
+    env: process.env,
+    repoRoot,
+    geaRoot,
+    builtMain,
+    builtMainExists: fs.existsSync(builtMain),
+    geaPath,
+    geaPathExists: Boolean(geaPath && fs.existsSync(geaPath)),
+    execPath: process.execPath,
+  });
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
     NEMESIS_BRIDGE_URL: `ws://localhost:${bridgePort}`,
   };
   delete childEnv.VITE_DEV_SERVER_URL;
 
-  let command: string | null = null;
-  let args: string[] = [];
-  let cwd = repoRoot;
-  const geaPath = process.env.NEMESIS_GEA_PATH;
-
-  if (geaPath && fs.existsSync(geaPath)) {
-    command = geaPath;
-  } else if (process.env.VITE_DEV_SERVER_URL) {
-    command = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    args = ['run', 'dev', '-w', '@nemesis/global-event-alpha'];
-  } else if (fs.existsSync(builtMain)) {
-    command = process.execPath;
-    args = [builtMain];
-    cwd = geaRoot;
-  }
-
-  if (!command) return;
-  geaProcess = spawn(command, args, { cwd, detached: true, stdio: 'ignore', env: childEnv });
-  geaProcess.once('exit', () => {
-    geaProcess = null;
+  if (!plan) return;
+  geaProcess = spawn(plan.command, plan.args, {
+    cwd: plan.cwd,
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: childEnv,
+    windowsHide: true, // hide npm console window; GEA's Electron window still appears
   });
-  geaProcess.unref();
+  geaProcess.stderr?.on('data', (d: Buffer) => {
+    process.stderr.write(`[gea] ${d.toString()}`);
+  });
+  geaProcess.once('error', (err) => {
+    console.warn(`[gea] spawn failed: ${err.message}`);
+    geaProcess = null;
+    setTimeout(spawnGlobalEventAlpha, 3_000);
+  });
+  geaProcess.once('exit', (code) => {
+    console.log(`[gea] exited (code=${code ?? 'null'})`);
+    geaProcess = null;
+    if (code !== 0) setTimeout(spawnGlobalEventAlpha, 3_000); // auto-retry once on crash
+  });
 }
 
 function setupIpc() {
@@ -964,11 +1343,19 @@ function setupIpc() {
       return { ok: false, error: 'Kalshi credentials not configured — add API Key ID and Private Key in Settings' };
     }
     const riskOverride = settings.liveEnabled && isRiskSettingOverride(partial);
-    settings = { ...settings, ...partial };
+    settings = normalizeGuardrailSettings({
+      ...settings,
+      ...partial,
+      autoClose: partial.autoClose
+        ? { ...autoCloseSettings(), ...partial.autoClose }
+        : autoCloseSettings(),
+    });
     if (riskOverride) recordSettingsManualOverride();
     feedHub.setKalshiApiKey(settings.kalshiApiKeyId);
     saveSettings();
     broadcast('settings:update', settings);
+    void evaluateAutoClosePositions('settings');
+    broadcastPaperUpdate();
     return { ok: true, settings };
   });
 
@@ -1059,6 +1446,7 @@ function setupIpc() {
       equityHistory,
       audit: auditLog.list(),
       sessionStats: sessionStatsData,
+      autoClose: autoCloseSnapshot(),
       equity: mtm.equity,
       csv: journal.exportCsv(),
     };
@@ -1137,6 +1525,7 @@ function setupIpc() {
     auditLog.append({ action: 'paper_buy', thesisId, ticker: card.ticker, detail: `filled ${result.fill?.filled}`, ok: true });
     savePaperPortfolio();
     saveAuditLog();
+    void evaluateAutoClosePositions('paper-buy');
     broadcastPaperUpdate();
     return result;
   });
@@ -1144,41 +1533,18 @@ function setupIpc() {
   ipcMain.handle('nemesis:paperClose', async (_e, positionId: string, contracts?: number) => {
     const pos = paperDesk.snapshot().positions.find((p) => p.id === positionId);
     if (!pos) return { ok: false, error: 'position not found' };
-    const card = theses.find((t) => t.ticker === pos.ticker);
-    const expectedPrice = pos.side === 'yes'
-      ? (card?.marketPrice ?? pos.entryPrice)
-      : (1 - (card?.marketPrice ?? pos.entryPrice));
+    const card = cardForPosition(pos);
+    const expectedPrice = positionMark(pos, card);
     const qty = contracts ?? pos.contracts;
-    const book = card ? await fetchBookForCard(card) : fallbackBook({
-      ...pos,
-      id: pos.thesisId,
-      marketPrice: pos.entryPrice,
-      impliedPrice: pos.entryPrice,
-      category: pos.category ?? '',
-      playbook: pos.playbook as never,
-      status: 'tradeable',
-      grossEdge: 0,
-      netEdge: 0,
-      spread: 0.02,
-      depthUsd: 100,
-      predictability: 50,
-      feeEstimate: 0,
-      signalReason: '',
-      externalSummary: '',
-      createdAt: 0,
-      updatedAt: 0,
-      freshnessMs: 0,
-      edgeHistory: [],
-      drivers: [],
-      invalidations: [],
-      title: pos.title,
-    });
+    const book = card ? await fetchBookForCard(card) : fallbackBook(fallbackCardForPosition(pos, expectedPrice));
     const result = simulatePaperClose(paperDesk, positionId, book, pos.side, expectedPrice, qty, settings);
     if (result.ok) {
+      recordBenchmarkSample('baseline', pos, qty, result.pnl ?? 0, result.fillQuality?.implementationShortfall ?? 0);
       sessionStatsData.tradeCount += 1;
       auditLog.append({ action: 'paper_close', ticker: pos.ticker, detail: `pnl ${result.pnl?.toFixed(2)}`, ok: true });
       savePaperPortfolio();
       saveAuditLog();
+      saveSessionStats();
       broadcastPaperUpdate();
     }
     return result;
@@ -1236,16 +1602,21 @@ function setupIpc() {
       workingOrders: paperOrderBook.working(),
       dailyPnl: sessionStatsData.dailyPnl,
       activeRegimes,
+      ...autoCloseSnapshot(),
     };
   });
 
   ipcMain.handle('nemesis:resetPaper', (_e, startingCash?: number) => {
     const cash = (startingCash && startingCash > 0) ? startingCash : DEFAULT_PAPER_CASH;
     paperDesk.reset(cash);
+    autoCloseStates.clear();
+    autoCloseDecisions = [];
+    latestExitSignals.clear();
     equityHistory = [{ t: Date.now(), equity: cash, deployed: 0, cash }];
     resetDailySession();
     savePaperPortfolio();
     saveEquityHistory();
+    saveAutoCloseState();
     broadcastPaperUpdate();
     return paperDesk.snapshot();
   });
@@ -1374,6 +1745,7 @@ app.whenReady().then(async () => {
   loadDiscoverySettings();
   loadJournal();
   loadPaperPortfolio();
+  loadAutoCloseState();
   loadEquityHistory();
   loadSessionStats();
   loadPaperOrders();
@@ -1382,27 +1754,65 @@ app.whenReady().then(async () => {
   kalshiStream.start();
   setupIpc();
   setupBridgeServer();
-  createWindow();
-  spawnGlobalEventAlpha();
+
+  // Probe connectors BEFORE creating the window.
+  // Instant connectors (FRED/EIA/kalshi-portfolio with no key, BLS pure calc) resolve
+  // synchronously or in one microtask tick, so getState() will never return all-idle.
   feedHub.startBackgroundPolling(8_000);
-  try {
-    await discovery.refreshUniverse();
-    marketsCache = discovery.getUniverse();
-  } catch {
-    marketsCache = FIXTURE_MARKETS;
-    discovery.seedFixtureDepth(FIXTURE_MARKETS);
-  }
-  await refreshMarkets();
-  setInterval(refreshMarkets, MARKET_REFRESH_MS);
-  setInterval(refreshUniverseLoop, 60_000);
-  setInterval(refreshWatchedTicker, WATCHED_TICK_MS);
+  void feedHub.refreshForMarkets(FIXTURE_MARKETS);
+  // Drain one event-loop tick: BLS records ok, FRED/EIA/kalshi-portfolio record warn
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  // Health broadcast starts before the window opens so the first connectors:update
+  // arrives within 5 s of the renderer mounting its listener.
   setInterval(() => {
     tickApiHealthDegraded();
     processWorkingOrders();
+    void evaluateAutoClosePositions('health-tick');
+    broadcast('connectors:update', registry.getAll());
     if (paperDesk.snapshot().positions.length > 0) {
       broadcastPaperUpdate();
     }
   }, 5_000);
+
+  createWindow();
+  spawnGlobalEventAlpha();
+
+  // 10 s hard cap on the startup universe fetch.  If the Kalshi API is slow or
+  // firewalled the paging loop (up to 10 pages × retries × bases) can run for
+  // 90 s+, keeping every connector in the initial "idle" state for the full
+  // duration.  We race against a timeout, fall to fixtures immediately, and let
+  // the background poll finish and update the registry when it's ready.
+  try {
+    await Promise.race([
+      discovery.refreshUniverse(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('startup universe fetch timed out')), 10_000)
+      ),
+    ]);
+    marketsCache = discovery.getUniverse();
+  } catch (startupErr) {
+    // Pull kalshi-rest out of the initial "idle" state (warn + no lastSuccess + no lastError)
+    // so the UI shows an honest error badge instead of a stale spinner.
+    const cr = registry.get('kalshi-rest');
+    if (cr && cr.lastSuccess === null && cr.lastError === null) {
+      registry.recordError(
+        'kalshi-rest',
+        startupErr instanceof Error ? startupErr.message : 'startup timeout',
+      );
+    }
+    marketsCache = discovery.getUniverse().length > 0
+      ? discovery.getUniverse()
+      : FIXTURE_MARKETS;
+    if (marketsCache === FIXTURE_MARKETS) discovery.seedFixtureDepth(FIXTURE_MARKETS);
+    marketsCache = mergeGeaMarkets(marketsCache);
+  }
+  // Push connector status immediately — don't wait for the next 5 s health tick.
+  broadcast('connectors:update', registry.getAll());
+  await refreshMarkets();
+  setInterval(refreshMarkets, MARKET_REFRESH_MS);
+  setInterval(refreshUniverseLoop, 60_000);
+  setInterval(refreshWatchedTicker, WATCHED_TICK_MS);
 
   globalShortcut.register('CommandOrControl+Shift+K', () => {
     void activateKillSwitch('shortcut');

@@ -124,13 +124,14 @@ export function simulatePaperClose(
   expectedPrice: number,
   contracts: number,
   settings: GuardrailSettings,
+  metaPatch?: Pick<FillMetadata, 'autoCloseDecisionId' | 'autoCloseReason' | 'autoCloseAction'>,
 ): PaperCloseResult {
   const fill = dryRunFill(book, side, contracts, expectedPrice, settings.maxSlippagePp);
   if (fill.aborted) {
     return { ok: false, error: fill.abortReason ?? 'fill aborted', fill };
   }
   const quality = fillQualityFromDryRun(fill, expectedPrice);
-  const meta = fillMeta(fill, quality);
+  const meta = { ...fillMeta(fill, quality), ...metaPatch };
   const result = desk.closePosition(positionId, fill.fillPrice, contracts, meta);
   if (!result.ok) return { ok: false, error: result.error };
   return { ok: true, pnl: result.pnl, fill, fillQuality: quality };

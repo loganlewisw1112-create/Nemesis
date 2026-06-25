@@ -1,5 +1,14 @@
 import { useState } from 'react';
-import type { PaperPortfolio, PaperPosition, PaperOrder, PaperTrade } from '@nemesis/core';
+import type {
+  AutoCloseDecision,
+  AutoCloseSettings,
+  AutoCloseState,
+  PaperPortfolio,
+  PaperPosition,
+  PaperOrder,
+  PaperTrade,
+} from '@nemesis/core';
+import { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
 import { positionUnrealizedPnl } from '@nemesis/core';
 
 interface Props {
@@ -10,6 +19,9 @@ interface Props {
   workingOrders?: PaperOrder[];
   dailyPnl?: number;
   dailyLossCap?: number;
+  autoCloseSettings?: AutoCloseSettings;
+  autoCloseStateByPosition?: Record<string, AutoCloseState>;
+  autoCloseDecisions?: AutoCloseDecision[];
   onClose: (id: string, contracts?: number) => void;
   onReset: () => void;
   onPreview?: (contracts: number) => void;
@@ -26,6 +38,9 @@ export function PaperDeskPanel({
   workingOrders = [],
   dailyPnl = 0,
   dailyLossCap = 5,
+  autoCloseSettings = DEFAULT_AUTO_CLOSE_SETTINGS,
+  autoCloseStateByPosition = {},
+  autoCloseDecisions = [],
   onClose,
   onReset,
   onPreview,
@@ -58,6 +73,16 @@ export function PaperDeskPanel({
         ) : (
           <span>${(dailyLossCap + dailyPnl).toFixed(2)} remaining</span>
         )}
+      </div>
+
+      <div style={{ ...cardStyle, marginBottom: 12, fontSize: 11 }}>
+        <span style={{ color: autoCloseSettings.enabled ? 'var(--success)' : 'var(--text-muted)', fontWeight: 700 }}>
+          Paper auto-close {autoCloseSettings.enabled ? 'ON' : 'OFF'}
+        </span>
+        <span style={{ color: 'var(--text-muted)' }}>
+          {' '}· trim +{(autoCloseSettings.firstTrimProfitPct * 100).toFixed(0)}%/{(autoCloseSettings.firstTrimGivebackPct * 100).toFixed(0)}% giveback
+          {' '}· close +{(autoCloseSettings.finalCloseProfitPct * 100).toFixed(0)}%/{(autoCloseSettings.finalCloseGivebackPct * 100).toFixed(0)}% giveback
+        </span>
       </div>
 
       {selectedTicker && onPreview && (
@@ -118,11 +143,34 @@ export function PaperDeskPanel({
               mark={marks[p.ticker] ?? p.entryPrice}
               equity={equity}
               closeQty={closeQty[p.id] ?? String(p.contracts)}
+              autoCloseState={autoCloseStateByPosition[p.id]}
+              autoCloseSettings={autoCloseSettings}
               onCloseQtyChange={(v) => setCloseQty((prev) => ({ ...prev, [p.id]: v }))}
               onClose={onClose}
             />
           ))}
         </div>
+      )}
+
+      {autoCloseDecisions.length > 0 && (
+        <>
+          <h2 style={sectionTitle}>Auto-close decisions</h2>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+            {autoCloseDecisions.slice(0, 5).map((d) => (
+              <div key={d.id} style={{ ...cardStyle, fontSize: 11 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                  <span style={{ fontWeight: 700, color: d.action === 'trim' ? 'var(--warning)' : 'var(--success)' }}>
+                    {d.action === 'trim' ? 'Auto-trimmed near peak' : d.reason.toLowerCase().includes('edge gone') ? 'Emergency close: edge gone' : 'Auto-closed after edge decay'}
+                  </span>
+                  <span style={{ color: 'var(--text-muted)' }}>{new Date(d.triggeredAt).toLocaleTimeString()}</span>
+                </div>
+                <div style={{ color: 'var(--text-muted)' }}>
+                  {d.ticker} ×{d.contracts} · current {(d.currentPnlPct * 100).toFixed(1)}% · peak {(d.peakPnlPct * 100).toFixed(1)}% · {(d.givebackPct * 100).toFixed(0)}% giveback
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
       )}
 
       {workingOrders.length > 0 && (
@@ -181,6 +229,8 @@ function PositionRow({
   mark,
   equity,
   closeQty,
+  autoCloseState,
+  autoCloseSettings,
   onCloseQtyChange,
   onClose,
 }: {
@@ -188,16 +238,35 @@ function PositionRow({
   mark: number;
   equity: number;
   closeQty: string;
+  autoCloseState?: AutoCloseState;
+  autoCloseSettings: AutoCloseSettings;
   onCloseQtyChange: (v: string) => void;
   onClose: (id: string, contracts?: number) => void;
 }) {
   const pnl = positionUnrealizedPnl(pos, mark);
   const pctBook = equity > 0 ? ((pos.entryPrice * pos.contracts) / equity) * 100 : 0;
+  const costBasis = pos.entryPrice * pos.contracts + pos.fees;
+  const currentPnlPct = costBasis > 0 ? pnl / costBasis : 0;
+  const giveback = autoCloseState?.peakPnlPct && autoCloseState.peakPnlPct > 0
+    ? Math.max(0, (autoCloseState.peakPnlPct - currentPnlPct) / autoCloseState.peakPnlPct)
+    : 0;
+  const nextTrigger = autoCloseState
+    ? autoCloseState.trimmedContracts > 0
+      ? `next close ${(autoCloseSettings.finalCloseGivebackPct * 100).toFixed(0)}% giveback`
+      : `next trim ${(autoCloseSettings.firstTrimGivebackPct * 100).toFixed(0)}% giveback`
+    : `waiting for ${autoCloseSettings.minTicks} ticks`;
   return (
     <div style={cardStyle}>
       <div style={{ fontWeight: 600, fontSize: 12 }}>{pos.title}</div>
       <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 6 }}>
         {pos.ticker} · {pos.side.toUpperCase()} × {pos.contracts} @ {(pos.entryPrice * 100).toFixed(1)}¢ · {pctBook.toFixed(0)}% of book
+      </div>
+      <div style={{ color: 'var(--text-muted)', fontSize: 10, marginBottom: 6 }}>
+        Peak {autoCloseState ? `${(autoCloseState.peakPnlPct * 100).toFixed(1)}%` : 'collecting'}
+        {' '}· Giveback {(giveback * 100).toFixed(0)}%
+        {' '}· Ticks {autoCloseState?.tickCount ?? 0}
+        {autoCloseState && autoCloseState.trimmedContracts > 0 ? ` · Trimmed ${autoCloseState.trimmedContracts}` : ''}
+        {' '}· {nextTrigger}
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
         <span style={{ color: pnl >= 0 ? 'var(--success)' : 'var(--danger)' }}>${pnl.toFixed(2)} unrealized</span>
@@ -224,10 +293,11 @@ function PositionRow({
 }
 
 function BlotterRow({ trade: t }: { trade: PaperTrade }) {
+  const typeLabel = t.autoCloseAction ? `auto-${t.autoCloseAction}` : t.type;
   return (
     <tr style={{ borderBottom: '1px solid var(--border)' }}>
       <td style={tdStyle}>{new Date(t.timestamp).toLocaleTimeString()}</td>
-      <td style={{ ...tdStyle, color: t.type === 'open' ? 'var(--accent)' : 'var(--warning)' }}>{t.type}</td>
+      <td style={{ ...tdStyle, color: t.type === 'open' ? 'var(--accent)' : 'var(--warning)' }}>{typeLabel}</td>
       <td style={tdStyle}>{t.ticker}</td>
       <td style={tdStyle}>{t.contracts}</td>
       <td style={tdStyle}>{(t.price * 100).toFixed(1)}¢</td>
@@ -236,7 +306,7 @@ function BlotterRow({ trade: t }: { trade: PaperTrade }) {
       <td style={{ ...tdStyle, color: (t.pnl ?? 0) >= 0 ? 'var(--success)' : 'var(--danger)' }}>
         {t.pnl !== undefined ? `$${t.pnl.toFixed(2)}` : '—'}
       </td>
-      <td style={tdStyle}>{t.playbook ?? '—'}</td>
+      <td style={tdStyle} title={t.autoCloseReason}>{t.playbook ?? '—'}</td>
     </tr>
   );
 }

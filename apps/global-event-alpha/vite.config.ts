@@ -7,7 +7,16 @@ export default defineConfig({
   plugins: [
     react(),
     electron({
-      main: { entry: 'electron/main.ts' },
+      main: {
+        entry: 'electron/main.ts',
+        vite: {
+          build: {
+            rollupOptions: {
+              external: ['ws', 'bufferutil', 'utf-8-validate', 'better-sqlite3'],
+            },
+          },
+        },
+      },
       preload: { input: 'electron/preload.ts' },
     }),
   ],
@@ -27,7 +36,7 @@ export default defineConfig({
   root: '.',
   server: {
     port: 5174,
-    strictPort: true,
+    strictPort: false,
   },
   build: {
     outDir: 'dist',

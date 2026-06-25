@@ -80,6 +80,10 @@ test.describe('NEMESIS bridge fail-closed behavior', () => {
 
     ws.send(JSON.stringify({ type: 'brain:recommendation', payload: recommendation(), seq: 1 }));
     await expect.poll(() => page.evaluate(() => window.nemesis.getBridgeStatus().then((s) => s.brainRole))).toBe('primary');
+    await expect(page.getByText('KXBRIDGE-26', { exact: true })).toBeVisible({ timeout: 5_000 });
+    await expect.poll(() => page.evaluate(() =>
+      window.nemesis.getState().then((s) => s.theses.some((t) => t.ticker === 'KXBRIDGE-26' && t.signalReason.includes('GEA elite'))),
+    )).toBe(true);
 
     ws.send(JSON.stringify({ type: 'brain:recommendation', payload: recommendation({ brain_role: 'standby-a', expires_at: 1 }), seq: 2 }));
     await page.waitForTimeout(200);

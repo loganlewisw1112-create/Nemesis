@@ -1,4 +1,4 @@
-import type { PaperPortfolio } from '@nemesis/core';
+import type { AutoCloseDecision, PaperPortfolio } from '@nemesis/core';
 import {
   buildLinePath,
   buildEquityCurve,
@@ -20,6 +20,7 @@ interface Props {
   equity: number;
   unrealized: number;
   equityHistory: EquityPoint[];
+  autoCloseDecisions?: AutoCloseDecision[];
 }
 
 const CHART_WIDTH = 400;
@@ -47,7 +48,7 @@ function StatCard({ label, value, color = 'var(--text)' }: { label: string; valu
   );
 }
 
-export function ProfitStationPanel({ portfolio, equity, unrealized, equityHistory }: Props) {
+export function ProfitStationPanel({ portfolio, equity, unrealized, equityHistory, autoCloseDecisions = [] }: Props) {
   const points = equityHistory.length > 0
     ? equityHistory
     : [{ t: Date.now(), equity, deployed: 0, cash: portfolio.cash }];
@@ -58,6 +59,11 @@ export function ProfitStationPanel({ portfolio, equity, unrealized, equityHistor
   const ladder = depthLadderFromTrades(portfolio.trades);
   const attribution = playbookAttribution(portfolio.trades, portfolio.positions);
   const fees = portfolioFeeWaterfall(portfolio.trades);
+  const autoCloseTrades = portfolio.trades.filter((t) => t.type === 'close' && t.autoCloseAction);
+  const autoCloseRealized = autoCloseTrades.reduce((sum, trade) => sum + (trade.pnl ?? 0), 0);
+  const autoCloseSaved = autoCloseTrades.reduce((sum, trade) => sum + Math.max(0, trade.pnl ?? 0), 0);
+  const autoCloseRegret = autoCloseDecisions.reduce((sum, d) => sum + Math.max(0, d.peakPnlUsd - d.currentPnlUsd), 0);
+  const missedUpside = autoCloseDecisions.reduce((sum, d) => sum + Math.max(0, d.peakPnlUsd - d.currentPnlUsd), 0);
 
   const equityPath = buildEquityCurve(points, CHART_WIDTH, HERO_HEIGHT);
   const profitVals = profitSeries(points, portfolio.startingCash);
@@ -104,6 +110,14 @@ export function ProfitStationPanel({ portfolio, equity, unrealized, equityHistor
         <StatCard label="Avg shortfall" value={formatUsd(fillQuality.avgShortfall)} />
         <StatCard label="Abort rate" value={`${(fillQuality.abortRate * 100).toFixed(0)}%`} />
         <StatCard label="Fills" value={String(fillQuality.fillCount)} />
+      </div>
+
+      <h2 style={sectionTitle}>Auto-close attribution</h2>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 16 }}>
+        <StatCard label="Saved profit" value={formatUsd(autoCloseSaved)} color={pnlColor(autoCloseSaved)} />
+        <StatCard label="Close regret" value={formatUsd(autoCloseRegret)} color={autoCloseRegret > 0 ? 'var(--warning)' : 'var(--text)' } />
+        <StatCard label="Missed upside" value={formatUsd(missedUpside)} color={missedUpside > 0 ? 'var(--warning)' : 'var(--text)' } />
+        <StatCard label="Auto realized" value={formatUsd(autoCloseRealized)} color={pnlColor(autoCloseRealized)} />
       </div>
 
       {ladder.length > 0 && (

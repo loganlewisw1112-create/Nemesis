@@ -48,6 +48,7 @@ export interface SportsSnapshot {
 
 export interface FeedHubOptions {
   fredApiKey?: string;
+  eiaApiKey?: string;
   fetchFn?: typeof fetch;
 }
 
@@ -411,6 +412,44 @@ export async function pingKalshiPortfolio(
   }
   registry.recordWarn('kalshi-portfolio', 'Credentials detected — signed portfolio sync pending pilot');
   return false;
+}
+
+export async function fetchEiaEnergy(
+  registry: ConnectorRegistry,
+  apiKey: string | undefined,
+  opts?: FeedHubOptions,
+): Promise<{ series: string; value: number; period: string } | null> {
+  if (!apiKey) {
+    registry.recordWarn('eia', 'Optional — set NEMESIS_EIA_API_KEY for live energy data');
+    return null;
+  }
+  return timed(registry, 'eia', async () => {
+    const fetchFn = getFetch(opts);
+    const url = `https://api.eia.gov/v2/petroleum/pri/spt/data/?api_key=${apiKey}&frequency=weekly&data[0]=value&facets[series][]=RWTC&sort[0][column]=period&sort[0][direction]=desc&length=1`;
+    const res = await fetchFn(url);
+    if (!res.ok) throw new Error(`EIA ${res.status}`);
+    const data = await res.json() as { response?: { data?: { period?: string; value?: number }[] } };
+    const row = data.response?.data?.[0];
+    if (!row?.value) throw new Error('EIA no data');
+    return { series: 'WTI Crude', value: row.value, period: row.period ?? '' };
+  });
+}
+
+export async function fetchSecEdgarHeadlines(
+  registry: ConnectorRegistry,
+  _opts?: FeedHubOptions,
+): Promise<{ title: string; link: string } | null> {
+  return timed(registry, 'sec-edgar', async () => {
+    const xml = await fetchText(
+      'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=5&output=atom',
+      { label: 'SEC EDGAR', timeoutMs: 12_000, retries: 2 },
+    );
+    const titles = [...xml.matchAll(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/g)].map((m) => m[1].trim());
+    const entry = titles.find((t) => t && !t.toLowerCase().startsWith('edgar') && !t.toLowerCase().startsWith('current'));
+    if (!entry) throw new Error('SEC EDGAR no entries');
+    const link = xml.match(/<link[^>]+href="([^"]+)"/)?.[1] ?? '';
+    return { title: entry, link };
+  }, { softFail: true });
 }
 
 export type TradesByTicker = Map<string, KalshiTrade[]>;

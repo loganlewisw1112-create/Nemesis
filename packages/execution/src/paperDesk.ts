@@ -122,6 +122,9 @@ export class PaperDesk {
       depthLevels: fillMeta?.depthLevels,
       mode: fillMeta?.mode ?? 'paper',
       playbook: pos.playbook,
+      autoCloseDecisionId: fillMeta?.autoCloseDecisionId,
+      autoCloseReason: fillMeta?.autoCloseReason,
+      autoCloseAction: fillMeta?.autoCloseAction,
     });
 
     if (qty === pos.contracts) {

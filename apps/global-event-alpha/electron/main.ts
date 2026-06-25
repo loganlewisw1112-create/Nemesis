@@ -31,6 +31,7 @@ import {
 } from '@nemesis/connectors';
 import {
   AlphaInterceptEngine,
+  AlphaScorer,
   EdgeEngine,
   EventGraph,
   HealthSupervisor,
@@ -58,6 +59,7 @@ import {
   type TicketAutopsyResult,
 } from '../../../packages/simulation-core/src/index.js';
 import { createGeaLocalStore, migrateGeaDatabase, type GeaDatabaseStatus, type GeaLocalStore } from './localDb.js';
+import { createEntryRecommendationPacket } from './bridgePublisher.js';
 
 const BRIDGE_URL = process.env.NEMESIS_BRIDGE_URL ?? 'ws://localhost:7430';
 const BRIDGE_VERSION = '0.1.0';
@@ -110,6 +112,7 @@ let publicDataMesh: PublicDataMesh | null = null;
 let publicDataRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let publicDataState: PublicDataMeshState = emptyPublicDataState();
 let intelligenceState: GlobalEventAlphaIntelligenceState = createIntelligenceState();
+let lastEntrySignature = '';
 let lastNoTradeSignature = '';
 let lastExitSignature = '';
 
@@ -303,6 +306,43 @@ function publishIntelligencePackets(state: GlobalEventAlphaIntelligenceState) {
   if (!bridgeStatus.connected) return;
   const role = activePublishingRole();
   const issuedAt = Date.now();
+  const alpha = AlphaScorer.score({
+    raw_edge: Math.max(0, state.edge.raw_edge),
+    net_edge: Math.max(0, state.edge.net_edge),
+    confidence: state.tribunal.model_agreement_score,
+    liquidity: state.noTrade.reasons.includes('LIQUIDITY_TOO_THIN') ? 0.25 : 0.75,
+    settlement_clarity: state.settlement.clarity_score,
+    freshness: state.noTrade.reasons.includes('DATA_STALE') ? 0.25 : 0.85,
+    volatility_penalty: Math.max(0, state.edge.raw_edge - state.edge.net_edge),
+  });
+  const entry = createEntryRecommendationPacket({
+    role,
+    id: `${state.edge.ticker}:alpha-v1:entry`,
+    modelVersion: 'alpha-v1',
+    ticker: state.edge.ticker,
+    alphaScore: alpha.alpha_score,
+    classification: alpha.classification,
+    nemesisProbability: state.tribunal.nemesis_probability,
+    confidenceBandLow: state.tribunal.confidence_band_low,
+    confidenceBandHigh: state.tribunal.confidence_band_high,
+    netEdge: state.edge.net_edge,
+    rawEdge: state.edge.raw_edge,
+    entryZoneLow: state.edge.entry_zone_low,
+    entryZoneHigh: state.edge.entry_zone_high,
+    doNotChaseLevel: state.edge.do_not_chase_level,
+    targetExit: state.edge.target_exit,
+    settlementClarityScore: state.settlement.clarity_score,
+    holdClass: state.hold.hold_class,
+    noTradeBlocked: state.noTrade.blocked,
+    now: issuedAt,
+  });
+  if (entry) {
+    const signature = `${entry.ticker}:${entry.classification}:${entry.alpha_score}:${entry.net_ev.toFixed(4)}:${entry.entry_zone_low.toFixed(4)}:${entry.entry_zone_high.toFixed(4)}`;
+    if (signature !== lastEntrySignature) {
+      lastEntrySignature = signature;
+      sendToNemesis({ type: 'brain:recommendation', payload: entry });
+    }
+  }
 
   if (state.noTrade.blocked) {
     const signature = `${state.noTrade.ticker}:${state.noTrade.reasons.join('|')}:${state.noTrade.recheck_at}`;

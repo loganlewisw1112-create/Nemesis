@@ -6,6 +6,7 @@ import {
   fetchBinanceSpot,
   fetchBlsCalendar,
   fetchCloudStatus,
+  fetchEiaEnergy,
   fetchEspnScoreboard,
   fetchFredCpi,
   fetchGdeltNews,
@@ -14,6 +15,7 @@ import {
   fetchNhcAdvisories,
   fetchNwsTemp,
   fetchOpenMeteoTemp,
+  fetchSecEdgarHeadlines,
   pingKalshiPortfolio,
   pingKalshiWs,
   minutesToNextCpiRelease,
@@ -27,7 +29,6 @@ import {
   gdeltQueryFromTitle,
   hoursToSettle,
   isCryptoMarket,
-  isSportsMarket,
   isWeatherMarket,
   parseBtcStrike,
   parseCpiStrike,
@@ -48,6 +49,8 @@ const STALE_MS: Record<string, number> = {
   trades: 15_000,
   kalshiWs: 45_000,
   worldNews: 180_000,
+  eia: 600_000,
+  secEdgar: 300_000,
 };
 
 const SHARED_GDELT_QUERY = 'united states economy politics';
@@ -67,6 +70,10 @@ export class FeedHub {
   private worldNewsAt = 0;
   private kalshiWsAt = 0;
   private portfolioPingAt = 0;
+  private eia: { series: string; value: number; period: string; fetchedAt: number } | null = null;
+  private eiaAt = 0;
+  private secEdgar: { title: string; link: string; fetchedAt: number } | null = null;
+  private secEdgarAt = 0;
   private backgroundTimer: ReturnType<typeof setInterval> | null = null;
   private lastMarkets: KalshiMarket[] = [];
   private binance: BinanceStream;
@@ -185,7 +192,7 @@ export class FeedHub {
       tasks.push(this.refreshIndustrial());
     }
 
-    if (markets.some(isSportsMarket) && this.isStale(this.sports?.fetchedAt, STALE_MS.sports)) {
+    if (this.isStale(this.sports?.fetchedAt, STALE_MS.sports)) {
       tasks.push(this.refreshSports());
     }
 
@@ -208,6 +215,14 @@ export class FeedHub {
 
     if (this.isStale(this.worldNewsAt, STALE_MS.worldNews)) {
       tasks.push(this.refreshWorldNews());
+    }
+
+    if (this.isStale(this.eiaAt, STALE_MS.eia)) {
+      tasks.push(this.refreshEia());
+    }
+
+    if (this.isStale(this.secEdgarAt, STALE_MS.secEdgar)) {
+      tasks.push(this.refreshSecEdgar());
     }
 
     await Promise.allSettled(tasks);
@@ -308,7 +323,8 @@ export class FeedHub {
       const res = await fetchTrades({ limit: 100, fetchFn: this.opts.fetchFn });
       this.trades = res.trades ?? [];
       this.tradesFetchedAt = Date.now();
-    } catch {
+    } catch (e) {
+      console.warn('[feedhub] refreshTrades failed:', e instanceof Error ? e.message : String(e));
       /* trades are optional — do not mark kalshi-rest error */
     }
   }
@@ -321,6 +337,30 @@ export class FeedHub {
   private async refreshPortfolioPing(): Promise<void> {
     await pingKalshiPortfolio(this.registry, this.kalshiApiKey ?? process.env.NEMESIS_KALSHI_API_KEY);
     this.portfolioPingAt = Date.now();
+  }
+
+  private async refreshEia(): Promise<void> {
+    const result = await fetchEiaEnergy(
+      this.registry,
+      this.opts.eiaApiKey ?? process.env.NEMESIS_EIA_API_KEY,
+      this.opts,
+    );
+    if (result) this.eia = { ...result, fetchedAt: Date.now() };
+    this.eiaAt = Date.now();
+  }
+
+  private async refreshSecEdgar(): Promise<void> {
+    const result = await fetchSecEdgarHeadlines(this.registry, this.opts);
+    if (result) this.secEdgar = { ...result, fetchedAt: Date.now() };
+    this.secEdgarAt = Date.now();
+  }
+
+  getEiaSnapshot(): { series: string; value: number; period: string } | null {
+    return this.eia;
+  }
+
+  getSecEdgarHeadline(): { title: string; link: string } | null {
+    return this.secEdgar;
   }
 
   /** Helpers used by main.ts when building pod inputs */

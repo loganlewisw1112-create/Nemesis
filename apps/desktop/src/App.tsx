@@ -18,6 +18,9 @@ import {
   DiscoveryCockpitPanel,
 } from '@nemesis/ui';
 import type {
+  AutoCloseDecision,
+  AutoCloseSettings,
+  AutoCloseState,
   GuardrailSettings,
   ThesisCard,
   GateStatus,
@@ -29,6 +32,7 @@ import type {
   DiscoveryState,
   ExecutableTier,
 } from '@nemesis/core';
+import { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
 
 interface AppState {
   settings: GuardrailSettings;
@@ -59,6 +63,9 @@ interface PaperState {
   workingOrders?: PaperOrder[];
   dailyPnl?: number;
   activeRegimes?: string[];
+  autoCloseStateByPosition?: Record<string, AutoCloseState>;
+  autoCloseDecisions?: AutoCloseDecision[];
+  profitabilityBenchmark?: unknown;
 }
 
 declare global {
@@ -106,6 +113,7 @@ declare global {
       getBridgeStatus: () => Promise<{ connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }>;
       onBridgeStatus: (cb: (s: { connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }) => void) => void;
       onBridgeRecommendation: (cb: (p: unknown) => void) => void;
+      onConnectorsUpdate: (cb: (d: ConnectorHealth[]) => void) => void;
     };
   }
 }
@@ -169,6 +177,10 @@ export default function App() {
     load();
     window.nemesis.getBridgeStatus().then((s) => setBridgeConnected(s.connected)).catch(() => {});
     window.nemesis.onBridgeStatus((s) => setBridgeConnected(s.connected));
+    const bridgePoll = setInterval(() => {
+      window.nemesis.getBridgeStatus().then((s) => setBridgeConnected(s.connected)).catch(() => {});
+    }, 1_000);
+    return () => clearInterval(bridgePoll);
   }, [load]);
 
   // IPC subscriptions — re-registers when selected ticker changes so the
@@ -185,6 +197,9 @@ export default function App() {
       } : prev));
       setMarkets(d.markets);
       if (d.discovery) setDiscovery(d.discovery);
+    });
+    window.nemesis.onConnectorsUpdate((connectors) => {
+      setState((prev) => prev ? { ...prev, connectors } : prev);
     });
     window.nemesis.onDiscoveryUpdate((d) => setDiscovery(d as DiscoveryState));
     window.nemesis.onSettingsUpdate((s) => {
@@ -442,6 +457,9 @@ export default function App() {
                 workingOrders={paper.workingOrders}
                 dailyPnl={dailyPnl}
                 dailyLossCap={state.settings.dailyLossCapUsd}
+                autoCloseSettings={state.settings.autoClose ?? DEFAULT_AUTO_CLOSE_SETTINGS}
+                autoCloseStateByPosition={paper.autoCloseStateByPosition}
+                autoCloseDecisions={paper.autoCloseDecisions}
                 selectedTicker={selected?.ticker ?? null}
                 onPreview={selected ? async (qty) => {
                   const r = await window.nemesis.paperPreview(selected.id, qty);
@@ -546,6 +564,7 @@ export default function App() {
               equity={paper.equity}
               unrealized={paper.unrealized}
               equityHistory={paper.equityHistory}
+              autoCloseDecisions={paper.autoCloseDecisions}
             />
           )}
 
@@ -601,6 +620,23 @@ export default function App() {
                     Live trading: {state.settings.liveEnabled ? 'ON' : 'OFF'}
                   </button>
                 </div>
+                {(() => {
+                  const autoClose: AutoCloseSettings = state.settings.autoClose ?? DEFAULT_AUTO_CLOSE_SETTINGS;
+                  return (
+                    <div style={{ padding: '10px 12px', background: 'var(--bg)', borderRadius: 8 }}>
+                      <button
+                        type="button"
+                        onClick={() => window.nemesis.updateSettings({ autoClose: { ...autoClose, enabled: !autoClose.enabled } }).then(load)}
+                        style={{ ...chipStyle(autoClose.enabled), width: '100%', marginBottom: 6 }}
+                      >
+                        Paper auto-close: {autoClose.enabled ? 'ON' : 'OFF'}
+                      </button>
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                        Trim +{(autoClose.firstTrimProfitPct * 100).toFixed(0)}% after {(autoClose.firstTrimGivebackPct * 100).toFixed(0)}% giveback · Close +{(autoClose.finalCloseProfitPct * 100).toFixed(0)}% after {(autoClose.finalCloseGivebackPct * 100).toFixed(0)}% giveback · Min {Math.round(autoClose.minAgeMs / 1000)}s/{autoClose.minTicks} ticks
+                      </div>
+                    </div>
+                  );
+                })()}
                 <label style={labelStyle}>
                   Max position ($)
                   <input

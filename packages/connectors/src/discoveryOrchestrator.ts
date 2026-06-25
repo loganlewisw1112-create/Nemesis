@@ -116,6 +116,11 @@ export class DiscoveryOrchestrator {
         merged.push(...res.markets);
         cursor = res.cursor;
         pages += 1;
+        // Record success on the first successful page so kalshi-rest exits
+        // "idle" within ~1-2 s of startup rather than waiting for all pages.
+        if (pages === 1) {
+          this.registry.recordSuccess('kalshi-rest', Date.now() - start);
+        }
         if (!cursor || merged.length >= this.settings.maxTrackedTickers * 2) break;
       } while (pages < 10);
 
@@ -155,49 +160,57 @@ export class DiscoveryOrchestrator {
     const candidates = this.universe.slice(0, this.settings.depthChecksPerCycle);
     this.depthPending = candidates.length;
 
-    for (const m of candidates) {
+    // Fetch orderbooks in parallel batches (sequential was 150 × ~400ms ≈ 60 s)
+    const CONCURRENCY = 8;
+    for (let i = 0; i < candidates.length; i += CONCURRENCY) {
       if (this.orderbooksThisCycle >= this.settings.depthChecksPerCycle) break;
-      const p = normalizeMarketPrice(m);
-      const t0 = Date.now();
-      let book;
-      try {
-        book = await this.fetchBookCached(m.ticker);
-      } catch {
-        this.depthPending = Math.max(0, this.depthPending - 1);
-        continue;
-      }
-      this.orderbooksThisCycle += 1;
-      this.bookMsTotal += Date.now() - t0;
-      this.bookMsCount += 1;
+      const batch = candidates.slice(i, i + CONCURRENCY);
+      await Promise.allSettled(batch.map(async (m) => {
+        const p = normalizeMarketPrice(m);
+        const t0 = Date.now();
+        let book;
+        try {
+          book = await this.fetchBookCached(m.ticker);
+        } catch {
+          this.depthPending = Math.max(0, this.depthPending - 1);
+          return;
+        }
+        this.orderbooksThisCycle += 1;
+        this.bookMsTotal += Date.now() - t0;
+        this.bookMsCount += 1;
 
-      const yesBid = book.yes[0]?.price ?? p;
-      const yesAsk = book.yesAsk ?? book.yes[book.yes.length - 1]?.price ?? p;
-      const spread = book.spread ?? Math.max(0.01, Math.abs(yesAsk - yesBid));
-      const depthUsd = (book.yes[0]?.quantity ?? 50) * p;
-      const yesPrice = p;
-      const noPrice = 1 - p;
+        const yesBid = book.yes[0]?.price ?? p;
+        const yesAsk = book.yesAsk ?? book.yes[book.yes.length - 1]?.price ?? p;
+        const spread = book.spread ?? Math.max(0.01, Math.abs(yesAsk - yesBid));
+        const depthUsd = (book.yes[0]?.quantity ?? 50) * p;
 
-      const yes = verifySideDepth(book, 'yes', yesPrice, thresholds);
-      const no = verifySideDepth(book, 'no', noPrice, thresholds);
+        const yes = verifySideDepth(book, 'yes', p, thresholds);
+        const no = verifySideDepth(book, 'no', 1 - p, thresholds);
 
-      if (yes.executableTier == null && no.executableTier == null) this.belowScout += 1;
+        if (yes.executableTier == null && no.executableTier == null) this.belowScout += 1;
 
-      this.depthByTicker.set(m.ticker, {
-        ticker: m.ticker,
-        spread,
-        depthUsd,
-        verifiedAt: Date.now(),
-        yes,
-        no,
-      });
-      this.depthVerifiedCycle += 1;
-      this.depthPending = Math.max(0, candidates.length - this.depthVerifiedCycle);
+        this.depthByTicker.set(m.ticker, {
+          ticker: m.ticker,
+          spread,
+          depthUsd,
+          verifiedAt: Date.now(),
+          yes,
+          no,
+        });
+        this.depthVerifiedCycle += 1;
+        this.depthPending = Math.max(0, candidates.length - this.depthVerifiedCycle);
+      }));
     }
 
     this.mode = this.settings.signalPassEnabled ? 'full' : 'depth-only';
   }
 
   seedFixtureDepth(markets: KalshiMarket[]) {
+    this.universe = markets;
+    this.universeUpdatedAt = Date.now();
+    this.universePages = markets.length > 0 ? 1 : 0;
+    this.depthPending = 0;
+    this.mode = this.settings.signalPassEnabled ? 'full' : 'depth-only';
     for (const m of markets) {
       const scout = {
         executableTier: 'scout' as const,

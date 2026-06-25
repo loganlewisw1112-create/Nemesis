@@ -69,4 +69,8 @@ contextBridge.exposeInMainWorld('nemesis', {
     ipcRenderer.removeAllListeners('bridge:recommendation');
     ipcRenderer.on('bridge:recommendation', (_e, p) => cb(p));
   },
+  onConnectorsUpdate: (cb: (d: unknown) => void) => {
+    ipcRenderer.removeAllListeners('connectors:update');
+    ipcRenderer.on('connectors:update', (_e, d) => cb(d));
+  },
 });
