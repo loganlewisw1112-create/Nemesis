@@ -6,7 +6,7 @@ import type {
   FillMetadata,
 } from '@nemesis/core';
 import { kalshiFeeForOrder } from '@nemesis/core';
-import { allocateSize, checkConcentration } from '@nemesis/capital';
+import { allocateSize, checkConcentration, decideCapitalAllocation, type CapitalDecision } from '@nemesis/capital';
 import { dryRunFill, type DryRunOrder } from './dryRun.js';
 import type { PaperDesk } from './paperDesk.js';
 
@@ -22,6 +22,7 @@ export interface PaperBuyResult {
   error?: string;
   fill?: DryRunOrder;
   fillQuality?: FillQuality;
+  capitalDecision?: CapitalDecision;
   aborted?: boolean;
   abortReason?: string;
 }
@@ -56,16 +57,18 @@ function fillMeta(_fill: DryRunOrder, quality: FillQuality): FillMetadata {
 
 export function resolveContractCount(
   card: ThesisCard,
-  _portfolio: PaperPortfolio,
+  portfolio: PaperPortfolio,
   settings: GuardrailSettings,
   contracts?: number,
 ): number {
   if (contracts !== undefined && contracts >= 1) return Math.floor(contracts);
+  const decision = decideCapitalAllocation({ card, portfolio, settings });
+  if (decision.contracts > 0) return decision.contracts;
   const usdSize = allocateSize({ card, maxPositionUsd: settings.maxPositionUsd });
   const price = card.side === 'yes' ? card.marketPrice : 1 - card.marketPrice;
   const fee = kalshiFeeForOrder(price, 1);
   const costPer = price + fee;
-  return Math.max(1, Math.min(50, Math.floor(usdSize / Math.max(costPer, 0.01))));
+  return Math.max(0, Math.min(50, Math.floor(usdSize / Math.max(costPer, 0.01))));
 }
 
 export function checkPaperRisk(
@@ -101,19 +104,36 @@ export function simulatePaperBuy(
   contracts?: number,
 ): PaperBuyResult {
   const portfolio = desk.snapshot();
-  const qty = resolveContractCount(card, portfolio, settings, contracts);
+  const capitalDecision = decideCapitalAllocation({ card, portfolio, settings, book });
+  if (contracts === undefined && capitalDecision.noTradeReasons.length > 0) {
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: capitalDecision.noTradeReasons.join('; '),
+      capitalDecision,
+    };
+  }
+  const qty = contracts !== undefined && contracts >= 1 ? Math.floor(contracts) : capitalDecision.contracts;
+  if (qty < 1) {
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: 'capital allocator returned zero safe contracts',
+      capitalDecision,
+    };
+  }
   const expectedPrice = card.side === 'yes' ? card.marketPrice : 1 - card.marketPrice;
   const fill = dryRunFill(book, card.side, qty, card.impliedPrice, settings.maxSlippagePp);
 
   if (fill.aborted) {
-    return { ok: false, aborted: true, abortReason: fill.abortReason, fill };
+    return { ok: false, aborted: true, abortReason: fill.abortReason, fill, capitalDecision };
   }
 
   const quality = fillQualityFromDryRun(fill, expectedPrice);
   const meta = fillMeta(fill, quality);
   const result = desk.openPosition(card, fill.filled, fill.fillPrice, meta, card.category);
   if (!result.ok) return { ok: false, error: result.error };
-  return { ok: true, fill, fillQuality: quality };
+  return { ok: true, fill, fillQuality: quality, capitalDecision };
 }
 
 export function simulatePaperClose(

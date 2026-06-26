@@ -4,14 +4,17 @@ import {
   fetchOpenKalshiOrders,
   fetchPortfolioPositions,
   type GuardrailSettings,
+  type LatencyMetrics,
   type ThesisCard,
 } from '@nemesis/core';
 import { authHeaders } from './signer.js';
 import { reconcilePositions } from './reconcile.js';
 import type { LocalPosition } from './reconcile.js';
+import { measureExchangeRoundTrip } from './exchangeLatency.js';
 
 export interface LiveOrderRequest {
   ticker: string;
+  action?: 'buy' | 'sell';
   side: 'yes' | 'no';
   contracts: number;
   limitPrice: number;
@@ -23,6 +26,7 @@ export interface LiveOrderResult {
   orderId?: string;
   error?: string;
   simulated?: boolean;
+  latencyMetrics?: LatencyMetrics;
 }
 
 export interface LiveCredentials {
@@ -37,10 +41,25 @@ export function createLiveOrderRequest(
 ): LiveOrderRequest {
   return {
     ticker: card.ticker,
+    action: 'buy',
     side: card.side,
     contracts,
     limitPrice,
     clientOrderId: `nem-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  };
+}
+
+export function createLiveCloseOrderRequest(
+  position: Pick<LiveOrderRequest, 'ticker' | 'side' | 'contracts'>,
+  limitPrice: number,
+): LiveOrderRequest {
+  return {
+    ticker: position.ticker,
+    action: 'sell',
+    side: position.side,
+    contracts: position.contracts,
+    limitPrice,
+    clientOrderId: `nem-close-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   };
 }
 
@@ -63,20 +82,26 @@ export async function submitLiveOrder(
   const yesPrice = req.side === 'yes' ? Math.round(req.limitPrice * 100) : undefined;
   const noPrice = req.side === 'no' ? Math.round(req.limitPrice * 100) : undefined;
   try {
-    const res = await createKalshiOrder(
-      {
-        ticker: req.ticker,
-        action: 'buy',
-        side: req.side,
-        count: req.contracts,
-        type: 'limit',
-        yes_price: yesPrice,
-        no_price: noPrice,
-        client_order_id: req.clientOrderId,
-      },
-      signedOpts(creds, 'POST', path),
-    );
-    return { ok: true, orderId: res.order.order_id };
+    const measured = await measureExchangeRoundTrip({
+      send: () => createKalshiOrder(
+        {
+          ticker: req.ticker,
+          action: req.action ?? 'buy',
+          side: req.side,
+          count: req.contracts,
+          type: 'limit',
+          yes_price: yesPrice,
+          no_price: noPrice,
+          client_order_id: req.clientOrderId,
+        },
+        signedOpts(creds, 'POST', path),
+      ),
+    });
+    return {
+      ok: true,
+      orderId: measured.result.order.order_id,
+      latencyMetrics: measured.metrics,
+    };
   } catch (e) {
     return { ok: false, error: String(e) };
   }

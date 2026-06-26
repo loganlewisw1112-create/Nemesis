@@ -36,7 +36,7 @@ import {
   rankThesesWithTiers,
   minNetEdgeForTier,
   scoreOpportunityForCard,
-  rankOpportunityRadar,
+  HotOpportunityIndex,
   evaluateLiveUnlock,
   type AutoCloseDecision,
   type AutoCloseSettings,
@@ -113,6 +113,7 @@ const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
 const feedHub = new FeedHub(registry);
 const kalshiStream = new KalshiStream(registry);
+const hotOpportunityIndex = new HotOpportunityIndex({ maxRows: 25, targetDecisionMs: 3 });
 const journal = new JournalStore();
 const quarantine = new StrategyQuarantine();
 let settings: GuardrailSettings = { ...DEFAULT_GUARDRAILS };
@@ -824,6 +825,15 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
   geaTheses = geaTheses.map(updateCard);
   if (changed) {
     const card = theses.find((t) => t.ticker === ticker);
+    if (card) {
+      hotOpportunityIndex.upsert(card, {
+        bridgeLatencyByTicker: new Map([[card.ticker, card.id.startsWith('gea-') && bridgeStatus.lastSeenAt ? Date.now() - bridgeStatus.lastSeenAt : 0]]),
+        playbookPerformance: new Map(),
+        maxRows: 25,
+        targetDecisionMs: 3,
+      });
+      opportunityRadarRows = hotOpportunityIndex.top(25);
+    }
     recordTick(ticker, yesPrice, spread, card?.netEdge ?? 0);
     const openPos = paperDesk.snapshot().positions.find((p) => p.ticker === ticker);
     const closeCard = openPos ? cardForPosition(openPos) : undefined;
@@ -974,14 +984,16 @@ function applyDepthToCard(card: ThesisCard): ThesisCard {
 
 function rankThesesForUi(cards: ThesisCard[]): ThesisCard[] {
   const base = discovery.settings.depthVerifyEnabled ? rankThesesWithTiers(cards) : rankTheses(cards);
-  opportunityRadarRows = rankOpportunityRadar(base, {
+  hotOpportunityIndex.replaceAll(base, {
     bridgeLatencyByTicker: new Map(base.map((card) => [
       card.ticker,
       card.id.startsWith('gea-') && bridgeStatus.lastSeenAt ? Date.now() - bridgeStatus.lastSeenAt : 0,
     ])),
     playbookPerformance: new Map(),
     maxRows: 25,
+    targetDecisionMs: 3,
   });
+  opportunityRadarRows = hotOpportunityIndex.top(25);
   return base
     .map((card, index) => ({
       card,
