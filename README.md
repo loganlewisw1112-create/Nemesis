@@ -1,117 +1,252 @@
 # NEMESIS
 
-NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha brain. It is built for thesis discovery, paper execution, guardrail-first operations, GEA bridge recommendations, and ProfitOS paper auto-close research.
+Current as of June 26, 2026.
 
-The app defaults to demo and dry-run behavior. Live trading requires explicit operator unlocks and is not enabled by the ProfitOS auto-close layer.
+NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha (GEA) intelligence app. It is built for event-market thesis discovery, fillability-aware ticket ranking, paper execution, profit-retention research, fail-closed bridge recommendations, and staged live-trading readiness.
 
-## Current UI
+The default posture is intentionally conservative: demo mode on, dry-run on, live trading locked, auto-live disabled, and ProfitOS auto-close limited to paper positions.
+
+## Screenshots
 
 ### NEMESIS Edge Theater
 
-Populated ticket discovery with a live GEA recommendation, tradeability filters, guardrails, and risk cockpit.
+Ranked thesis discovery with GEA bridge status, Scout/Solid/Whale tiers, tradeability filters, guardrails, and risk cockpit context.
 
 ![NEMESIS Edge Theater](docs/screenshots/nemesis-edge-theater.png)
 
 ### NEMESIS Paper Command Desk
 
-Populated paper desk showing an open paper position, trade blotter, auto-close status, account metrics, and guardrail/risk panels.
+Paper portfolio, open positions, working orders, realized/unrealized P&L, trade blotter, auto-close decisions, guardrails, and risk panels.
 
 ![NEMESIS Paper Command Desk](docs/screenshots/nemesis-paper-desk.png)
 
 ### Global Event Alpha Command Center
 
-GEA connected to NEMESIS with mirrored thesis/market state, paper P&L, brain health, ticket boards, retention logic, and fail-closed bridge status.
+GEA connected to NEMESIS with mirrored state, market/tape intelligence, paper P&L, recommendation flow, retention logic, bridge health, and local persistence.
 
 ![Global Event Alpha Command Center](docs/screenshots/global-event-alpha-command-center.png)
 
-## What It Does
+## Current Capabilities
 
-- Discovers and ranks Kalshi/event-market trade theses.
-- Ingests Global Event Alpha recommendation and exit packets over a local WebSocket bridge.
-- Scores opportunities by net edge, probability gap, fillable liquidity, freshness, confidence, settlement clarity, bridge latency, spread, and slippage.
-- Executes paper buys and paper closes through a dry-run fill model.
-- Tracks peak paper P&L, peak edge, giveback, tick count, and GEA exit confidence per open position.
-- Supports paper-only ProfitOS auto-trim/auto-close behind an operator setting.
-- Reports baseline vs upgraded paper strategy performance with a target of 80% better risk-adjusted net P&L per dollar risked.
-- Keeps guardrails, kill switch, API health, readiness gates, and live-order locks visible.
+- Discovers and ranks Kalshi/event-market opportunities from a broader universe cache.
+- Assigns executable tiers: Scout, Solid, and Whale, based on fillable depth and slippage context.
+- Scores trade theses by net edge, probability gap, settlement clarity, liquidity, freshness, confidence, spread, slippage, source context, and bridge latency.
+- Runs a NEMESIS desktop app and a companion Global Event Alpha desktop app.
+- Publishes GEA recommendation, no-trade, exit, close-result, hello, ping, and state-mirror packets over a local WebSocket bridge.
+- Validates bridge packets fail-closed, including role, freshness, confidence, settlement clarity, schema, and sequence checks.
+- Executes paper buys, paper closes, paper cancels, and paper auto-close actions through a dry-run fill model.
+- Tracks paper cash, equity, daily P&L, open positions, fills, working orders, marks, regimes, and auto-close history.
+- Runs ProfitOS paper auto-close with dynamic exit scoring, GEA exit freshness, velocity trims, predictive threshold crossing, and profit-biased close thresholds.
+- Keeps live trading behind an 8-gate guardrail model plus staged manual-live and auto-live unlock certificates.
+- Persists GEA market snapshots, orderbook snapshots, public data, ticket cards, profit-retention state, and close feedback in SQLite when the native module is available.
+- Builds a Windows installer through Electron Builder.
 
-## ProfitOS Auto-Close
+## Safety Model
 
-ProfitOS is paper-only in this version. It does not place live sell orders.
+NEMESIS is not live-first software. The current defaults in code are:
 
-Default auto-close behavior:
+| Setting | Default |
+| --- | --- |
+| Demo mode | On |
+| Dry-run | On |
+| Live enabled | Off |
+| Live stage | `paper` |
+| Auto-live enabled | Off |
+| Crypto live enabled | Off |
+| Max position | `$10` |
+| Daily loss cap | `$5` |
+| Max slippage | `3pp` |
+| Paper wallet | `$1,000` |
+| ProfitOS auto-close | Off |
+| ProfitOS live orders | Not supported |
 
-- Off by default and visible in Settings.
-- Minimum age: 30 seconds.
-- Minimum ticks: 3.
-- First trim: 50% of contracts after +12% peak P&L and 25% giveback.
-- Final close: remaining contracts after +18% peak P&L and 35% giveback.
-- Emergency close: edge gone, stale signal, bad liquidity, or high-confidence GEA exit.
-- Decision reasons are pushed into the Paper Desk, trade blotter, notifications, and Profit Station attribution.
+Live unlock is staged:
 
-## Quickstart
+1. Paper mode is the default operating mode.
+2. Manual live requires Kalshi credentials, all 8 guardrail gates, at least 50 paper trades, positive realized paper P&L, equity above start, positive P&L per risk dollar, 65%+ win rate, false-exit rate at or below 10%, average close regret at or below $0.50, average slippage at or below 3pp, drawdown within the daily cap, healthy API status, clean audit state, inactive kill switch, and the confirmation text `ENABLE LIVE MANUAL`.
+3. Auto live requires manual live first, at least 20 reconciled manual-live orders, no risk breaches, no unresolved rejects, manual slippage within modeled slippage plus 2pp, at least 30 shadow-auto decisions with expectancy at or above manual baseline, shadow false-exit rate at or below 8%, positive missed-ticket reduction, at least 15 tiny-auto pilot trades, positive pilot expectancy, no pilot risk breaches, and the confirmation text `ENABLE LIVE AUTO`.
 
-Requires Node.js 18+ and npm.
+The kill switch is available from the UI and by `Ctrl+Shift+K`.
+
+## ProfitOS Paper Auto-Close
+
+ProfitOS is paper-only in the current implementation. It does not place live sell orders.
+
+Current default auto-close settings:
+
+| Control | Default |
+| --- | --- |
+| Enabled | Off |
+| Minimum position age | 30 seconds |
+| Minimum ticks | 3 |
+| First trim | 50% of contracts |
+| First trim trigger | 6% peak P&L and 15% giveback |
+| Final close trigger | 12% peak P&L and 25% giveback |
+| Emergency edge exit | Edge at or below 0 |
+| GEA exit confidence | 0.85 |
+| Stale signal close | 90 seconds |
+| Bad-liquidity slippage close | 7pp |
+| Max bridge latency for GEA exits | 2 seconds |
+| Standard decision cooldown | 5 seconds |
+| High-confidence cooldown | 500 ms |
+| Predictive crossing | On |
+| Profit-biased thresholds | On |
+| Quick-profit trim | Implemented, off by default |
+| Adaptive drift | Implemented, off by default |
+
+The engine records peak paper P&L, peak edge, mark velocity, edge velocity, giveback, exit score, GEA retention action, bridge freshness, slippage, and decision reasons. Decisions are pushed into the Paper Command Desk, trade blotter, notifications, and GEA close feedback.
+
+## Install
+
+Prerequisites:
+
+- Windows 10/11 for the packaged desktop target.
+- Node.js 18+.
+- npm.
+- Git.
+
+Clone and install:
 
 ```bash
+git clone https://github.com/loganlewisw1112-create/Nemesis.git
+cd Nemesis
 npm install
+```
+
+GEA uses `better-sqlite3` for local persistence. The GEA workspace includes a `postinstall` rebuild for Electron. If SQLite loading fails after installing dependencies, rebuild the native module manually:
+
+```bash
+npm run rebuild:sqlite -w @nemesis/global-event-alpha
+```
+
+The GEA SQLite database is stored under the Electron user-data directory, typically:
+
+```text
+%APPDATA%\@nemesis\global-event-alpha\global-event-alpha.sqlite
+```
+
+## Run
+
+Launch NEMESIS in development:
+
+```bash
 npm run dev
 ```
 
-`npm run dev` launches the NEMESIS Electron desktop app. NEMESIS can auto-spawn Global Event Alpha, or GEA can be run separately from `apps/global-event-alpha`.
+`npm run dev` delegates to `@nemesis/desktop`. NEMESIS starts its local bridge server on port `7430` by default and can auto-spawn Global Event Alpha.
+
+Run GEA directly:
+
+```bash
+npm run dev -w @nemesis/global-event-alpha
+```
+
+Useful environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NEMESIS_BRIDGE_PORT` | `7430` | Local WebSocket bridge port |
+| `NEMESIS_AUTO_SPAWN_GEA` | not `false` | Set to `false` to stop NEMESIS from auto-spawning GEA |
+| `GEA_TAPE_REFRESH_MS` | `30000` | GEA Kalshi tape REST refresh interval |
+| `GEA_TAPE_STALE_MS` | `15000` | GEA tape stale threshold |
+| `GEA_TAPE_MARKET_LIMIT` | `25` | GEA market refresh limit |
+| `GEA_TAPE_STREAM` | enabled | Set to `false` to disable tape streaming |
+| `GEA_TAPE_REST` | enabled | Set to `false` to disable tape REST refresh |
+| `GEA_PUBLIC_DATA` | enabled | Set to `false` to disable public-data mesh startup |
 
 ## Scripts
 
 | Command | Description |
 | --- | --- |
-| `npm run dev` | Launch NEMESIS desktop in development |
+| `npm run dev` | Launch the NEMESIS desktop app |
+| `npm run dev -w @nemesis/global-event-alpha` | Launch the GEA companion app directly |
 | `npm test -- --run` | Run the Vitest suite |
-| `npm run typecheck --workspaces --if-present` | Typecheck all workspaces |
-| `npm run build -w @nemesis/desktop` | Build NEMESIS desktop |
-| `npm run build -w @nemesis/global-event-alpha` | Build Global Event Alpha |
-| `npm run test:e2e -w @nemesis/desktop` | Run Electron E2E smoke and bridge tests |
-| `npm run package -w @nemesis/desktop` | Build the Windows installer |
+| `npm run typecheck --workspaces --if-present` | Typecheck all workspaces that expose a typecheck script |
+| `npm run build` | Build every workspace that exposes a build script |
+| `npm run build -w @nemesis/desktop` | Build the NEMESIS desktop app |
+| `npm run build -w @nemesis/global-event-alpha` | Build the Global Event Alpha app |
+| `npm run test:e2e -w @nemesis/desktop` | Run Electron smoke and bridge tests |
+| `npm run package` | Build the unsigned Windows installer |
 
 ## Architecture
 
 ```text
-apps/desktop/              NEMESIS Electron shell and bridge server
-apps/global-event-alpha/   Companion GEA brain desktop app
-packages/bridge-contracts/ Fail-closed bridge schemas and validation
-packages/core/             Kalshi client, fees, thesis engine, guardrails, paper types
-packages/execution/        Paper execution, auto-close engine, benchmarking, live adapter
-packages/connectors/       Feed hub, Kalshi stream/tape, public data mesh
-packages/pods/             Market signal pods and edge scanner
-packages/ui/               Shared React panels and cockpit components
+apps/desktop/              NEMESIS Electron shell, bridge server, IPC, renderer
+apps/global-event-alpha/   Companion GEA Electron app, tape engine, SQLite store
+packages/bridge-contracts/ Bridge message contracts and fail-closed validation
+packages/core/             Kalshi types/client, fees, thesis model, guardrails, live unlock
+packages/execution/        Paper desk, live adapter, auto-close engine, benchmarking, audit log
+packages/connectors/       Feed hub, Kalshi stream/tape, discovery orchestrator, public data mesh
+packages/pods/             Signal pods, edge scanner, playbook logic
+packages/ui/               Shared cockpit, guardrail, paper desk, and live-unlock components
 packages/charts/           Profit Station chart utilities
-packages/capital/          Allocator, risk controls, strategy quarantine
+packages/capital/          Allocator, risk controls, quarantine logic
 packages/journal/          Session journal
-packages/brain-core/       Institutional intelligence and retention engines
-packages/simulation-core/  Replay, ticket autopsy, model tournament
+packages/brain-core/       GEA intelligence, retention, tournament, no-trade logic
+packages/simulation-core/  Replay, ticket autopsy, and model evaluation utilities
 ```
 
-## Safety Defaults
+## Bridge Contract
 
-- Demo mode on.
-- Dry-run on.
-- Live trading locked.
-- Paper auto-close off until explicitly enabled.
-- Kill switch: `Ctrl+Shift+K`.
-- GEA bridge packets validate fail-closed before becoming NEMESIS tickets.
-- Live auto-close is intentionally out of scope for this version.
+The local bridge currently supports these message types:
 
-## Verification
+- `bridge:hello`
+- `bridge:ping`
+- `bridge:pong`
+- `nemesis:state`
+- `brain:recommendation`
+- `brain:no-trade`
+- `brain:exit`
+- `nemesis:close-result`
 
-The current implementation was verified with:
+NEMESIS rejects expired recommendations, forbidden publishing roles, malformed packets, low-clarity packets, and invalid exit/close payloads before they can become visible tickets or exit actions.
+
+## Build And Verify
+
+Use the full local verification set before treating a branch as release-ready:
 
 ```bash
 npm test -- --run
 npm run typecheck --workspaces --if-present
-npm run build -w @nemesis/desktop
-npm run build -w @nemesis/global-event-alpha
+npm run build
 npm run test:e2e -w @nemesis/desktop
 ```
 
-## Disclaimer
+For a faster documentation-only check, verify the README-linked screenshots exist and run at least:
 
-NEMESIS is not financial advice. Trading carries risk. Use demo and paper workflows first, validate behavior locally, and do not enable live trading without independent review.
+```bash
+git status --short
+npm test -- --run
+```
+
+## Packaging
+
+Build the Windows installer:
+
+```bash
+npm run package
+```
+
+The desktop package uses Electron Builder with an unsigned NSIS target. Output is written under the desktop app release directory.
+
+## Repository Status
+
+This README describes the current NEMESIS + GEA mainline after the institutional platform upgrade:
+
+- GEA SQLite persistence is declared through `better-sqlite3`.
+- GEA native SQLite rebuild support is present through `rebuild:sqlite` and `postinstall`.
+- NEMESIS and GEA use Electron `42.5.0`.
+- The bridge E2E suite covers valid recommendation ingestion and fail-closed rejection of expired or forbidden packets.
+- Desktop smoke coverage checks app boot, thesis-tier summary rendering, paper desk rendering, refresh behavior, and kill-switch activation.
+
+## Risk Notice
+
+NEMESIS is experimental software. It is not financial advice, investment advice, legal advice, tax advice, or a promise of profitable trading. Event-contract trading can lose money quickly. Automated or semi-automated systems can also fail because of stale data, bad assumptions, bugs, API outages, liquidity changes, fee drag, or operator error.
+
+Use demo and paper workflows first. Do not enable live trading without independent review, dedicated Kalshi credentials, local verification, and a clear risk limit you can afford to lose.
+
+See [DISCLAIMER.md](DISCLAIMER.md) for the full risk notice.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
