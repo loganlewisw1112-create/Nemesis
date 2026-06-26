@@ -1,5 +1,5 @@
 import type { NemesisBridgeMessage, NemesisBridgeMessageType } from './bridge.js';
-import type { BrainRole, Classification, ExitRecommendation, NoTradeWarning, RecommendationPacket } from './recommendations.js';
+import type { BrainRole, Classification, ExitRecommendation, NemesisCloseResult, NoTradeWarning, RecommendationPacket } from './recommendations.js';
 
 export interface ValidationOptions {
   now?: number;
@@ -28,6 +28,7 @@ const MESSAGE_TYPES = new Set<NemesisBridgeMessageType>([
   'brain:recommendation',
   'brain:no-trade',
   'brain:exit',
+  'nemesis:close-result',
   'bridge:ping',
   'bridge:pong',
   'bridge:hello',
@@ -130,6 +131,20 @@ export function validateExitRecommendation(value: unknown): ValidationResult<Exi
   return { ok: true, value: value as unknown as ExitRecommendation };
 }
 
+
+export function validateNemesisCloseResult(value: unknown): ValidationResult<NemesisCloseResult> {
+  if (!isRecord(value)) return fail('invalid schema');
+  if (!isNonEmptyString(value.ticker)) return fail('missing ticker');
+  if (!['trim', 'close'].includes(String(value.action))) return fail('invalid action');
+  for (const field of ['contracts', 'pnl', 'peak_pnl_usd', 'close_regret_usd', 'closed_at']) {
+    if (!isFiniteNumber(value[field])) return fail(`invalid ${field}`);
+  }
+  if ((value.contracts as number) < 1) return fail('invalid contracts');
+  if (typeof value.was_profit !== 'boolean') return fail('invalid was_profit');
+  if (!isNonEmptyString(value.reason)) return fail('missing reason');
+  if (!['scalp', 'core', 'runner'].includes(String(value.tier))) return fail('invalid tier');
+  return { ok: true, value: value as unknown as NemesisCloseResult };
+}
 export function validateBridgeMessage(
   value: unknown,
   options: ValidationOptions = {},
@@ -150,6 +165,10 @@ export function validateBridgeMessage(
   }
   if (message.type === 'brain:exit') {
     const result = validateExitRecommendation(message.payload);
+    if (!result.ok) return result;
+  }
+  if (message.type === 'nemesis:close-result') {
+    const result = validateNemesisCloseResult(message.payload);
     if (!result.ok) return result;
   }
   return { ok: true, value: message };

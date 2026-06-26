@@ -1,24 +1,30 @@
-import { useState } from 'react';
-import type { GateStatus } from '@nemesis/core';
+import { useState, type CSSProperties } from 'react';
+import type { GateStatus, LiveUnlockEvaluation } from '@nemesis/core';
 
 interface Props {
   gates: GateStatus[];
   canLive: boolean;
+  liveUnlock?: Pick<LiveUnlockEvaluation, 'targetStage' | 'blockers'>;
   onUnlock: (confirmText: string) => Promise<{ ok: boolean; error?: string }>;
 }
 
-export function LiveUnlockWizard({ gates, canLive, onUnlock }: Props) {
+export function LiveUnlockWizard({ gates, canLive, liveUnlock, onUnlock }: Props) {
   const [step, setStep] = useState(0);
   const [confirm, setConfirm] = useState('');
   const [result, setResult] = useState<string | null>(null);
+  const targetStage = liveUnlock?.targetStage ?? 'manual-live';
+  const confirmPhrase = targetStage === 'auto-live' ? 'ENABLE LIVE AUTO' : 'ENABLE LIVE MANUAL';
+  const stageLabel = targetStage === 'auto-live' ? 'live auto trading' : 'live manual trading';
+  const blockers = (liveUnlock?.blockers ?? [])
+    .filter((blocker) => !blocker.startsWith('Type ENABLE LIVE'));
 
   if (!canLive) {
     return (
       <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-        Complete all 8 gates before live unlock is available.
+        Complete staged requirements before {stageLabel} unlock is available.
         <ul style={{ marginTop: 8, paddingLeft: 16 }}>
-          {gates.filter((g) => !g.passed).map((g) => (
-            <li key={g.id}>{g.name}: {g.detail}</li>
+          {(blockers.length > 0 ? blockers : gates.filter((g) => !g.passed).map((g) => `${g.name}: ${g.detail}`)).map((blocker) => (
+            <li key={blocker}>{blocker}</li>
           ))}
         </ul>
       </div>
@@ -30,23 +36,23 @@ export function LiveUnlockWizard({ gates, canLive, onUnlock }: Props) {
       <div style={{ fontWeight: 700, color: 'var(--warning)', marginBottom: 8 }}>Live unlock wizard</div>
       {step === 0 && (
         <>
-          <p>All gates passed. Live trading uses real money on Kalshi.</p>
+          <p>{targetStage === 'auto-live' ? 'Manual live, shadow auto, and tiny pilot checks passed.' : 'Paper evaluation certificate passed.'} This unlocks {stageLabel}.</p>
           <button type="button" style={btnStyle} onClick={() => setStep(1)}>Continue</button>
         </>
       )}
       {step === 1 && (
         <>
-          <p>Type <strong>ENABLE LIVE</strong> to confirm:</p>
+          <p>Type <strong>{confirmPhrase}</strong> to confirm:</p>
           <input value={confirm} onChange={(e) => setConfirm(e.target.value)} style={inputStyle} />
           <button
             type="button"
             style={{ ...btnStyle, marginLeft: 8 }}
             onClick={async () => {
               const res = await onUnlock(confirm);
-              setResult(res.ok ? 'Live mode enabled.' : res.error ?? 'Failed');
+              setResult(res.ok ? `${stageLabel} enabled.` : res.error ?? 'Failed');
             }}
           >
-            Unlock live
+            Unlock {stageLabel}
           </button>
           {result && <div style={{ marginTop: 8 }}>{result}</div>}
         </>
@@ -55,7 +61,7 @@ export function LiveUnlockWizard({ gates, canLive, onUnlock }: Props) {
   );
 }
 
-const btnStyle: React.CSSProperties = {
+const btnStyle: CSSProperties = {
   background: 'var(--danger)',
   border: 'none',
   color: '#fff',
@@ -64,7 +70,7 @@ const btnStyle: React.CSSProperties = {
   cursor: 'pointer',
 };
 
-const inputStyle: React.CSSProperties = {
+const inputStyle: CSSProperties = {
   background: 'var(--bg-card)',
   border: '1px solid var(--border)',
   color: 'var(--text)',

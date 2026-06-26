@@ -6,15 +6,18 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "npx tsc --noEmit"
+    "typecheck": "npx tsc --noEmit",
+    "rebuild:sqlite": "electron-rebuild -f -w better-sqlite3",
+    "postinstall": "npm run rebuild:sqlite"
   },
   "dependencies": {
-    "@nemesis/bridge-contracts": "*",
     "@nemesis/brain-core": "*",
+    "@nemesis/bridge-contracts": "*",
     "@nemesis/connectors": "*",
     "@nemesis/core": "*",
-    "@nemesis/ui": "*",
     "@nemesis/simulation-core": "*",
+    "@nemesis/ui": "*",
+    "better-sqlite3": "^12.11.1",
     "framer-motion": "^12.41.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

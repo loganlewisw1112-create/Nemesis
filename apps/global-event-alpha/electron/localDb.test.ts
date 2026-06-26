@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { GEA_SCHEMA } from './localDb.js';
 
 describe('GEA local database schema', () => {
@@ -35,5 +37,20 @@ describe('GEA local database schema', () => {
     ]) {
       expect(schema).toContain(table);
     }
+  });
+  it('declares better-sqlite3 so GEA persistence is installed with the app workspace', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+    };
+
+    expect(pkg.dependencies?.['better-sqlite3']).toMatch(/^\^?\d+\.\d+\.\d+/);
+  });
+  it('rebuilds better-sqlite3 for Electron after installs', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8')) as {
+      scripts?: Record<string, string>;
+    };
+
+    expect(pkg.scripts?.['rebuild:sqlite']).toContain('electron-rebuild');
+    expect(pkg.scripts?.postinstall).toContain('rebuild:sqlite');
   });
 });

@@ -57,3 +57,18 @@ export interface ExitRecommendation {
   issued_by: BrainRole;
   issued_at: number;
 }
+
+export type NemesisPositionTier = 'scalp' | 'core' | 'runner';
+
+export interface NemesisCloseResult {
+  ticker: string;
+  action: 'trim' | 'close';
+  contracts: number;
+  pnl: number;
+  was_profit: boolean;
+  peak_pnl_usd: number;
+  close_regret_usd: number;
+  closed_at: number;
+  reason: string;
+  tier: NemesisPositionTier;
+}

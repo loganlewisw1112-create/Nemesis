@@ -17,11 +17,24 @@ export function DataFreshnessBoard({ state }: DataFreshnessBoardProps) {
         <div style={emptyStyle}>Waiting for public data sources.</div>
       ) : (
         <div style={{ display: 'grid', gap: 6 }}>
-          {rows.slice(0, 10).map((row) => (
+          {rows.slice(0, 10).map((row) => {
+            const freshnessPct = row.age_ms == null
+              ? 0
+              : Math.max(0, Math.min(100, 100 - (row.age_ms / row.stale_after_ms) * 100));
+            return (
             <div key={row.source_id} style={rowStyle}>
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <div style={nameStyle}>{row.name}</div>
                 <div style={subStyle}>Tier {row.trust_tier} / {formatAge(row.age_ms)}</div>
+                <div style={barTrackStyle}>
+                  <div
+                    style={{
+                      ...barFillStyle,
+                      width: `${freshnessPct}%`,
+                      background: row.stale ? '#fbbf24' : 'var(--success)',
+                    }}
+                  />
+                </div>
               </div>
               <span style={{
                 ...badgeStyle,
@@ -32,7 +45,8 @@ export function DataFreshnessBoard({ state }: DataFreshnessBoardProps) {
                 {row.stale ? 'STALE' : 'FRESH'}
               </span>
             </div>
-          ))}
+          );
+          })}
         </div>
       )}
     </div>
@@ -63,6 +77,7 @@ const rowStyle: CSSProperties = {
   gap: 12,
   padding: '8px 0',
   borderTop: '1px solid var(--border)',
+  transition: 'background var(--dur-normal), border-color var(--dur-normal)',
 };
 const nameStyle: CSSProperties = { fontSize: 12, fontWeight: 700 };
 const subStyle: CSSProperties = { fontSize: 10, color: 'var(--text-muted)', marginTop: 2 };
@@ -74,4 +89,17 @@ const badgeStyle: CSSProperties = {
   fontWeight: 700,
   letterSpacing: 1,
   flexShrink: 0,
+};
+const barTrackStyle: CSSProperties = {
+  width: '100%',
+  height: 3,
+  background: 'rgba(255,255,255,0.08)',
+  borderRadius: 999,
+  marginTop: 5,
+  overflow: 'hidden',
+};
+const barFillStyle: CSSProperties = {
+  height: '100%',
+  borderRadius: 999,
+  transition: 'width var(--dur-slow), background var(--dur-normal)',
 };

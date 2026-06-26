@@ -8,6 +8,7 @@ import type {
   PublicDataReleaseRecord,
   PublicDataSourceRecord,
 } from '@nemesis/connectors';
+import type { NemesisCloseResult } from '@nemesis/bridge-contracts';
 
 export const GEA_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS brain_instance (
@@ -242,7 +243,20 @@ export const GEA_SCHEMA = [
     metric_name TEXT NOT NULL,
     metric_value REAL NOT NULL
   )`,
-  `CREATE TABLE IF NOT EXISTS audit_event (
+  `CREATE TABLE IF NOT EXISTS nemesis_close_result (
+    id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    action TEXT NOT NULL,
+    contracts INTEGER NOT NULL,
+    pnl REAL NOT NULL,
+    was_profit INTEGER NOT NULL,
+    peak_pnl_usd REAL NOT NULL,
+    close_regret_usd REAL NOT NULL,
+    closed_at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    result_json TEXT NOT NULL
+  )`,  `CREATE TABLE IF NOT EXISTS audit_event (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
     brain_id TEXT,
@@ -272,6 +286,7 @@ type SqliteDatabase = {
 type BetterSqliteStoreCtor = new (path: string) => SqliteDatabase;
 
 export interface GeaLocalStore extends KalshiTapeSink, PublicDataMeshSink {
+  insertNemesisCloseResult(result: NemesisCloseResult): void;
   listMarketSnapshots(limit?: number): KalshiMarketSnapshotRecord[];
   listTradePrints(limit?: number): KalshiTradePrintRecord[];
   listOrderbookSnapshots(limit?: number): KalshiOrderbookSnapshotRecord[];
@@ -366,8 +381,23 @@ export async function createGeaLocalStore(path: string): Promise<GeaLocalStore |
     const listPublicSources = db.prepare('SELECT * FROM public_data_source ORDER BY trust_tier ASC, id ASC');
     const listPublicObservations = db.prepare('SELECT * FROM public_data_observation ORDER BY observed_at DESC LIMIT ?');
     const listPublicReleases = db.prepare('SELECT * FROM public_data_release ORDER BY observed_at DESC LIMIT ?');
+    const insertCloseResult = db.prepare(`
+      INSERT OR REPLACE INTO nemesis_close_result (
+        id, ticker, action, contracts, pnl, was_profit, peak_pnl_usd, close_regret_usd, closed_at, reason, tier, result_json
+      ) VALUES (
+        @id, @ticker, @action, @contracts, @pnl, @was_profit, @peak_pnl_usd, @close_regret_usd, @closed_at, @reason, @tier, @result_json
+      )
+    `);
 
     return {
+      insertNemesisCloseResult: (result) => {
+        insertCloseResult.run({
+          ...result,
+          id: `${result.ticker}:${result.closed_at}:${result.action}`,
+          was_profit: result.was_profit ? 1 : 0,
+          result_json: JSON.stringify(result),
+        });
+      },
       insertMarketSnapshot: (snapshot) => { insertMarket.run(snapshot); },
       insertTradePrint: (trade) => { insertTrade.run(trade); },
       insertOrderbookSnapshot: (book) => { insertBook.run(book); },

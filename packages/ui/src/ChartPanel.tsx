@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { useEffect, useId, useState } from 'react';
 
 interface ChartPanelProps {
   title: string;
@@ -9,6 +9,11 @@ interface ChartPanelProps {
   height: number;
   baseline?: number;
   marginBottom?: number;
+  live?: boolean;
+  emptyLabel?: string;
+  ariaLabel?: string;
+  drawOnMount?: boolean;
+  pulseKey?: string | number;
 }
 
 export function ChartPanel({
@@ -20,8 +25,14 @@ export function ChartPanel({
   height,
   baseline,
   marginBottom = 10,
+  live = true,
+  emptyLabel,
+  ariaLabel,
+  drawOnMount = true,
+  pulseKey,
 }: ChartPanelProps) {
   const gradId = useId();
+  const reducedMotion = usePrefersReducedMotion();
 
   // Parse last point for the live pulse dot
   const pts = path ? path.trim().split(/\s+/).filter(Boolean) : [];
@@ -31,6 +42,8 @@ export function ChartPanel({
 
   // Area fill: close the polygon at the bottom corners
   const areaPts = hasPoints ? `${path} ${width},${height} 0,${height}` : '';
+  const shouldAnimate = drawOnMount && !reducedMotion;
+  const showPulse = live && !reducedMotion;
 
   return (
     <div
@@ -48,7 +61,15 @@ export function ChartPanel({
         </span>
         {subtitle && <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{subtitle}</span>}
       </div>
-      <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ display: 'block', width: '100%', overflow: 'visible' }}>
+      <svg
+        width={width}
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={ariaLabel ?? `${title} chart`}
+        style={{ display: 'block', width: '100%', overflow: 'visible' }}
+      >
         <defs>
           <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor={color} stopOpacity="0.22" />
@@ -77,30 +98,50 @@ export function ChartPanel({
               strokeLinecap="round"
               strokeLinejoin="round"
               points={path}
-              style={{
+              style={shouldAnimate ? {
                 strokeDasharray: 9999,
                 strokeDashoffset: 9999,
                 animation: 'chartDraw 0.65s cubic-bezier(0.16,1,0.3,1) forwards',
-              }}
+              } : undefined}
             />
 
             {/* Pulsing dot at latest data point */}
             {lastPt && (
               <>
                 <circle cx={lx} cy={ly} r={3} fill={color} opacity={0.9} />
-                <circle
-                  key={`${lx}-${ly}`}
-                  cx={lx}
-                  cy={ly}
-                  r={3}
-                  fill={color}
-                  style={{ animation: 'chartPulse 1.1s ease-out forwards' }}
-                />
+                {showPulse && (
+                  <circle
+                    key={pulseKey ?? `${lx}-${ly}`}
+                    cx={lx}
+                    cy={ly}
+                    r={3}
+                    fill={color}
+                    style={{ animation: 'chartPulse 1.1s ease-out forwards' }}
+                  />
+                )}
               </>
             )}
           </>
         )}
       </svg>
+      {!hasPoints && emptyLabel && (
+        <div style={{ color: 'var(--text-muted)', fontSize: 11, marginTop: 6 }}>{emptyLabel}</div>
+      )}
     </div>
   );
+}
+
+function usePrefersReducedMotion() {
+  const [reduced, setReduced] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    setReduced(query.matches);
+    const onChange = () => setReduced(query.matches);
+    query.addEventListener?.('change', onChange);
+    return () => query.removeEventListener?.('change', onChange);
+  }, []);
+
+  return reduced;
 }

@@ -1,10 +1,11 @@
-import type { RecommendationPacket, NoTradeWarning, ExitRecommendation, BrainRole } from './recommendations.js';
+import type { RecommendationPacket, NoTradeWarning, ExitRecommendation, BrainRole, NemesisCloseResult } from './recommendations.js';
 
 export type NemesisBridgeMessageType =
   | 'nemesis:state'
   | 'brain:recommendation'
   | 'brain:no-trade'
   | 'brain:exit'
+  | 'nemesis:close-result'
   | 'bridge:ping'
   | 'bridge:pong'
   | 'bridge:hello';
@@ -32,6 +33,7 @@ export type BridgePayload =
   | RecommendationPacket
   | NoTradeWarning
   | ExitRecommendation
+  | NemesisCloseResult
   | BridgeHello
   | Record<string, never>;
 

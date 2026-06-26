@@ -22,7 +22,6 @@ import {
   fetchOrderbook,
   normalizeMarketPrice,
   evaluateGates,
-  canEnableLive,
   rankTheses,
   detectNoTradeRegimes,
   shouldShutdownSession,
@@ -37,6 +36,8 @@ import {
   rankThesesWithTiers,
   minNetEdgeForTier,
   scoreOpportunityForCard,
+  rankOpportunityRadar,
+  evaluateLiveUnlock,
   type AutoCloseDecision,
   type AutoCloseSettings,
   type AutoCloseState,
@@ -44,6 +45,8 @@ import {
   type GuardrailSettings,
   type ThesisCard,
   type KalshiMarket,
+  type KalshiOrderbook,
+  type OpportunityRadarRow,
   type PriceTick,
   type PaperPortfolio,
   type PaperPosition,
@@ -100,6 +103,7 @@ const PAPER_OK = new Set(['tradeable', 'qualified', 'watch-only']);
 const MARKET_REFRESH_MS = 15_000;
 const WATCHED_TICK_MS = 1_000;
 const FEED_WAIT_MS = 2_000;
+const BOOK_CACHE_TTL_MS = 600;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
@@ -124,6 +128,8 @@ const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 })
 const tickHistory = new Map<string, PriceTick[]>();
 const autoCloseStates = new Map<string, AutoCloseState>();
 const latestExitSignals = new Map<string, AutoCloseExitSignal>();
+const bookCache = new Map<string, { book: KalshiOrderbook; fetchedAt: number }>();
+let opportunityRadarRows: OpportunityRadarRow[] = [];
 let watchedTicker: string | null = null;
 let activeRegimes: string[] = [];
 let autoCloseDecisions: AutoCloseDecision[] = [];
@@ -488,10 +494,23 @@ async function fetchBookForCard(card: ThesisCard) {
     if (book.noAsk === undefined && book.no.length === 0) book.noAsk = 1 - card.marketPrice;
     if (book.yes.length === 0) book.yes = [{ price: card.marketPrice, quantity: 500 }];
     if (book.no.length === 0) book.no = [{ price: 1 - card.marketPrice, quantity: 500 }];
+    bookCache.set(card.ticker, { book, fetchedAt: Date.now() });
     return book;
   } catch {
-    return fallbackBook(card);
+    const book = fallbackBook(card);
+    bookCache.set(card.ticker, { book, fetchedAt: Date.now() });
+    return book;
   }
+}
+
+function cachedBookForTicker(ticker: string): KalshiOrderbook | null {
+  const cached = bookCache.get(ticker);
+  if (!cached || Date.now() - cached.fetchedAt > BOOK_CACHE_TTL_MS) return null;
+  return cached.book;
+}
+
+function prefetchBookForCard(card: ThesisCard) {
+  void fetchBookForCard(card).catch(() => undefined);
 }
 
 function clamp01(value: number): number {
@@ -601,7 +620,7 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
   const mark = positionMark(pos, card);
   const closeCard = card ?? fallbackCardForPosition(pos, mark);
   const qty = Math.min(pos.contracts, decision.contracts);
-  const book = await fetchBookForCard(closeCard);
+  const book = cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
   const result = simulatePaperClose(
     paperDesk,
     pos.id,
@@ -621,6 +640,7 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
     state.lastDecisionAt = decision.triggeredAt;
     if (result.ok && decision.action === 'trim') {
       state.trimmedContracts += qty;
+      if (/quick-profit|velocity|predictive/i.test(decision.reason)) state.earlyTrimContracts += qty;
     }
   }
 
@@ -652,6 +672,21 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
     detail: `auto-${decision.action}: ${decision.reason}; pnl ${result.pnl?.toFixed(2)}`,
     ok: true,
   });
+  broadcastToGea({
+    type: 'nemesis:close-result',
+    payload: {
+      ticker: pos.ticker,
+      action: decision.action === 'close' ? 'close' : 'trim',
+      contracts: qty,
+      pnl: result.pnl ?? 0,
+      was_profit: (result.pnl ?? 0) > 0,
+      peak_pnl_usd: decision.peakPnlUsd,
+      close_regret_usd: Math.max(0, decision.peakPnlUsd - decision.currentPnlUsd),
+      closed_at: Date.now(),
+      reason: decision.reason,
+      tier: decision.tier ?? state?.tier ?? 'scalp',
+    },
+  });
   savePaperPortfolio();
   saveAutoCloseState();
   saveAuditLog();
@@ -669,9 +704,13 @@ async function evaluateAutoClosePositions(_trigger: string) {
   try {
     const now = Date.now();
     const openIds = new Set<string>();
+    const closable: Array<{ pos: PaperPosition; decision: AutoCloseDecision }> = [];
+    const acSettings = autoCloseSettings();
+
     for (const pos of paperDesk.snapshot().positions) {
       openIds.add(pos.id);
       const card = cardForPosition(pos);
+      if (card) prefetchBookForCard(card);
       const mark = positionMark(pos, card);
       const tickCount = Math.max(tickHistory.get(pos.ticker)?.length ?? 0, autoCloseStates.get(pos.id)?.tickCount ?? 0);
       const currentEdge = card?.netEdge ?? latestExitSignals.get(pos.ticker)?.currentEdge ?? 0;
@@ -682,6 +721,7 @@ async function evaluateAutoClosePositions(_trigger: string) {
         tickCount,
         now,
         prior: autoCloseStates.get(pos.id),
+        tier: pos.tier,
       });
       autoCloseStates.set(pos.id, nextState);
 
@@ -692,19 +732,24 @@ async function evaluateAutoClosePositions(_trigger: string) {
         tickCount,
         now,
         state: nextState,
-        settings: autoCloseSettings(),
+        settings: acSettings,
         exitSignal: latestExitSignals.get(pos.ticker),
         freshnessMs: card?.freshnessMs,
         slippagePp: card?.slippagePp ?? card?.spread,
       });
 
       if (decision.action === 'hold') continue;
-      if (nextState.lastDecisionAt && now - nextState.lastDecisionAt < 10_000) continue;
+      const cooldownMs = decision.confidence >= 0.85
+        ? acSettings.highConfidenceCooldownMs
+        : acSettings.minDecisionCooldownMs;
+      if (nextState.lastDecisionAt && now - nextState.lastDecisionAt < cooldownMs) continue;
       nextState.lastDecisionAt = now;
       autoCloseStates.set(pos.id, nextState);
-      const ok = await executeAutoCloseDecision(pos, decision);
-      executed = executed || ok;
+      closable.push({ pos, decision });
     }
+
+    const results = await Promise.all(closable.map(({ pos, decision }) => executeAutoCloseDecision(pos, decision)));
+    executed = results.some(Boolean);
 
     let pruned = false;
     for (const id of [...autoCloseStates.keys()]) {
@@ -780,6 +825,9 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
   if (changed) {
     const card = theses.find((t) => t.ticker === ticker);
     recordTick(ticker, yesPrice, spread, card?.netEdge ?? 0);
+    const openPos = paperDesk.snapshot().positions.find((p) => p.ticker === ticker);
+    const closeCard = openPos ? cardForPosition(openPos) : undefined;
+    if (closeCard) prefetchBookForCard(closeCard);
     publishMarketState();
     void evaluateAutoClosePositions('quote');
     broadcastPaperUpdate();
@@ -829,6 +877,7 @@ function broadcastPaperUpdate() {
     workingOrders: paperOrderBook.working(),
     dailyPnl: sessionStatsData.dailyPnl,
     activeRegimes,
+    opportunityRadar: opportunityRadarRows,
     ...autoCloseSnapshot(),
   });
 }
@@ -925,15 +974,24 @@ function applyDepthToCard(card: ThesisCard): ThesisCard {
 
 function rankThesesForUi(cards: ThesisCard[]): ThesisCard[] {
   const base = discovery.settings.depthVerifyEnabled ? rankThesesWithTiers(cards) : rankTheses(cards);
+  opportunityRadarRows = rankOpportunityRadar(base, {
+    bridgeLatencyByTicker: new Map(base.map((card) => [
+      card.ticker,
+      card.id.startsWith('gea-') && bridgeStatus.lastSeenAt ? Date.now() - bridgeStatus.lastSeenAt : 0,
+    ])),
+    playbookPerformance: new Map(),
+    maxRows: 25,
+  });
   return base
     .map((card, index) => ({
       card,
       index,
-      score: scoreOpportunityForCard(card, {
-        bridgeLatencyMs: card.id.startsWith('gea-') && bridgeStatus.lastSeenAt
-          ? Date.now() - bridgeStatus.lastSeenAt
-          : undefined,
-      }).score,
+      score: opportunityRadarRows.find((row) => row.id === card.id)?.rankScore
+        ?? scoreOpportunityForCard(card, {
+          bridgeLatencyMs: card.id.startsWith('gea-') && bridgeStatus.lastSeenAt
+            ? Date.now() - bridgeStatus.lastSeenAt
+            : undefined,
+        }).score,
     }))
     .sort((a, b) => b.score - a.score || a.index - b.index)
     .map((row) => row.card);
@@ -1320,32 +1378,93 @@ function spawnGlobalEventAlpha() {
   });
 }
 
+function buildLiveUnlockReadiness(targetStage: 'manual-live' | 'auto-live', confirmationText: string) {
+  const gates = evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false);
+  const port = paperDesk.snapshot();
+  const closeTrades = port.trades.filter((t) => t.type === 'close');
+  const wins = closeTrades.filter((t) => (t.pnl ?? 0) > 0).length;
+  const riskUsd = closeTrades.reduce((sum, trade) => sum + Math.max(0, trade.price * trade.contracts), 0);
+  const pnl = closeTrades.reduce((sum, trade) => sum + (trade.pnl ?? 0), 0);
+  const slippageRows = port.trades.filter((t) => t.slippage !== undefined);
+  const benchmark = profitabilityBenchmark.report();
+  const shutdown = getShutdownCounters();
+  return evaluateLiveUnlock({
+    now: Date.now(),
+    targetStage,
+    currentStage: settings.liveStage ?? 'paper',
+    hasCredentials: Boolean(getLiveCreds()),
+    gates,
+    confirmationText,
+    paper: {
+      tradeCount: port.trades.length,
+      autoCloseDecisionCount: autoCloseDecisions.length,
+      realizedPnlUsd: port.realizedPnl,
+      equityAboveStart: paperDesk.markToMarket(getMarkPrices()).equity > port.startingCash,
+      pnlPerRiskDollar: riskUsd > 0 ? pnl / riskUsd : 0,
+      winRate: closeTrades.length > 0 ? wins / closeTrades.length : 0,
+      falseExitRate: benchmark.upgraded.falseExitRate,
+      avgCloseRegretUsd: benchmark.upgraded.closeRegretUsd,
+      avgSlippagePp: slippageRows.length > 0
+        ? slippageRows.reduce((sum, trade) => sum + Math.abs(trade.slippage ?? 0), 0) / slippageRows.length
+        : 0,
+      maxDrawdownUsd: Math.max(0, -sessionStatsData.dailyPnl),
+      dailyLossCapUsd: settings.dailyLossCapUsd,
+      shutdownTriggered: shouldShutdownSession(shutdown),
+      killSwitchActive: settings.killSwitchActive,
+      apiHealthy: registry.isHealthy('kalshi-rest'),
+      cleanAudit: auditLog.list().slice(-100).every((entry) => entry.ok),
+    },
+    manualLive: { orderCount: 0, reconciled: false, riskBreaches: 0, unresolvedRejects: 0, avgSlippagePp: 0, modeledSlippagePp: settings.maxSlippagePp },
+    shadowAuto: { decisions: 0, expectancy: 0, manualExpectancy: 0, falseExitRate: 0, missedTicketReduction: 0 },
+    tinyAutoPilot: { trades: 0, expectancy: 0, riskBreaches: 0 },
+  });
+}
+
+function invalidateLiveCertificate(reason: string) {
+  if (!settings.liveUnlockCertificate && (settings.liveStage ?? 'paper') === 'paper') return;
+  settings = { ...settings, liveUnlockCertificate: undefined, liveStage: 'paper', liveEnabled: false, autoLiveEnabled: false, demoMode: true, dryRun: true };
+  auditLog.append({ action: 'gate_block', detail: `live certificate invalidated: ${reason}`, ok: false });
+}
 function setupIpc() {
-  ipcMain.handle('nemesis:getState', () => ({
-    settings,
-    theses: rankThesesForUi(theses),
-    gates: evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false),
-    connectors: registry.getAll(),
-    journalCount: journal.count(),
-    reviewOnly,
-    canLive: canEnableLive(evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false)),
-    activeRegimes,
-    dailyPnl: sessionStatsData.dailyPnl,
-    humanQuizPassed: settings.humanQuizPassed ?? false,
-    backtestPassed: settings.backtestPassed ?? false,
-    shutdown: getShutdownCounters(),
-  }));
+  ipcMain.handle('nemesis:getState', () => {
+    const targetStage = settings.liveStage === 'manual-live' ? 'auto-live' : 'manual-live';
+    const confirmText = targetStage === 'auto-live' ? 'ENABLE LIVE AUTO' : 'ENABLE LIVE MANUAL';
+    const liveUnlock = buildLiveUnlockReadiness(targetStage, confirmText);
+    return {
+      settings,
+      theses: rankThesesForUi(theses),
+      gates: evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false),
+      connectors: registry.getAll(),
+      journalCount: journal.count(),
+      reviewOnly,
+      canLive: liveUnlock.passed,
+      liveUnlock,
+      opportunityRadar: opportunityRadarRows,
+      activeRegimes,
+      dailyPnl: sessionStatsData.dailyPnl,
+      humanQuizPassed: settings.humanQuizPassed ?? false,
+      backtestPassed: settings.backtestPassed ?? false,
+      shutdown: getShutdownCounters(),
+    };
+  });
 
   ipcMain.handle('nemesis:getMarkets', () => marketsCache);
 
   ipcMain.handle('nemesis:updateSettings', (_e, partial: Partial<GuardrailSettings>) => {
-    if (partial.liveEnabled && !getLiveCreds()) {
-      return { ok: false, error: 'Kalshi credentials not configured — add API Key ID and Private Key in Settings' };
+    if (partial.liveEnabled) {
+      return { ok: false, error: 'Use the staged live unlock wizard; credentials alone cannot enable live trading' };
     }
     const riskOverride = settings.liveEnabled && isRiskSettingOverride(partial);
+    const credentialChange = partial.kalshiApiKeyId !== undefined || partial.kalshiPrivateKey !== undefined;
+    if ((riskOverride || credentialChange) && (settings.liveStage ?? 'paper') !== 'paper') {
+      invalidateLiveCertificate(riskOverride ? 'risk setting override' : 'credential change');
+    }
     settings = normalizeGuardrailSettings({
       ...settings,
       ...partial,
+      liveEnabled: partial.liveEnabled === false ? false : settings.liveEnabled,
+      liveStage: partial.liveEnabled === false ? 'paper' : settings.liveStage,
+      autoLiveEnabled: partial.liveEnabled === false ? false : settings.autoLiveEnabled,
       autoClose: partial.autoClose
         ? { ...autoCloseSettings(), ...partial.autoClose }
         : autoCloseSettings(),
@@ -1423,16 +1542,24 @@ function setupIpc() {
   ipcMain.handle('nemesis:killSwitch', () => activateKillSwitch('ipc'));
 
   ipcMain.handle('nemesis:unlockLive', (_e, confirmText: string) => {
-    if (confirmText !== 'ENABLE LIVE') {
-      return { ok: false, error: 'Type ENABLE LIVE to confirm' };
+    const targetStage = confirmText === 'ENABLE LIVE AUTO' ? 'auto-live' : 'manual-live';
+    const evaluation = buildLiveUnlockReadiness(targetStage, confirmText);
+    if (!evaluation.passed || !evaluation.certificate) {
+      return { ok: false, error: evaluation.blockers.join('; ') || 'live unlock blocked' };
     }
-    if (!getLiveCreds()) {
-      return { ok: false, error: 'Kalshi credentials not configured — add API Key ID and Private Key in Settings' };
-    }
-    settings = { ...settings, liveEnabled: true, demoMode: false, dryRun: false, killSwitchActive: false };
+    settings = normalizeGuardrailSettings({
+      ...settings,
+      liveEnabled: true,
+      liveStage: targetStage,
+      autoLiveEnabled: targetStage === 'auto-live',
+      liveUnlockCertificate: evaluation.certificate,
+      demoMode: false,
+      dryRun: false,
+      killSwitchActive: false,
+    });
     recordSettingsManualOverride();
     saveSettings();
-    auditLog.append({ action: 'live_order', detail: 'live mode enabled', ok: true });
+    auditLog.append({ action: 'live_order', detail: `${targetStage} enabled`, ok: true });
     saveAuditLog();
     broadcast('settings:update', settings);
     return { ok: true, settings };

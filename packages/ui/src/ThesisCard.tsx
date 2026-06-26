@@ -52,6 +52,7 @@ export function ThesisCardView({
   const depthRisk = depthRiskItem(card);
   const failedCount = riskItems.filter((r) => !r.ok).length + (depthRisk.ok ? 0 : 1);
   const showProfitBox = true;
+  const cryptoContext = card.cryptoContext;
 
   return (
     <div
@@ -116,6 +117,34 @@ export function ThesisCardView({
       <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>
         {card.externalSummary}
       </div>
+
+      {cryptoContext && (
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+            gap: 6,
+            fontSize: 11,
+            marginBottom: 10,
+            color: 'var(--text-muted)',
+          }}
+        >
+          <div>
+            <div>Momentum</div>
+            <div style={{ color: cryptoContext.momentumBps >= 0 ? 'var(--success)' : 'var(--danger)' }}>
+              {cryptoContext.momentumBps >= 0 ? '+' : ''}{cryptoContext.momentumBps.toFixed(1)} bps
+            </div>
+          </div>
+          <div>
+            <div>Volatility</div>
+            <div>{cryptoContext.volatilityBps.toFixed(1)} bps</div>
+          </div>
+          <div>
+            <div>Context</div>
+            <div>{cryptoContext.confidence}% · {cryptoContext.sampleCount} ticks</div>
+          </div>
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, fontSize: 12, marginBottom: 10 }}>
         <div>

@@ -38,6 +38,11 @@ function state(overrides: Partial<AutoCloseState> = {}): AutoCloseState {
     lastDecisionAt: 0,
     lastMark: 0.54,
     lastEdge: 0.08,
+    markVelocityPct: 0,
+    edgeVelocityPct: 0,
+    consecutiveDownTicks: 0,
+    earlyTrimContracts: 0,
+    tier: 'scalp',
     ...overrides,
   };
 }
@@ -163,5 +168,88 @@ describe('AutoCloseEngine', () => {
 
     expect(decision.action).toBe('close');
     expect(decision.reason).toMatch(/GEA exit confirmed/i);
+  });
+  it('tracks adverse velocity and trims profitable positions before full giveback', () => {
+    const prior = state({
+      lastMark: 0.51,
+      lastEdge: 0.08,
+      consecutiveDownTicks: 2,
+      earlyTrimContracts: 0,
+    });
+    const next = updateAutoCloseState({
+      position: position({ contracts: 10 }),
+      mark: 0.5,
+      currentEdge: 0.05,
+      tickCount: 5,
+      now,
+      prior,
+    });
+
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 10 }),
+      mark: 0.5,
+      currentEdge: 0.05,
+      tickCount: 5,
+      now,
+      state: next,
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, minAgeMs: 0 },
+    });
+
+    expect(next.markVelocityPct).toBeLessThan(0);
+    expect(next.consecutiveDownTicks).toBe(3);
+    expect(decision.action).toBe('trim');
+    expect(decision.reason).toMatch(/velocity/i);
+  });
+
+  it('fires quick-profit trims when profit is positive and edge compresses', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 20 }),
+      mark: 0.425,
+      currentEdge: 0.055,
+      tickCount: 5,
+      now,
+      state: state({
+        peakPnlPct: 0.08,
+        peakEdge: 0.08,
+        trimmedContracts: 0,
+        tickCount: 5,
+      }),
+      settings: {
+        ...DEFAULT_AUTO_CLOSE_SETTINGS,
+        enabled: true,
+        minAgeMs: 0,
+        quickProfitExitEnabled: true,
+      },
+    });
+
+    expect(decision.action).toBe('trim');
+    expect(decision.contracts).toBe(5);
+    expect(decision.reason).toMatch(/quick-profit/i);
+  });
+
+  it('predictively trims before the trailing threshold is fully crossed', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 12 }),
+      mark: 0.477,
+      currentEdge: 0.05,
+      tickCount: 5,
+      now,
+      state: state({
+        peakPnlPct: 0.2,
+        peakEdge: 0.08,
+        markVelocityPct: -0.03,
+        trimmedContracts: 0,
+        tickCount: 5,
+      }),
+      settings: {
+        ...DEFAULT_AUTO_CLOSE_SETTINGS,
+        enabled: true,
+        minAgeMs: 0,
+        predictiveCrossingEnabled: true,
+      },
+    });
+
+    expect(decision.action).toBe('trim');
+    expect(decision.reason).toMatch(/predictive/i);
   });
 });

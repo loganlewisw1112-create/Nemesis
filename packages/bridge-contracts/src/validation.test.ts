@@ -92,4 +92,25 @@ describe('bridge validation', () => {
     expect(validateNoTradeWarning({ ...warning, issued_by: 'shadow' }).reason).toBe('forbidden role');
     expect(validateExitRecommendation({ ...exit, issued_by: 'replay' }).reason).toBe('forbidden role');
   });
+  it('validates NEMESIS close-result packets for GEA feedback', () => {
+    const msg: NemesisBridgeMessage = {
+      type: 'nemesis:close-result',
+      seq: 2,
+      payload: {
+        ticker: 'KXTEST-26',
+        action: 'trim',
+        contracts: 3,
+        pnl: 1.25,
+        was_profit: true,
+        peak_pnl_usd: 2,
+        close_regret_usd: 0.25,
+        closed_at: Date.now(),
+        reason: 'quick-profit trim',
+        tier: 'scalp',
+      },
+    };
+
+    expect(validateBridgeMessage(msg).ok).toBe(true);
+    expect(validateBridgeMessage({ ...msg, payload: { ...msg.payload, tier: 'invalid' } }).ok).toBe(false);
+  });
 });

@@ -4,6 +4,16 @@ export { GuardrailCockpit } from './GuardrailCockpit.js';
 export { ExplainMovePanel, DriverStack, RegimeBanner } from './ExplainMove.js';
 export { TicketLiveCharts } from './LiveCharts.js';
 export { ChartPanel } from './ChartPanel.js';
+export {
+  CommandShell,
+  CommandRibbon,
+  CommandNavRail,
+  OperationalRail,
+  PanelCard,
+  MetricTile,
+  RealtimeChartPanel,
+  type CommandNavItem,
+} from './CommandShell.js';
 export { PaperDeskPanel } from './PaperDeskPanel.js';
 export { ProfitStationPanel } from './ProfitStationPanel.js';
 export { RiskCockpit } from './RiskCockpit.js';

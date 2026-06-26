@@ -50,13 +50,19 @@ function HeatColumn({
       <div style={columnLabelStyle}>{label}</div>
       {levels.slice(0, 8).map((level) => {
         const intensity = Math.max(0.12, Math.min(0.85, level.quantity / maxQty));
+        const widthPct = Math.max(6, Math.min(100, (level.quantity / maxQty) * 100));
         return (
-          <div key={`${label}-${level.price}-${level.quantity}`} style={{
-            ...rowStyle,
-            background: `${tint} ${intensity})`,
-          }}>
-            <span>{level.price.toFixed(2)}</span>
-            <strong>{level.quantity}</strong>
+          <div key={`${label}-${level.price}-${level.quantity}`} style={rowStyle}>
+            <span
+              aria-hidden="true"
+              style={{
+                ...heatFillStyle,
+                width: `${widthPct}%`,
+                background: `${tint} ${intensity})`,
+              }}
+            />
+            <span style={rowTextStyle}>{level.price.toFixed(2)}</span>
+            <strong style={rowTextStyle}>{level.quantity}</strong>
           </div>
         );
       })}
@@ -96,10 +102,20 @@ const columnLabelStyle: CSSProperties = { fontSize: 10, color: 'var(--text-muted
 const rowStyle: CSSProperties = {
   display: 'flex',
   justifyContent: 'space-between',
+  position: 'relative',
+  overflow: 'hidden',
   padding: '6px 8px',
   marginBottom: 4,
   borderRadius: 4,
   color: '#f8fafc',
   fontSize: 12,
+  border: '1px solid rgba(255,255,255,0.06)',
+  background: 'rgba(255,255,255,0.04)',
 };
+const heatFillStyle: CSSProperties = {
+  position: 'absolute',
+  inset: '0 auto 0 0',
+  transition: 'width var(--dur-slow), background var(--dur-normal)',
+};
+const rowTextStyle: CSSProperties = { position: 'relative', zIndex: 1 };
 const emptyStyle: CSSProperties = { color: 'var(--text-muted)', fontSize: 12 };

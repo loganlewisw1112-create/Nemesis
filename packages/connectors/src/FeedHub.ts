@@ -1,5 +1,5 @@
 import { fetchTrades, type KalshiMarket, type KalshiTrade, type GeoNewsItem } from '@nemesis/core';
-import { BinanceStream } from './binanceStream.js';
+import { BinanceStream, type BinanceQuote } from './binanceStream.js';
 import type { ConnectorRegistry } from './registry.js';
 import type { InfraAlert, NewsItem } from './feeds.js';
 import {
@@ -170,6 +170,10 @@ export class FeedHub {
           spotPrice: live.price,
           lagMs: live.lagMs,
           fetchedAt: live.fetchedAt,
+          momentumBps: live.momentumBps,
+          volatilityBps: live.volatilityBps,
+          sampleCount: live.sampleCount,
+          windowMs: live.windowMs,
         });
       } else if (this.isStale(snap?.fetchedAt, STALE_MS.crypto)) {
         tasks.push(this.refreshCrypto(symbol));
@@ -251,11 +255,16 @@ export class FeedHub {
   private async refreshCrypto(symbol: string): Promise<void> {
     const result = await fetchBinanceSpot(this.registry, symbol, this.opts);
     if (result) {
+      const fetchedAt = Date.now();
       this.crypto.set(symbol, {
         symbol,
         spotPrice: result.price,
         lagMs: result.lagMs,
-        fetchedAt: Date.now(),
+        fetchedAt,
+        momentumBps: 0,
+        volatilityBps: 0,
+        sampleCount: 1,
+        windowMs: 0,
       });
     }
   }
@@ -380,12 +389,28 @@ export class FeedHub {
     const live = this.binance.getQuote(symbol);
     const snap = this.crypto.get(symbol);
     const strike = parseBtcStrike(market.title);
+    const binanceQuote = live ?? this.snapshotToBinanceQuote(symbol, snap);
     return {
       symbol,
-      spotPrice: live?.price ?? snap?.spotPrice ?? strike,
+      spotPrice: binanceQuote?.price ?? strike,
       strike,
-      lagMs: live?.lagMs ?? snap?.lagMs ?? 0,
+      lagMs: binanceQuote?.lagMs ?? 0,
       kalshiImpliedSpot: marketPrice * strike,
+      binanceQuote,
+    };
+  }
+
+  private snapshotToBinanceQuote(symbol: string, snap: CryptoSnapshot | undefined): BinanceQuote | undefined {
+    if (!snap) return undefined;
+    return {
+      symbol,
+      price: snap.spotPrice,
+      lagMs: snap.lagMs,
+      fetchedAt: snap.fetchedAt,
+      momentumBps: snap.momentumBps ?? 0,
+      volatilityBps: snap.volatilityBps ?? 0,
+      sampleCount: snap.sampleCount ?? 1,
+      windowMs: snap.windowMs ?? 0,
     };
   }
 

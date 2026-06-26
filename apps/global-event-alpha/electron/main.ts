@@ -13,7 +13,7 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import WebSocket, { type RawData } from 'ws';
-import type { BrainRole, ExitRecommendation, NemesisBridgeMessage, BridgeStatus, NoTradeWarning } from '@nemesis/bridge-contracts';
+import type { BrainRole, ExitRecommendation, NemesisBridgeMessage, BridgeStatus, NoTradeWarning, NemesisCloseResult } from '@nemesis/bridge-contracts';
 import { fetchMarkets, fetchOrderbook, fetchTrades } from '@nemesis/core';
 import {
   ConnectorRegistry,
@@ -634,6 +634,9 @@ function connectBridge() {
         broadcast('gea:nemesisState', msg.payload);
       } else if (msg.type === 'brain:recommendation') {
         broadcast('gea:recommendation', msg.payload);
+      } else if (msg.type === 'nemesis:close-result') {
+        localStore?.insertNemesisCloseResult(msg.payload as NemesisCloseResult);
+        broadcast('gea:closeResult', msg.payload);
       } else if (msg.type === 'bridge:pong') {
         // heartbeat ack
       }

@@ -58,10 +58,23 @@ export interface KalshiTradesResponse {
   cursor?: string;
 }
 
+export type LiveTradingStage = 'paper' | 'manual-live' | 'auto-live';
+
+export interface LiveUnlockCertificate {
+  stage: Exclude<LiveTradingStage, 'paper'>;
+  issuedAt: number;
+  expiresAt: number;
+  summary: string;
+  metrics: Record<string, number | boolean | string>;
+}
+
 export interface GuardrailSettings {
   demoMode: boolean;
   dryRun: boolean;
   liveEnabled: boolean;
+  liveStage?: LiveTradingStage;
+  autoLiveEnabled?: boolean;
+  liveUnlockCertificate?: LiveUnlockCertificate;
   cryptoLiveEnabled: boolean;
   maxPositionUsd: number;
   dailyLossCapUsd: number;
@@ -79,6 +92,8 @@ export const DEFAULT_GUARDRAILS: GuardrailSettings = {
   demoMode: true,
   dryRun: true,
   liveEnabled: false,
+  liveStage: 'paper',
+  autoLiveEnabled: false,
   cryptoLiveEnabled: false,
   maxPositionUsd: 10,
   dailyLossCapUsd: 5,
@@ -142,6 +157,7 @@ export interface ThesisCard {
   fillableUsd?: number;
   slippagePp?: number;
   depthLevels?: number;
+  cryptoContext?: CryptoThesisContext;
 }
 
 export type SourceMoveClass =
@@ -156,6 +172,18 @@ export interface ThesisDriver {
   label: string;
   impact: number;
   detail: string;
+}
+
+export interface CryptoThesisContext {
+  symbol: string;
+  spotPrice: number;
+  strike: number;
+  distanceBps: number;
+  momentumBps: number;
+  volatilityBps: number;
+  confidence: number;
+  sampleCount: number;
+  windowMs: number;
 }
 
 export interface JournalEntry {

@@ -31,6 +31,7 @@ import type {
   PriceTick,
   DiscoveryState,
   ExecutableTier,
+  LiveUnlockEvaluation,
 } from '@nemesis/core';
 import { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
 
@@ -42,6 +43,7 @@ interface AppState {
   journalCount: number;
   reviewOnly: boolean;
   canLive: boolean;
+  liveUnlock?: LiveUnlockEvaluation;
   activeRegimes?: string[];
   dailyPnl?: number;
   humanQuizPassed?: boolean;
@@ -814,6 +816,7 @@ export default function App() {
                 <LiveUnlockWizard
                   gates={state.gates}
                   canLive={state.canLive}
+                  liveUnlock={state.liveUnlock}
                   onUnlock={(text) => window.nemesis.unlockLive(text).then((r) => { load(); return r; })}
                 />
                 <button type="button" onClick={() => window.nemesis.killSwitch().then(load)} style={{ ...chipStyle(false), color: 'var(--danger)' }}>

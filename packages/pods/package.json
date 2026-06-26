@@ -5,6 +5,6 @@
   "type": "module",
   "main": "./src/index.ts",
   "exports": { ".": "./src/index.ts" },
-  "dependencies": { "@nemesis/core": "*" },
+  "dependencies": { "@nemesis/core": "*", "@nemesis/connectors": "*" },
   "devDependencies": { "typescript": "^5.7.3" }
 }

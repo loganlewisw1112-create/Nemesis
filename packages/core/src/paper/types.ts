@@ -31,6 +31,7 @@ export interface PaperPosition {
   playbook: string;
   category?: string;
   eventTicker?: string;
+  tier?: PositionTier;
 }
 
 export interface PaperTrade {
@@ -76,6 +77,8 @@ export interface PaperOrder {
   status: 'working' | 'filled' | 'cancelled';
 }
 
+export type PositionTier = 'scalp' | 'core' | 'runner';
+
 export type AutoCloseAction = 'hold' | 'trim' | 'close';
 
 export interface AutoCloseSettings {
@@ -93,6 +96,23 @@ export interface AutoCloseSettings {
   staleSignalMs: number;
   badLiquiditySlippagePp: number;
   maxBridgeLatencyMs: number;
+  minDecisionCooldownMs: number;
+  highConfidenceCooldownMs: number;
+  quickProfitExitEnabled: boolean;
+  quickProfitPct: number;
+  quickProfitEdgeCompressionTrigger: number;
+  quickProfitTrimFraction: number;
+  velocityDownTicksToTrim: number;
+  predictiveCrossingEnabled: boolean;
+  predictiveCrossingLeadPct: number;
+  exitScoreCloseThreshold: number;
+  exitScoreTrimThreshold: number;
+  profitBiasEnabled: boolean;
+  scalp_to_core_winRate: number;
+  core_to_runner_winRate: number;
+  tier_lookback_n: number;
+  adaptiveEnabled: boolean;
+  adaptiveMaxDriftPct: number;
 }
 
 export interface AutoCloseState {
@@ -107,6 +127,11 @@ export interface AutoCloseState {
   lastDecisionAt: number;
   lastMark: number;
   lastEdge: number;
+  markVelocityPct: number;
+  edgeVelocityPct: number;
+  consecutiveDownTicks: number;
+  earlyTrimContracts: number;
+  tier: PositionTier;
 }
 
 export interface AutoCloseDecision {
@@ -125,6 +150,8 @@ export interface AutoCloseDecision {
   peakEdge: number;
   givebackPct: number;
   triggeredAt: number;
+  tier?: PositionTier;
+  exitScore?: number;
 }
 
 export interface AutoCloseStateSnapshot {
@@ -137,16 +164,33 @@ export const DEFAULT_AUTO_CLOSE_SETTINGS: AutoCloseSettings = {
   paperOnly: true,
   minAgeMs: 30_000,
   minTicks: 3,
-  firstTrimProfitPct: 0.12,
-  firstTrimGivebackPct: 0.25,
+  firstTrimProfitPct: 0.06,
+  firstTrimGivebackPct: 0.15,
   firstTrimFraction: 0.5,
-  finalCloseProfitPct: 0.18,
-  finalCloseGivebackPct: 0.35,
+  finalCloseProfitPct: 0.12,
+  finalCloseGivebackPct: 0.25,
   emergencyEdgeExit: 0,
   geaExitConfidence: 0.85,
   staleSignalMs: 90_000,
   badLiquiditySlippagePp: 0.07,
   maxBridgeLatencyMs: 2_000,
+  minDecisionCooldownMs: 5_000,
+  highConfidenceCooldownMs: 500,
+  quickProfitExitEnabled: false,
+  quickProfitPct: 0.03,
+  quickProfitEdgeCompressionTrigger: 0.2,
+  quickProfitTrimFraction: 0.25,
+  velocityDownTicksToTrim: 3,
+  predictiveCrossingEnabled: true,
+  predictiveCrossingLeadPct: 0.15,
+  exitScoreCloseThreshold: 0.7,
+  exitScoreTrimThreshold: 0.5,
+  profitBiasEnabled: true,
+  scalp_to_core_winRate: 0.6,
+  core_to_runner_winRate: 0.8,
+  tier_lookback_n: 20,
+  adaptiveEnabled: false,
+  adaptiveMaxDriftPct: 0.2,
 };
 
 import type { ShutdownCounters } from '../guardrails/engine.js';

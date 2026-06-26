@@ -196,6 +196,33 @@ beforeEach(() => {
 });
 
 describe('Global Event Alpha shell', () => {
+  it('renders the NEMESIS-style shell with command ribbon and operational rail', async () => {
+    render(<App />);
+
+    expect(await screen.findByText('GEA COMMAND RIBBON')).toBeTruthy();
+    expect(await screen.findByText('OPERATIONAL RAIL')).toBeTruthy();
+    expect(await screen.findByText('BRIDGE LINK')).toBeTruthy();
+    expect(await screen.findByText('BRAIN CLUSTER')).toBeTruthy();
+  });
+
+  it('keeps the operational rail visible while navigating tabs', async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByTitle('Replay Lab'));
+
+    expect(await screen.findByText('Historical Replay Factory')).toBeTruthy();
+    expect(screen.getByText('OPERATIONAL RAIL')).toBeTruthy();
+    expect(screen.getByText('DATA FRESHNESS')).toBeTruthy();
+  });
+
+  it('renders realtime alpha, tape, and brain charts in the command center', async () => {
+    render(<App />);
+
+    expect(await screen.findByLabelText('Alpha Pulse probability trend')).toBeTruthy();
+    expect(await screen.findByLabelText('Tape Pulse spread trend')).toBeTruthy();
+    expect(await screen.findByLabelText('Brain Heartbeat latency trend')).toBeTruthy();
+  });
+
   it('renders live brain health rows', async () => {
     render(<App />);
 

@@ -28,6 +28,10 @@ export interface CryptoSnapshot {
   spotPrice: number;
   lagMs: number;
   fetchedAt: number;
+  momentumBps?: number;
+  volatilityBps?: number;
+  sampleCount?: number;
+  windowMs?: number;
 }
 
 export interface MacroSnapshot {
