@@ -9,7 +9,7 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-import { app, BrowserWindow, ipcMain, globalShortcut } from 'electron';
+import { app, BrowserWindow, ipcMain, globalShortcut, safeStorage } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { WebSocketServer, WebSocket as WsSocket, type RawData } from 'ws';
@@ -97,6 +97,7 @@ const PAPER_ORDERS_PATH = path.join(DATA_DIR, 'paper-orders.json');
 const AUDIT_PATH = path.join(DATA_DIR, 'audit-log.json');
 const DISCOVERY_SETTINGS_PATH = path.join(DATA_DIR, 'discovery-settings.json');
 const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
+const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json');
 
 const MAX_TICKS = 120;
 const PAPER_OK = new Set(['tradeable', 'qualified', 'watch-only']);
@@ -148,6 +149,21 @@ let equityHistory: { t: number; equity: number; deployed: number; cash: number }
 ];
 let lastApiHealthTickAt = Date.now();
 
+interface StoredKalshiCredentials {
+  storage: 'electron-safeStorage-v1';
+  kalshiApiKeyId?: string;
+  encryptedPrivateKey?: string;
+  updatedAt: number;
+}
+
+interface KalshiCredentialStatus {
+  apiKeyId: string | null;
+  hasPrivateKey: boolean;
+  privateKeyStorage: 'env' | 'electron-safeStorage' | 'none';
+  encryptionAvailable: boolean;
+  updatedAt: number | null;
+}
+
 // Bridge WebSocket server (port 7430)
 const bridgeClients = new Set<WsSocket>();
 let bridgeSeq = 0;
@@ -161,6 +177,104 @@ const bridgeStatus: BridgeStatus = {
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function encryptionAvailable(): boolean {
+  try {
+    return safeStorage.isEncryptionAvailable();
+  } catch {
+    return false;
+  }
+}
+
+function readStoredKalshiCredentials(): StoredKalshiCredentials | null {
+  ensureDataDir();
+  if (!fs.existsSync(KALSHI_CREDENTIALS_PATH)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(KALSHI_CREDENTIALS_PATH, 'utf8')) as Partial<StoredKalshiCredentials>;
+    if (raw.storage !== 'electron-safeStorage-v1') return null;
+    return {
+      storage: 'electron-safeStorage-v1',
+      kalshiApiKeyId: typeof raw.kalshiApiKeyId === 'string' ? raw.kalshiApiKeyId : undefined,
+      encryptedPrivateKey: typeof raw.encryptedPrivateKey === 'string' ? raw.encryptedPrivateKey : undefined,
+      updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredKalshiCredentials(credentials: StoredKalshiCredentials) {
+  ensureDataDir();
+  fs.writeFileSync(KALSHI_CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+}
+
+function decryptStoredPrivateKey(stored: StoredKalshiCredentials | null): string {
+  if (!stored?.encryptedPrivateKey || !encryptionAvailable()) return '';
+  try {
+    return safeStorage.decryptString(Buffer.from(stored.encryptedPrivateKey, 'base64'));
+  } catch {
+    return '';
+  }
+}
+
+function currentKalshiApiKeyId(): string {
+  const stored = readStoredKalshiCredentials();
+  return process.env.NEMESIS_KALSHI_API_KEY_ID
+    ?? stored?.kalshiApiKeyId
+    ?? settings.kalshiApiKeyId
+    ?? '';
+}
+
+function kalshiCredentialStatus(): KalshiCredentialStatus {
+  const stored = readStoredKalshiCredentials();
+  const envPrivateKey = Boolean(process.env.NEMESIS_KALSHI_PRIVATE_KEY);
+  const hasStoredPrivateKey = Boolean(stored?.encryptedPrivateKey);
+  return {
+    apiKeyId: currentKalshiApiKeyId() || null,
+    hasPrivateKey: envPrivateKey || hasStoredPrivateKey,
+    privateKeyStorage: envPrivateKey ? 'env' : hasStoredPrivateKey ? 'electron-safeStorage' : 'none',
+    encryptionAvailable: encryptionAvailable(),
+    updatedAt: stored?.updatedAt ?? null,
+  };
+}
+
+function persistKalshiCredentials(input: { kalshiApiKeyId?: string; privateKeyPem?: string }) {
+  const stored = readStoredKalshiCredentials();
+  const apiKeyId = input.kalshiApiKeyId?.trim() || stored?.kalshiApiKeyId || settings.kalshiApiKeyId;
+  let encryptedPrivateKey = stored?.encryptedPrivateKey;
+  const privateKeyPem = input.privateKeyPem?.trim();
+
+  if (privateKeyPem) {
+    if (!encryptionAvailable()) {
+      return { ok: false, error: 'Electron safeStorage is unavailable; use NEMESIS_KALSHI_PRIVATE_KEY for this session' };
+    }
+    encryptedPrivateKey = safeStorage.encryptString(privateKeyPem).toString('base64');
+  }
+
+  if (!apiKeyId && !encryptedPrivateKey) {
+    return { ok: false, error: 'API key ID or private key is required' };
+  }
+
+  writeStoredKalshiCredentials({
+    storage: 'electron-safeStorage-v1',
+    kalshiApiKeyId: apiKeyId,
+    encryptedPrivateKey,
+    updatedAt: Date.now(),
+  });
+
+  settings = normalizeGuardrailSettings({ ...settings, kalshiApiKeyId: apiKeyId });
+  feedHub.setKalshiApiKey(currentKalshiApiKeyId());
+  saveSettings();
+  return { ok: true, status: kalshiCredentialStatus() };
+}
+
+function clearStoredKalshiCredentials() {
+  if (fs.existsSync(KALSHI_CREDENTIALS_PATH)) fs.rmSync(KALSHI_CREDENTIALS_PATH, { force: true });
+  settings = normalizeGuardrailSettings({ ...settings, kalshiApiKeyId: undefined });
+  feedHub.setKalshiApiKey(undefined);
+  saveSettings();
+  return kalshiCredentialStatus();
 }
 
 function getShutdownCounters() {
@@ -227,7 +341,30 @@ function autoCloseSettings(): AutoCloseSettings {
 function loadSettings() {
   ensureDataDir();
   if (fs.existsSync(SETTINGS_PATH)) {
-    settings = normalizeGuardrailSettings(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')));
+    const raw = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')) as Partial<GuardrailSettings> & {
+      kalshiPrivateKey?: unknown;
+    };
+    const legacyPrivateKey = typeof raw.kalshiPrivateKey === 'string' ? raw.kalshiPrivateKey.trim() : '';
+    delete raw.kalshiPrivateKey;
+    settings = normalizeGuardrailSettings(raw);
+    if (legacyPrivateKey) {
+      const migrated = persistKalshiCredentials({
+        kalshiApiKeyId: settings.kalshiApiKeyId,
+        privateKeyPem: legacyPrivateKey,
+      });
+      if (!migrated.ok) {
+        settings = normalizeGuardrailSettings({
+          ...settings,
+          liveEnabled: false,
+          liveStage: 'paper',
+          autoLiveEnabled: false,
+          demoMode: true,
+          dryRun: true,
+        });
+        console.warn(`[nemesis] Removed legacy plaintext Kalshi private key from settings; encrypted migration failed: ${migrated.error}`);
+      }
+      saveSettings();
+    }
   } else {
     settings = normalizeGuardrailSettings(settings);
   }
@@ -235,7 +372,9 @@ function loadSettings() {
 
 function saveSettings() {
   ensureDataDir();
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  const safeSettings = { ...settings } as Record<string, unknown>;
+  delete safeSettings.kalshiPrivateKey;
+  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(safeSettings, null, 2));
 }
 
 function loadDiscoverySettings() {
@@ -589,6 +728,11 @@ function exitSignalFromRecommendation(packet: ExitRecommendation): AutoCloseExit
     confidence: clamp01(baseConfidence + edgePressure),
     currentEdge: packet.current_edge,
     capturedEdge: packet.captured_edge,
+    executableClosePrice: packet.executable_close_price,
+    bookTimestamp: packet.book_timestamp,
+    bookDepth: packet.book_depth,
+    priceSource: packet.price_source,
+    expiresAt: packet.expires_at,
     reason: packet.reason,
     issuedAt: packet.issued_at,
   };
@@ -940,6 +1084,7 @@ function publishMarketState(extra: Record<string, unknown> = {}) {
     markets: marketsCache,
     theses: rankThesesForUi(theses),
     connectors: registry.getAll(),
+    tradeFeed: feedHub.getTradeFeedState(),
     discovery: discovery.getState(),
     gates: evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false),
     ...extra,
@@ -1211,10 +1356,11 @@ const FIXTURE_MARKETS: KalshiMarket[] = [
 ];
 
 function getLiveCreds(): LiveCredentials | null {
-  if (!settings.kalshiApiKeyId) return null;
-  const privateKeyPem = process.env.NEMESIS_KALSHI_PRIVATE_KEY ?? settings.kalshiPrivateKey ?? '';
+  const apiKeyId = currentKalshiApiKeyId();
+  if (!apiKeyId) return null;
+  const privateKeyPem = process.env.NEMESIS_KALSHI_PRIVATE_KEY ?? decryptStoredPrivateKey(readStoredKalshiCredentials());
   if (!privateKeyPem) return null;
-  return { apiKeyId: settings.kalshiApiKeyId, privateKeyPem };
+  return { apiKeyId, privateKeyPem };
 }
 
 async function activateKillSwitch(source: 'ipc' | 'shortcut'): Promise<GuardrailSettings> {
@@ -1301,7 +1447,10 @@ function setupBridgeServer() {
         const msg = JSON.parse(raw.toString()) as NemesisBridgeMessage;
         bridgeStatus.lastSeenAt = Date.now();
 
-        const validation = validateBridgeMessage(msg);
+        const validation = validateBridgeMessage(msg, {
+          now: Date.now(),
+          maxExitBookAgeMs: autoCloseSettings().maxBridgeLatencyMs,
+        });
         if (!validation.ok) {
           auditLog.append({ action: 'gate_block', detail: `bridge packet rejected: ${validation.reason}`, ok: false });
           saveAuditLog();
@@ -1350,7 +1499,12 @@ function spawnGlobalEventAlpha() {
   const repoRoot = path.resolve(__dirname, '..', '..', '..');
   const geaRoot = path.resolve(__dirname, '..', '..', 'global-event-alpha');
   const builtMain = path.join(geaRoot, 'dist-electron', 'main.js');
-  const geaPath = process.env.NEMESIS_GEA_PATH;
+  // In a packaged install, GEA ships as a bundled self-contained exe inside
+  // resources/gea-app. Fall back to NEMESIS_GEA_PATH for custom overrides.
+  const packedGeaExe = app.isPackaged
+    ? path.join(process.resourcesPath, 'gea-app', 'Global Event Alpha.exe')
+    : undefined;
+  const geaPath = process.env.NEMESIS_GEA_PATH ?? packedGeaExe;
   const plan = createGeaSpawnPlan({
     platform: process.platform,
     env: process.env,
@@ -1373,7 +1527,7 @@ function spawnGlobalEventAlpha() {
     cwd: plan.cwd,
     stdio: ['ignore', 'ignore', 'pipe'],
     env: childEnv,
-    windowsHide: true, // hide npm console window; GEA's Electron window still appears
+    windowsHide: plan.windowsHide,
   });
   geaProcess.stderr?.on('data', (d: Buffer) => {
     process.stderr.write(`[gea] ${d.toString()}`);
@@ -1447,6 +1601,8 @@ function setupIpc() {
       theses: rankThesesForUi(theses),
       gates: evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false),
       connectors: registry.getAll(),
+      tradeFeed: feedHub.getTradeFeedState(),
+      credentialStatus: kalshiCredentialStatus(),
       journalCount: journal.count(),
       reviewOnly,
       canLive: liveUnlock.passed,
@@ -1466,8 +1622,12 @@ function setupIpc() {
     if (partial.liveEnabled) {
       return { ok: false, error: 'Use the staged live unlock wizard; credentials alone cannot enable live trading' };
     }
+    const legacyCredentialPayload = partial as Partial<GuardrailSettings> & { kalshiPrivateKey?: unknown };
+    if (legacyCredentialPayload.kalshiPrivateKey !== undefined) {
+      return { ok: false, error: 'Private keys must be saved through encrypted credential storage' };
+    }
     const riskOverride = settings.liveEnabled && isRiskSettingOverride(partial);
-    const credentialChange = partial.kalshiApiKeyId !== undefined || partial.kalshiPrivateKey !== undefined;
+    const credentialChange = partial.kalshiApiKeyId !== undefined;
     if ((riskOverride || credentialChange) && (settings.liveStage ?? 'paper') !== 'paper') {
       invalidateLiveCertificate(riskOverride ? 'risk setting override' : 'credential change');
     }
@@ -1482,12 +1642,33 @@ function setupIpc() {
         : autoCloseSettings(),
     });
     if (riskOverride) recordSettingsManualOverride();
-    feedHub.setKalshiApiKey(settings.kalshiApiKeyId);
+    feedHub.setKalshiApiKey(currentKalshiApiKeyId());
     saveSettings();
     broadcast('settings:update', settings);
     void evaluateAutoClosePositions('settings');
     broadcastPaperUpdate();
     return { ok: true, settings };
+  });
+
+  ipcMain.handle('nemesis:getKalshiCredentialStatus', () => kalshiCredentialStatus());
+
+  ipcMain.handle('nemesis:saveKalshiCredentials', (_e, input: { kalshiApiKeyId?: string; privateKeyPem?: string }) => {
+    const result = persistKalshiCredentials(input ?? {});
+    if (result.ok && (settings.liveStage ?? 'paper') !== 'paper') {
+      invalidateLiveCertificate('credential change');
+      saveSettings();
+    }
+    broadcast('settings:update', settings);
+    return result;
+  });
+
+  ipcMain.handle('nemesis:clearKalshiCredentials', () => {
+    if ((settings.liveStage ?? 'paper') !== 'paper') {
+      invalidateLiveCertificate('credential change');
+    }
+    const status = clearStoredKalshiCredentials();
+    broadcast('settings:update', settings);
+    return { ok: true, status };
   });
 
   ipcMain.handle('nemesis:journalAdd', (_e, thesisId: string, notes?: string) => {
@@ -1880,7 +2061,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   loadSettings();
-  feedHub.setKalshiApiKey(settings.kalshiApiKeyId);
+  feedHub.setKalshiApiKey(currentKalshiApiKeyId());
   loadDiscoverySettings();
   loadJournal();
   loadPaperPortfolio();

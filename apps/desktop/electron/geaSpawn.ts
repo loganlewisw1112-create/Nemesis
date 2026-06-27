@@ -2,6 +2,7 @@ export interface GeaSpawnPlan {
   command: string;
   args: string[];
   cwd: string;
+  windowsHide: boolean;
 }
 
 export interface GeaSpawnPlanInput {
@@ -18,7 +19,7 @@ export interface GeaSpawnPlanInput {
 
 export function createGeaSpawnPlan(input: GeaSpawnPlanInput): GeaSpawnPlan | null {
   if (input.geaPath && input.geaPathExists) {
-    return { command: input.geaPath, args: [], cwd: input.repoRoot };
+    return { command: input.geaPath, args: [], cwd: input.repoRoot, windowsHide: false };
   }
 
   if (input.env.VITE_DEV_SERVER_URL) {
@@ -27,6 +28,7 @@ export function createGeaSpawnPlan(input: GeaSpawnPlanInput): GeaSpawnPlan | nul
         command: input.env.ComSpec || 'cmd.exe',
         args: ['/d', '/s', '/c', 'npm run dev'],
         cwd: input.geaRoot,
+        windowsHide: true,
       };
     }
 
@@ -34,6 +36,7 @@ export function createGeaSpawnPlan(input: GeaSpawnPlanInput): GeaSpawnPlan | nul
       command: 'npm',
       args: ['run', 'dev'],
       cwd: input.geaRoot,
+      windowsHide: false,
     };
   }
 
@@ -42,6 +45,7 @@ export function createGeaSpawnPlan(input: GeaSpawnPlanInput): GeaSpawnPlan | nul
       command: input.execPath ?? process.execPath,
       args: [input.builtMain],
       cwd: input.geaRoot,
+      windowsHide: false,
     };
   }
 

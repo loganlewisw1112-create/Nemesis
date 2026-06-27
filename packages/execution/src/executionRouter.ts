@@ -7,7 +7,7 @@ import type {
 } from '@nemesis/core';
 import { kalshiFeeForOrder } from '@nemesis/core';
 import { allocateSize, checkConcentration, decideCapitalAllocation, type CapitalDecision } from '@nemesis/capital';
-import { dryRunFill, type DryRunOrder } from './dryRun.js';
+import { dryRunCloseFill, dryRunFill, type DryRunOrder } from './dryRun.js';
 import type { PaperDesk } from './paperDesk.js';
 
 export interface FillQuality {
@@ -146,7 +146,7 @@ export function simulatePaperClose(
   settings: GuardrailSettings,
   metaPatch?: Pick<FillMetadata, 'autoCloseDecisionId' | 'autoCloseReason' | 'autoCloseAction'>,
 ): PaperCloseResult {
-  const fill = dryRunFill(book, side, contracts, expectedPrice, settings.maxSlippagePp);
+  const fill = dryRunCloseFill(book, side, contracts, expectedPrice, settings.maxSlippagePp);
   if (fill.aborted) {
     return { ok: false, error: fill.abortReason ?? 'fill aborted', fill };
   }

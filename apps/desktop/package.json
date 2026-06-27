@@ -43,6 +43,7 @@
   "build": {
     "appId": "cc.nemesis.trader",
     "productName": "NEMESIS",
+    "electronVersion": "42.5.0",
     "directories": {
       "output": "release"
     },
@@ -50,11 +51,18 @@
       "dist/**/*",
       "dist-electron/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "../global-event-alpha/release/win-unpacked",
+        "to": "gea-app",
+        "filter": ["**/*"]
+      }
+    ],
     "win": {
       "target": [
         "nsis"
       ],
-      "signAndEditExecutable": false
+      "signAndEditExecutable": true
     },
     "nsis": {
       "oneClick": false,

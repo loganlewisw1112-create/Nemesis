@@ -14,7 +14,12 @@
     "test": "vitest run",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test:e2e": "npm run build -w @nemesis/desktop && npm run test:e2e -w @nemesis/desktop",
-    "package": "npm run package -w @nemesis/desktop"
+    "package": "npm run package -w @nemesis/global-event-alpha && npm run package -w @nemesis/desktop",
+    "ci:build": "npm run build",
+    "ci:typecheck": "npm run typecheck",
+    "ci:unit": "npm test -- --run",
+    "ci:e2e": "npm run test:e2e",
+    "ci:package": "npm run package"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.0",

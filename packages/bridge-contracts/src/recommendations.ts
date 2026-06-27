@@ -53,6 +53,11 @@ export interface ExitRecommendation {
   action: 'hold' | 'trim' | 'exit' | 'add-only-on-pullback';
   current_edge: number;
   captured_edge: number;
+  executable_close_price: number;
+  book_timestamp: number;
+  book_depth: number;
+  price_source: 'kalshi-orderbook' | 'kalshi-snapshot' | 'nemesis-local-book';
+  expires_at: number;
   reason: string;
   issued_by: BrainRole;
   issued_at: number;

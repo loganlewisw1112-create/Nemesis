@@ -54,6 +54,25 @@ const STALE_MS: Record<string, number> = {
 };
 
 const SHARED_GDELT_QUERY = 'united states economy politics';
+const TRADE_BACKOFF_BASE_MS = 30_000;
+const TRADE_BACKOFF_MAX_MS = 300_000;
+const TRADE_WARNING_THROTTLE_MS = 300_000;
+
+export interface FeedHubTradeFeedState {
+  status: 'ok' | 'degraded';
+  lastSuccessAt: number | null;
+  lastAttemptAt: number | null;
+  nextRetryAt: number | null;
+  failureCount: number;
+  lastError: string | null;
+  cachedTradeCount: number;
+  backoffMs: number;
+  lastWarningAt: number | null;
+}
+
+function tradeBackoffMs(failureCount: number): number {
+  return Math.min(TRADE_BACKOFF_MAX_MS, TRADE_BACKOFF_BASE_MS * (2 ** Math.max(0, failureCount - 1)));
+}
 
 export class FeedHub {
   private weather: WeatherSnapshot | null = null;
@@ -66,6 +85,18 @@ export class FeedHub {
   private sports: SportsSnapshot | null = null;
   private trades: KalshiTrade[] = [];
   private tradesFetchedAt = 0;
+  private tradeWarningAt = 0;
+  private tradeFeedState: FeedHubTradeFeedState = {
+    status: 'ok',
+    lastSuccessAt: null,
+    lastAttemptAt: null,
+    nextRetryAt: null,
+    failureCount: 0,
+    lastError: null,
+    cachedTradeCount: 0,
+    backoffMs: 0,
+    lastWarningAt: null,
+  };
   private worldNews: GeoNewsItem[] = [];
   private worldNewsAt = 0;
   private kalshiWsAt = 0;
@@ -147,6 +178,10 @@ export class FeedHub {
     return this.trades.filter((t) => t.ticker === ticker);
   }
 
+  getTradeFeedState(): FeedHubTradeFeedState {
+    return { ...this.tradeFeedState, cachedTradeCount: this.trades.length };
+  }
+
   async refreshForMarkets(markets: KalshiMarket[]): Promise<void> {
     this.lastMarkets = markets;
 
@@ -200,7 +235,7 @@ export class FeedHub {
       tasks.push(this.refreshSports());
     }
 
-    if (this.isStale(this.tradesFetchedAt, STALE_MS.trades)) {
+    if (this.shouldRefreshTrades()) {
       tasks.push(this.refreshTrades());
     }
 
@@ -240,6 +275,12 @@ export class FeedHub {
   private isStale(fetchedAt: number | undefined, maxAge: number): boolean {
     if (!fetchedAt) return true;
     return Date.now() - fetchedAt > maxAge;
+  }
+
+  private shouldRefreshTrades(now = Date.now()): boolean {
+    const nextRetryAt = this.tradeFeedState.nextRetryAt;
+    if (nextRetryAt !== null && now < nextRetryAt) return false;
+    return this.tradeFeedState.status === 'degraded' || this.isStale(this.tradesFetchedAt, STALE_MS.trades);
   }
 
   private async refreshWeather(markets: KalshiMarket[]): Promise<void> {
@@ -328,13 +369,66 @@ export class FeedHub {
   }
 
   private async refreshTrades(): Promise<void> {
+    const now = Date.now();
+    const nextRetryAt = this.tradeFeedState.nextRetryAt;
+    if (nextRetryAt !== null && now < nextRetryAt) return;
+
+    const attemptStartedAt = now;
+    this.tradeFeedState = {
+      ...this.tradeFeedState,
+      lastAttemptAt: attemptStartedAt,
+      cachedTradeCount: this.trades.length,
+    };
+
     try {
       const res = await fetchTrades({ limit: 100, fetchFn: this.opts.fetchFn });
+      const fetchedAt = Date.now();
       this.trades = res.trades ?? [];
-      this.tradesFetchedAt = Date.now();
+      this.tradesFetchedAt = fetchedAt;
+      this.tradeFeedState = {
+        status: 'ok',
+        lastSuccessAt: fetchedAt,
+        lastAttemptAt: attemptStartedAt,
+        nextRetryAt: null,
+        failureCount: 0,
+        lastError: null,
+        cachedTradeCount: this.trades.length,
+        backoffMs: 0,
+        lastWarningAt: this.tradeWarningAt || null,
+      };
+      this.registry.recordSuccess('kalshi-trades', fetchedAt - attemptStartedAt);
     } catch (e) {
-      console.warn('[feedhub] refreshTrades failed:', e instanceof Error ? e.message : String(e));
-      /* trades are optional — do not mark kalshi-rest error */
+      const failedAt = Date.now();
+      const message = e instanceof Error ? e.message : String(e);
+      const failureCount = this.tradeFeedState.failureCount + 1;
+      const backoffMs = tradeBackoffMs(failureCount);
+      const nextRetryAt = failedAt + backoffMs;
+      const shouldWarn = this.tradeWarningAt === 0
+        || failureCount === 1
+        || failedAt - this.tradeWarningAt >= TRADE_WARNING_THROTTLE_MS;
+      if (shouldWarn) {
+        console.warn(
+          '[feedhub] optional Kalshi trade tape degraded; using cached/no trade-flow theses:',
+          `${message}; retry in ${Math.round(backoffMs / 1000)}s`,
+        );
+        this.tradeWarningAt = failedAt;
+      }
+      this.tradeFeedState = {
+        status: 'degraded',
+        lastSuccessAt: this.tradeFeedState.lastSuccessAt,
+        lastAttemptAt: attemptStartedAt,
+        nextRetryAt,
+        failureCount,
+        lastError: message,
+        cachedTradeCount: this.trades.length,
+        backoffMs,
+        lastWarningAt: this.tradeWarningAt || null,
+      };
+      this.registry.recordDegraded(
+        'kalshi-trades',
+        `Trade tape degraded (${failureCount} failure${failureCount === 1 ? '' : 's'}): ${message}; retry in ${Math.round(backoffMs / 1000)}s`,
+      );
+      /* trades are optional - keep cached trade tape and leave Kalshi REST errors to required callers */
     }
   }
 

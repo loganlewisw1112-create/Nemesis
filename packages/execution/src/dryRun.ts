@@ -78,6 +78,67 @@ export function dryRunFill(
   };
 }
 
+export function dryRunCloseFill(
+  book: KalshiOrderbook,
+  side: 'yes' | 'no',
+  contracts: number,
+  expectedPrice: number,
+  maxSlippagePp = 0.03,
+): DryRunOrder {
+  const levels = side === 'yes'
+    ? book.yes.map((l) => ({ price: l.price, quantity: l.quantity })).sort((a, b) => b.price - a.price)
+    : book.no.map((l) => ({ price: l.price, quantity: l.quantity })).sort((a, b) => b.price - a.price);
+
+  const walk = walkBookFill(levels, contracts);
+  if (!walk) {
+    return {
+      ticker: book.ticker,
+      side,
+      contracts,
+      expectedPrice,
+      fillPrice: 0,
+      filled: 0,
+      slippage: 0,
+      fees: 0,
+      netEdge: 0,
+      aborted: true,
+      abortReason: 'insufficient close-side depth',
+    };
+  }
+
+  const bestBid = levels[0]?.price ?? walk.avgPrice;
+  const closeSlippage = Math.max(0, bestBid - walk.avgPrice);
+  if (closeSlippage > maxSlippagePp) {
+    return {
+      ticker: book.ticker,
+      side,
+      contracts,
+      expectedPrice,
+      fillPrice: walk.avgPrice,
+      filled: walk.filled,
+      slippage: closeSlippage,
+      fees: kalshiFeeForOrder(walk.avgPrice, walk.filled),
+      netEdge: walk.avgPrice - expectedPrice - closeSlippage,
+      aborted: true,
+      abortReason: 'close-side slippage exceeded',
+    };
+  }
+
+  const fees = kalshiFeeForOrder(walk.avgPrice, walk.filled);
+  return {
+    ticker: book.ticker,
+    side,
+    contracts,
+    expectedPrice,
+    fillPrice: walk.avgPrice,
+    filled: walk.filled,
+    slippage: closeSlippage,
+    fees,
+    netEdge: walk.avgPrice - expectedPrice - fees / walk.filled,
+    aborted: false,
+  };
+}
+
 export function requoteGuard(
   originalEdge: number,
   currentEdge: number,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { dryRunFill, reconcilePositions } from '../src/index.js';
+import { dryRunCloseFill, dryRunFill, reconcilePositions } from '../src/index.js';
 
 describe('execution', () => {
   it('dry runs fill', () => {
@@ -11,6 +11,27 @@ describe('execution', () => {
     );
     expect(r.aborted).toBe(false);
     expect(r.filled).toBe(5);
+  });
+
+  it('prices paper closes from the executable close-side bid ladder', () => {
+    const r = dryRunCloseFill(
+      {
+        ticker: 'T',
+        yes: [
+          { price: 0.48, quantity: 3 },
+          { price: 0.46, quantity: 7 },
+        ],
+        no: [],
+        yesAsk: 0.55,
+      },
+      'yes',
+      5,
+      0.5,
+    );
+
+    expect(r.aborted).toBe(false);
+    expect(r.fillPrice).toBeCloseTo(0.472);
+    expect(r.slippage).toBeCloseTo(0.008);
   });
 
   it('detects reconcile mismatch', () => {

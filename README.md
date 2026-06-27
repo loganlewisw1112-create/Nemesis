@@ -166,7 +166,7 @@ Useful environment variables:
 | `npm run build -w @nemesis/desktop` | Build the NEMESIS desktop app |
 | `npm run build -w @nemesis/global-event-alpha` | Build the Global Event Alpha app |
 | `npm run test:e2e -w @nemesis/desktop` | Run Electron smoke and bridge tests |
-| `npm run package` | Build the unsigned Windows installer |
+| `npm run package` | Build the Windows installer; signs when `CSC_LINK` and `CSC_KEY_PASSWORD` are configured |
 
 ## Architecture
 
@@ -227,7 +227,7 @@ Build the Windows installer:
 npm run package
 ```
 
-The desktop package uses Electron Builder with an unsigned NSIS target. Output is written under the desktop app release directory.
+The desktop package uses Electron Builder with an NSIS target. Configure `CSC_LINK` and `CSC_KEY_PASSWORD` locally or as GitHub Actions secrets to sign the Windows executable and installer; output is written under the desktop app release directory.
 
 ## Repository Status
 

@@ -161,6 +161,11 @@ describe('AutoCloseEngine', () => {
         confidence: 0.92,
         currentEdge: 0.04,
         capturedEdge: 0.06,
+        executableClosePrice: 0.455,
+        bookTimestamp: now,
+        bookDepth: 100,
+        priceSource: 'kalshi-orderbook',
+        expiresAt: now + 500,
         reason: 'GEA retention says exit',
         issuedAt: now,
       },
@@ -168,6 +173,34 @@ describe('AutoCloseEngine', () => {
 
     expect(decision.action).toBe('close');
     expect(decision.reason).toMatch(/GEA exit confirmed/i);
+  });
+  it('rejects stale executable GEA exit context even when confidence is high', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position(),
+      mark: 0.46,
+      currentEdge: 0.04,
+      tickCount: 4,
+      now,
+      state: state({ peakPnlPct: 0.14, tickCount: 4 }),
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, maxBridgeLatencyMs: 500 },
+      exitSignal: {
+        ticker: 'TEST-1',
+        action: 'exit',
+        confidence: 0.97,
+        currentEdge: 0.04,
+        capturedEdge: 0.06,
+        executableClosePrice: 0.45,
+        bookTimestamp: now - 501,
+        bookDepth: 100,
+        priceSource: 'kalshi-orderbook',
+        expiresAt: now - 1,
+        reason: 'GEA retention says exit',
+        issuedAt: now,
+      },
+    });
+
+    expect(decision.action).not.toBe('close');
+    expect(decision.reason).not.toMatch(/GEA exit confirmed/i);
   });
   it('tracks adverse velocity and trims profitable positions before full giveback', () => {
     const prior = state({

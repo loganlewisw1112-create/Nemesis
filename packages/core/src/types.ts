@@ -81,7 +81,6 @@ export interface GuardrailSettings {
   maxSlippagePp: number;
   killSwitchActive: boolean;
   kalshiApiKeyId?: string;
-  kalshiPrivateKey?: string;
   useProductionApi?: boolean;
   humanQuizPassed?: boolean;
   backtestPassed?: boolean;

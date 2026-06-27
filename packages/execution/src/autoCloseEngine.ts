@@ -16,6 +16,11 @@ export interface AutoCloseExitSignal {
   confidence: number;
   currentEdge: number;
   capturedEdge: number;
+  executableClosePrice: number;
+  bookTimestamp: number;
+  bookDepth: number;
+  priceSource: string;
+  expiresAt: number;
   reason: string;
   issuedAt: number;
 }
@@ -171,7 +176,13 @@ export function computeExitScore(input: EvaluateAutoCloseInput): ExitScore {
   const edgeCompression = edgeCompressionRate(input.state, input.currentEdge);
   const downsideToEntryUsd = Math.max(0, (input.position.entryPrice - input.mark) * input.position.contracts);
   const expectedRemainingUpsideUsd = Math.max(0, input.currentEdge) * input.position.contracts;
-  const bookSlippageToCloseUsd = Math.max(0, input.slippagePp ?? 0) * input.position.contracts;
+  const signalCloseSlippageUsd = input.exitSignal?.ticker === input.position.ticker
+    ? Math.max(0, input.mark - input.exitSignal.executableClosePrice) * input.position.contracts
+    : 0;
+  const bookSlippageToCloseUsd = Math.max(
+    Math.max(0, input.slippagePp ?? 0) * input.position.contracts,
+    signalCloseSlippageUsd,
+  );
   const geaAction = input.exitSignal?.action ?? 'none';
   const geaScore = geaAction === 'exit' ? 1 : geaAction === 'trim' ? 0.65 : 0;
   const adverseVelocity = clamp(Math.max(0, -(input.state.markVelocityPct ?? 0)) * 10);
@@ -222,6 +233,8 @@ export function evaluateAutoClosePosition(input: EvaluateAutoCloseInput): AutoCl
     : settings.exitScoreCloseThreshold;
   const geaFresh = input.exitSignal
     ? input.now - input.exitSignal.issuedAt <= Math.max(settings.staleSignalMs, settings.maxBridgeLatencyMs)
+      && input.now <= input.exitSignal.expiresAt
+      && input.now - input.exitSignal.bookTimestamp <= settings.maxBridgeLatencyMs
     : false;
 
   if (

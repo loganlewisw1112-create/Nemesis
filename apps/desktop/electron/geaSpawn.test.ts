@@ -20,6 +20,7 @@ describe('GEA spawn planning', () => {
       command: 'C:\\Windows\\System32\\cmd.exe',
       args: ['/d', '/s', '/c', 'npm run dev'],
       cwd: 'D:\\repo\\apps\\global-event-alpha',
+      windowsHide: true,
     });
   });
 
@@ -38,6 +39,27 @@ describe('GEA spawn planning', () => {
       command: process.execPath,
       args: [builtMain],
       cwd: 'D:\\repo\\apps\\global-event-alpha',
+      windowsHide: false,
+    });
+  });
+
+  it('keeps bundled GEA executables visible when NEMESIS auto-spawns them', () => {
+    const plan = createGeaSpawnPlan({
+      platform: 'win32',
+      env: {},
+      repoRoot: 'D:\\repo',
+      geaRoot: 'D:\\repo\\apps\\global-event-alpha',
+      builtMain: 'D:\\repo\\apps\\global-event-alpha\\dist-electron\\main.js',
+      builtMainExists: true,
+      geaPath: 'D:\\repo\\resources\\gea-app\\Global Event Alpha.exe',
+      geaPathExists: true,
+    });
+
+    expect(plan).toEqual({
+      command: 'D:\\repo\\resources\\gea-app\\Global Event Alpha.exe',
+      args: [],
+      cwd: 'D:\\repo',
+      windowsHide: false,
     });
   });
 });

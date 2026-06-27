@@ -34,12 +34,15 @@ import type {
   LiveUnlockEvaluation,
 } from '@nemesis/core';
 import { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
+import type { FeedHubTradeFeedState } from '@nemesis/connectors';
 
 interface AppState {
   settings: GuardrailSettings;
   theses: ThesisCard[];
   gates: GateStatus[];
   connectors: ConnectorHealth[];
+  tradeFeed?: FeedHubTradeFeedState;
+  credentialStatus?: KalshiCredentialStatus;
   journalCount: number;
   reviewOnly: boolean;
   canLive: boolean;
@@ -70,12 +73,23 @@ interface PaperState {
   profitabilityBenchmark?: unknown;
 }
 
+interface KalshiCredentialStatus {
+  apiKeyId: string | null;
+  hasPrivateKey: boolean;
+  privateKeyStorage: 'env' | 'electron-safeStorage' | 'none';
+  encryptionAvailable: boolean;
+  updatedAt: number | null;
+}
+
 declare global {
   interface Window {
     nemesis: {
       getState: () => Promise<AppState>;
       getMarkets: () => Promise<KalshiMarket[]>;
       updateSettings: (p: Partial<GuardrailSettings>) => Promise<{ ok: boolean; error?: string }>;
+      getKalshiCredentialStatus: () => Promise<KalshiCredentialStatus>;
+      saveKalshiCredentials: (input: { kalshiApiKeyId?: string; privateKeyPem?: string }) => Promise<{ ok: boolean; error?: string; status?: KalshiCredentialStatus }>;
+      clearKalshiCredentials: () => Promise<{ ok: boolean; status: KalshiCredentialStatus }>;
       journalAdd: (id: string, notes?: string) => Promise<unknown>;
       journalExport: () => Promise<string>;
       dryRun: (id: string) => Promise<{ aborted: boolean; abortReason?: string; fillPrice?: number; slippage?: number }>;
@@ -104,7 +118,7 @@ declare global {
       forceUniverseRefresh: () => Promise<DiscoveryState>;
       forceDepthPass: () => Promise<DiscoveryState>;
       onSettingsUpdate: (cb: (s: GuardrailSettings) => void) => void;
-      onMarketsUpdate: (cb: (d: { theses: ThesisCard[]; markets: KalshiMarket[]; offline?: boolean; connectors?: ConnectorHealth[]; discovery?: DiscoveryState; gates?: GateStatus[] }) => void) => void;
+      onMarketsUpdate: (cb: (d: { theses: ThesisCard[]; markets: KalshiMarket[]; offline?: boolean; connectors?: ConnectorHealth[]; tradeFeed?: FeedHubTradeFeedState; discovery?: DiscoveryState; gates?: GateStatus[] }) => void) => void;
       onPaperUpdate: (cb: (d: PaperState) => void) => void;
       onTicksUpdate: (cb: (d: { ticker: string; ticks: PriceTick[] }) => void) => void;
       onDiscoveryUpdate: (cb: (d: DiscoveryState) => void) => void;
@@ -195,6 +209,7 @@ export default function App() {
         ...prev,
         theses: d.theses,
         connectors: d.connectors ?? prev.connectors,
+        tradeFeed: d.tradeFeed ?? prev.tradeFeed,
         gates: d.gates ?? prev.gates,
       } : prev));
       setMarkets(d.markets);
@@ -275,6 +290,11 @@ export default function App() {
   const dailyPnl = paper?.dailyPnl ?? state.dailyPnl ?? 0;
   const deployed = paper?.portfolio.positions.reduce((s, p) => s + p.entryPrice * p.contracts, 0) ?? 0;
   const heatPct = paper && paper.equity > 0 ? (deployed / paper.equity) * 100 : 0;
+  const tradeFeed = state.tradeFeed;
+  const tradeFeedRetrySeconds = tradeFeed?.nextRetryAt
+    ? Math.max(0, Math.ceil((tradeFeed.nextRetryAt - Date.now()) / 1000))
+    : null;
+  const credentialStatus = state.credentialStatus;
 
   function handleNotifAction(n: NemesisNotification) {
     if (n.positionId) {
@@ -357,6 +377,11 @@ export default function App() {
                     <button type="button" onClick={() => { setTab('settings'); setSettingsSubTab('discovery'); }} style={{ fontSize: 11, marginTop: 4, background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', padding: 0 }}>
                       Manage discovery →
                     </button>
+                  )}
+                  {tradeFeed?.status === 'degraded' && (
+                    <div style={{ fontSize: 11, color: 'var(--warning)', marginTop: 6, maxWidth: 520 }}>
+                      Kalshi trade tape degraded. Using cached trade prints{tradeFeedRetrySeconds !== null ? `; retry in ${tradeFeedRetrySeconds}s` : ''}. Other theses remain available.
+                    </div>
                   )}
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -670,11 +695,14 @@ export default function App() {
                 {/* Kalshi API credentials */}
                 <div style={{ marginTop: 4, padding: '10px 12px', background: 'var(--bg)', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>Kalshi Live Trading Credentials</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                    Status: {credentialStatus?.apiKeyId ? `key ${credentialStatus.apiKeyId.slice(0, 8)}…` : 'no key ID'} · private key {credentialStatus?.hasPrivateKey ? `set via ${credentialStatus.privateKeyStorage}` : 'not set'}
+                  </div>
                   <label style={labelStyle}>
                     API Key ID
                     <input
                       type="text"
-                      placeholder={state.settings.kalshiApiKeyId ? `Current: ${state.settings.kalshiApiKeyId.slice(0, 8)}…` : 'Paste your Kalshi API Key ID'}
+                      placeholder={credentialStatus?.apiKeyId ? `Current: ${credentialStatus.apiKeyId.slice(0, 8)}…` : 'Paste your Kalshi API Key ID'}
                       value={apiKeyId}
                       onChange={(e) => setApiKeyId(e.target.value)}
                       style={inputStyle}
@@ -683,7 +711,7 @@ export default function App() {
                   <label style={labelStyle}>
                     Private Key (PEM)
                     <textarea
-                      placeholder={state.settings.kalshiPrivateKey ? '(private key already set — paste new to replace)' : '-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----'}
+                      placeholder={credentialStatus?.hasPrivateKey ? '(private key already set — paste new to replace)' : '-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----'}
                       value={apiPrivateKey}
                       onChange={(e) => setApiPrivateKey(e.target.value)}
                       rows={4}
@@ -694,10 +722,11 @@ export default function App() {
                     type="button"
                     disabled={!apiKeyId && !apiPrivateKey}
                     onClick={async () => {
-                      const updates: Record<string, string> = {};
-                      if (apiKeyId.trim()) updates.kalshiApiKeyId = apiKeyId.trim();
-                      if (apiPrivateKey.trim()) updates.kalshiPrivateKey = apiPrivateKey.trim();
-                      await window.nemesis.updateSettings(updates as Parameters<typeof window.nemesis.updateSettings>[0]);
+                      const r = await window.nemesis.saveKalshiCredentials({
+                        kalshiApiKeyId: apiKeyId.trim() || undefined,
+                        privateKeyPem: apiPrivateKey.trim() || undefined,
+                      });
+                      if (!r.ok) { alert(r.error); return; }
                       setApiKeyId('');
                       setApiPrivateKey('');
                       load();
@@ -706,8 +735,21 @@ export default function App() {
                   >
                     Save credentials
                   </button>
+                  <button
+                    type="button"
+                    disabled={!credentialStatus?.apiKeyId && !credentialStatus?.hasPrivateKey}
+                    onClick={async () => {
+                      await window.nemesis.clearKalshiCredentials();
+                      setApiKeyId('');
+                      setApiPrivateKey('');
+                      load();
+                    }}
+                    style={chipStyle(false)}
+                  >
+                    Clear stored credentials
+                  </button>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                    Credentials are saved locally. Get your API key from kalshi.com → Settings → API.
+                    Private keys are encrypted with Electron safeStorage before local persistence. If safeStorage is unavailable, use NEMESIS_KALSHI_PRIVATE_KEY for the session.
                   </div>
                 </div>
 

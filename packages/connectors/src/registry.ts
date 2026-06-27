@@ -3,6 +3,7 @@ import { fetchMarkets } from '@nemesis/core';
 
 export type ConnectorId =
   | 'kalshi-rest'
+  | 'kalshi-trades'
   | 'kalshi-ws'
   | 'kalshi-portfolio'
   | 'nws'
@@ -26,6 +27,7 @@ export interface ConnectorDef {
 
 export const CONNECTORS: ConnectorDef[] = [
   { id: 'kalshi-rest', name: 'Kalshi REST', pollMs: 30_000 },
+  { id: 'kalshi-trades', name: 'Kalshi Trade Tape', pollMs: 15_000 },
   { id: 'kalshi-ws', name: 'Kalshi WebSocket', pollMs: 5_000 },
   { id: 'kalshi-portfolio', name: 'Kalshi Portfolio' },
   { id: 'nws', name: 'NWS', pollMs: 300_000 },
@@ -88,6 +90,13 @@ export class ConnectorRegistry {
     const h = this.health.get(id);
     if (!h) return;
     if (h.status === 'ok') return;
+    h.status = 'warn';
+    h.lastError = detail;
+  }
+
+  recordDegraded(id: ConnectorId, detail: string) {
+    const h = this.health.get(id);
+    if (!h) return;
     h.status = 'warn';
     h.lastError = detail;
   }

@@ -6,6 +6,7 @@ export interface ValidationOptions {
   minConfidence?: number;
   minSettlementClarity?: number;
   highScoreSettlementClarity?: number;
+  maxExitBookAgeMs?: number;
 }
 
 export type ValidationResult<T> =
@@ -33,6 +34,8 @@ const MESSAGE_TYPES = new Set<NemesisBridgeMessageType>([
   'bridge:pong',
   'bridge:hello',
 ]);
+const EXIT_PRICE_SOURCES = new Set(['kalshi-orderbook', 'kalshi-snapshot', 'nemesis-local-book']);
+const DEFAULT_MAX_EXIT_BOOK_AGE_MS = 2_000;
 
 function fail(reason: string): ValidationResult<never> {
   return { ok: false, reason };
@@ -119,15 +122,35 @@ export function validateNoTradeWarning(value: unknown): ValidationResult<NoTrade
   return { ok: true, value: value as unknown as NoTradeWarning };
 }
 
-export function validateExitRecommendation(value: unknown): ValidationResult<ExitRecommendation> {
+export function validateExitRecommendation(
+  value: unknown,
+  options: ValidationOptions = {},
+): ValidationResult<ExitRecommendation> {
   if (!isRecord(value)) return fail('invalid schema');
   if (!isNonEmptyString(value.ticker)) return fail('missing ticker');
   if (!['hold', 'trim', 'exit', 'add-only-on-pullback'].includes(String(value.action))) return fail('invalid action');
   if (!isFiniteNumber(value.current_edge) || !isFiniteNumber(value.captured_edge)) return fail('invalid edge');
+  const executableClosePrice = value.executable_close_price;
+  if (!isFiniteNumber(executableClosePrice) || executableClosePrice <= 0 || executableClosePrice >= 1) {
+    return fail('invalid executable close price');
+  }
+  if (!isFiniteNumber(value.book_timestamp) || !isFiniteNumber(value.expires_at) || !isFiniteNumber(value.issued_at)) {
+    return fail('invalid timestamps');
+  }
+  const bookDepth = value.book_depth;
+  if (!Number.isInteger(bookDepth) || (bookDepth as number) < 1) return fail('invalid book depth');
+  if (typeof value.price_source !== 'string' || !EXIT_PRICE_SOURCES.has(value.price_source)) return fail('invalid price source');
   if (!isNonEmptyString(value.reason)) return fail('missing reason');
-  if (!isFiniteNumber(value.issued_at)) return fail('invalid timestamps');
   if (!isBrainRole(value.issued_by)) return fail('invalid brain role');
   if (!canPublish(value.issued_by)) return fail('forbidden role');
+  const issuedAt = value.issued_at;
+  const bookTimestamp = value.book_timestamp;
+  const expiresAt = value.expires_at;
+  const now = options.now ?? Date.now();
+  if (expiresAt < now) return fail('expired exit packet');
+  if (bookTimestamp > now + 1_000 || issuedAt > now + 1_000) return fail('invalid timestamps');
+  const maxBookAge = options.maxExitBookAgeMs ?? DEFAULT_MAX_EXIT_BOOK_AGE_MS;
+  if (now - bookTimestamp > maxBookAge) return fail('stale exit book');
   return { ok: true, value: value as unknown as ExitRecommendation };
 }
 
@@ -164,7 +187,7 @@ export function validateBridgeMessage(
     if (!result.ok) return result;
   }
   if (message.type === 'brain:exit') {
-    const result = validateExitRecommendation(message.payload);
+    const result = validateExitRecommendation(message.payload, options);
     if (!result.ok) return result;
   }
   if (message.type === 'nemesis:close-result') {

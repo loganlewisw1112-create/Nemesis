@@ -5,6 +5,8 @@ release/
 *.log
 *.tsbuildinfo
 test-results/
+ci-artifacts/
+WINDOWS PACKAGE/
 .DS_Store
 .env
 .env.local

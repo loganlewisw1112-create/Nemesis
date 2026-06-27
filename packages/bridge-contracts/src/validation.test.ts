@@ -33,6 +33,25 @@ function packet(overrides: Partial<RecommendationPacket> = {}): RecommendationPa
   };
 }
 
+function exitPacket(overrides: Partial<ExitRecommendation> = {}): ExitRecommendation {
+  const now = Date.now();
+  return {
+    ticker: 'KXTEST-26',
+    action: 'trim',
+    current_edge: 0.03,
+    captured_edge: 0.07,
+    executable_close_price: 0.46,
+    book_timestamp: now,
+    book_depth: 3,
+    price_source: 'kalshi-orderbook',
+    expires_at: now + 500,
+    reason: 'edge decayed',
+    issued_by: 'emergency',
+    issued_at: now,
+    ...overrides,
+  };
+}
+
 describe('bridge validation', () => {
   it('accepts primary recommendation packets with required fields', () => {
     const result = validateRecommendationPacket(packet(), { now: Date.now() });
@@ -78,19 +97,29 @@ describe('bridge validation', () => {
       issued_by: 'standby-a',
       issued_at: Date.now(),
     };
-    const exit: ExitRecommendation = {
-      ticker: 'KXTEST-26',
-      action: 'trim',
-      current_edge: 0.03,
-      captured_edge: 0.07,
-      reason: 'edge decayed',
-      issued_by: 'emergency',
-      issued_at: Date.now(),
-    };
+    const exit = exitPacket();
     expect(validateNoTradeWarning(warning).ok).toBe(true);
     expect(validateExitRecommendation(exit).ok).toBe(true);
     expect(validateNoTradeWarning({ ...warning, issued_by: 'shadow' }).reason).toBe('forbidden role');
     expect(validateExitRecommendation({ ...exit, issued_by: 'replay' }).reason).toBe('forbidden role');
+  });
+
+  it('rejects expired and stale exit packets fail-closed', () => {
+    const now = Date.now();
+    expect(validateExitRecommendation(exitPacket({ expires_at: now - 1 }), { now }).reason).toBe('expired exit packet');
+    expect(validateExitRecommendation(exitPacket({ book_timestamp: now - 2_001 }), { now }).reason).toBe('stale exit book');
+    expect(validateBridgeMessage({
+      type: 'brain:exit',
+      seq: 9,
+      payload: exitPacket({ book_timestamp: now - 501, expires_at: now + 500 }),
+    }, { now, maxExitBookAgeMs: 500 }).reason).toBe('stale exit book');
+  });
+
+  it('requires executable close context on exit packets', () => {
+    const exit = exitPacket();
+    expect(validateExitRecommendation({ ...exit, executable_close_price: 1.2 }).reason).toBe('invalid executable close price');
+    expect(validateExitRecommendation({ ...exit, book_depth: 0 }).reason).toBe('invalid book depth');
+    expect(validateExitRecommendation({ ...exit, price_source: 'model-midpoint' }).reason).toBe('invalid price source');
   });
   it('validates NEMESIS close-result packets for GEA feedback', () => {
     const msg: NemesisBridgeMessage = {
