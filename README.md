@@ -167,6 +167,7 @@ Useful environment variables:
 | `npm run build -w @nemesis/global-event-alpha` | Build the Global Event Alpha app |
 | `npm run test:e2e -w @nemesis/desktop` | Run Electron smoke and bridge tests |
 | `npm run package` | Build the Windows installer; signs when `CSC_LINK` and `CSC_KEY_PASSWORD` are configured |
+| `npm run package:local-signed` | Build and locally sign Windows artifacts with a current-user trusted NEMESIS dev certificate |
 
 ## Architecture
 
@@ -228,6 +229,8 @@ npm run package
 ```
 
 The desktop package uses Electron Builder with an NSIS target. Configure `CSC_LINK` and `CSC_KEY_PASSWORD` locally or as GitHub Actions secrets to sign the Windows executable and installer; output is written under the desktop app release directory.
+
+For this development machine, `npm run package:local-signed` creates or reuses a current-user `NEMESIS Local Dev Code Signing` certificate, trusts it only for the current Windows user, exports a temporary PFX for Electron Builder, deletes that temporary PFX, and verifies the packaged artifacts with `Get-AuthenticodeSignature`. This removes `NotSigned` locally, but it is not a substitute for a CA-issued certificate for public distribution.
 
 ## Repository Status
 

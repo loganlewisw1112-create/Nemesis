@@ -15,6 +15,7 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test:e2e": "npm run build -w @nemesis/desktop && npm run test:e2e -w @nemesis/desktop",
     "package": "npm run package -w @nemesis/global-event-alpha && npm run package -w @nemesis/desktop",
+    "package:local-signed": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sign-windows-local.ps1 -Package -TrustCurrentUser",
     "ci:build": "npm run build",
     "ci:typecheck": "npm run typecheck",
     "ci:unit": "npm test -- --run",
