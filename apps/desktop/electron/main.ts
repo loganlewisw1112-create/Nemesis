@@ -105,8 +105,18 @@ const MARKET_REFRESH_MS = 15_000;
 const WATCHED_TICK_MS = 1_000;
 const FEED_WAIT_MS = 2_000;
 const BOOK_CACHE_TTL_MS = 600;
+const MARKET_BROADCAST_THROTTLE_MS = 750;
+const PAPER_BROADCAST_THROTTLE_MS = 1_000;
+const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
+
+function startupTrace(label: string) {
+  if (process.env.NEMESIS_STARTUP_TRACE === 'true') {
+    console.error(`[nemesis:start] ${Date.now()} ${label}`);
+  }
+}
+startupTrace('module-loaded');
 
 let mainWindow: BrowserWindow | null = null;
 const widgetWindows = new Set<BrowserWindow>();
@@ -148,6 +158,9 @@ let equityHistory: { t: number; equity: number; deployed: number; cash: number }
   { t: Date.now(), equity: DEFAULT_PAPER_CASH, deployed: 0, cash: DEFAULT_PAPER_CASH },
 ];
 let lastApiHealthTickAt = Date.now();
+let lastEquitySnapshotAt = 0;
+let marketBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+let paperBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 
 interface StoredKalshiCredentials {
   storage: 'electron-safeStorage-v1';
@@ -604,11 +617,17 @@ function recordTick(ticker: string, yesPrice: number, spread: number, netEdge: n
   }
 }
 
-function snapshotEquity() {
+function snapshotEquity(force = false) {
+  const now = Date.now();
+  if (!force && now - lastEquitySnapshotAt < EQUITY_SNAPSHOT_MIN_MS) {
+    refreshDailyPnl();
+    return;
+  }
+  lastEquitySnapshotAt = now;
   const marks = getMarkPrices();
   const { equity, deployed } = paperDesk.markToMarket(marks);
   const port = paperDesk.snapshot();
-  equityHistory.push({ t: Date.now(), equity, deployed, cash: port.cash });
+  equityHistory.push({ t: now, equity, deployed, cash: port.cash });
   if (equityHistory.length > 2000) equityHistory.shift();
   saveEquityHistory();
   refreshDailyPnl();
@@ -907,7 +926,7 @@ async function evaluateAutoClosePositions(_trigger: string) {
   } finally {
     autoCloseRunning = false;
   }
-  if (executed) broadcastPaperUpdate();
+  if (executed) broadcastPaperUpdate(true);
   if (autoCloseQueued) {
     autoCloseQueued = false;
     void evaluateAutoClosePositions('queued');
@@ -982,9 +1001,9 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
     const openPos = paperDesk.snapshot().positions.find((p) => p.ticker === ticker);
     const closeCard = openPos ? cardForPosition(openPos) : undefined;
     if (closeCard) prefetchBookForCard(closeCard);
-    publishMarketState();
+    scheduleMarketStatePublish();
     void evaluateAutoClosePositions('quote');
-    broadcastPaperUpdate();
+    schedulePaperUpdate();
   }
 }
 
@@ -1009,19 +1028,19 @@ function processWorkingOrders() {
         savePaperOrders();
         sessionStatsData.tradeCount += 1;
         void evaluateAutoClosePositions('working-order-fill');
-        broadcastPaperUpdate();
+        broadcastPaperUpdate(true);
       }
     })();
   }
 }
 
-function broadcastPaperUpdate() {
+function broadcastPaperUpdate(forceSnapshot = false) {
   const marks = getMarkPrices();
   const mtm = paperDesk.markToMarket(marks);
   const portfolio = paperDesk.snapshot();
   const marksObj: Record<string, number> = {};
   for (const [k, v] of marks) marksObj[k] = v;
-  snapshotEquity();
+  snapshotEquity(forceSnapshot);
   broadcast('paper:update', {
     portfolio,
     marks: marksObj,
@@ -1048,13 +1067,13 @@ async function refreshWatchedTicker() {
     const spread = Math.abs(yesAsk - yesBid) || card.spread;
     recordTick(watchedTicker, yesPrice, spread, card.netEdge);
     void evaluateAutoClosePositions('watched-ticker');
-    broadcastPaperUpdate();
+    schedulePaperUpdate();
   } catch {
     const jitter = (Math.random() - 0.5) * 0.02;
     const yesPrice = Math.max(0.01, Math.min(0.99, card.marketPrice + jitter));
     recordTick(watchedTicker, yesPrice, card.spread, card.netEdge);
     void evaluateAutoClosePositions('watched-ticker-fallback');
-    broadcastPaperUpdate();
+    schedulePaperUpdate();
   }
 }
 
@@ -1091,6 +1110,22 @@ function publishMarketState(extra: Record<string, unknown> = {}) {
   });
   broadcastDiscovery();
   broadcastWorldEvents();
+}
+
+function scheduleMarketStatePublish() {
+  if (marketBroadcastTimer) return;
+  marketBroadcastTimer = setTimeout(() => {
+    marketBroadcastTimer = null;
+    publishMarketState();
+  }, MARKET_BROADCAST_THROTTLE_MS);
+}
+
+function schedulePaperUpdate() {
+  if (paperBroadcastTimer) return;
+  paperBroadcastTimer = setTimeout(() => {
+    paperBroadcastTimer = null;
+    broadcastPaperUpdate();
+  }, PAPER_BROADCAST_THROTTLE_MS);
 }
 
 function applyBridgeRecommendation(packet: RecommendationPacket) {
@@ -1846,7 +1881,7 @@ function setupIpc() {
     savePaperPortfolio();
     saveAuditLog();
     void evaluateAutoClosePositions('paper-buy');
-    broadcastPaperUpdate();
+    broadcastPaperUpdate(true);
     return result;
   });
 
@@ -1865,7 +1900,7 @@ function setupIpc() {
       savePaperPortfolio();
       saveAuditLog();
       saveSessionStats();
-      broadcastPaperUpdate();
+      broadcastPaperUpdate(true);
     }
     return result;
   });
@@ -1937,7 +1972,7 @@ function setupIpc() {
     savePaperPortfolio();
     saveEquityHistory();
     saveAutoCloseState();
-    broadcastPaperUpdate();
+    broadcastPaperUpdate(true);
     return paperDesk.snapshot();
   });
 
@@ -2030,7 +2065,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
-    show: false,
+    show: true,
     backgroundColor: '#0a0b0f',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -2059,29 +2094,32 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(async () => {
+app.whenReady().then(() => {
+  startupTrace('ready');
   loadSettings();
+  startupTrace('settings');
   feedHub.setKalshiApiKey(currentKalshiApiKeyId());
   loadDiscoverySettings();
+  startupTrace('discovery-settings');
   loadJournal();
+  startupTrace('journal');
   loadPaperPortfolio();
+  startupTrace('paper');
   loadAutoCloseState();
+  startupTrace('auto-close');
   loadEquityHistory();
+  startupTrace('equity-history');
   loadSessionStats();
+  startupTrace('session-stats');
   loadPaperOrders();
+  startupTrace('paper-orders');
   loadAuditLog();
+  startupTrace('audit-log');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
-  kalshiStream.start();
   setupIpc();
+  startupTrace('ipc');
   setupBridgeServer();
-
-  // Probe connectors BEFORE creating the window.
-  // Instant connectors (FRED/EIA/kalshi-portfolio with no key, BLS pure calc) resolve
-  // synchronously or in one microtask tick, so getState() will never return all-idle.
-  feedHub.startBackgroundPolling(8_000);
-  void feedHub.refreshForMarkets(FIXTURE_MARKETS);
-  // Drain one event-loop tick: BLS records ok, FRED/EIA/kalshi-portfolio record warn
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  startupTrace('bridge');
 
   // Health broadcast starts before the window opens so the first connectors:update
   // arrives within 5 s of the renderer mounting its listener.
@@ -2096,43 +2134,52 @@ app.whenReady().then(async () => {
   }, 5_000);
 
   createWindow();
+  startupTrace('window-created');
   spawnGlobalEventAlpha();
+  startupTrace('gea-spawned');
+  kalshiStream.start();
+  startupTrace('kalshi-stream');
+  feedHub.startBackgroundPolling(8_000);
+  void feedHub.refreshForMarkets(FIXTURE_MARKETS);
+  startupTrace('feedhub-started');
 
-  // 10 s hard cap on the startup universe fetch.  If the Kalshi API is slow or
-  // firewalled the paging loop (up to 10 pages × retries × bases) can run for
-  // 90 s+, keeping every connector in the initial "idle" state for the full
-  // duration.  We race against a timeout, fall to fixtures immediately, and let
-  // the background poll finish and update the registry when it's ready.
-  try {
-    await Promise.race([
-      discovery.refreshUniverse(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('startup universe fetch timed out')), 10_000)
-      ),
-    ]);
-    marketsCache = discovery.getUniverse();
-  } catch (startupErr) {
-    // Pull kalshi-rest out of the initial "idle" state (warn + no lastSuccess + no lastError)
-    // so the UI shows an honest error badge instead of a stale spinner.
-    const cr = registry.get('kalshi-rest');
-    if (cr && cr.lastSuccess === null && cr.lastError === null) {
-      registry.recordError(
-        'kalshi-rest',
-        startupErr instanceof Error ? startupErr.message : 'startup timeout',
-      );
+  marketsCache = mergeGeaMarkets(FIXTURE_MARKETS);
+  discovery.seedFixtureDepth(FIXTURE_MARKETS);
+  void buildThesesFromMarkets(marketsCache)
+    .then(() => {
+      publishMarketState({ offline: true });
+      broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
+      void evaluateAutoClosePositions('startup-fixtures');
+    })
+    .catch((err) => registry.recordError('kalshi-rest', err instanceof Error ? err.message : String(err)));
+
+  // Startup market discovery must not hold app readiness hostage. Slow Kalshi
+  // paging or connector calls update the already-open window when they finish.
+  void (async () => {
+    try {
+      await Promise.race([
+        discovery.refreshUniverse(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('startup universe fetch timed out')), 10_000)
+        ),
+      ]);
+      const universe = discovery.getUniverse();
+      if (universe.length > 0) marketsCache = mergeGeaMarkets(universe);
+    } catch (startupErr) {
+      const cr = registry.get('kalshi-rest');
+      if (cr && cr.lastSuccess === null && cr.lastError === null) {
+        registry.recordError(
+          'kalshi-rest',
+          startupErr instanceof Error ? startupErr.message : 'startup timeout',
+        );
+      }
     }
-    marketsCache = discovery.getUniverse().length > 0
-      ? discovery.getUniverse()
-      : FIXTURE_MARKETS;
-    if (marketsCache === FIXTURE_MARKETS) discovery.seedFixtureDepth(FIXTURE_MARKETS);
-    marketsCache = mergeGeaMarkets(marketsCache);
-  }
-  // Push connector status immediately — don't wait for the next 5 s health tick.
-  broadcast('connectors:update', registry.getAll());
-  await refreshMarkets();
-  setInterval(refreshMarkets, MARKET_REFRESH_MS);
-  setInterval(refreshUniverseLoop, 60_000);
-  setInterval(refreshWatchedTicker, WATCHED_TICK_MS);
+    broadcast('connectors:update', registry.getAll());
+    await refreshMarkets();
+  })();
+  setInterval(() => { void refreshMarkets(); }, MARKET_REFRESH_MS);
+  setInterval(() => { void refreshUniverseLoop(); }, 60_000);
+  setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
 
   globalShortcut.register('CommandOrControl+Shift+K', () => {
     void activateKillSwitch('shortcut');

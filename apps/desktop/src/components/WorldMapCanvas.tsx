@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ComposableMap, Geographies, Geography, Marker } from 'react-simple-maps';
 import type { GeoMarket, WorldEventsPayload } from '@nemesis/core';
+import { WORLD_MAP_PROJECTION } from '../worldMapProjection';
 
 const GEO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
 
@@ -45,7 +46,7 @@ export function WorldMapCanvas({ heatData, markers, selectedCountry, onSelectCou
   return (
     <div style={{ flex: 1, position: 'relative', background: '#0e111a', overflow: 'hidden' }}>
       <ComposableMap
-        projection="geoNaturalEarth1"
+        projection={WORLD_MAP_PROJECTION}
         projectionConfig={{ scale: 160 }}
         style={{ width: '100%', height: '100%' }}
       >

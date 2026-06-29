@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ComposableMap, Geographies, Geography } from 'react-simple-maps';
 import type { WorldEventsPayload } from '@nemesis/core';
 import { WidgetShell } from './WidgetShell';
+import { WORLD_MAP_PROJECTION } from '../worldMapProjection';
 
 const GEO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
 
@@ -41,7 +42,7 @@ export function WorldWidget() {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ flex: 1, overflow: 'hidden', background: '#0e111a' }}>
           <ComposableMap
-            projection="geoNaturalEarth1"
+            projection={WORLD_MAP_PROJECTION}
             projectionConfig={{ scale: 130 }}
             style={{ width: '100%', height: '100%' }}
           >

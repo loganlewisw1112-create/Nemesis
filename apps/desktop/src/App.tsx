@@ -422,14 +422,13 @@ export default function App() {
               )}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
                 <AnimatePresence>
-                {filtered.map((card, i) => (
+                {filtered.map((card) => (
                   <motion.div
                     key={card.id}
                     initial={{ opacity: 0, y: 14, scale: 0.97 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.95 }}
-                    transition={{ duration: 0.22, delay: Math.min(i * 0.035, 0.35) }}
-                    layout
+                    transition={{ duration: 0.16 }}
                   >
                   <ThesisCardView
                     card={card}
