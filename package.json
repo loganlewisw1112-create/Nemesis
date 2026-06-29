@@ -19,7 +19,7 @@
     "ci:build": "npm run build",
     "ci:typecheck": "npm run typecheck",
     "ci:unit": "npm test -- --run",
-    "ci:e2e": "npm run test:e2e",
+    "ci:e2e": "node apps/desktop/e2e/ci-smoke.cjs",
     "ci:package": "npm run package"
   },
   "devDependencies": {

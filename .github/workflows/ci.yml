@@ -28,12 +28,6 @@ jobs:
           npm ci 2>&1 | Tee-Object -FilePath ci-artifacts/install.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Install Playwright browser
-        shell: pwsh
-        run: |
-          npx playwright install chromium 2>&1 | Tee-Object -FilePath ci-artifacts/playwright-install.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: Build
         shell: pwsh
         run: |

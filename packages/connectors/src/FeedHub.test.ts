@@ -33,7 +33,34 @@ describe('FeedHub trade tape degradation', () => {
 
   afterEach(() => {
     warnSpy.mockRestore();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it('does not open Binance websocket during construction', () => {
+    const openedUrls: string[] = [];
+    class FakeWebSocket {
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+
+      constructor(url: string) {
+        openedUrls.push(url);
+      }
+
+      send() {}
+      close() {
+        this.onclose?.();
+      }
+    }
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+
+    const hub = new FeedHub(new ConnectorRegistry(), { fetchFn: vi.fn<typeof fetch>() });
+    hub.stopBackgroundPolling();
+
+    expect(openedUrls).toEqual([]);
   });
 
   it('backs off optional trade failures and exposes degraded state without repeated warnings', async () => {

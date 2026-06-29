@@ -112,6 +112,7 @@ export class FeedHub {
   private refreshQueuedMarkets: KalshiMarket[] | null = null;
   private refreshQueuedKey: string | null = null;
   private binance: BinanceStream;
+  private binanceStarted = false;
 
   private kalshiApiKey: string | undefined;
 
@@ -121,7 +122,6 @@ export class FeedHub {
   ) {
     this.opts.fredApiKey = opts.fredApiKey ?? process.env.NEMESIS_FRED_API_KEY;
     this.binance = new BinanceStream(registry);
-    this.binance.start();
   }
 
   setKalshiApiKey(key: string | undefined) {
@@ -129,6 +129,7 @@ export class FeedHub {
   }
 
   startBackgroundPolling(intervalMs = 8_000) {
+    this.ensureBinanceStarted();
     if (this.backgroundTimer) return;
     this.backgroundTimer = setInterval(() => {
       if (this.lastMarkets.length > 0) void this.refreshForMarkets(this.lastMarkets);
@@ -139,6 +140,13 @@ export class FeedHub {
     if (this.backgroundTimer) clearInterval(this.backgroundTimer);
     this.backgroundTimer = null;
     this.binance.stop();
+    this.binanceStarted = false;
+  }
+
+  private ensureBinanceStarted() {
+    if (this.binanceStarted) return;
+    this.binance.start();
+    this.binanceStarted = true;
   }
 
   getWeatherSnapshot(): WeatherSnapshot | null {
