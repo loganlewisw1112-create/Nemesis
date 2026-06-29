@@ -82,6 +82,8 @@ import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalTo
 import { DiscoveryOrchestrator } from './discovery.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaSpawnPlan } from './geaSpawn.js';
+import { createSingleFlight } from './singleFlight.js';
+import { startupTrace } from './startupTrace.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.setPath('userData', process.env.NEMESIS_E2E_USER_DATA);
@@ -111,11 +113,6 @@ const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
-function startupTrace(label: string) {
-  if (process.env.NEMESIS_STARTUP_TRACE === 'true') {
-    console.error(`[nemesis:start] ${Date.now()} ${label}`);
-  }
-}
 startupTrace('module-loaded');
 
 let mainWindow: BrowserWindow | null = null;
@@ -1240,12 +1237,16 @@ async function refreshUniverseLoop() {
   }
 }
 
+const runMarketRefresh = createSingleFlight(refreshMarkets);
+const runUniverseRefresh = createSingleFlight(refreshUniverseLoop);
+
 async function buildThesesFromMarkets(markets: KalshiMarket[]) {
-  await Promise.race([
-    feedHub.refreshForMarkets(markets),
-    new Promise<void>((resolve) => setTimeout(resolve, FEED_WAIT_MS)),
+  const feedRefresh = feedHub.refreshForMarkets(markets);
+  const feedTimedOut = await Promise.race([
+    feedRefresh.then(() => false),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(true), FEED_WAIT_MS)),
   ]);
-  feedHub.kickRefresh(markets);
+  if (feedTimedOut) feedHub.kickRefresh(markets);
 
   const cards: ThesisCard[] = [];
   const slice = markets;
@@ -1818,7 +1819,7 @@ function setupIpc() {
     return reconcileLiveBook(local, getLiveCreds());
   });
 
-  ipcMain.handle('nemesis:refresh', refreshMarkets);
+  ipcMain.handle('nemesis:refresh', () => runMarketRefresh());
 
   ipcMain.handle('nemesis:liveBuy', async (_e, thesisId: string, contracts?: number, limitPrice?: number) => {
     if (!settings.liveEnabled) return { ok: false, error: 'live trading not enabled' };
@@ -2008,7 +2009,7 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:forceUniverseRefresh', async () => {
-    await refreshUniverseLoop();
+    await runUniverseRefresh();
     return discovery.getState();
   });
 
@@ -2056,15 +2057,17 @@ function setupIpc() {
 
   ipcMain.handle('nemesis:forceDepthPass', async () => {
     await discovery.runDepthPass();
-    await refreshMarkets();
+    await runMarketRefresh();
     return discovery.getState();
   });
 }
 
 function createWindow() {
+  startupTrace('window-before-create');
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
+    title: 'NEMESIS',
     show: true,
     backgroundColor: '#0a0b0f',
     webPreferences: {
@@ -2073,6 +2076,7 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  startupTrace('window-after-create');
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   mainWindow.webContents.on('did-fail-load', (_event, code, desc, url) => {
@@ -2090,8 +2094,16 @@ function createWindow() {
     mainWindow.loadURL(devUrl).catch((err) => console.error('[nemesis] loadURL failed', err));
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    const indexPath = path.join(__dirname, '../dist/index.html');
+    startupTrace(`window-load-file:${indexPath}`);
+    mainWindow.loadFile(indexPath)
+      .then(() => startupTrace('window-load-file-ok'))
+      .catch((err) => {
+        startupTrace(`window-load-file-failed:${err instanceof Error ? err.message : String(err)}`);
+        console.error('[nemesis] loadFile failed', err);
+      });
   }
+  startupTrace('window-create-return');
 }
 
 app.whenReady().then(() => {
@@ -2175,10 +2187,10 @@ app.whenReady().then(() => {
       }
     }
     broadcast('connectors:update', registry.getAll());
-    await refreshMarkets();
+    await runMarketRefresh();
   })();
-  setInterval(() => { void refreshMarkets(); }, MARKET_REFRESH_MS);
-  setInterval(() => { void refreshUniverseLoop(); }, 60_000);
+  setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
+  setInterval(() => { void runUniverseRefresh(); }, 60_000);
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
 
   globalShortcut.register('CommandOrControl+Shift+K', () => {

@@ -33,6 +33,7 @@ export class DiscoveryOrchestrator {
   private bookMsCount = 0;
   private belowScout = 0;
   private mode: DiscoveryMode = 'full';
+  private depthPassInFlight: Promise<void> | null = null;
 
   constructor(private registry: ConnectorRegistry) {}
 
@@ -139,7 +140,15 @@ export class DiscoveryOrchestrator {
     return this.universe;
   }
 
-  async runDepthPass(): Promise<void> {
+  runDepthPass(): Promise<void> {
+    if (this.depthPassInFlight) return this.depthPassInFlight;
+    this.depthPassInFlight = this.runDepthPassOnce().finally(() => {
+      this.depthPassInFlight = null;
+    });
+    return this.depthPassInFlight;
+  }
+
+  private async runDepthPassOnce(): Promise<void> {
     if (this.paused) return;
     if (!this.settings.depthVerifyEnabled) {
       this.mode = 'legacy';

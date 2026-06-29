@@ -107,6 +107,10 @@ export class FeedHub {
   private secEdgarAt = 0;
   private backgroundTimer: ReturnType<typeof setInterval> | null = null;
   private lastMarkets: KalshiMarket[] = [];
+  private refreshInFlight: Promise<void> | null = null;
+  private refreshActiveKey: string | null = null;
+  private refreshQueuedMarkets: KalshiMarket[] | null = null;
+  private refreshQueuedKey: string | null = null;
   private binance: BinanceStream;
 
   private kalshiApiKey: string | undefined;
@@ -182,9 +186,48 @@ export class FeedHub {
     return { ...this.tradeFeedState, cachedTradeCount: this.trades.length };
   }
 
-  async refreshForMarkets(markets: KalshiMarket[]): Promise<void> {
+  refreshForMarkets(markets: KalshiMarket[]): Promise<void> {
     this.lastMarkets = markets;
+    const key = this.marketRefreshKey(markets);
+    if (this.refreshInFlight) {
+      if (key !== this.refreshActiveKey) {
+        this.refreshQueuedMarkets = markets;
+        this.refreshQueuedKey = key;
+      }
+      return this.refreshInFlight;
+    }
 
+    this.refreshActiveKey = key;
+    this.refreshInFlight = this.runRefreshLoop(markets, key).finally(() => {
+      this.refreshInFlight = null;
+      this.refreshActiveKey = null;
+      this.refreshQueuedMarkets = null;
+      this.refreshQueuedKey = null;
+    });
+    return this.refreshInFlight;
+  }
+
+  private async runRefreshLoop(markets: KalshiMarket[], key: string): Promise<void> {
+    let currentMarkets = markets;
+    let currentKey = key;
+    for (;;) {
+      this.refreshQueuedMarkets = null;
+      this.refreshQueuedKey = null;
+      await this.refreshForMarketsOnce(currentMarkets);
+      const nextMarkets = this.refreshQueuedMarkets;
+      const nextKey = this.refreshQueuedKey;
+      if (!nextMarkets || !nextKey || nextKey === currentKey) return;
+      currentMarkets = nextMarkets;
+      currentKey = nextKey;
+      this.refreshActiveKey = currentKey;
+    }
+  }
+
+  private marketRefreshKey(markets: KalshiMarket[]): string {
+    return markets.map((m) => m.ticker).join('\u0000');
+  }
+
+  private async refreshForMarketsOnce(markets: KalshiMarket[]): Promise<void> {
     for (const m of markets.filter(isCryptoMarket)) {
       this.binance.track(parseCryptoSymbol(m.title, m.ticker));
     }

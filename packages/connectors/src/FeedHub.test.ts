@@ -99,4 +99,58 @@ describe('FeedHub trade tape degradation', () => {
       lastError: 'fetch failed: trade endpoint timeout',
     });
   });
+
+  it('coalesces overlapping market refreshes so background polling does not duplicate trade fetches', async () => {
+    let releaseTradeFetch: (() => void) | undefined;
+    const tradeResponse = new Promise<Response>((resolve) => {
+      releaseTradeFetch = () => resolve(response({ trades: [] }));
+    });
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const url = String(input);
+      if (url.includes('/markets/trades')) return tradeResponse;
+      return Promise.resolve(response({}));
+    });
+    const { hub } = makeHub(fetchFn);
+    const now = Date.now();
+    Object.assign(hub as unknown as {
+      weather: unknown;
+      macro: unknown;
+      infra: unknown;
+      nhc: unknown;
+      industrial: unknown;
+      sports: unknown;
+      kalshiWsAt: number;
+      portfolioPingAt: number;
+      gdeltCache: Map<string, unknown>;
+      worldNewsAt: number;
+      eiaAt: number;
+      secEdgarAt: number;
+    }, {
+      weather: { nws: null, openMeteo: null, lat: 0, lon: 0, fetchedAt: now },
+      macro: { releaseName: 'CPI', consensus: 3.2, minutesToRelease: 60, fetchedAt: now },
+      infra: { provider: 'AWS', status: 'operational', summary: 'ok', fetchedAt: now },
+      nhc: { active: false, summary: 'quiet', fetchedAt: now },
+      industrial: { headline: 'quiet', url: '', fetchedAt: now },
+      sports: { homeScore: 0, awayScore: 0, impliedWinProb: 0.5, eventName: 'none', fetchedAt: now },
+      kalshiWsAt: now,
+      portfolioPingAt: now,
+      worldNewsAt: now,
+      eiaAt: now,
+      secEdgarAt: now,
+    });
+    (hub as unknown as { gdeltCache: Map<string, unknown> }).gdeltCache.set(
+      'united states economy politics',
+      { news: { title: 'quiet', url: '', category: 'macro', severity: 0.1 }, fetchedAt: now },
+    );
+    const markets = [{ ticker: 'KXDEMO', title: 'Demo market', status: 'open' }];
+
+    const first = hub.refreshForMarkets(markets);
+    const second = hub.refreshForMarkets(markets);
+
+    await Promise.resolve();
+    expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
+
+    releaseTradeFetch?.();
+    await Promise.all([first, second]);
+  });
 });
