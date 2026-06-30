@@ -1,6 +1,8 @@
 # NEMESIS
 
-Current as of June 26, 2026.
+[![NEMESIS CI](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml/badge.svg)](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml)
+
+Current as of June 30, 2026.
 
 NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha (GEA) intelligence app. It is built for event-market thesis discovery, fillability-aware ticket ranking, paper execution, profit-retention research, fail-closed bridge recommendations, and staged live-trading readiness.
 
@@ -110,10 +112,10 @@ Clone and install:
 ```bash
 git clone https://github.com/loganlewisw1112-create/Nemesis.git
 cd Nemesis
-npm install
+npm ci
 ```
 
-GEA uses `better-sqlite3` for local persistence. The GEA workspace includes a `postinstall` rebuild for Electron. If SQLite loading fails after installing dependencies, rebuild the native module manually:
+GEA uses `better-sqlite3` for local persistence. Packaging runs the Electron native rebuild before building GEA. If SQLite loading fails after dependency changes, rebuild the native module manually:
 
 ```bash
 npm run rebuild:sqlite -w @nemesis/global-event-alpha
@@ -165,7 +167,8 @@ Useful environment variables:
 | `npm run build` | Build every workspace that exposes a build script |
 | `npm run build -w @nemesis/desktop` | Build the NEMESIS desktop app |
 | `npm run build -w @nemesis/global-event-alpha` | Build the Global Event Alpha app |
-| `npm run test:e2e -w @nemesis/desktop` | Run Electron smoke and bridge tests |
+| `npm run ci:e2e` | Run the direct Electron startup smoke with bridge `bridge:hello` verification |
+| `npm run ci:package` | Build GEA, rebuild SQLite for Electron, and package the Windows apps |
 | `npm run package` | Build the Windows installer; signs when `CSC_LINK` and `CSC_KEY_PASSWORD` are configured |
 | `npm run package:local-signed` | Build and locally sign Windows artifacts with a current-user trusted NEMESIS dev certificate |
 
@@ -207,10 +210,11 @@ NEMESIS rejects expired recommendations, forbidden publishing roles, malformed p
 Use the full local verification set before treating a branch as release-ready:
 
 ```bash
-npm test -- --run
-npm run typecheck --workspaces --if-present
-npm run build
-npm run test:e2e -w @nemesis/desktop
+npm run ci:typecheck
+npm run ci:build
+npm run ci:unit
+npm run ci:e2e
+npm run ci:package
 ```
 
 For a faster documentation-only check, verify the README-linked screenshots exist and run at least:
@@ -228,19 +232,22 @@ Build the Windows installer:
 npm run package
 ```
 
-The desktop package uses Electron Builder with an NSIS target. Configure `CSC_LINK` and `CSC_KEY_PASSWORD` locally or as GitHub Actions secrets to sign the Windows executable and installer; output is written under the desktop app release directory.
+The package flow builds Global Event Alpha first, rebuilds `better-sqlite3` for Electron, writes the unpacked GEA app to `apps/global-event-alpha/release/win-unpacked`, then bundles that app into the NEMESIS desktop package under `resources/gea-app`.
+
+The desktop package uses Electron Builder with an NSIS target. Configure `CSC_LINK` and `CSC_KEY_PASSWORD` locally or as GitHub Actions secrets to sign the Windows executable and installer; output is written under `apps/desktop/release`.
 
 For this development machine, `npm run package:local-signed` creates or reuses a current-user `NEMESIS Local Dev Code Signing` certificate, trusts it only for the current Windows user, exports a temporary PFX for Electron Builder, deletes that temporary PFX, and verifies the packaged artifacts with `Get-AuthenticodeSignature`. This removes `NotSigned` locally, but it is not a substitute for a CA-issued certificate for public distribution.
 
 ## Repository Status
 
-This README describes the current NEMESIS + GEA mainline after the institutional platform upgrade:
+This README describes the current NEMESIS + GEA mainline after CI/package stabilization:
 
 - GEA SQLite persistence is declared through `better-sqlite3`.
-- GEA native SQLite rebuild support is present through `rebuild:sqlite` and `postinstall`.
+- GEA native SQLite rebuild support is present through `rebuild:sqlite`; the package script runs it before Electron Builder.
 - NEMESIS and GEA use Electron `42.5.0`.
-- The bridge E2E suite covers valid recommendation ingestion and fail-closed rejection of expired or forbidden packets.
-- Desktop smoke coverage checks app boot, thesis-tier summary rendering, paper desk rendering, refresh behavior, and kill-switch activation.
+- The root CI path runs `npm ci`, build, typecheck, 160 Vitest tests, direct Electron bridge smoke, Windows packaging, and signature verification.
+- The direct Electron smoke waits for startup trace milestones, verifies `window-load-file-ok`, and requires bridge `bridge:hello`.
+- Package output includes the NSIS setup executable, unpacked `NEMESIS.exe`, and bundled `resources/gea-app/Global Event Alpha.exe`.
 
 ## Risk Notice
 
