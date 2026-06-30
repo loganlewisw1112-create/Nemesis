@@ -8,6 +8,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
   plugins: [react()],
   resolve: {
+    dedupe: ['react', 'react-dom'],
     alias: {
       '@nemesis/core': path.join(root, 'packages/core/src'),
       '@nemesis/ui': path.join(root, 'packages/ui/src'),
@@ -25,6 +26,11 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    server: {
+      deps: {
+        inline: [/@testing-library\/react/, /react-dom/, /framer-motion/],
+      },
+    },
     environmentMatchGlobs: [
       ['apps/desktop/src/**/*.test.tsx', 'happy-dom'],
       ['apps/global-event-alpha/src/**/*.test.tsx', 'happy-dom'],
