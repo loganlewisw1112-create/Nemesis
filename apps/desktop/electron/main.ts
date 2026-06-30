@@ -86,6 +86,8 @@ import { createSingleFlight } from './singleFlight.js';
 import { startupTrace } from './startupTrace.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('disable-gpu');
   app.setPath('userData', process.env.NEMESIS_E2E_USER_DATA);
 }
 

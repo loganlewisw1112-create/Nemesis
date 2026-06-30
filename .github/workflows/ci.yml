@@ -25,7 +25,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force ci-artifacts | Out-Null
-          npm ci 2>&1 | Tee-Object -FilePath ci-artifacts/install.log
+          npm ci --foreground-scripts --no-audit --fund=false 2>&1 | Tee-Object -FilePath ci-artifacts/install.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build

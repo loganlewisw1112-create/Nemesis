@@ -45,12 +45,14 @@ describe('GEA local database schema', () => {
 
     expect(pkg.dependencies?.['better-sqlite3']).toMatch(/^\^?\d+\.\d+\.\d+/);
   });
-  it('rebuilds better-sqlite3 for Electron after installs', () => {
+  it('rebuilds better-sqlite3 for Electron during packaging', () => {
     const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8')) as {
       scripts?: Record<string, string>;
     };
 
     expect(pkg.scripts?.['rebuild:sqlite']).toContain('electron-rebuild');
-    expect(pkg.scripts?.postinstall).toContain('rebuild:sqlite');
+    expect(pkg.scripts?.postinstall).toBeUndefined();
+    expect(pkg.scripts?.package).toContain('rebuild:sqlite');
+    expect(pkg.scripts?.package).toContain('electron-builder');
   });
 });
