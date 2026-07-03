@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { kalshiFeePerContract, computeNetEdge, walkBookFill } from './kalshiFee.js';
-import { parseOrderbook, normalizeMarketPrice } from '../kalshi/client.js';
+import {
+  isExecutablePrice,
+  normalizeExecutablePrice,
+  parseOrderbook,
+  normalizeMarketPrice,
+  sanitizeExecutableBook,
+} from '../kalshi/client.js';
 import { qualifyThesis, detectSourceDisagreement } from '../thesis/qualification.js';
-import type { KalshiMarket } from '../src/types.js';
+import type { KalshiMarket, KalshiOrderbook } from '../types.js';
 
 describe('kalshiFee', () => {
   it('computes fee at 50c', () => {
@@ -40,6 +46,40 @@ describe('kalshi client', () => {
   it('normalizes cent market prices', () => {
     const m: KalshiMarket = { ticker: 'T', title: 'T', status: 'open', yes_ask: 34 };
     expect(normalizeMarketPrice(m)).toBeCloseTo(0.34);
+  });
+
+  it('rejects non-executable prices instead of treating zero as tradable', () => {
+    expect(isExecutablePrice(0)).toBe(false);
+    expect(isExecutablePrice(1)).toBe(false);
+    expect(isExecutablePrice(Number.NaN)).toBe(false);
+    expect(isExecutablePrice(0.34)).toBe(true);
+
+    const zeroAsk: KalshiMarket = { ticker: 'T', title: 'T', status: 'open', yes_ask: 0 };
+    expect(normalizeExecutablePrice(zeroAsk)).toBeNull();
+  });
+
+  it('sanitizes executable books and removes invalid synthetic levels', () => {
+    const book: KalshiOrderbook = {
+      ticker: 'T',
+      yes: [
+        { price: 0, quantity: 100 },
+        { price: 0.42, quantity: 25 },
+        { price: 1, quantity: 10 },
+      ],
+      no: [
+        { price: 0.58, quantity: 0 },
+        { price: 0.57, quantity: 30 },
+      ],
+      yesAsk: 0,
+      noAsk: 0.57,
+      spread: 0.02,
+    };
+
+    const sanitized = sanitizeExecutableBook(book);
+    expect(sanitized.yes).toEqual([{ price: 0.42, quantity: 25 }]);
+    expect(sanitized.no).toEqual([{ price: 0.57, quantity: 30 }]);
+    expect(sanitized.yesAsk).toBeUndefined();
+    expect(sanitized.noAsk).toBe(0.57);
   });
 });
 

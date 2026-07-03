@@ -68,6 +68,22 @@ export interface LiveUnlockCertificate {
   metrics: Record<string, number | boolean | string>;
 }
 
+export interface StrictProfitModeSettings {
+  enabled: boolean;
+  minNetPnlUsd: number;
+  requireEntryLiquidationPath: boolean;
+  allowEmergencyLossClose: boolean;
+  maxBookAgeMs: number;
+}
+
+export interface OpportunityThroughputSettings {
+  enabled: boolean;
+  maxConcurrentBookFetches: number;
+  retryableBlockCooldownMs: number;
+  maxDailyCertifiedTrades: number | null;
+  minCertifiedProfitPerTradeUsd: number;
+}
+
 export interface GuardrailSettings {
   demoMode: boolean;
   dryRun: boolean;
@@ -85,7 +101,25 @@ export interface GuardrailSettings {
   humanQuizPassed?: boolean;
   backtestPassed?: boolean;
   autoClose?: AutoCloseSettings;
+  strictProfitMode?: StrictProfitModeSettings;
+  opportunityThroughput?: OpportunityThroughputSettings;
 }
+
+export const DEFAULT_STRICT_PROFIT_MODE: StrictProfitModeSettings = {
+  enabled: true,
+  minNetPnlUsd: 0.01,
+  requireEntryLiquidationPath: true,
+  allowEmergencyLossClose: false,
+  maxBookAgeMs: 2_000,
+};
+
+export const DEFAULT_OPPORTUNITY_THROUGHPUT: OpportunityThroughputSettings = {
+  enabled: true,
+  maxConcurrentBookFetches: 8,
+  retryableBlockCooldownMs: 5_000,
+  maxDailyCertifiedTrades: null,
+  minCertifiedProfitPerTradeUsd: 0.01,
+};
 
 export const DEFAULT_GUARDRAILS: GuardrailSettings = {
   demoMode: true,
@@ -102,6 +136,8 @@ export const DEFAULT_GUARDRAILS: GuardrailSettings = {
   humanQuizPassed: false,
   backtestPassed: false,
   autoClose: { ...DEFAULT_AUTO_CLOSE_SETTINGS },
+  strictProfitMode: { ...DEFAULT_STRICT_PROFIT_MODE },
+  opportunityThroughput: { ...DEFAULT_OPPORTUNITY_THROUGHPUT },
 };
 
 export type ThesisStatus =

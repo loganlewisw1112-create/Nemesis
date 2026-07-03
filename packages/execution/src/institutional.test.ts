@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
 import { PaperDesk } from './paperDesk.js';
-import { simulatePaperBuy, checkPaperRisk } from './executionRouter.js';
+import { simulatePaperBuy, simulatePaperClose, checkPaperRisk } from './executionRouter.js';
 import { positionUnrealizedPnl, markToMarketPortfolio } from './pnlEngine.js';
 import { runFeeAwareBacktest } from './backtestRunner.js';
-import { DEFAULT_GUARDRAILS, type ThesisCard } from '@nemesis/core';
+import { DEFAULT_GUARDRAILS, type KalshiOrderbook, type ThesisCard } from '@nemesis/core';
 
 const card: ThesisCard = {
   id: 't1',
@@ -32,21 +32,105 @@ const card: ThesisCard = {
   invalidations: [],
 };
 
-const book = {
+const book: KalshiOrderbook = {
   ticker: 'TEST-1',
-  yes: [{ price: 0.45, quantity: 200 }],
+  yes: [{ price: 0.5, quantity: 200 }],
   no: [{ price: 0.55, quantity: 200 }],
   yesAsk: 0.46,
   noAsk: 0.56,
   spread: 0.02,
 };
 
+const crossedProfitBook: KalshiOrderbook = {
+  ticker: 'TEST-1',
+  yes: [{ price: 0.52, quantity: 200 }],
+  no: [{ price: 0.55, quantity: 200 }],
+  yesAsk: 0.46,
+  noAsk: 0.56,
+  spread: 0.02,
+};
+
+const highEdgeCard: ThesisCard = {
+  ...card,
+  impliedPrice: 0.75,
+  grossEdge: 0.3,
+  netEdge: 0.25,
+  predictability: 95,
+  edgeHistory: [0.25],
+};
+
 describe('executionRouter', () => {
   it('simulates paper buy via orderbook', () => {
     const desk = new PaperDesk(1000);
-    const result = simulatePaperBuy(desk, card, book, DEFAULT_GUARDRAILS, 5);
+    const result = simulatePaperBuy(desk, highEdgeCard, crossedProfitBook, DEFAULT_GUARDRAILS, 2);
     expect(result.ok).toBe(true);
+    expect(result.profitCertificate?.netPnlUsd).toBeGreaterThanOrEqual(0.01);
+    expect(result.wouldMutate).toBe(true);
     expect(desk.snapshot().positions.length).toBe(1);
+  });
+
+  it('blocks zero-price books before mutating paper positions', () => {
+    const desk = new PaperDesk(1000);
+    const zeroBook: KalshiOrderbook = {
+      ticker: 'TEST-1',
+      yes: [{ price: 0, quantity: 200 }],
+      no: [{ price: 0, quantity: 200 }],
+      yesAsk: 0,
+      noAsk: 1,
+      spread: 0.02,
+    };
+    const result = simulatePaperBuy(desk, { ...card, marketPrice: 0 }, zeroBook, DEFAULT_GUARDRAILS, 5);
+
+    expect(result.ok).toBe(false);
+    expect(result.abortCode).toBe('invalid_price');
+    expect(result.wouldMutate).toBe(false);
+    expect(desk.snapshot().positions).toHaveLength(0);
+  });
+
+  it('blocks flat or negative paper closes without mutating the portfolio', () => {
+    const desk = new PaperDesk(1000);
+    const opened = desk.openPosition(card, 5, 0.5);
+    expect(opened.ok).toBe(true);
+    const positionId = desk.snapshot().positions[0].id;
+    const before = desk.snapshot();
+
+    const result = simulatePaperClose(
+      desk,
+      positionId,
+      { ticker: 'TEST-1', yes: [{ price: 0.5, quantity: 5 }], no: [{ price: 0.5, quantity: 5 }], spread: 0.02 },
+      'yes',
+      0.5,
+      5,
+      DEFAULT_GUARDRAILS,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.abortCode).toBe('strict_profit_block');
+    expect(result.wouldMutate).toBe(false);
+    expect(desk.snapshot()).toEqual(before);
+  });
+
+  it('attaches a profit certificate to profitable paper closes', () => {
+    const desk = new PaperDesk(1000);
+    const opened = desk.openPosition(card, 5, 0.5);
+    expect(opened.ok).toBe(true);
+    const positionId = desk.snapshot().positions[0].id;
+
+    const result = simulatePaperClose(
+      desk,
+      positionId,
+      { ticker: 'TEST-1', yes: [{ price: 0.55, quantity: 5 }], no: [{ price: 0.45, quantity: 5 }], spread: 0.02 },
+      'yes',
+      0.55,
+      5,
+      DEFAULT_GUARDRAILS,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.profitCertificate?.kind).toBe('close');
+    expect(result.profitCertificate?.netPnlUsd).toBeGreaterThanOrEqual(0.01);
+    expect(result.wouldMutate).toBe(true);
+    expect(desk.snapshot().positions).toHaveLength(0);
   });
 
   it('blocks when daily loss cap breached', () => {
@@ -59,7 +143,7 @@ describe('executionRouter', () => {
 describe('pnlEngine parity', () => {
   it('matches desk markToMarket', () => {
     const desk = new PaperDesk(1000);
-    simulatePaperBuy(desk, card, book, DEFAULT_GUARDRAILS, 5);
+    simulatePaperBuy(desk, highEdgeCard, crossedProfitBook, DEFAULT_GUARDRAILS, 2);
     const pos = desk.snapshot().positions[0];
     const marks = new Map([[pos.ticker, 0.5]]);
     const deskMtm = desk.markToMarket(marks);

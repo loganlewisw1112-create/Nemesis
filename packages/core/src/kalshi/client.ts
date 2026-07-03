@@ -35,6 +35,37 @@ function dollarToProb(v: string | undefined): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+export function isExecutablePrice(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value < 1;
+}
+
+function executableCentsToProb(v: number | undefined): number | undefined {
+  const p = centsToProb(v);
+  return isExecutablePrice(p) ? p : undefined;
+}
+
+function executableDollarToProb(v: string | undefined): number | undefined {
+  const p = dollarToProb(v);
+  return isExecutablePrice(p) ? p : undefined;
+}
+
+export function normalizeExecutablePrice(market: KalshiMarket, side: 'yes' | 'no' = 'yes'): number | null {
+  const price = side === 'yes'
+    ? (
+      executableDollarToProb(market.yes_ask_dollars) ??
+      executableCentsToProb(market.yes_ask) ??
+      executableDollarToProb(market.yes_bid_dollars) ??
+      executableCentsToProb(market.yes_bid)
+    )
+    : (
+      executableDollarToProb(market.no_ask_dollars) ??
+      executableCentsToProb(market.no_ask) ??
+      executableDollarToProb(market.no_bid_dollars) ??
+      executableCentsToProb(market.no_bid)
+    );
+  return price ?? null;
+}
+
 export function normalizeMarketPrice(market: KalshiMarket, side: 'yes' | 'no' = 'yes'): number {
   if (side === 'yes') {
     return (
@@ -79,6 +110,23 @@ export function parseOrderbook(ticker: string, raw: Record<string, unknown>): Ka
   const spread = yesAsk !== undefined && bestYesBid !== undefined ? yesAsk - bestYesBid : undefined;
 
   return { ticker, yes, no, yesAsk, noAsk, spread };
+}
+
+export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
+  const cleanLevels = (levels: OrderbookLevel[]) => levels
+    .filter((level) => isExecutablePrice(level.price) && Number.isFinite(level.quantity) && level.quantity > 0)
+    .map((level) => ({ price: level.price, quantity: level.quantity }))
+    .sort((a, b) => b.price - a.price);
+
+  const yes = cleanLevels(book.yes);
+  const no = cleanLevels(book.no);
+  const yesAsk = isExecutablePrice(book.yesAsk) ? book.yesAsk : undefined;
+  const noAsk = isExecutablePrice(book.noAsk) ? book.noAsk : undefined;
+  const spread = Number.isFinite(book.spread) && book.spread !== undefined && book.spread >= 0
+    ? book.spread
+    : undefined;
+
+  return { ticker: book.ticker, yes, no, yesAsk, noAsk, spread };
 }
 
 let _workingBase: string | null = null;

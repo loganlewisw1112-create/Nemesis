@@ -7,6 +7,31 @@ export interface InfraAlert {
   summary: string;
 }
 
+const INFRA_TERMS = [
+  'aws',
+  'amazon web services',
+  'azure',
+  'microsoft cloud',
+  'google cloud',
+  'gcp',
+  'cloudflare',
+  'cdn',
+  'cloud',
+  'datacenter',
+  'data center',
+  'server',
+  'internet',
+  'infrastructure',
+  'outage',
+  'uptime',
+];
+
+function isRelevantInfraMarket(ticker: string, title: string, alert: InfraAlert): boolean {
+  const haystack = `${ticker} ${title}`.toLowerCase();
+  const provider = alert.provider.toLowerCase();
+  return haystack.includes(provider) || INFRA_TERMS.some((term) => haystack.includes(term));
+}
+
 export function infraToThesis(
   ticker: string,
   title: string,
@@ -16,6 +41,7 @@ export function infraToThesis(
   depthUsd: number,
 ): ThesisCard | null {
   if (alert.status === 'operational') return null;
+  if (!isRelevantInfraMarket(ticker, title, alert)) return null;
   const implied = alert.status === 'outage' ? 0.75 : 0.55;
   const breakdown = computeNetEdge(implied, marketPrice, spread);
   const qual = qualifyThesis({

@@ -13,9 +13,25 @@ export interface FillMetadata {
   depthLevels?: number;
   abortReason?: string;
   mode: 'paper' | 'live';
+  profitCertificate?: ProfitCertificate;
   autoCloseDecisionId?: string;
   autoCloseReason?: string;
   autoCloseAction?: AutoCloseAction;
+}
+
+export interface ProfitCertificate {
+  kind: 'open' | 'close';
+  ticker: string;
+  side: 'yes' | 'no';
+  contracts: number;
+  entryPrice: number;
+  exitPrice: number;
+  entryFees: number;
+  exitFees: number;
+  netPnlUsd: number;
+  bookTimestamp: number;
+  expiresAt: number;
+  reason: string;
 }
 
 export interface PaperPosition {
@@ -52,6 +68,7 @@ export interface PaperTrade {
   abortReason?: string;
   mode?: 'paper' | 'live';
   playbook?: string;
+  profitCertificate?: ProfitCertificate;
   autoCloseDecisionId?: string;
   autoCloseReason?: string;
   autoCloseAction?: AutoCloseAction;

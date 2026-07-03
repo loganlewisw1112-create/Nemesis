@@ -82,6 +82,7 @@ export class PaperDesk {
       depthLevels: fillMeta?.depthLevels,
       mode: fillMeta?.mode ?? 'paper',
       playbook: card.playbook,
+      profitCertificate: fillMeta?.profitCertificate,
     });
     return { ok: true, position: this.portfolio.positions.find((p) => p.id === positionId)! };
   }
@@ -122,6 +123,7 @@ export class PaperDesk {
       depthLevels: fillMeta?.depthLevels,
       mode: fillMeta?.mode ?? 'paper',
       playbook: pos.playbook,
+      profitCertificate: fillMeta?.profitCertificate,
       autoCloseDecisionId: fillMeta?.autoCloseDecisionId,
       autoCloseReason: fillMeta?.autoCloseReason,
       autoCloseAction: fillMeta?.autoCloseAction,

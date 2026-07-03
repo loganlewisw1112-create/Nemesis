@@ -5,6 +5,9 @@ export interface AuditEntry {
   ticker?: string;
   detail: string;
   ok: boolean;
+  code?: string;
+  severity?: 'info' | 'warning' | 'error';
+  blocksLiveUnlock?: boolean;
 }
 
 export class AuditLog {

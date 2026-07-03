@@ -34,13 +34,14 @@ export function globalToThesis(input: GlobalPulseInput): ThesisCard {
     executionHealthy: true,
   });
   const now = Date.now();
+  const invalidations = [...qual.failedGates, 'heuristic source requires execution certificate'];
   return {
     id: `global-${input.ticker}`,
     ticker: input.ticker,
     title: input.marketTitle,
     category: input.news.category,
     playbook: 'global-pulse',
-    status: qual.status,
+    status: qual.status === 'tradeable' ? 'qualified' : qual.status,
     side: 'yes',
     marketPrice: input.marketPrice,
     impliedPrice: implied,
@@ -57,7 +58,7 @@ export function globalToThesis(input: GlobalPulseInput): ThesisCard {
     freshnessMs: 3000,
     edgeHistory: [breakdown.netEdge],
     drivers: [{ label: 'News', impact: input.news.severity, detail: input.news.title }],
-    invalidations: qual.failedGates,
+    invalidations,
     sourceMove: 'news-driven',
   };
 }

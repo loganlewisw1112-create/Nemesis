@@ -19,6 +19,8 @@ export interface NemesisStateMirror {
   dailyPnl: number;
   gates: string[];
   activeRegimes: string[];
+  opportunityThroughput?: Record<string, number>;
+  throughputTrigger?: string;
   timestamp: number;
 }
 
