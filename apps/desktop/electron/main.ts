@@ -81,15 +81,17 @@ import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
 import { DiscoveryOrchestrator } from './discovery.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
-import { createGeaSpawnPlan } from './geaSpawn.js';
+import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
 import { createSingleFlight } from './singleFlight.js';
 import { startupTrace } from './startupTrace.js';
+import { createBridgeAuth, isBridgeRequestAuthenticated, resolveBridgeHost } from './bridgeSecurity.js';
+import { resolveNemesisUserDataPath } from './userDataPath.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
   app.commandLine.appendSwitch('disable-gpu');
-  app.setPath('userData', process.env.NEMESIS_E2E_USER_DATA);
 }
+app.setPath('userData', resolveNemesisUserDataPath(process.env, app.getPath('appData')));
 
 const DATA_DIR = path.join(app.getPath('userData'), 'nemesis-data');
 const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
@@ -180,6 +182,7 @@ interface KalshiCredentialStatus {
 const bridgeClients = new Set<WsSocket>();
 let bridgeSeq = 0;
 let geaProcess: ChildProcess | null = null;
+const bridgeAuth = createBridgeAuth(process.env);
 const bridgeStatus: BridgeStatus = {
   connected: false,
   brainRole: null,
@@ -1458,7 +1461,17 @@ function buildNemesisStateMirror() {
 
 function setupBridgeServer() {
   const port = parseInt(process.env.NEMESIS_BRIDGE_PORT ?? '7430', 10);
-  const wss = new WebSocketServer({ port });
+  let host: string;
+  try {
+    host = resolveBridgeHost(process.env);
+  } catch (err) {
+    console.warn(`[nemesis] ${err instanceof Error ? err.message : String(err)}`);
+    bridgeStatus.connected = false;
+    bridgeStatus.clientCount = 0;
+    broadcastBridgeStatus();
+    return;
+  }
+  const wss = new WebSocketServer({ port, host });
   wss.on('error', (err: Error) => {
     console.warn('[nemesis] Bridge server unavailable on port ' + port + ': ' + err.message);
     bridgeStatus.connected = false;
@@ -1466,7 +1479,12 @@ function setupBridgeServer() {
     broadcastBridgeStatus();
   });
 
-  wss.on('connection', (ws: WsSocket) => {
+  wss.on('connection', (ws: WsSocket, req) => {
+    if (!isBridgeRequestAuthenticated(req.url, bridgeAuth.token)) {
+      ws.close(1008, 'bridge auth required');
+      return;
+    }
+
     bridgeClients.add(ws);
     bridgeStatus.connected = true;
     bridgeStatus.clientCount = bridgeClients.size;
@@ -1534,6 +1552,12 @@ function spawnGlobalEventAlpha() {
   if (geaProcess && !geaProcess.killed) return;
 
   const bridgePort = process.env.NEMESIS_BRIDGE_PORT ?? '7430';
+  let bridgeHost = '127.0.0.1';
+  try {
+    bridgeHost = resolveBridgeHost(process.env);
+  } catch {
+    // setupBridgeServer already reports the operator-facing error.
+  }
   const repoRoot = path.resolve(__dirname, '..', '..', '..');
   const geaRoot = path.resolve(__dirname, '..', '..', 'global-event-alpha');
   const builtMain = path.join(geaRoot, 'dist-electron', 'main.js');
@@ -1554,11 +1578,11 @@ function spawnGlobalEventAlpha() {
     geaPathExists: Boolean(geaPath && fs.existsSync(geaPath)),
     execPath: process.execPath,
   });
-  const childEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-    NEMESIS_BRIDGE_URL: `ws://localhost:${bridgePort}`,
-  };
-  delete childEnv.VITE_DEV_SERVER_URL;
+  const childEnv = createGeaChildEnv(
+    process.env,
+    createGeaBridgeUrl(bridgeHost, bridgePort),
+    bridgeAuth.token,
+  );
 
   if (!plan) return;
   geaProcess = spawn(plan.command, plan.args, {

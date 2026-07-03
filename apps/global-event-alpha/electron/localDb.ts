@@ -9,6 +9,8 @@ import type {
   PublicDataSourceRecord,
 } from '@nemesis/connectors';
 import type { NemesisCloseResult } from '@nemesis/bridge-contracts';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export const GEA_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS brain_instance (
@@ -303,6 +305,21 @@ const KALSHI_MARKET_SNAPSHOT_COLUMNS = [
   ['spread', 'REAL'],
   ['source', "TEXT NOT NULL DEFAULT 'rest-market'"],
 ] as const;
+
+export function resolveGeaDatabasePath(userDataPath: string): string {
+  return path.join(userDataPath, 'global-event-alpha.sqlite');
+}
+
+export function legacyGeaDatabasePath(appDataPath: string): string {
+  return path.join(appDataPath, 'Electron', 'global-event-alpha.sqlite');
+}
+
+export function copyLegacyGeaDatabaseIfMissing(productPath: string, legacyPath: string): boolean {
+  if (fs.existsSync(productPath) || !fs.existsSync(legacyPath)) return false;
+  fs.mkdirSync(path.dirname(productPath), { recursive: true });
+  fs.copyFileSync(legacyPath, productPath);
+  return true;
+}
 
 export async function migrateGeaDatabase(path: string): Promise<GeaDatabaseStatus> {
   try {

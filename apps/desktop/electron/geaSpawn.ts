@@ -17,6 +17,29 @@ export interface GeaSpawnPlanInput {
   execPath?: string;
 }
 
+function hostForUrl(host: string): string {
+  const trimmed = host.trim();
+  return trimmed.includes(':') && !trimmed.startsWith('[') ? `[${trimmed}]` : trimmed;
+}
+
+export function createGeaBridgeUrl(host: string, port: string | number): string {
+  return `ws://${hostForUrl(host)}:${port}`;
+}
+
+export function createGeaChildEnv(
+  env: NodeJS.ProcessEnv,
+  bridgeUrl: string,
+  bridgeToken: string,
+): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = {
+    ...env,
+    NEMESIS_BRIDGE_URL: bridgeUrl,
+    NEMESIS_BRIDGE_TOKEN: bridgeToken,
+  };
+  delete childEnv.VITE_DEV_SERVER_URL;
+  return childEnv;
+}
+
 export function createGeaSpawnPlan(input: GeaSpawnPlanInput): GeaSpawnPlan | null {
   if (input.geaPath && input.geaPathExists) {
     return { command: input.geaPath, args: [], cwd: input.repoRoot, windowsHide: false };

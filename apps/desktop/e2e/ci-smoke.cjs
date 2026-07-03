@@ -45,9 +45,9 @@ async function waitFor(label, timeoutMs, predicate, child, traceFile, output) {
   throw new Error(`${label} timed out after ${timeoutMs}ms\ntrace:\n${readIfExists(traceFile)}\noutput:\n${output()}`);
 }
 
-function connectBridgeHello(port, timeoutMs) {
+function connectBridgeHello(port, token, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
     let settled = false;
     const finish = (error, value) => {
       if (settled) return;
@@ -76,12 +76,12 @@ function connectBridgeHello(port, timeoutMs) {
   });
 }
 
-async function waitForBridgeHello(port, timeoutMs) {
+async function waitForBridgeHello(port, token, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
     try {
-      return await connectBridgeHello(port, Math.min(2_000, deadline - Date.now()));
+      return await connectBridgeHello(port, token, Math.min(2_000, deadline - Date.now()));
     } catch (error) {
       lastError = error;
       await sleep(250);
@@ -99,6 +99,7 @@ async function waitForBridgeHello(port, timeoutMs) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'nemesis-ci-e2e-'));
   const traceFile = path.join(userData, 'startup-trace.log');
   const bridgePort = 18_900 + Math.floor(Math.random() * 900);
+  const bridgeToken = `ci-smoke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const chunks = [];
   const electronArgs = [
     '--disable-gpu',
@@ -113,7 +114,9 @@ async function waitForBridgeHello(port, timeoutMs) {
       ...process.env,
       NEMESIS_E2E_USER_DATA: userData,
       NEMESIS_AUTO_SPAWN_GEA: 'false',
+      NEMESIS_BRIDGE_HOST: '127.0.0.1',
       NEMESIS_BRIDGE_PORT: String(bridgePort),
+      NEMESIS_BRIDGE_TOKEN: bridgeToken,
       NEMESIS_STARTUP_TRACE: 'true',
       NEMESIS_STARTUP_TRACE_FILE: traceFile,
     },
@@ -129,7 +132,7 @@ async function waitForBridgeHello(port, timeoutMs) {
 
   try {
     await waitFor('ipc startup', 90_000, () => readIfExists(traceFile).includes('ipc'), child, traceFile, output);
-    const hello = await waitForBridgeHello(bridgePort, 30_000);
+    const hello = await waitForBridgeHello(bridgePort, bridgeToken, 30_000);
     await waitFor('window load attempt', 30_000, () => {
       const trace = readIfExists(traceFile);
       return trace.includes('window-load-file-ok') || trace.includes('window-load-file-failed');

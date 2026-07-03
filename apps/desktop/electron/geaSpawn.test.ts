@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import path from 'node:path';
-import { createGeaSpawnPlan } from './geaSpawn.js';
+import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
 
 describe('GEA spawn planning', () => {
   it('uses cmd.exe for Windows npm dev spawn so .cmd launch does not throw EINVAL', () => {
@@ -61,5 +61,29 @@ describe('GEA spawn planning', () => {
       cwd: 'D:\\repo',
       windowsHide: false,
     });
+  });
+
+  it('passes the bridge URL and token to spawned GEA without putting the secret in args', () => {
+    const bridgeUrl = createGeaBridgeUrl('127.0.0.1', '7430');
+    const env = createGeaChildEnv({
+      PATH: 'C:\\Windows\\System32',
+      VITE_DEV_SERVER_URL: 'http://localhost:5173',
+    }, bridgeUrl, 'spawn-secret');
+
+    expect(env.NEMESIS_BRIDGE_URL).toBe('ws://127.0.0.1:7430');
+    expect(env.NEMESIS_BRIDGE_TOKEN).toBe('spawn-secret');
+    expect(env.VITE_DEV_SERVER_URL).toBeUndefined();
+
+    const plan = createGeaSpawnPlan({
+      platform: 'win32',
+      env: {},
+      repoRoot: 'D:\\repo',
+      geaRoot: 'D:\\repo\\apps\\global-event-alpha',
+      builtMain: 'D:\\repo\\apps\\global-event-alpha\\dist-electron\\main.js',
+      builtMainExists: true,
+      execPath: 'C:\\Program Files\\NEMESIS\\NEMESIS.exe',
+    });
+
+    expect(JSON.stringify(plan)).not.toContain('spawn-secret');
   });
 });

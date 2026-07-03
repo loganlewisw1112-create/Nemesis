@@ -60,8 +60,17 @@ import {
 } from '../../../packages/simulation-core/src/index.js';
 import { createGeaLocalStore, migrateGeaDatabase, type GeaDatabaseStatus, type GeaLocalStore } from './localDb.js';
 import { createEntryRecommendationPacket } from './bridgePublisher.js';
+import { resolveNemesisBridgeUrl } from './bridgeClient.js';
+import { resolveGeaUserDataPath } from './userDataPath.js';
+import { copyLegacyGeaDatabaseIfMissing, legacyGeaDatabasePath, resolveGeaDatabasePath } from './localDb.js';
 
-const BRIDGE_URL = process.env.NEMESIS_BRIDGE_URL ?? 'ws://localhost:7430';
+if (process.env.GEA_E2E_USER_DATA) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('disable-gpu');
+}
+app.setPath('userData', resolveGeaUserDataPath(process.env, app.getPath('appData')));
+
+const BRIDGE_URL = resolveNemesisBridgeUrl(process.env);
 const BRIDGE_VERSION = '0.1.0';
 const RECONNECT_INITIAL_MS = 2_000;
 const RECONNECT_MAX_MS = 30_000;
@@ -640,7 +649,8 @@ function startBrainCluster() {
 }
 
 async function initializeLocalDb() {
-  const dbPath = path.join(app.getPath('userData'), 'global-event-alpha.sqlite');
+  const dbPath = resolveGeaDatabasePath(app.getPath('userData'));
+  copyLegacyGeaDatabaseIfMissing(dbPath, legacyGeaDatabasePath(app.getPath('appData')));
   dbStatus = await migrateGeaDatabase(dbPath);
   localStore = dbStatus.available ? await createGeaLocalStore(dbPath) : null;
   broadcast('gea:dbStatus', dbStatus);

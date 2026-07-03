@@ -3,6 +3,7 @@ name: NEMESIS CI
 on:
   push:
     branches: ["main"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -58,6 +59,14 @@ jobs:
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
         run: |
+          $isRelease = "${{ startsWith(github.ref, 'refs/tags/') }}"
+          if ($isRelease -eq "true" -and (-not $env:CSC_LINK -or -not $env:CSC_KEY_PASSWORD)) {
+            throw "Release/tag builds require CSC_LINK and CSC_KEY_PASSWORD signing secrets."
+          }
+          if (-not $env:CSC_LINK -or -not $env:CSC_KEY_PASSWORD) {
+            "UNSIGNED CI ARTIFACTS: signing secrets are not configured for this non-release run." | Tee-Object -FilePath ci-artifacts/unsigned-artifacts.txt
+            $env:CSC_IDENTITY_AUTO_DISCOVERY = "false"
+          }
           npm run ci:package 2>&1 | Tee-Object -FilePath ci-artifacts/package.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -65,14 +74,21 @@ jobs:
         shell: pwsh
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
         run: |
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
           $files = @(
-            "apps/desktop/release/NEMESIS Setup 0.1.0.exe",
+            "apps/desktop/release/NEMESIS Setup $version.exe",
             "apps/desktop/release/win-unpacked/NEMESIS.exe",
-            "apps/desktop/release/win-unpacked/resources/gea-app/Global Event Alpha.exe"
+            "apps/desktop/release/win-unpacked/resources/gea-app/Global Event Alpha.exe",
+            "apps/global-event-alpha/release/win-unpacked/Global Event Alpha.exe"
           )
-          if (-not $env:CSC_LINK) {
-            "CSC_LINK not configured; package artifacts are unsigned in this run." | Tee-Object -FilePath ci-artifacts/signatures.log
+          $isRelease = "${{ startsWith(github.ref, 'refs/tags/') }}"
+          if (-not $env:CSC_LINK -or -not $env:CSC_KEY_PASSWORD) {
+            if ($isRelease -eq "true") {
+              throw "Release/tag builds require signing secrets before signature verification."
+            }
+            "UNSIGNED CI ARTIFACTS: signing secrets are not configured for this non-release run." | Tee-Object -FilePath ci-artifacts/signatures.log
             exit 0
           }
           foreach ($file in $files) {

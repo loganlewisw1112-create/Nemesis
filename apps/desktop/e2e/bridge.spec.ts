@@ -33,7 +33,7 @@ function recommendation(overrides = {}) {
   };
 }
 
-async function launchApp(port) {
+async function launchApp(port, token) {
   if (!fs.existsSync(mainEntry)) {
     throw new Error('Build required: run npm run build -w @nemesis/desktop before e2e tests');
   }
@@ -46,7 +46,9 @@ async function launchApp(port) {
       ...process.env,
       NEMESIS_E2E_USER_DATA: userData,
       NEMESIS_AUTO_SPAWN_GEA: 'false',
+      NEMESIS_BRIDGE_HOST: '127.0.0.1',
       NEMESIS_BRIDGE_PORT: String(port),
+      NEMESIS_BRIDGE_TOKEN: token,
     },
   });
 }
@@ -70,12 +72,13 @@ test.describe('NEMESIS bridge fail-closed behavior', () => {
 
   test('updates status for valid recommendations and rejects expired or forbidden packets', async () => {
     const port = 18_430 + Math.floor(Math.random() * 1_000);
-    app = await launchApp(port);
+    const token = `bridge-e2e-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    app = await launchApp(port, token);
     const page = await app.firstWindow({ timeout: 45_000 });
     await expect(page.getByRole('heading', { name: 'Edge Theater' })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/STND\s*ALONE/i)).toBeVisible();
 
-    ws = await connect(`ws://127.0.0.1:${port}`);
+    ws = await connect(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
     await expect(page.getByText(/INTEL\s*ONLINE/i)).toBeVisible({ timeout: 5_000 });
 
     ws.send(JSON.stringify({ type: 'brain:recommendation', payload: recommendation(), seq: 1 }));

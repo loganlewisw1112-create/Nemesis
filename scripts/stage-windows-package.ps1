@@ -2,12 +2,26 @@ param(
   [switch]$Package,
   [switch]$TrustCurrentUser,
   [string]$Subject = 'CN=NEMESIS Local Dev Code Signing',
-  [string]$TimestampServer = 'http://timestamp.digicert.com'
+  [string]$TimestampServer = 'http://timestamp.digicert.com',
+  [string]$StageDir = 'WINDOWS PACKAGE'
 )
 
 $ErrorActionPreference = 'Stop'
 
+$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
+Set-Location $RepoRoot
 Add-Type -AssemblyName System.Security
+
+function New-Password {
+  $bytes = New-Object byte[] 32
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $rng.GetBytes($bytes)
+  } finally {
+    $rng.Dispose()
+  }
+  return [Convert]::ToBase64String($bytes)
+}
 
 function Test-CodeSigningEku($cert) {
   foreach ($extension in $cert.Extensions) {
@@ -34,8 +48,8 @@ function Get-CodeSigningCertificate {
           -and $_.NotAfter -gt (Get-Date).AddDays(7) `
           -and (Test-CodeSigningEku $_)
       } |
-    Sort-Object NotAfter -Descending |
-    Select-Object -First 1
+      Sort-Object NotAfter -Descending |
+      Select-Object -First 1
 
     if ($cert) { return $cert }
 
@@ -102,17 +116,6 @@ function Trust-CertificateForCurrentUser($cert) {
   }
 }
 
-function New-Password {
-  $bytes = New-Object byte[] 32
-  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-  try {
-    $rng.GetBytes($bytes)
-  } finally {
-    $rng.Dispose()
-  }
-  return [Convert]::ToBase64String($bytes)
-}
-
 function Invoke-NpmPackage {
   $oldCscLink = $env:CSC_LINK
   $oldCscPassword = $env:CSC_KEY_PASSWORD
@@ -137,23 +140,62 @@ function Invoke-NpmPackage {
   }
 }
 
-function Sign-Artifact($path, $cert) {
-  if (!(Test-Path $path)) { throw "Missing signing target: $path" }
-  $signature = Set-AuthenticodeSignature -FilePath $path -Certificate $cert -HashAlgorithm SHA256
+function Get-PackageVersion {
+  return (Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'package.json') | ConvertFrom-Json).version
+}
+
+function Get-RequiredTargets($Version) {
+  return @(
+    'apps\global-event-alpha\release\win-unpacked\Global Event Alpha.exe',
+    'apps\desktop\release\win-unpacked\resources\gea-app\Global Event Alpha.exe',
+    'apps\desktop\release\win-unpacked\NEMESIS.exe',
+    "apps\desktop\release\NEMESIS Setup $Version.exe"
+  )
+}
+
+function Sign-Artifact($Path, $cert) {
+  if (!(Test-Path -LiteralPath $Path)) { throw "Missing signing target: $Path" }
+  $signature = Set-AuthenticodeSignature -FilePath $Path -Certificate $cert -HashAlgorithm SHA256
   if ($signature.Status -ne 'Valid') {
-    throw "Signing failed for ${path}: $($signature.StatusMessage)"
+    throw "Signing failed for ${Path}: $($signature.StatusMessage)"
   }
 }
 
-function Assert-SignedArtifact($path) {
-  if (!(Test-Path $path)) { throw "Missing signing target: $path" }
-  $sig = Get-AuthenticodeSignature $path
-  "{0}`t{1}`t{2}" -f $path, $sig.Status, $sig.SignerCertificate.Subject
+function Assert-SignedArtifact($Path) {
+  if (!(Test-Path -LiteralPath $Path)) { throw "Missing signing target: $Path" }
+  $sig = Get-AuthenticodeSignature -FilePath $Path
+  $subject = ''
+  if ($sig.SignerCertificate) { $subject = $sig.SignerCertificate.Subject }
+  $line = "{0}`t{1}`t{2}" -f $Path, $sig.Status, $subject
   if ($sig.Status -ne 'Valid') {
-    throw "Signature verification failed for ${path}: $($sig.StatusMessage)"
+    throw "Signature verification failed for ${Path}: $($sig.StatusMessage)"
   }
+  return $line
 }
 
+function Write-HashEvidence($StagedFile) {
+  $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $StagedFile
+  $hashFile = "$StagedFile.sha256.txt"
+  $content = "$($hash.Hash)  $(Split-Path -Leaf $StagedFile)"
+  Set-Content -LiteralPath $hashFile -Value $content -Encoding UTF8
+  $written = (Get-Content -Raw -LiteralPath $hashFile).Trim()
+  if ($written -ne $content) {
+    throw "Hash output mismatch for ${hashFile}"
+  }
+  return $hashFile
+}
+
+function Remove-StaleStagedPackages($StagePath, $CurrentSetup) {
+  $current = @(
+    [System.IO.Path]::GetFullPath($CurrentSetup),
+    [System.IO.Path]::GetFullPath("$CurrentSetup.sha256.txt")
+  )
+  Get-ChildItem -LiteralPath $StagePath -Filter 'NEMESIS-Windows-v*-Setup.exe*' -ErrorAction SilentlyContinue |
+    Where-Object { $current -notcontains [System.IO.Path]::GetFullPath($_.FullName) } |
+    Remove-Item -Force
+}
+
+$Version = Get-PackageVersion
 $cert = Get-CodeSigningCertificate
 if ($TrustCurrentUser) {
   Trust-CertificateForCurrentUser $cert
@@ -163,21 +205,26 @@ if ($Package) {
   Invoke-NpmPackage
 }
 
-$Version = (Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version
-
-$targets = @(
-  'apps\global-event-alpha\release\win-unpacked\Global Event Alpha.exe',
-  'apps\desktop\release\win-unpacked\resources\gea-app\Global Event Alpha.exe',
-  'apps\desktop\release\win-unpacked\NEMESIS.exe',
-  "apps\desktop\release\NEMESIS Setup $Version.exe"
-)
-
+$targets = Get-RequiredTargets $Version
 foreach ($target in $targets) {
   Sign-Artifact $target $cert
 }
 
-foreach ($target in $targets) {
+$stagePath = Join-Path $RepoRoot $StageDir
+New-Item -ItemType Directory -Force -Path $stagePath | Out-Null
+$setupPath = "apps\desktop\release\NEMESIS Setup $Version.exe"
+$stagedSetup = Join-Path $stagePath "NEMESIS-Windows-v$Version-Setup.exe"
+Remove-StaleStagedPackages $stagePath $stagedSetup
+Copy-Item -LiteralPath $setupPath -Destination $stagedSetup -Force
+
+$signatureLines = foreach ($target in ($targets + $stagedSetup)) {
   Assert-SignedArtifact $target
 }
+$signaturePath = Join-Path $stagePath 'signatures.txt'
+Set-Content -LiteralPath $signaturePath -Value $signatureLines -Encoding UTF8
 
-Write-Host "NEMESIS Windows artifacts verify as Authenticode Valid for current user certificate trust."
+$hashPath = Write-HashEvidence $stagedSetup
+
+Write-Host "Staged signed Windows package: $stagedSetup"
+Write-Host "SHA256: $hashPath"
+Write-Host "Signatures: $signaturePath"

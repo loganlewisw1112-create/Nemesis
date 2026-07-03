@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { GEA_SCHEMA } from './localDb.js';
+import {
+  GEA_SCHEMA,
+  copyLegacyGeaDatabaseIfMissing,
+  legacyGeaDatabasePath,
+  resolveGeaDatabasePath,
+} from './localDb.js';
 
 describe('GEA local database schema', () => {
   it('includes durable Kalshi orderbook snapshots for tape replay', () => {
@@ -54,5 +59,32 @@ describe('GEA local database schema', () => {
     expect(pkg.scripts?.postinstall).toBeUndefined();
     expect(pkg.scripts?.package).toContain('rebuild:sqlite');
     expect(pkg.scripts?.package).toContain('electron-builder');
+  });
+
+  it('resolves the normal product SQLite path from GEA user data', () => {
+    expect(resolveGeaDatabasePath('C:\\Users\\logan\\AppData\\Roaming\\@nemesis\\global-event-alpha'))
+      .toBe(path.join('C:\\Users\\logan\\AppData\\Roaming\\@nemesis\\global-event-alpha', 'global-event-alpha.sqlite'));
+  });
+
+  it('copies the legacy Electron SQLite database only when the product database is missing', () => {
+    const root = fs.mkdtempSync(path.join(process.cwd(), 'tmp-gea-db-'));
+    try {
+      const appData = path.join(root, 'AppData', 'Roaming');
+      const userData = path.join(appData, '@nemesis', 'global-event-alpha');
+      const legacyPath = legacyGeaDatabasePath(appData);
+      const productPath = resolveGeaDatabasePath(userData);
+
+      fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+      fs.writeFileSync(legacyPath, 'legacy-db');
+
+      expect(copyLegacyGeaDatabaseIfMissing(productPath, legacyPath)).toBe(true);
+      expect(fs.readFileSync(productPath, 'utf8')).toBe('legacy-db');
+
+      fs.writeFileSync(productPath, 'product-db');
+      expect(copyLegacyGeaDatabaseIfMissing(productPath, legacyPath)).toBe(false);
+      expect(fs.readFileSync(productPath, 'utf8')).toBe('product-db');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

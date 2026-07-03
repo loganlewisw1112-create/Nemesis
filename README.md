@@ -2,7 +2,7 @@
 
 [![NEMESIS CI](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml/badge.svg)](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml)
 
-Current as of June 30, 2026.
+Current as of July 3, 2026.
 
 NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha (GEA) intelligence app. It is built for event-market thesis discovery, fillability-aware ticket ranking, paper execution, profit-retention research, fail-closed bridge recommendations, and staged live-trading readiness.
 
@@ -34,14 +34,14 @@ GEA connected to NEMESIS with mirrored state, market/tape intelligence, paper P&
 - Assigns executable tiers: Scout, Solid, and Whale, based on fillable depth and slippage context.
 - Scores trade theses by net edge, probability gap, settlement clarity, liquidity, freshness, confidence, spread, slippage, source context, and bridge latency.
 - Runs a NEMESIS desktop app and a companion Global Event Alpha desktop app.
-- Publishes GEA recommendation, no-trade, exit, close-result, hello, ping, and state-mirror packets over a local WebSocket bridge.
+- Publishes GEA recommendation, no-trade, exit, close-result, hello, ping, and state-mirror packets over an authenticated loopback WebSocket bridge.
 - Validates bridge packets fail-closed, including role, freshness, confidence, settlement clarity, schema, and sequence checks.
 - Executes paper buys, paper closes, paper cancels, and paper auto-close actions through a dry-run fill model.
 - Tracks paper cash, equity, daily P&L, open positions, fills, working orders, marks, regimes, and auto-close history.
 - Runs ProfitOS paper auto-close with dynamic exit scoring, GEA exit freshness, velocity trims, predictive threshold crossing, and profit-biased close thresholds.
 - Keeps live trading behind an 8-gate guardrail model plus staged manual-live and auto-live unlock certificates.
 - Persists GEA market snapshots, orderbook snapshots, public data, ticket cards, profit-retention state, and close feedback in SQLite when the native module is available.
-- Builds a Windows installer through Electron Builder.
+- Builds Windows packages through Electron Builder, with separate postures for unsigned development CI, local signed/staged packages, and release signed packages.
 
 ## Safety Model
 
@@ -121,11 +121,13 @@ GEA uses `better-sqlite3` for local persistence. Packaging runs the Electron nat
 npm run rebuild:sqlite -w @nemesis/global-event-alpha
 ```
 
-The GEA SQLite database is stored under the Electron user-data directory, typically:
+The GEA SQLite database is stored under the product user-data directory:
 
 ```text
 %APPDATA%\@nemesis\global-event-alpha\global-event-alpha.sqlite
 ```
+
+On first launch after an older Electron-default build, GEA non-destructively copies `%APPDATA%\Electron\global-event-alpha.sqlite` to the product path if the product database is missing.
 
 ## Run
 
@@ -135,7 +137,7 @@ Launch NEMESIS in development:
 npm run dev
 ```
 
-`npm run dev` delegates to `@nemesis/desktop`. NEMESIS starts its local bridge server on port `7430` by default and can auto-spawn Global Event Alpha.
+`npm run dev` delegates to `@nemesis/desktop`. NEMESIS starts its authenticated local bridge server on `127.0.0.1:7430` by default and can auto-spawn Global Event Alpha with the bridge token in the child process environment.
 
 Run GEA directly:
 
@@ -148,7 +150,12 @@ Useful environment variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NEMESIS_BRIDGE_PORT` | `7430` | Local WebSocket bridge port |
+| `NEMESIS_BRIDGE_HOST` | `127.0.0.1` | Bridge bind host; non-loopback values require `NEMESIS_ALLOW_REMOTE_BRIDGE=true` |
+| `NEMESIS_BRIDGE_TOKEN` | generated per NEMESIS process | Bridge authentication token; spawned GEA receives it automatically |
+| `NEMESIS_ALLOW_REMOTE_BRIDGE` | unset | Must be `true` before NEMESIS accepts a non-loopback bridge host |
 | `NEMESIS_AUTO_SPAWN_GEA` | not `false` | Set to `false` to stop NEMESIS from auto-spawning GEA |
+| `NEMESIS_E2E_USER_DATA` | unset | NEMESIS e2e user-data override |
+| `GEA_E2E_USER_DATA` | unset | GEA e2e user-data override |
 | `GEA_TAPE_REFRESH_MS` | `30000` | GEA Kalshi tape REST refresh interval |
 | `GEA_TAPE_STALE_MS` | `15000` | GEA tape stale threshold |
 | `GEA_TAPE_MARKET_LIMIT` | `25` | GEA market refresh limit |
@@ -167,10 +174,12 @@ Useful environment variables:
 | `npm run build` | Build every workspace that exposes a build script |
 | `npm run build -w @nemesis/desktop` | Build the NEMESIS desktop app |
 | `npm run build -w @nemesis/global-event-alpha` | Build the Global Event Alpha app |
-| `npm run ci:e2e` | Run the direct Electron startup smoke with bridge `bridge:hello` verification |
+| `npm run ci:e2e` | Run the direct Electron startup smoke with authenticated bridge `bridge:hello` verification |
 | `npm run ci:package` | Build GEA, rebuild SQLite for Electron, and package the Windows apps |
 | `npm run package` | Build the Windows installer; signs when `CSC_LINK` and `CSC_KEY_PASSWORD` are configured |
-| `npm run package:local-signed` | Build and locally sign Windows artifacts with a current-user trusted NEMESIS dev certificate |
+| `npm run package:local-signed` | Build, locally sign, verify, hash, and stage the Windows package with a current-user trusted NEMESIS dev certificate |
+| `npm run stage:windows-package` | Sign, verify, hash, and stage existing Windows package outputs |
+| `npm run smoke:desktop-pair` | Launch the built NEMESIS/GEA pair and verify visible windows plus authenticated bridge `hello/state/pong` |
 
 ## Architecture
 
@@ -192,7 +201,7 @@ packages/simulation-core/  Replay, ticket autopsy, and model evaluation utilitie
 
 ## Bridge Contract
 
-The local bridge currently supports these message types:
+The local bridge binds to `127.0.0.1` by default and requires a token query parameter before NEMESIS sends `bridge:hello` or `nemesis:state`. The bridge currently supports these message types:
 
 - `bridge:hello`
 - `bridge:ping`
@@ -203,7 +212,7 @@ The local bridge currently supports these message types:
 - `brain:exit`
 - `nemesis:close-result`
 
-NEMESIS rejects expired recommendations, forbidden publishing roles, malformed packets, low-clarity packets, and invalid exit/close payloads before they can become visible tickets or exit actions.
+NEMESIS rejects unauthenticated clients, expired recommendations, forbidden publishing roles, malformed packets, low-clarity packets, and invalid exit/close payloads before they can become visible tickets or exit actions.
 
 ## Build And Verify
 
@@ -215,6 +224,7 @@ npm run ci:build
 npm run ci:unit
 npm run ci:e2e
 npm run ci:package
+npm run smoke:desktop-pair
 ```
 
 For a faster documentation-only check, verify the README-linked screenshots exist and run at least:
@@ -234,9 +244,23 @@ npm run package
 
 The package flow builds Global Event Alpha first, rebuilds `better-sqlite3` for Electron, writes the unpacked GEA app to `apps/global-event-alpha/release/win-unpacked`, then bundles that app into the NEMESIS desktop package under `resources/gea-app`.
 
-The desktop package uses Electron Builder with an NSIS target. Configure `CSC_LINK` and `CSC_KEY_PASSWORD` locally or as GitHub Actions secrets to sign the Windows executable and installer; output is written under `apps/desktop/release`.
+The desktop package uses Electron Builder with an NSIS target. Raw Electron Builder output is written under `apps/desktop/release`.
 
-For this development machine, `npm run package:local-signed` creates or reuses a current-user `NEMESIS Local Dev Code Signing` certificate, trusts it only for the current Windows user, exports a temporary PFX for Electron Builder, deletes that temporary PFX, and verifies the packaged artifacts with `Get-AuthenticodeSignature`. This removes `NotSigned` locally, but it is not a substitute for a CA-issued certificate for public distribution.
+Packaging/signing postures:
+
+- Development CI may build unsigned artifacts when signing secrets are absent. CI labels those artifacts as unsigned and still uploads evidence.
+- Release/tag CI fails if `CSC_LINK` or `CSC_KEY_PASSWORD` is absent. Release artifacts must verify as Authenticode `Valid`.
+- Local signed packages use `npm run package:local-signed` to build, sign, verify, hash, and stage the installer.
+
+For this development machine, `npm run package:local-signed` creates or reuses a current-user `NEMESIS Local Dev Code Signing` certificate, trusts it only for the current Windows user, signs the required executables, verifies them with `Get-AuthenticodeSignature`, and stages:
+
+```text
+WINDOWS PACKAGE\NEMESIS-Windows-v0.1.0-Setup.exe
+WINDOWS PACKAGE\NEMESIS-Windows-v0.1.0-Setup.exe.sha256.txt
+WINDOWS PACKAGE\signatures.txt
+```
+
+Required signature targets are the final setup executable, unpacked `NEMESIS.exe`, bundled `resources\gea-app\Global Event Alpha.exe`, and the GEA release `Global Event Alpha.exe`. The local development certificate removes `NotSigned` locally, but it is not a substitute for a CA-issued certificate for public distribution.
 
 ## Repository Status
 
@@ -245,8 +269,8 @@ This README describes the current NEMESIS + GEA mainline after CI/package stabil
 - GEA SQLite persistence is declared through `better-sqlite3`.
 - GEA native SQLite rebuild support is present through `rebuild:sqlite`; the package script runs it before Electron Builder.
 - NEMESIS and GEA use Electron `42.5.0`.
-- The root CI path runs `npm ci`, build, typecheck, 160 Vitest tests, direct Electron bridge smoke, Windows packaging, and signature verification.
-- The direct Electron smoke waits for startup trace milestones, verifies `window-load-file-ok`, and requires bridge `bridge:hello`.
+- The root CI path runs `npm ci`, build, typecheck, Vitest, direct authenticated Electron bridge smoke, Windows packaging, and signature verification or unsigned labeling.
+- The direct Electron smoke waits for startup trace milestones, verifies `window-load-file-ok`, and requires authenticated bridge `bridge:hello`.
 - Package output includes the NSIS setup executable, unpacked `NEMESIS.exe`, and bundled `resources/gea-app/Global Event Alpha.exe`.
 
 ## Risk Notice
@@ -259,4 +283,4 @@ See [DISCLAIMER.md](DISCLAIMER.md) for the full risk notice.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Proprietary and all rights reserved. See [LICENSE](LICENSE).
