@@ -43,6 +43,22 @@ describe('kalshi client', () => {
     expect(ob.spread).toBeDefined();
   });
 
+  it('parses orderbook_fp dollar-string levels as executable depth', () => {
+    const ob = parseOrderbook('TEST', {
+      orderbook_fp: {
+        no_dollars: [['0.9790', '5000.00'], ['0.9880', '92.00']],
+        yes_dollars: [],
+      },
+    });
+
+    expect(ob.no).toEqual([
+      { price: 0.988, quantity: 92 },
+      { price: 0.979, quantity: 5000 },
+    ]);
+    expect(ob.yesAsk).toBeCloseTo(0.012);
+    expect(sanitizeExecutableBook(ob).no).toHaveLength(2);
+  });
+
   it('normalizes cent market prices', () => {
     const m: KalshiMarket = { ticker: 'T', title: 'T', status: 'open', yes_ask: 34 };
     expect(normalizeMarketPrice(m)).toBeCloseTo(0.34);

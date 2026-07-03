@@ -336,6 +336,10 @@ function isRetryableExecutionCode(code?: string): boolean {
   return code === 'book_unavailable' || code === 'fill_aborted';
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function recordPaperBlock(input: {
   thesisId?: string;
   ticker?: string;
@@ -748,13 +752,14 @@ async function executeStrictPaperBuyForCard(
   try {
     book = await fetchBookForCard(card);
     opportunityQueue.markBookFetched(key);
-  } catch {
+  } catch (error) {
+    const reason = describeError(error);
     sessionStatsData.abortCount += 1;
     opportunityQueue.markBlocked(key, 'book_unavailable', true);
     recordPaperBlock({
       thesisId,
       ticker: card.ticker,
-      detail: `${source} paper buy blocked: book unavailable`,
+      detail: `${source} paper buy blocked: book unavailable (${reason})`,
       code: 'book_unavailable',
       severity: 'warning',
       blocksLiveUnlock: false,
@@ -763,7 +768,8 @@ async function executeStrictPaperBuyForCard(
     return {
       ok: false,
       aborted: true,
-      abortReason: 'book unavailable',
+      abortReason: `book unavailable: ${reason}`,
+      error: `book unavailable: ${reason}`,
       abortCode: 'book_unavailable',
       queueState: 'blocked_retryable',
       wouldMutate: false,
@@ -929,10 +935,11 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
   let book: KalshiOrderbook;
   try {
     book = cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
-  } catch {
+  } catch (error) {
+    const reason = describeError(error);
     recordPaperBlock({
       ticker: pos.ticker,
-      detail: `auto-${decision.action} blocked: book unavailable`,
+      detail: `auto-${decision.action} blocked: book unavailable (${reason})`,
       code: 'book_unavailable',
       severity: 'warning',
       blocksLiveUnlock: false,
@@ -1956,8 +1963,9 @@ function setupIpc() {
         resetDryRunInvalidationStreak();
       }
       return result;
-    } catch {
-      return { aborted: true, abortReason: 'book unavailable', abortCode: 'book_unavailable' };
+    } catch (error) {
+      const reason = describeError(error);
+      return { aborted: true, abortReason: `book unavailable: ${reason}`, abortCode: 'book_unavailable' };
     }
   });
 
@@ -2085,15 +2093,16 @@ function setupIpc() {
     let book: KalshiOrderbook;
     try {
       book = cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
-    } catch {
+    } catch (error) {
+      const reason = describeError(error);
       recordPaperBlock({
         ticker: pos.ticker,
-        detail: 'manual close blocked: book unavailable',
+        detail: `manual close blocked: book unavailable (${reason})`,
         code: 'book_unavailable',
         severity: 'warning',
         blocksLiveUnlock: false,
       });
-      return { ok: false, error: 'book unavailable', abortCode: 'book_unavailable', wouldMutate: false };
+      return { ok: false, error: `book unavailable: ${reason}`, abortCode: 'book_unavailable', wouldMutate: false };
     }
     const result = simulatePaperClose(paperDesk, positionId, book, pos.side, expectedPrice, qty, settings);
     if (result.ok) {
@@ -2131,8 +2140,9 @@ function setupIpc() {
     try {
       const book = await fetchBookForCard(card);
       return dryRunFill(book, card.side, qty, card.impliedPrice, settings.maxSlippagePp);
-    } catch {
-      return { aborted: true, abortReason: 'book unavailable', abortCode: 'book_unavailable' };
+    } catch (error) {
+      const reason = describeError(error);
+      return { aborted: true, abortReason: `book unavailable: ${reason}`, abortCode: 'book_unavailable' };
     }
   });
 

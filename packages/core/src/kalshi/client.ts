@@ -86,14 +86,28 @@ export function normalizeMarketPrice(market: KalshiMarket, side: 'yes' | 'no' = 
 }
 
 export function parseOrderbook(ticker: string, raw: Record<string, unknown>): KalshiOrderbook {
-  const ob = (raw.orderbook ?? raw) as Record<string, unknown>;
-  const parseLevels = (side: unknown): OrderbookLevel[] => {
+  const books = [raw.orderbook, raw.orderbook_fp, raw]
+    .filter((book): book is Record<string, unknown> => typeof book === 'object' && book !== null);
+
+  const parseNumber = (value: unknown): number | null => {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string') {
+      const parsed = Number.parseFloat(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+  };
+
+  const parseLevels = (side: unknown, quotedInDollars: boolean): OrderbookLevel[] => {
     if (!Array.isArray(side)) return [];
     return side
       .map((row: unknown) => {
         if (Array.isArray(row) && row.length >= 2) {
-          const price = row[0] > 1 ? row[0] / 100 : row[0];
-          return { price, quantity: row[1] as number };
+          const rawPrice = parseNumber(row[0]);
+          const quantity = parseNumber(row[1]);
+          if (rawPrice === null || quantity === null) return null;
+          const price = quotedInDollars ? rawPrice : (rawPrice > 1 ? rawPrice / 100 : rawPrice);
+          return { price, quantity };
         }
         return null;
       })
@@ -101,8 +115,14 @@ export function parseOrderbook(ticker: string, raw: Record<string, unknown>): Ka
       .sort((a, b) => b.price - a.price);
   };
 
-  const yes = parseLevels(ob.yes ?? ob.yes_dollars);
-  const no = parseLevels(ob.no ?? ob.no_dollars);
+  const collectLevels = (centsKey: 'yes' | 'no', dollarsKey: 'yes_dollars' | 'no_dollars') => {
+    const cents = books.flatMap((book) => parseLevels(book[centsKey], false));
+    if (cents.length > 0) return cents.sort((a, b) => b.price - a.price);
+    return books.flatMap((book) => parseLevels(book[dollarsKey], true)).sort((a, b) => b.price - a.price);
+  };
+
+  const yes = collectLevels('yes', 'yes_dollars');
+  const no = collectLevels('no', 'no_dollars');
   const bestYesBid = yes[0]?.price;
   const bestNoBid = no[0]?.price;
   const yesAsk = bestNoBid !== undefined ? 1 - bestNoBid : undefined;
