@@ -2,7 +2,7 @@
 
 [![NEMESIS CI](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml/badge.svg)](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml)
 
-Current as of July 3, 2026.
+Current as of July 4, 2026.
 
 NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha (GEA) intelligence app. It is built for event-market thesis discovery, fillability-aware ticket ranking, paper execution, profit-retention research, fail-closed bridge recommendations, and staged live-trading readiness.
 
@@ -10,15 +10,21 @@ The default posture is intentionally conservative: demo mode on, dry-run on, liv
 
 ## Screenshots
 
+### Strict Profit Certification Flow
+
+NEMESIS now keeps suggested tickets watch-only until a fresh executable book can prove a post-fee, post-slippage paper profit certificate.
+
+![NEMESIS Strict Profit Certification Flow](docs/screenshots/nemesis-strict-profit-flow.gif)
+
 ### NEMESIS Edge Theater
 
-Ranked thesis discovery with GEA bridge status, Scout/Solid/Whale tiers, tradeability filters, guardrails, and risk cockpit context.
+Ranked thesis discovery with GEA bridge status, Scout/Solid/Whale tiers, tradeability filters, guardrails, risk cockpit context, and visible strict-certification block reasons.
 
 ![NEMESIS Edge Theater](docs/screenshots/nemesis-edge-theater.png)
 
 ### NEMESIS Paper Command Desk
 
-Paper portfolio, open positions, working orders, realized/unrealized P&L, trade blotter, auto-close decisions, guardrails, and risk panels.
+Paper portfolio, open positions, working orders, realized/unrealized P&L, trade blotter, auto-close decisions, guardrails, and risk panels. Trade count only moves after a certified paper mutation.
 
 ![NEMESIS Paper Command Desk](docs/screenshots/nemesis-paper-desk.png)
 
@@ -31,12 +37,16 @@ GEA connected to NEMESIS with mirrored state, market/tape intelligence, paper P&
 ## Current Capabilities
 
 - Discovers and ranks Kalshi/event-market opportunities from a broader universe cache.
+- Runs a strict profit-only paper execution gate: opens and closes require a valid `ProfitCertificate` with `netPnlUsd >= $0.01` after modeled fees and slippage.
+- Rejects missing, zero, stale, synthetic, and non-executable orderbooks before any mutating paper action.
+- Keeps unproven ideas visible as watch-only candidates with explicit certification block reasons instead of allowing bad paper buys.
+- Scans candidates through a high-throughput queue that fetches books in bounded parallel batches, retries temporary depth/freshness failures, and executes only certified opportunities.
 - Assigns executable tiers: Scout, Solid, and Whale, based on fillable depth and slippage context.
 - Scores trade theses by net edge, probability gap, settlement clarity, liquidity, freshness, confidence, spread, slippage, source context, and bridge latency.
 - Runs a NEMESIS desktop app and a companion Global Event Alpha desktop app.
 - Publishes GEA recommendation, no-trade, exit, close-result, hello, ping, and state-mirror packets over an authenticated loopback WebSocket bridge.
 - Validates bridge packets fail-closed, including role, freshness, confidence, settlement clarity, schema, and sequence checks.
-- Executes paper buys, paper closes, paper cancels, and paper auto-close actions through a dry-run fill model.
+- Executes paper buys, paper closes, paper cancels, and paper auto-close actions through a strict, certificate-backed dry-run fill model.
 - Tracks paper cash, equity, daily P&L, open positions, fills, working orders, marks, regimes, and auto-close history.
 - Runs ProfitOS paper auto-close with dynamic exit scoring, GEA exit freshness, velocity trims, predictive threshold crossing, and profit-biased close thresholds.
 - Keeps live trading behind an 8-gate guardrail model plus staged manual-live and auto-live unlock certificates.
@@ -59,6 +69,10 @@ NEMESIS is not live-first software. The current defaults in code are:
 | Daily loss cap | `$5` |
 | Max slippage | `3pp` |
 | Paper wallet | `$1,000` |
+| Strict profit mode | On |
+| Minimum certified net P&L | `$0.01` |
+| Maximum executable book age | `2 seconds` |
+| Emergency loss close | Off |
 | ProfitOS auto-close | Off |
 | ProfitOS live orders | Not supported |
 
@@ -69,6 +83,19 @@ Live unlock is staged:
 3. Auto live requires manual live first, at least 20 reconciled manual-live orders, no risk breaches, no unresolved rejects, manual slippage within modeled slippage plus 2pp, at least 30 shadow-auto decisions with expectancy at or above manual baseline, shadow false-exit rate at or below 8%, positive missed-ticket reduction, at least 15 tiny-auto pilot trades, positive pilot expectancy, no pilot risk breaches, and the confirmation text `ENABLE LIVE AUTO`.
 
 The kill switch is available from the UI and by `Ctrl+Shift+K`.
+
+## Strict Profit Gate
+
+NEMESIS prefers no trade over an unproven trade. Every paper open and close now needs a local, fee-aware execution certificate before the Paper Desk can mutate:
+
+- Entry/exit price, contracts, fees, modeled slippage, book age, and `netPnlUsd` are captured in the certificate.
+- `netPnlUsd` must be at least `$0.01`.
+- Books must be real, fresh, sanitized, and deep enough to execute the requested side.
+- Fallback liquidity, synthetic prices, stale quotes, `0`, `1`, `NaN`, and missing depth are rejected.
+- Flat or negative paper closes are quarantined unless a future explicit emergency-loss mode is enabled.
+- GEA can improve discovery and timing, but it cannot bypass local strict certification.
+
+The throughput engine still tries to maximize trades per day by scanning more candidates, refreshing books, and retrying temporary depth/freshness blocks. Volume never weakens the profit gate: if market data cannot certify a profitable paper mutation, the correct result is no trade.
 
 ## ProfitOS Paper Auto-Close
 
@@ -227,7 +254,7 @@ npm run ci:package
 npm run smoke:desktop-pair
 ```
 
-For a faster documentation-only check, verify the README-linked screenshots exist and run at least:
+For a faster documentation-only check, verify the README-linked screenshots/GIF exist and run at least:
 
 ```bash
 git status --short
@@ -269,6 +296,7 @@ This README describes the current NEMESIS + GEA mainline after CI/package stabil
 - GEA SQLite persistence is declared through `better-sqlite3`.
 - GEA native SQLite rebuild support is present through `rebuild:sqlite`; the package script runs it before Electron Builder.
 - NEMESIS and GEA use Electron `42.5.0`.
+- Strict profit certification is enabled for paper execution and surfaced on thesis cards as certified, retryable, or blocked.
 - The root CI path runs `npm ci`, build, typecheck, Vitest, direct authenticated Electron bridge smoke, Windows packaging, and signature verification or unsigned labeling.
 - The direct Electron smoke waits for startup trace milestones, verifies `window-load-file-ok`, and requires authenticated bridge `bridge:hello`.
 - Package output includes the NSIS setup executable, unpacked `NEMESIS.exe`, and bundled `resources/gea-app/Global Event Alpha.exe`.
