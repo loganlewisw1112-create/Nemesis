@@ -79,6 +79,7 @@ import {
   updateAutoCloseState,
   ProfitabilityBenchmark,
   OpportunityThroughputQueue,
+  annotateCardsWithCertification,
   type AutoCloseExitSignal,
   type LiveCredentials,
   type PaperBuyResult,
@@ -755,7 +756,7 @@ async function executeStrictPaperBuyForCard(
   } catch (error) {
     const reason = describeError(error);
     sessionStatsData.abortCount += 1;
-    opportunityQueue.markBlocked(key, 'book_unavailable', true);
+    opportunityQueue.markBlocked(key, `book unavailable: ${reason}`, true);
     recordPaperBlock({
       thesisId,
       ticker: card.ticker,
@@ -780,9 +781,10 @@ async function executeStrictPaperBuyForCard(
   const result = simulatePaperBuy(paperDesk, card, book, settings, contracts);
   if (!result.ok) {
     sessionStatsData.abortCount += 1;
+    const blockReason = result.abortReason ?? result.error ?? result.abortCode ?? 'paper buy blocked';
     opportunityQueue.markBlocked(
       key,
-      result.abortCode ?? result.abortReason ?? result.error ?? 'paper buy blocked',
+      blockReason,
       retryableFromResult(result),
     );
     recordPaperBlock({
@@ -1223,6 +1225,7 @@ async function runThroughputCertification(trigger: string) {
       }));
     }
     if (candidates.length > 0) {
+      publishMarketState();
       broadcastToGea({
         type: 'nemesis:state',
         payload: { ...buildNemesisStateMirror(), throughputTrigger: trigger },
@@ -1301,7 +1304,7 @@ function replaceGeaTheses(base: ThesisCard[]): ThesisCard[] {
 function publishMarketState(extra: Record<string, unknown> = {}) {
   broadcast('markets:update', {
     markets: marketsCache,
-    theses: rankThesesForUi(theses),
+    theses: thesesForUi(),
     connectors: registry.getAll(),
     tradeFeed: feedHub.getTradeFeedState(),
     discovery: discovery.getState(),
@@ -1389,6 +1392,32 @@ function rankThesesForUi(cards: ThesisCard[]): ThesisCard[] {
     }))
     .sort((a, b) => b.score - a.score || a.index - b.index)
     .map((row) => row.card);
+}
+
+function thesesForUi(): ThesisCard[] {
+  return annotateCardsWithCertification(
+    rankThesesForUi(theses),
+    opportunityQueue.snapshot(),
+    Date.now(),
+  );
+}
+
+function certifiedQueueItemForCard(card: Pick<ThesisCard, 'ticker' | 'side'>) {
+  const key = opportunityKey(card);
+  const item = opportunityQueue.snapshot().items.find((candidate) => candidate.key === key);
+  if (!item?.profitCertificate) return null;
+  if (item.state !== 'certified') return null;
+  if (item.profitCertificate.expiresAt < Date.now()) return null;
+  return item;
+}
+
+function certificationBlockForCard(card: Pick<ThesisCard, 'ticker' | 'side'>): string {
+  const key = opportunityKey(card);
+  const item = opportunityQueue.snapshot().items.find((candidate) => candidate.key === key);
+  if (item?.blockReason) return item.blockReason;
+  if (item?.state === 'executed') return 'already executed';
+  if (item?.state === 'book_pending') return 'awaiting executable book certification';
+  return 'awaiting strict profit certification';
 }
 
 async function refreshMarkets() {
@@ -1864,7 +1893,7 @@ function setupIpc() {
     const liveUnlock = buildLiveUnlockReadiness(targetStage, confirmText);
     return {
       settings,
-      theses: rankThesesForUi(theses),
+      theses: thesesForUi(),
       gates: evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false),
       connectors: registry.getAll(),
       tradeFeed: feedHub.getTradeFeedState(),
@@ -2079,6 +2108,19 @@ function setupIpc() {
     const card = theses.find((t) => t.id === thesisId);
     if (!card || card.netEdge <= 0) {
       return { ok: false, error: 'thesis not eligible for paper trading' };
+    }
+    const certified = certifiedQueueItemForCard(card);
+    if (!certified) {
+      const reason = certificationBlockForCard(card);
+      return {
+        ok: false,
+        aborted: true,
+        error: `not strict-profit certified: ${reason}`,
+        abortReason: `not strict-profit certified: ${reason}`,
+        abortCode: 'not_certified',
+        queueState: 'blocked_final',
+        wouldMutate: false,
+      };
     }
     return executeStrictPaperBuyForCard(card, contracts, 'manual');
   });

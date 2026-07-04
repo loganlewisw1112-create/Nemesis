@@ -1,13 +1,12 @@
-import type { OpportunityThroughputSettings, ProfitCertificate, ThesisCard } from '@nemesis/core';
+import type {
+  ExecutionQueueState,
+  OpportunityThroughputSettings,
+  ProfitCertificate,
+  ThesisCard,
+} from '@nemesis/core';
 import { DEFAULT_OPPORTUNITY_THROUGHPUT } from '@nemesis/core';
 
-export type OpportunityQueueState =
-  | 'discovered'
-  | 'book_pending'
-  | 'certified'
-  | 'blocked_retryable'
-  | 'blocked_final'
-  | 'executed';
+export type OpportunityQueueState = ExecutionQueueState;
 
 export interface OpportunityQueueItem {
   key: string;
@@ -41,6 +40,78 @@ export interface OpportunityThroughputSnapshot {
 
 function keyFor(card: Pick<ThesisCard, 'ticker' | 'side'>): string {
   return `${card.ticker}:${card.side}`;
+}
+
+function downgradeActionableStatus(card: ThesisCard): ThesisCard['status'] {
+  return card.status === 'tradeable' || card.status === 'qualified'
+    ? 'watch-only'
+    : card.status;
+}
+
+export function annotateCardsWithCertification(
+  cards: ThesisCard[],
+  snapshot: OpportunityThroughputSnapshot,
+  now = Date.now(),
+): ThesisCard[] {
+  const byKey = new Map(snapshot.items.map((item) => [item.key, item]));
+  return cards.map((card) => {
+    const item = byKey.get(keyFor(card));
+    if (!item) {
+      return {
+        ...card,
+        executionQueueState: 'discovered',
+        executionBlockReason: undefined,
+        executionAbortCode: undefined,
+        certifiedNetPnlUsd: undefined,
+        profitCertificate: undefined,
+      };
+    }
+
+    const certificate = item.profitCertificate;
+    if (item.state === 'certified' && certificate) {
+      if (certificate.expiresAt >= now) {
+        return {
+          ...card,
+          executionQueueState: 'certified',
+          executionBlockReason: undefined,
+          executionAbortCode: undefined,
+          certifiedNetPnlUsd: certificate.netPnlUsd,
+          profitCertificate: certificate,
+        };
+      }
+
+      return {
+        ...card,
+        status: downgradeActionableStatus(card),
+        executionQueueState: 'blocked_retryable',
+        executionBlockReason: 'profit certificate expired; awaiting fresh executable book',
+        executionAbortCode: 'certificate_expired',
+        certifiedNetPnlUsd: undefined,
+        profitCertificate: undefined,
+      };
+    }
+
+    if (item.state === 'blocked_retryable' || item.state === 'blocked_final') {
+      return {
+        ...card,
+        status: downgradeActionableStatus(card),
+        executionQueueState: item.state,
+        executionBlockReason: item.blockReason,
+        executionAbortCode: item.blockReason,
+        certifiedNetPnlUsd: undefined,
+        profitCertificate: undefined,
+      };
+    }
+
+    return {
+      ...card,
+      executionQueueState: item.state,
+      executionBlockReason: item.blockReason,
+      executionAbortCode: item.blockReason,
+      certifiedNetPnlUsd: undefined,
+      profitCertificate: undefined,
+    };
+  });
 }
 
 function emptyTelemetry(): OpportunityThroughputTelemetry {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ProfitCertificate, ThesisCard } from '@nemesis/core';
-import { OpportunityThroughputQueue } from './opportunityThroughput.js';
+import { annotateCardsWithCertification, OpportunityThroughputQueue } from './opportunityThroughput.js';
 
 function card(overrides: Partial<ThesisCard> = {}): ThesisCard {
   return {
@@ -70,5 +70,32 @@ describe('OpportunityThroughputQueue', () => {
     expect(queue.dueForRetry(6_100).map((item) => item.key)).toEqual(['KXTHRU:yes']);
     expect(queue.snapshot().telemetry.retryableBlocked).toBe(1);
     expect(queue.snapshot().telemetry.profitBlocked).toBe(1);
+  });
+
+  it('marks only fresh certified opportunities as actionable for the UI', () => {
+    const queue = new OpportunityThroughputQueue({ retryableBlockCooldownMs: 5_000 });
+    queue.discover([card(), card({ ticker: 'KXBLOCKED' }), card({ ticker: 'KXEXPIRED' })], 1_000);
+    queue.markCertified('KXTHRU:yes', certificate, 1_100);
+    queue.markBlocked('KXBLOCKED:yes', 'strict_profit_block', false, 1_100);
+    queue.markCertified('KXEXPIRED:yes', { ...certificate, ticker: 'KXEXPIRED', expiresAt: 1_500 }, 1_100);
+
+    const annotated = annotateCardsWithCertification([
+      card(),
+      card({ ticker: 'KXBLOCKED', status: 'tradeable' }),
+      card({ ticker: 'KXEXPIRED', status: 'qualified' }),
+    ], queue.snapshot(), 2_000);
+
+    expect(annotated[0].executionQueueState).toBe('certified');
+    expect(annotated[0].profitCertificate?.netPnlUsd).toBeGreaterThanOrEqual(0.01);
+
+    expect(annotated[1].status).toBe('watch-only');
+    expect(annotated[1].executionQueueState).toBe('blocked_final');
+    expect(annotated[1].executionBlockReason).toBe('strict_profit_block');
+    expect(annotated[1].profitCertificate).toBeUndefined();
+
+    expect(annotated[2].status).toBe('watch-only');
+    expect(annotated[2].executionQueueState).toBe('blocked_retryable');
+    expect(annotated[2].executionBlockReason).toMatch(/expired/i);
+    expect(annotated[2].profitCertificate).toBeUndefined();
   });
 });

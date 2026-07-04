@@ -1,4 +1,4 @@
-import { DEFAULT_AUTO_CLOSE_SETTINGS, type AutoCloseSettings } from './paper/types.js';
+import { DEFAULT_AUTO_CLOSE_SETTINGS, type AutoCloseSettings, type ProfitCertificate } from './paper/types.js';
 
 export const KALSHI_WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
 
@@ -152,6 +152,14 @@ export type ThesisStatus =
   | 'closed'
   | 'review';
 
+export type ExecutionQueueState =
+  | 'discovered'
+  | 'book_pending'
+  | 'certified'
+  | 'blocked_retryable'
+  | 'blocked_final'
+  | 'executed';
+
 export type PlaybookId =
   | 'flow-hunter'
   | 'weather-wing'
@@ -192,6 +200,11 @@ export interface ThesisCard {
   fillableUsd?: number;
   slippagePp?: number;
   depthLevels?: number;
+  executionQueueState?: ExecutionQueueState;
+  executionBlockReason?: string;
+  executionAbortCode?: string;
+  certifiedNetPnlUsd?: number;
+  profitCertificate?: ProfitCertificate;
   cryptoContext?: CryptoThesisContext;
 }
 

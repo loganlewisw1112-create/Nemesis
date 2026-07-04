@@ -53,6 +53,14 @@ export function ThesisCardView({
   const failedCount = riskItems.filter((r) => !r.ok).length + (depthRisk.ok ? 0 : 1);
   const showProfitBox = true;
   const cryptoContext = card.cryptoContext;
+  const certifiedPaperBuy = showPaperBuy
+    && card.netEdge > 0
+    && card.executionQueueState === 'certified'
+    && !!card.profitCertificate;
+  const certificationPending = showPaperBuy
+    && card.netEdge > 0
+    && !certifiedPaperBuy
+    && !card.executionBlockReason;
 
   return (
     <div
@@ -118,6 +126,22 @@ export function ThesisCardView({
         {card.externalSummary}
       </div>
 
+      {card.profitCertificate && (
+        <div style={{ fontSize: 11, color: 'var(--success)', marginBottom: 8, fontWeight: 700 }}>
+          Strict certified +${card.profitCertificate.netPnlUsd.toFixed(2)} net after fees/slippage
+        </div>
+      )}
+      {card.executionBlockReason && (
+        <div style={{ fontSize: 11, color: 'var(--warning)', marginBottom: 8, lineHeight: 1.4 }}>
+          Execution blocked: {card.executionBlockReason}
+        </div>
+      )}
+      {certificationPending && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
+          Certifying executable book before this can be traded.
+        </div>
+      )}
+
       {cryptoContext && (
         <div
           style={{
@@ -173,7 +197,7 @@ export function ThesisCardView({
           onClick={(e) => e.stopPropagation()}
         >
           <summary style={{ cursor: 'pointer', fontWeight: 700, color: card.netEdge > 0 ? 'var(--success)' : 'var(--warning)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>Why this trade is profitable</span>
+            <span>{card.profitCertificate ? 'Certified profit proof' : 'Profit model and execution checks'}</span>
             {failedCount > 0 && (
               <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--warning)', background: 'rgba(245,158,11,0.15)', padding: '1px 6px', borderRadius: 4 }}>
                 {failedCount} risk{failedCount > 1 ? 's' : ''}
@@ -273,13 +297,24 @@ export function ThesisCardView({
             Live Buy
           </button>
         )}
-        {card.netEdge > 0 && showPaperBuy && (
+        {certifiedPaperBuy && (
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); onPaperBuy?.(); }}
             style={{ ...btnStyle, borderColor: 'var(--success)', color: 'var(--success)' }}
           >
-            Paper Buy
+            Certified Buy
+          </button>
+        )}
+        {card.netEdge > 0 && showPaperBuy && !certifiedPaperBuy && (
+          <button
+            type="button"
+            disabled
+            title={card.executionBlockReason ?? 'Awaiting strict profit certification'}
+            onClick={(e) => { e.stopPropagation(); }}
+            style={{ ...btnStyle, color: 'var(--text-muted)', opacity: 0.6, cursor: 'not-allowed' }}
+          >
+            Not Certified
           </button>
         )}
         <button
