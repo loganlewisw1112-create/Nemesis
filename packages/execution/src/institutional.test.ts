@@ -4,7 +4,7 @@ import { PaperDesk } from './paperDesk.js';
 import { simulatePaperBuy, simulatePaperClose, checkPaperRisk } from './executionRouter.js';
 import { positionUnrealizedPnl, markToMarketPortfolio } from './pnlEngine.js';
 import { runFeeAwareBacktest } from './backtestRunner.js';
-import { DEFAULT_GUARDRAILS, type KalshiOrderbook, type ThesisCard } from '@nemesis/core';
+import { DEFAULT_GUARDRAILS, DEFAULT_STRICT_PROFIT_MODE, type KalshiOrderbook, type ThesisCard } from '@nemesis/core';
 
 const card: ThesisCard = {
   id: 't1',
@@ -137,6 +137,78 @@ describe('executionRouter', () => {
     const desk = new PaperDesk(1000);
     const risk = checkPaperRisk(card, desk.snapshot(), DEFAULT_GUARDRAILS, -10);
     expect(risk.ok).toBe(false);
+  });
+
+  it('certifies thesis-edge entry when the round-trip is flat but modeled edge clears the threshold', () => {
+    const desk = new PaperDesk(1000);
+    // `book` nets ~$0.00 on an instant round-trip (below minNetPnlUsd), so this only
+    // certifies through the thesis-edge path, not the instant-flip path.
+    const result = simulatePaperBuy(desk, highEdgeCard, book, DEFAULT_GUARDRAILS, 2);
+    expect(result.ok).toBe(true);
+    expect(result.profitCertificate?.reason).toBe('thesis edge certified (modeled, not locked-in)');
+    expect(result.wouldMutate).toBe(true);
+  });
+
+  it('still blocks entry when the thesis carries no modeled edge and the round-trip is not profitable', () => {
+    const desk = new PaperDesk(1000);
+    const zeroEdgeCard = { ...card, netEdge: 0 };
+    const result = simulatePaperBuy(desk, zeroEdgeCard, book, DEFAULT_GUARDRAILS, 2);
+    expect(result.ok).toBe(false);
+    // The capital allocator refuses to size a zero-edge thesis before certification
+    // even runs; a forced contract count would instead hit strict_profit_block.
+    expect(result.abortCode).toBe('capital_allocator_block');
+    expect(result.wouldMutate).toBe(false);
+  });
+
+  it('certifies an emergency loss close when explicitly tagged and allowed by settings', () => {
+    const desk = new PaperDesk(1000);
+    const opened = desk.openPosition(card, 5, 0.5);
+    expect(opened.ok).toBe(true);
+    const positionId = desk.snapshot().positions[0].id;
+    const settings = {
+      ...DEFAULT_GUARDRAILS,
+      strictProfitMode: { ...DEFAULT_STRICT_PROFIT_MODE, allowEmergencyLossClose: true },
+    };
+
+    const result = simulatePaperClose(
+      desk,
+      positionId,
+      { ticker: 'TEST-1', yes: [{ price: 0.45, quantity: 5 }], no: [{ price: 0.55, quantity: 5 }], spread: 0.02 },
+      'yes',
+      0.45,
+      5,
+      settings,
+      { autoCloseReason: 'emergency close: edge gone', autoCloseAction: 'close' },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.pnl).toBeLessThan(0);
+    expect(result.profitCertificate?.reason).toBe('emergency loss close certified');
+    expect(desk.snapshot().positions).toHaveLength(0);
+  });
+
+  it('still blocks a losing close when not tagged as an emergency decision, even if the setting is on', () => {
+    const desk = new PaperDesk(1000);
+    const opened = desk.openPosition(card, 5, 0.5);
+    expect(opened.ok).toBe(true);
+    const positionId = desk.snapshot().positions[0].id;
+    const settings = {
+      ...DEFAULT_GUARDRAILS,
+      strictProfitMode: { ...DEFAULT_STRICT_PROFIT_MODE, allowEmergencyLossClose: true },
+    };
+
+    const result = simulatePaperClose(
+      desk,
+      positionId,
+      { ticker: 'TEST-1', yes: [{ price: 0.45, quantity: 5 }], no: [{ price: 0.55, quantity: 5 }], spread: 0.02 },
+      'yes',
+      0.45,
+      5,
+      settings,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.abortCode).toBe('strict_profit_block');
   });
 });
 

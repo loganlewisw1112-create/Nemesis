@@ -146,12 +146,43 @@ function certifyOpenProfit(
   }
 
   if (!hasCloseDepth(book, card.side)) return null;
+
+  // Path A: instant round-trip (buy then immediately sell the same book) clears fees.
+  // This only fires on a crossed/mispriced book; on a normal two-sided market the ask
+  // is always >= the bid, so this is near-impossible by construction, not a sign the
+  // thesis lacks edge.
   const exitFill = dryRunCloseFill(book, card.side, entryFill.filled, entryFill.fillPrice, settings.maxSlippagePp);
-  if (exitFill.aborted || !isExecutablePrice(exitFill.fillPrice)) return null;
-  const proceeds = exitFill.fillPrice * exitFill.filled - exitFill.fees;
-  const cost = entryFill.fillPrice * entryFill.filled + entryFill.fees;
-  const netPnlUsd = Number((proceeds - cost).toFixed(4));
-  if (netPnlUsd < strict.minNetPnlUsd) return null;
+  if (!exitFill.aborted && isExecutablePrice(exitFill.fillPrice)) {
+    const proceeds = exitFill.fillPrice * exitFill.filled - exitFill.fees;
+    const cost = entryFill.fillPrice * entryFill.filled + entryFill.fees;
+    const instantNetPnlUsd = Number((proceeds - cost).toFixed(4));
+    if (instantNetPnlUsd >= strict.minNetPnlUsd) {
+      const now = Date.now();
+      return {
+        kind: 'open',
+        ticker: card.ticker,
+        side: card.side,
+        contracts: entryFill.filled,
+        entryPrice: entryFill.fillPrice,
+        exitPrice: exitFill.fillPrice,
+        entryFees: entryFill.fees,
+        exitFees: exitFill.fees,
+        netPnlUsd: instantNetPnlUsd,
+        bookTimestamp: now,
+        expiresAt: now + strict.maxBookAgeMs,
+        reason: 'instant round-trip certified',
+      };
+    }
+  }
+
+  // Path B: thesis-edge certification. card.netEdge is the scorer's own fee/spread/
+  // slippage-aware probability-gap estimate (see AlphaScorer / edge-scanner). This
+  // certifies a modeled expected-value edge realized by holding toward settlement,
+  // not a locked-in outcome -- it can still lose. hasCloseDepth above already proved
+  // an exit path exists so the position won't be stranded.
+  if (!Number.isFinite(card.netEdge) || card.netEdge <= 0) return null;
+  const thesisNetPnlUsd = Number((card.netEdge * entryFill.filled - entryFill.fees).toFixed(4));
+  if (thesisNetPnlUsd < strict.minNetPnlUsd) return null;
   const now = Date.now();
   return {
     kind: 'open',
@@ -159,13 +190,13 @@ function certifyOpenProfit(
     side: card.side,
     contracts: entryFill.filled,
     entryPrice: entryFill.fillPrice,
-    exitPrice: exitFill.fillPrice,
+    exitPrice: entryFill.fillPrice,
     entryFees: entryFill.fees,
-    exitFees: exitFill.fees,
-    netPnlUsd,
+    exitFees: 0,
+    netPnlUsd: thesisNetPnlUsd,
     bookTimestamp: now,
     expiresAt: now + strict.maxBookAgeMs,
-    reason: 'strict profit certified',
+    reason: 'thesis edge certified (modeled, not locked-in)',
   };
 }
 
@@ -173,11 +204,14 @@ function certifyCloseProfit(
   position: PaperPosition,
   fill: DryRunOrder,
   settings: GuardrailSettings,
+  isEmergencyClose = false,
 ): { certificate: ProfitCertificate; pnl: number } | null {
   if (!isExecutablePrice(fill.fillPrice)) return null;
   const strict = strictProfitSettings(settings);
   const pnl = Number(closePnl(position, fill.fillPrice, fill.filled, fill.fees).toFixed(4));
-  if (strict.enabled && pnl < strict.minNetPnlUsd) return null;
+  const blockAsLoss = strict.enabled && pnl < strict.minNetPnlUsd;
+  const emergencyOverride = isEmergencyClose && strict.allowEmergencyLossClose;
+  if (blockAsLoss && !emergencyOverride) return null;
   const feePortion = (position.fees * fill.filled) / position.contracts;
   const now = Date.now();
   return {
@@ -194,7 +228,7 @@ function certifyCloseProfit(
       netPnlUsd: pnl,
       bookTimestamp: now,
       expiresAt: now + strict.maxBookAgeMs,
-      reason: 'strict profit certified',
+      reason: blockAsLoss ? 'emergency loss close certified' : 'strict profit certified',
     },
   };
 }
@@ -302,7 +336,8 @@ export function simulatePaperClose(
   }
   const position = desk.snapshot().positions.find((p) => p.id === positionId);
   if (!position) return abortClose('position not found', 'position_not_found', fill);
-  const certified = certifyCloseProfit(position, fill, settings);
+  const isEmergencyClose = /^emergency close:/i.test(metaPatch?.autoCloseReason ?? '');
+  const certified = certifyCloseProfit(position, fill, settings, isEmergencyClose);
   if (!certified) return abortClose('strict profit certification failed', 'strict_profit_block', fill);
 
   const quality = fillQualityFromDryRun(fill, expectedPrice);
