@@ -1,13 +1,20 @@
 import type { ThesisCard, KalshiMarket, KalshiTrade } from '@nemesis/core';
-import { qualifyThesis, computeNetEdge, kalshiFeePerContract } from '@nemesis/core';
+import { qualifyThesis, computeNetEdge, kalshiFeePerContract, clampProbability } from '@nemesis/core';
 
 const WHALE_THRESHOLD = 50;
+
+// Square-root price-impact law (standard microstructure heuristic): impact
+// grows with the size of the flow but with diminishing returns, instead of
+// every qualifying trade producing the same fixed nudge regardless of size.
+const BASE_IMPACT = 0.02;
+const MAX_IMPACT = 0.08;
 
 export function tradeToThesis(trade: KalshiTrade, market?: KalshiMarket): ThesisCard | null {
   const notional = trade.count * (trade.yes_price / 100);
   if (notional < WHALE_THRESHOLD) return null;
   const marketPrice = trade.taker_side === 'yes' ? trade.yes_price / 100 : trade.no_price / 100;
-  const implied = marketPrice + (trade.taker_side === 'yes' ? 0.03 : -0.03);
+  const impact = Math.min(MAX_IMPACT, BASE_IMPACT * Math.sqrt(notional / WHALE_THRESHOLD));
+  const implied = clampProbability(marketPrice + (trade.taker_side === 'yes' ? impact : -impact));
   const spread = 0.04;
   const breakdown = computeNetEdge(implied, marketPrice, spread, 0);
   const qual = qualifyThesis({

@@ -1,5 +1,12 @@
 import type { ThesisCard } from '@nemesis/core';
-import { qualifyThesis, computeNetEdge, detectSourceDisagreement, kalshiFeePerContract } from '@nemesis/core';
+import {
+  qualifyThesis,
+  computeNetEdge,
+  detectSourceDisagreement,
+  kalshiFeePerContract,
+  sigmoidProbability,
+  clampProbability,
+} from '@nemesis/core';
 
 export interface WeatherInput {
   ticker: string;
@@ -46,7 +53,12 @@ export function weatherToThesis(input: WeatherInput): ThesisCard {
     [{ value: input.nwsForecast }, { value: input.openMeteoForecast }],
     3,
   );
-  const implied = input.nwsForecast > input.strike ? 0.65 : 0.25;
+  // Same-day NWS high-temp forecasts run ~1.5°F of error; error grows with
+  // lead time. Scale the forecast-vs-strike distance by that lead-time-aware
+  // error band instead of collapsing every distance into the same bucket.
+  const distance = input.nwsForecast - input.strike;
+  const sigma = 1.5 * Math.sqrt(Math.max(1, input.hoursToSettle) / 12);
+  const implied = clampProbability(sigmoidProbability(distance, sigma));
   const breakdown = computeNetEdge(implied, input.marketPrice, input.spread);
   const qual = qualifyThesis({
     impliedPrice: implied,

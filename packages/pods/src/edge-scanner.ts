@@ -12,6 +12,30 @@ export interface ScanMarketInput {
   depthContext?: TickerDepthResult;
 }
 
+// Absent any pod-specific signal, there is no general basis to assume a
+// market is mispriced -- inventing an edge for every price would just be
+// noise. The one documented, evidenced bias with no external signal
+// required is the favorite-longshot effect: cheap "longshot" contracts are
+// systematically overpriced relative to true resolution frequency, and
+// expensive "favorite" contracts are systematically underpriced. Apply a
+// small, magnitude-scaled correction only at genuine extremes; elsewhere,
+// don't fabricate an edge.
+const LONGSHOT_CUTOFF = 0.15;
+const FAVORITE_CUTOFF = 0.85;
+const MAX_CORRECTION = 0.03;
+
+function longshotFavoriteCorrection(marketPrice: number): number {
+  if (marketPrice <= LONGSHOT_CUTOFF) {
+    const depth = (LONGSHOT_CUTOFF - marketPrice) / LONGSHOT_CUTOFF;
+    return -MAX_CORRECTION * depth; // fade the longshot: fair value below market
+  }
+  if (marketPrice >= FAVORITE_CUTOFF) {
+    const depth = (marketPrice - FAVORITE_CUTOFF) / (1 - FAVORITE_CUTOFF);
+    return MAX_CORRECTION * depth; // follow the favorite: fair value above market
+  }
+  return 0; // no documented edge in the mid-range
+}
+
 /** Scan YES and NO sides for positive net edge when pod-specific signals are absent. */
 export function scanMarketTheses(input: ScanMarketInput): ThesisCard[] {
   const cards: ThesisCard[] = [];
@@ -19,12 +43,12 @@ export function scanMarketTheses(input: ScanMarketInput): ThesisCard[] {
     {
       side: 'yes',
       marketPrice: input.marketPrice,
-      implied: Math.min(0.95, input.marketPrice + Math.max(0.05, (0.55 - input.marketPrice) * 0.4)),
+      implied: Math.min(0.995, Math.max(0.005, input.marketPrice + longshotFavoriteCorrection(input.marketPrice))),
     },
     {
       side: 'no',
       marketPrice: 1 - input.marketPrice,
-      implied: Math.min(0.95, (1 - input.marketPrice) + Math.max(0.05, (0.55 - (1 - input.marketPrice)) * 0.4)),
+      implied: Math.min(0.995, Math.max(0.005, (1 - input.marketPrice) + longshotFavoriteCorrection(1 - input.marketPrice))),
     },
   ];
 

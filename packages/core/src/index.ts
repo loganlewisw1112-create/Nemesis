@@ -3,6 +3,7 @@ export * from './kalshi/client.js';
 export { KALSHI_API_BASE } from './kalshi/client.js';
 export * from './http/resilientFetch.js';
 export * from './fees/kalshiFee.js';
+export * from './stats/calibration.js';
 export * from './thesis/qualification.js';
 export * from './guardrails/engine.js';
 export * from './guardrails/liveUnlock.js';

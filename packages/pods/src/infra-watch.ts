@@ -57,13 +57,16 @@ export function infraToThesis(
     executionHealthy: true,
   });
   const now = Date.now();
+  // A binary outage/degraded flag carries only coarse information -- no
+  // duration or severity magnitude -- so this never certifies as directly
+  // tradeable on its own, same posture as global-pulse's heuristic sources.
   return {
     id: `infra-${ticker}`,
     ticker,
     title,
     category: 'infra',
     playbook: 'infra-watch',
-    status: qual.status,
+    status: qual.status === 'tradeable' ? 'qualified' : qual.status,
     side: 'yes',
     marketPrice,
     impliedPrice: implied,
@@ -80,7 +83,7 @@ export function infraToThesis(
     freshnessMs: 1000,
     edgeHistory: [breakdown.netEdge],
     drivers: [{ label: alert.provider, impact: 0.7, detail: alert.summary }],
-    invalidations: qual.failedGates,
+    invalidations: [...qual.failedGates, 'heuristic source requires execution certificate'],
     sourceMove: 'news-driven',
   };
 }

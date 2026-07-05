@@ -1,5 +1,16 @@
 import type { ThesisCard } from '@nemesis/core';
-import { qualifyThesis, computeNetEdge, kalshiFeePerContract } from '@nemesis/core';
+import {
+  qualifyThesis,
+  computeNetEdge,
+  kalshiFeePerContract,
+  sigmoidProbability,
+  clampProbability,
+} from '@nemesis/core';
+
+// Typical consensus-vs-actual error scale for a headline macro release
+// (e.g. CPI m/m, in percentage points). Surprises are measured against this
+// scale rather than mapped to a fixed +/-0.2 bucket regardless of size.
+const SURPRISE_SCALE = 0.15;
 
 export interface MacroEvent {
   ticker: string;
@@ -16,7 +27,7 @@ export interface MacroEvent {
 export function macroToThesis(event: MacroEvent): ThesisCard {
   const surprise = event.actual !== undefined ? event.actual - event.consensus : 0;
   const implied = event.actual !== undefined
-    ? (surprise > 0 ? 0.7 : 0.3)
+    ? clampProbability(sigmoidProbability(surprise, SURPRISE_SCALE))
     : 0.5;
   const breakdown = computeNetEdge(implied, event.marketPrice, event.spread);
   const qual = qualifyThesis({
