@@ -119,6 +119,9 @@ export interface AutoCloseSettings {
   quickProfitPct: number;
   quickProfitEdgeCompressionTrigger: number;
   quickProfitTrimFraction: number;
+  profitLockEnabled: boolean;
+  minProfitLockUsd: number;
+  profitLockCompressionTrigger: number;
   velocityDownTicksToTrim: number;
   predictiveCrossingEnabled: boolean;
   predictiveCrossingLeadPct: number;
@@ -197,6 +200,9 @@ export const DEFAULT_AUTO_CLOSE_SETTINGS: AutoCloseSettings = {
   quickProfitPct: 0.03,
   quickProfitEdgeCompressionTrigger: 0.2,
   quickProfitTrimFraction: 0.25,
+  profitLockEnabled: true,
+  minProfitLockUsd: 1,
+  profitLockCompressionTrigger: 0.15,
   velocityDownTicksToTrim: 3,
   predictiveCrossingEnabled: true,
   predictiveCrossingLeadPct: 0.15,

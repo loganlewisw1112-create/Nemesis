@@ -107,7 +107,10 @@ describe('AutoCloseEngine', () => {
         peakMark: 0.5,
         tickCount: 5,
       }),
-      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
+      // Isolated from the profit-lock layer, which would otherwise also
+      // qualify on this fixture (peak profit + edge compression) and fire
+      // first -- see the dedicated 'profit lock' tests below.
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, profitLockEnabled: false },
     });
 
     expect(decision.action).toBe('trim');
@@ -131,14 +134,14 @@ describe('AutoCloseEngine', () => {
     expect(decision.reason).toMatch(/final/i);
   });
 
-  it('emergency closes when edge is gone', () => {
+  it('emergency closes when edge is gone and no real profit was ever banked', () => {
     const decision = evaluateAutoClosePosition({
       position: position(),
       mark: 0.44,
       currentEdge: 0,
       tickCount: 4,
       now,
-      state: state({ peakPnlPct: 0.12, tickCount: 4 }),
+      state: state({ peakPnlPct: 0.12, peakPnlUsd: 0.5, tickCount: 4 }),
       settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
     });
 
@@ -182,7 +185,7 @@ describe('AutoCloseEngine', () => {
       tickCount: 4,
       now,
       state: state({ peakPnlPct: 0.14, tickCount: 4 }),
-      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, maxBridgeLatencyMs: 500 },
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, maxBridgeLatencyMs: 500, profitLockEnabled: false },
       exitSignal: {
         ticker: 'TEST-1',
         action: 'exit',
@@ -225,7 +228,7 @@ describe('AutoCloseEngine', () => {
       tickCount: 5,
       now,
       state: next,
-      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, minAgeMs: 0 },
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, minAgeMs: 0, profitLockEnabled: false },
     });
 
     expect(next.markVelocityPct).toBeLessThan(0);
@@ -279,10 +282,91 @@ describe('AutoCloseEngine', () => {
         enabled: true,
         minAgeMs: 0,
         predictiveCrossingEnabled: true,
+        profitLockEnabled: false,
       },
     });
 
     expect(decision.action).toBe('trim');
     expect(decision.reason).toMatch(/predictive/i);
+  });
+
+  it('locks in profit on edge compression instead of waiting for the full giveback threshold', () => {
+    // Reproduces the real incident: a scalp position peaks at a real,
+    // fee-adjusted profit ($1.50 on a $5.50 cost basis -- well above both
+    // the 3% quick-profit bar and the $1 profit-lock floor) and edge starts
+    // compressing well before it fully collapses to zero.
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 50, entryPrice: 0.1 }),
+      mark: 0.13,
+      currentEdge: 0.02,
+      tickCount: 5,
+      now,
+      state: state({
+        peakPnlUsd: 1.5,
+        peakPnlPct: 0.27,
+        peakEdge: 0.06,
+        trimmedContracts: 0,
+        tickCount: 5,
+      }),
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
+    });
+
+    expect(decision.action).toBe('close');
+    expect(decision.reason).toMatch(/profit lock/i);
+  });
+
+  it('does not lock in profit below the minimum dollar floor', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 5, entryPrice: 0.1 }),
+      mark: 0.11,
+      currentEdge: 0.01,
+      tickCount: 5,
+      now,
+      state: state({
+        peakPnlUsd: 0.2,
+        peakPnlPct: 0.4,
+        peakEdge: 0.06,
+        trimmedContracts: 0,
+        tickCount: 5,
+      }),
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
+    });
+
+    expect(decision.reason).not.toMatch(/profit lock/i);
+  });
+
+  it('lets a fresh, high-confidence GEA exit signal take priority over the profit lock', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 50, entryPrice: 0.1 }),
+      mark: 0.13,
+      currentEdge: 0.02,
+      tickCount: 5,
+      now,
+      state: state({
+        peakPnlUsd: 1.5,
+        peakPnlPct: 0.27,
+        peakEdge: 0.06,
+        trimmedContracts: 0,
+        tickCount: 5,
+      }),
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
+      exitSignal: {
+        ticker: 'TEST-1',
+        action: 'exit',
+        confidence: 0.95,
+        currentEdge: 0.02,
+        capturedEdge: 0.06,
+        executableClosePrice: 0.13,
+        bookTimestamp: now,
+        bookDepth: 100,
+        priceSource: 'kalshi-orderbook',
+        expiresAt: now + 500,
+        reason: 'GEA retention says exit',
+        issuedAt: now,
+      },
+    });
+
+    expect(decision.action).toBe('close');
+    expect(decision.reason).toMatch(/GEA exit confirmed/i);
   });
 });

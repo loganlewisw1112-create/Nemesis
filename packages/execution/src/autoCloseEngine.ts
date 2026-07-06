@@ -255,6 +255,34 @@ export function evaluateAutoClosePosition(input: EvaluateAutoCloseInput): AutoCl
     return decision(input, 'close', input.position.contracts, input.exitSignal.confidence, `GEA exit confirmed: ${input.exitSignal.reason}`, exitScore.score);
   }
 
+  // Profit lock: the percentage-based giveback checks below (firstTrim/
+  // finalClose) require a large peak (6-18%+) *and* a large giveback
+  // (15-35%) before they fire, and emergencyEdgeExit fires unconditionally
+  // once edge hits zero regardless of P&L. On small, fast-decaying positions
+  // that combination let real, banked profit (peakPnlUsd) evaporate into a
+  // loss before either check engaged -- by the time edge fully collapsed to
+  // zero, the giveback checks hadn't yet crossed their (much larger)
+  // thresholds. This is a dollar-denominated, low-friction safety net that
+  // triggers on modest edge compression -- long before edge fully decays --
+  // as soon as a real, fee-adjusted profit has actually been reached. A
+  // fresh, high-confidence GEA exit signal (checked above) still takes
+  // priority when both conditions are true.
+  if (
+    settings.profitLockEnabled &&
+    input.state.trimmedContracts === 0 &&
+    input.state.peakPnlUsd >= settings.minProfitLockUsd &&
+    compression >= settings.profitLockCompressionTrigger
+  ) {
+    return decision(
+      input,
+      'close',
+      input.position.contracts,
+      0.9,
+      `profit lock: peak $${input.state.peakPnlUsd.toFixed(2)} secured, edge compressing`,
+      exitScore.score,
+    );
+  }
+
   if ((input.state.trimmedContracts > 0 || exitScore.score >= 0.9) && exitScore.score >= dynamicCloseThreshold) {
     return decision(input, 'close', input.position.contracts, exitScore.score, 'score close: continuous exit score crossed dynamic threshold', exitScore.score);
   }
