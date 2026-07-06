@@ -7,6 +7,7 @@ export interface KalshiMarket {
   title: string;
   subtitle?: string;
   status: string;
+  result?: string;
   yes_bid?: number;
   yes_ask?: number;
   no_bid?: number;

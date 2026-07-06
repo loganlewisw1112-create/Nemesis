@@ -22,6 +22,7 @@ import {
   DEFAULT_STRICT_PROFIT_MODE,
   DEFAULT_PAPER_CASH,
   fetchOrderbook,
+  fetchMarket,
   isExecutablePrice,
   normalizeMarketPrice,
   sanitizeExecutableBook,
@@ -77,6 +78,7 @@ import {
   submitLiveOrder,
   evaluateAutoClosePosition,
   updateAutoCloseState,
+  resolveSettlement,
   ProfitabilityBenchmark,
   OpportunityThroughputQueue,
   annotateCardsWithCertification,
@@ -1020,6 +1022,81 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
   saveAuditLog();
   saveSessionStats();
   return true;
+}
+
+// Settlement sweep: resolves paper positions whose market has settled while
+// the book-certified close path can no longer run (a resolved market has no
+// orderbook). Without this, positions held through resolution sit open
+// forever while the auto-close engine spams "book unavailable" blocks.
+const settlementCheckAt = new Map<string, number>();
+const SETTLEMENT_SWEEP_MS = 5 * 60_000;
+const SETTLEMENT_TICKER_COOLDOWN_MS = 10 * 60_000;
+let settlementSweepRunning = false;
+
+async function sweepSettledPositions() {
+  if (settlementSweepRunning) return;
+  settlementSweepRunning = true;
+  let settledCount = 0;
+  try {
+    const now = Date.now();
+    const tickers = [...new Set(paperDesk.snapshot().positions.map((p) => p.ticker))]
+      .filter((t) => now - (settlementCheckAt.get(t) ?? 0) >= SETTLEMENT_TICKER_COOLDOWN_MS);
+    for (const ticker of tickers) {
+      let market: KalshiMarket;
+      try {
+        market = await fetchMarket(ticker);
+      } catch {
+        continue; // API/network failure; retry on a later sweep
+      }
+      settlementCheckAt.set(ticker, now);
+      for (const pos of paperDesk.snapshot().positions.filter((p) => p.ticker === ticker)) {
+        const decision = resolveSettlement(market.status, market.result, pos.side);
+        if (!decision) continue;
+        const closed = paperDesk.closePosition(pos.id, decision.exitPrice, pos.contracts, {
+          mode: 'paper',
+          expectedPrice: decision.exitPrice,
+          slippage: 0,
+          implementationShortfall: 0,
+          autoCloseReason: `settlement: market resolved ${decision.result.toUpperCase()}`,
+        });
+        if (!closed.ok) continue;
+        settledCount += 1;
+        autoCloseStates.delete(pos.id);
+        sessionStatsData.tradeCount += 1;
+        auditLog.append({
+          action: 'paper_close',
+          ticker,
+          detail: `settlement: resolved ${decision.result.toUpperCase()} at $${decision.exitPrice}; pnl ${closed.pnl?.toFixed(2)}`,
+          ok: true,
+        });
+        broadcastToGea({
+          type: 'nemesis:close-result',
+          payload: {
+            ticker,
+            action: 'close',
+            contracts: pos.contracts,
+            pnl: closed.pnl ?? 0,
+            was_profit: (closed.pnl ?? 0) > 0,
+            peak_pnl_usd: 0,
+            close_regret_usd: 0,
+            closed_at: Date.now(),
+            reason: 'settlement',
+            tier: 'scalp',
+          },
+        });
+      }
+    }
+    if (settledCount > 0) {
+      refreshDailyPnl();
+      savePaperPortfolio();
+      saveAutoCloseState();
+      saveAuditLog();
+      saveSessionStats();
+      broadcastPaperUpdate(true);
+    }
+  } finally {
+    settlementSweepRunning = false;
+  }
 }
 
 async function evaluateAutoClosePositions(_trigger: string) {
@@ -2466,6 +2543,8 @@ app.whenReady().then(() => {
   setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
   setInterval(() => { void runUniverseRefresh(); }, 60_000);
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
+  setTimeout(() => { void sweepSettledPositions(); }, 20_000);
+  setInterval(() => { void sweepSettledPositions(); }, SETTLEMENT_SWEEP_MS);
 
   globalShortcut.register('CommandOrControl+Shift+K', () => {
     void activateKillSwitch('shortcut');
