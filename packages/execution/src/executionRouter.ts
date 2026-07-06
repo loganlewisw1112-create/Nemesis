@@ -233,6 +233,56 @@ function certifyCloseProfit(
   };
 }
 
+/**
+ * Kalshi multi-outcome markets share an event stem before the final outcome
+ * segment, e.g. `KXMLBGAME-26JUL052130BOSLAA-BOS` and `...-LAA` share
+ * `KXMLBGAME-26JUL052130BOSLAA`. The persisted `eventTicker` field is often
+ * undefined, so derive the stem from the ticker itself.
+ */
+export function eventStem(ticker: string): string {
+  const idx = ticker.lastIndexOf('-');
+  return idx > 0 ? ticker.slice(0, idx) : ticker;
+}
+
+/**
+ * Blocks opens that would combine with existing holdings into a structurally
+ * guaranteed loss on a mutually-exclusive event:
+ *  - Holding YES and NO on the *same* market pays exactly $1 at settlement for
+ *    a combined (post-fee) cost above $1.
+ *  - Holding YES on multiple distinct outcomes of the same event caps the
+ *    combined payout at $1 (at most one outcome resolves), so once the entry
+ *    cost of those YES claims reaches $1 the set can never profit. This is the
+ *    "bought both sides of the game" case.
+ *
+ * The YES-stacking check keys on the ticker stem, which for genuinely
+ * mutually-exclusive winner markets is exactly right. For scalar/overlapping
+ * bucket markets (where two YES buckets could both resolve) it may
+ * conservatively block a legitimate stack, which is acceptable under the
+ * system's no-trade-preferred posture: a skipped trade is the safe default,
+ * a guaranteed-loss fill is not.
+ */
+export function mutualExclusionBlock(
+  ticker: string,
+  side: 'yes' | 'no',
+  entryPrice: number,
+  positions: PaperPosition[],
+): string | undefined {
+  const oppositeSameTicker = positions.find((p) => p.ticker === ticker && p.side !== side);
+  if (oppositeSameTicker) {
+    return 'mutual-exclusion: opposite side already held on same market';
+  }
+  if (side === 'yes') {
+    const stem = eventStem(ticker);
+    const siblingYesCost = positions
+      .filter((p) => p.side === 'yes' && p.ticker !== ticker && eventStem(p.ticker) === stem)
+      .reduce((sum, p) => sum + p.entryPrice, 0);
+    if (siblingYesCost > 0 && siblingYesCost + entryPrice >= 1) {
+      return 'mutual-exclusion: combined YES cost across event outcomes >= $1 (guaranteed non-profit)';
+    }
+  }
+  return undefined;
+}
+
 export function resolveContractCount(
   card: ThesisCard,
   portfolio: PaperPortfolio,
@@ -303,6 +353,11 @@ export function simulatePaperBuy(
     return abortBuy(fill.abortReason ?? 'fill aborted', 'fill_aborted', capitalDecision, fill, true);
   }
   if (!isExecutablePrice(fill.fillPrice)) return abortBuy('invalid executable fill price', 'invalid_price', capitalDecision, fill);
+
+  const exclusion = mutualExclusionBlock(card.ticker, card.side, fill.fillPrice, portfolio.positions);
+  if (exclusion) {
+    return abortBuy(exclusion, 'mutual_exclusion_block', capitalDecision, fill);
+  }
 
   const certificate = certifyOpenProfit(card, cleanBook, fill, settings);
   if (!certificate) {

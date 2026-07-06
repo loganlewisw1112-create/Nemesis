@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
 import { PaperDesk } from './paperDesk.js';
-import { simulatePaperBuy, simulatePaperClose, checkPaperRisk } from './executionRouter.js';
+import { simulatePaperBuy, simulatePaperClose, checkPaperRisk, mutualExclusionBlock } from './executionRouter.js';
 import { positionUnrealizedPnl, markToMarketPortfolio } from './pnlEngine.js';
 import { runFeeAwareBacktest } from './backtestRunner.js';
 import { DEFAULT_GUARDRAILS, DEFAULT_STRICT_PROFIT_MODE, type KalshiOrderbook, type ThesisCard } from '@nemesis/core';
@@ -137,6 +137,42 @@ describe('executionRouter', () => {
     const desk = new PaperDesk(1000);
     const risk = checkPaperRisk(card, desk.snapshot(), DEFAULT_GUARDRAILS, -10);
     expect(risk.ok).toBe(false);
+  });
+
+  it('blocks buying a second YES outcome of the same event once combined cost reaches $1', () => {
+    const desk = new PaperDesk(1000);
+    // Already long YES on the BOS outcome of an MLB game at 0.61.
+    desk.openPosition(
+      { ...highEdgeCard, ticker: 'KXMLBGAME-26JUL052130BOSLAA-BOS', side: 'yes' },
+      50,
+      0.61,
+    );
+    // Attempt to also buy YES on the LAA outcome of the same game at ~0.41.
+    const laaCard = { ...highEdgeCard, id: 't2', ticker: 'KXMLBGAME-26JUL052130BOSLAA-LAA', side: 'yes' as const, marketPrice: 0.41 };
+    const laaBook: KalshiOrderbook = {
+      ticker: 'KXMLBGAME-26JUL052130BOSLAA-LAA',
+      yes: [{ price: 0.41, quantity: 200 }],
+      no: [{ price: 0.6, quantity: 200 }],
+      yesAsk: 0.41,
+      noAsk: 0.6,
+      spread: 0.02,
+    };
+    const result = simulatePaperBuy(desk, laaCard, laaBook, DEFAULT_GUARDRAILS, 50);
+    expect(result.ok).toBe(false);
+    expect(result.abortCode).toBe('mutual_exclusion_block');
+    expect(desk.snapshot().positions).toHaveLength(1);
+  });
+
+  it('allows a YES outcome of an unrelated event with the same category', () => {
+    const desk = new PaperDesk(1000);
+    desk.openPosition(
+      { ...highEdgeCard, ticker: 'KXMLBGAME-26JUL052130BOSLAA-BOS', side: 'yes' },
+      50,
+      0.61,
+    );
+    const otherGame = { ...highEdgeCard, id: 't3', ticker: 'KXMLBGAME-26JUL061800NYYTOR-NYY', side: 'yes' as const };
+    const block = mutualExclusionBlock(otherGame.ticker, 'yes', 0.55, desk.snapshot().positions);
+    expect(block).toBeUndefined();
   });
 
   it('certifies thesis-edge entry when the round-trip is flat but modeled edge clears the threshold', () => {
