@@ -40,6 +40,7 @@ import {
   isRiskSettingOverride,
   rankThesesWithTiers,
   minNetEdgeForTier,
+  hasRealExecutableDepth,
   scoreOpportunityForCard,
   HotOpportunityIndex,
   evaluateLiveUnlock,
@@ -116,6 +117,7 @@ const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json'
 
 const MAX_TICKS = 120;
 const PAPER_OK = new Set(['tradeable', 'qualified', 'watch-only']);
+const LIQUIDITY_PREFILTER_MAX_AGE_MS = 45_000;
 const MARKET_REFRESH_MS = 15_000;
 const WATCHED_TICK_MS = 1_000;
 const FEED_WAIT_MS = 2_000;
@@ -1284,7 +1286,10 @@ async function runThroughputCertification(trigger: string) {
     if (remaining <= 0) return;
 
     const candidates = theses
-      .filter((card) => PAPER_OK.has(card.status) && card.netEdge > 0 && !openKeys.has(opportunityKey(card)))
+      .filter((card) => PAPER_OK.has(card.status)
+        && card.netEdge > 0
+        && hasRealExecutableDepth(card)
+        && !openKeys.has(opportunityKey(card)))
       .sort((a, b) => {
         const edgeDelta = b.netEdge - a.netEdge;
         if (edgeDelta !== 0) return edgeDelta;
@@ -1375,7 +1380,7 @@ function mergeGeaMarkets(markets: KalshiMarket[]): KalshiMarket[] {
 
 function replaceGeaTheses(base: ThesisCard[]): ThesisCard[] {
   const withoutGea = base.filter((card) => !card.id.startsWith('gea-'));
-  return rankThesesForUi([...geaTheses, ...withoutGea]);
+  return rankThesesForUi([...geaTheses.map(applyDepthToCard), ...withoutGea]);
 }
 
 function publishMarketState(extra: Record<string, unknown> = {}) {
@@ -1413,9 +1418,11 @@ function applyBridgeRecommendation(packet: RecommendationPacket) {
     ?? geaMarkets.find((m) => m.ticker === packet.ticker);
   geaMarkets = upsertRecommendationMarket(geaMarkets, packet, market);
   marketsCache = mergeGeaMarkets(marketsCache);
-  geaTheses = upsertRecommendationThesis(geaTheses, packet, market);
+  geaTheses = upsertRecommendationThesis(geaTheses, packet, market).map(applyDepthToCard);
   theses = replaceGeaTheses(theses);
-  opportunityQueue.discover(geaTheses.filter((c) => PAPER_OK.has(c.status) && c.netEdge > 0));
+  opportunityQueue.discover(geaTheses.filter((c) => PAPER_OK.has(c.status)
+    && c.netEdge > 0
+    && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
   publishMarketState();
   void evaluateAutoClosePositions('bridge-entry');
@@ -1430,11 +1437,21 @@ function applyBridgeExitRecommendation(packet: ExitRecommendation) {
   broadcastPaperUpdate();
 }
 
+function withoutExecutableDepth(card: ThesisCard): ThesisCard {
+  const next = { ...card };
+  delete next.executableTier;
+  delete next.fillableUsd;
+  delete next.slippagePp;
+  delete next.depthLevels;
+  return next;
+}
+
 function applyDepthToCard(card: ThesisCard): ThesisCard {
   const d = discovery.getDepth(card.ticker);
-  if (!d) return card;
+  if (!d) return withoutExecutableDepth(card);
+  if (Date.now() - d.verifiedAt > LIQUIDITY_PREFILTER_MAX_AGE_MS) return withoutExecutableDepth(card);
   const sideResult = card.side === 'yes' ? d.yes : d.no;
-  if (!sideResult?.executableTier) return card;
+  if (!sideResult?.executableTier) return withoutExecutableDepth(card);
   return {
     ...card,
     executableTier: sideResult.executableTier,
@@ -1688,7 +1705,9 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
     built = withTier.length > 0 ? withTier : built;
   }
   theses = replaceGeaTheses(built);
-  opportunityQueue.discover(theses.filter((c) => PAPER_OK.has(c.status) && c.netEdge > 0));
+  opportunityQueue.discover(theses.filter((c) => PAPER_OK.has(c.status)
+    && c.netEdge > 0
+    && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
 
   for (const c of theses) {

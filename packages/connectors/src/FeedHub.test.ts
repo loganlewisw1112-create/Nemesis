@@ -19,7 +19,7 @@ function makeHub(fetchFn: typeof fetch) {
 }
 
 async function refreshTrades(hub: FeedHub) {
-  await (hub as unknown as { refreshTrades(): Promise<void> }).refreshTrades();
+  await hub.refreshTradeTape();
 }
 
 describe('FeedHub trade tape degradation', () => {
@@ -127,7 +127,7 @@ describe('FeedHub trade tape degradation', () => {
     });
   });
 
-  it('coalesces overlapping market refreshes so background polling does not duplicate trade fetches', async () => {
+  it('coalesces overlapping market and tape refreshes and serves the short-TTL cache', async () => {
     let releaseTradeFetch: (() => void) | undefined;
     const tradeResponse = new Promise<Response>((resolve) => {
       releaseTradeFetch = () => resolve(response({ trades: [] }));
@@ -172,12 +172,15 @@ describe('FeedHub trade tape degradation', () => {
     const markets = [{ ticker: 'KXDEMO', title: 'Demo market', status: 'open' }];
 
     const first = hub.refreshForMarkets(markets);
-    const second = hub.refreshForMarkets(markets);
+    const second = hub.refreshTradeTape();
 
     await Promise.resolve();
     expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
 
     releaseTradeFetch?.();
     await Promise.all([first, second]);
+
+    await hub.refreshTradeTape();
+    expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
   });
 });

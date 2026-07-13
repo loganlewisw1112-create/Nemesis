@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildAskLevels,
   getTierThresholds,
+  hasRealExecutableDepth,
   usdToContracts,
   verifySideDepth,
 } from './executableTier.js';
@@ -26,6 +27,7 @@ describe('executableTier', () => {
     expect(levels.length).toBeGreaterThan(0);
     const result = verifySideDepth(book, 'yes', 0.52, getTierThresholds('balanced'));
     expect(['scout', 'solid', 'whale']).toContain(result.executableTier);
+    expect(hasRealExecutableDepth(result)).toBe(true);
     expect(result.fillableUsd).toBeGreaterThan(0);
   });
 
@@ -45,5 +47,26 @@ describe('executableTier', () => {
     const c = getTierThresholds('conservative').find((t) => t.tier === 'scout')!;
     const a = getTierThresholds('aggressive').find((t) => t.tier === 'scout')!;
     expect(c.maxSlippagePp).toBeLessThan(a.maxSlippagePp);
+  });
+
+  it('only admits measured executable depth at the declared tier', () => {
+    expect(hasRealExecutableDepth({
+      executableTier: 'scout',
+      fillableUsd: 100,
+      slippagePp: 0.01,
+      depthLevels: 2,
+    })).toBe(true);
+    expect(hasRealExecutableDepth({
+      executableTier: 'scout',
+      fillableUsd: 98,
+      slippagePp: 0.01,
+      depthLevels: 2,
+    })).toBe(false);
+    expect(hasRealExecutableDepth({
+      executableTier: undefined,
+      fillableUsd: 500,
+      slippagePp: 0,
+      depthLevels: 4,
+    })).toBe(false);
   });
 });

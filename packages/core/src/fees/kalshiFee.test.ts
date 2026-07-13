@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { kalshiFeePerContract, computeNetEdge, walkBookFill } from './kalshiFee.js';
 import {
   isExecutablePrice,
+  fetchTrades,
   normalizeExecutablePrice,
   parseOrderbook,
   normalizeMarketPrice,
@@ -96,6 +97,13 @@ describe('kalshi client', () => {
     expect(sanitized.no).toEqual([{ price: 0.57, quantity: 30 }]);
     expect(sanitized.yesAsk).toBeUndefined();
     expect(sanitized.noAsk).toBe(0.57);
+  });
+
+  it('does not multiply a 429 across fallback API hosts', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}', { status: 429 }));
+
+    await expect(fetchTrades({ fetchFn })).rejects.toThrow('Kalshi API 429');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 });
 

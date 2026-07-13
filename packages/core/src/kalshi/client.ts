@@ -151,6 +151,13 @@ export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
 
 let _workingBase: string | null = null;
 
+class KalshiHttpError extends Error {
+  constructor(readonly status: number, path: string) {
+    super(`Kalshi API ${status}: ${path}`);
+    this.name = 'KalshiHttpError';
+  }
+}
+
 async function kalshiFetch<T>(
   path: string,
   opts: FetchOptions = {},
@@ -180,7 +187,11 @@ async function kalshiFetch<T>(
           // retries:1).  App-level timeouts in main.ts cap real blocking to ≤20 s.
           : await resilientFetch(url, { headers, label: `Kalshi ${path}`, retries: 0, timeoutMs: 10_000 });
         if (!res.ok) {
-          lastError = new Error(`Kalshi API ${res.status}: ${path}`);
+          lastError = new KalshiHttpError(res.status, path);
+          // A 4xx applies to the request, not to one hostname. In particular,
+          // rotating a 429 through all fallback bases multiplies the rate-limit
+          // storm and defeats FeedHub backoff.
+          if (res.status >= 400 && res.status < 500) throw lastError;
           if (res.status >= 500 && attempt < 2) {
             await sleep(300 * (attempt + 1));
             continue;
@@ -192,6 +203,9 @@ async function kalshiFetch<T>(
       } catch (e) {
         lastError = e instanceof Error ? e : new Error(String(e));
         // Don't retry SSL/connection errors — move to next base immediately
+        if (lastError instanceof KalshiHttpError && lastError.status >= 400 && lastError.status < 500) {
+          throw lastError;
+        }
         const msg = lastError.message ?? '';
         const isFatal = msg.includes('SSL') || msg.includes('ECONNRESET') || msg.includes('fetch failed');
         if (!isFatal && attempt < 2) await sleep(300 * (attempt + 1));

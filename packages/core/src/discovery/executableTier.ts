@@ -13,6 +13,11 @@ const BASE_THRESHOLDS: TierThreshold[] = [
   { tier: 'solid', minFillableUsd: 250, maxSlippagePp: 0.03 },
   { tier: 'scout', minFillableUsd: 100, maxSlippagePp: 0.02 },
 ];
+const MIN_FILLABLE_USD: Record<ExecutableTier, number> = {
+  scout: 100,
+  solid: 250,
+  whale: 500,
+};
 
 const TIER_ORDER: Record<ExecutableTier, number> = { whale: 0, solid: 1, scout: 2 };
 
@@ -93,6 +98,22 @@ export function minNetEdgeForTier(tier: ExecutableTier | undefined, demoMode: bo
   if (tier === 'whale') return 0.02;
   if (tier === 'solid') return 0.015;
   return demoMode ? 0.008 : 0.012;
+}
+
+/**
+ * Fail-closed pre-filter for automated certification. A tier label alone is
+ * insufficient: require the measured fill amount and at least one executable
+ * level produced by verifySideDepth(). The strict execution gate still fetches
+ * and validates a fresh book before any fill.
+ */
+export function hasRealExecutableDepth(
+  card: Pick<ThesisCard, 'executableTier' | 'fillableUsd' | 'slippagePp' | 'depthLevels'>,
+): boolean {
+  const tier = card.executableTier;
+  if (!tier) return false;
+  if (!Number.isFinite(card.fillableUsd) || (card.fillableUsd ?? 0) < MIN_FILLABLE_USD[tier] * 0.99) return false;
+  if (!Number.isFinite(card.slippagePp) || (card.slippagePp ?? -1) < 0) return false;
+  return Number.isFinite(card.depthLevels) && (card.depthLevels ?? 0) > 0;
 }
 
 export function tierRank(tier: ExecutableTier | undefined): number {

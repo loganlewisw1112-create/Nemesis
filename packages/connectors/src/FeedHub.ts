@@ -46,7 +46,7 @@ const STALE_MS: Record<string, number> = {
   nhc: 300_000,
   industrial: 300_000,
   sports: 30_000,
-  trades: 15_000,
+  trades: 30_000,
   kalshiWs: 45_000,
   worldNews: 180_000,
   eia: 600_000,
@@ -57,6 +57,7 @@ const SHARED_GDELT_QUERY = 'united states economy politics';
 const TRADE_BACKOFF_BASE_MS = 30_000;
 const TRADE_BACKOFF_MAX_MS = 300_000;
 const TRADE_WARNING_THROTTLE_MS = 300_000;
+const TRADE_MIN_REQUEST_INTERVAL_MS = 30_000;
 
 export interface FeedHubTradeFeedState {
   status: 'ok' | 'degraded';
@@ -111,6 +112,7 @@ export class FeedHub {
   private refreshActiveKey: string | null = null;
   private refreshQueuedMarkets: KalshiMarket[] | null = null;
   private refreshQueuedKey: string | null = null;
+  private tradeRefreshInFlight: Promise<void> | null = null;
   private binance: BinanceStream;
   private binanceStarted = false;
 
@@ -192,6 +194,12 @@ export class FeedHub {
 
   getTradeFeedState(): FeedHubTradeFeedState {
     return { ...this.tradeFeedState, cachedTradeCount: this.trades.length };
+  }
+
+  /** Return the short-TTL cached tape, refreshing through one paced request when eligible. */
+  async refreshTradeTape(): Promise<KalshiTrade[]> {
+    if (this.shouldRefreshTrades()) await this.refreshTradesCoalesced();
+    return [...this.trades];
   }
 
   refreshForMarkets(markets: KalshiMarket[]): Promise<void> {
@@ -287,7 +295,7 @@ export class FeedHub {
     }
 
     if (this.shouldRefreshTrades()) {
-      tasks.push(this.refreshTrades());
+      tasks.push(this.refreshTradesCoalesced());
     }
 
     if (this.isStale(this.kalshiWsAt, STALE_MS.kalshiWs)) {
@@ -331,7 +339,17 @@ export class FeedHub {
   private shouldRefreshTrades(now = Date.now()): boolean {
     const nextRetryAt = this.tradeFeedState.nextRetryAt;
     if (nextRetryAt !== null && now < nextRetryAt) return false;
+    const lastAttemptAt = this.tradeFeedState.lastAttemptAt;
+    if (lastAttemptAt !== null && now - lastAttemptAt < TRADE_MIN_REQUEST_INTERVAL_MS) return false;
     return this.tradeFeedState.status === 'degraded' || this.isStale(this.tradesFetchedAt, STALE_MS.trades);
+  }
+
+  private refreshTradesCoalesced(): Promise<void> {
+    if (this.tradeRefreshInFlight) return this.tradeRefreshInFlight;
+    this.tradeRefreshInFlight = this.refreshTrades().finally(() => {
+      this.tradeRefreshInFlight = null;
+    });
+    return this.tradeRefreshInFlight;
   }
 
   private async refreshWeather(markets: KalshiMarket[]): Promise<void> {

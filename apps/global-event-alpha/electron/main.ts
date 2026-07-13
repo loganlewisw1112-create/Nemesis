@@ -14,7 +14,7 @@ import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import WebSocket, { type RawData } from 'ws';
 import type { BrainRole, ExitRecommendation, NemesisBridgeMessage, BridgeStatus, NoTradeWarning, NemesisCloseResult } from '@nemesis/bridge-contracts';
-import { fetchMarkets, fetchOrderbook, fetchTrades } from '@nemesis/core';
+import { fetchMarkets, fetchOrderbook } from '@nemesis/core';
 import {
   ConnectorRegistry,
   FeedHub,
@@ -526,8 +526,8 @@ async function refreshKalshiTape() {
     }
 
     try {
-      const trades = await fetchTrades({ limit: 50 });
-      for (const trade of trades.trades ?? []) tapeEngine.ingestTrade(trade);
+      const trades = await feedHub.refreshTradeTape();
+      for (const trade of trades) tapeEngine.ingestTrade(trade);
     } catch (err) {
       connectorRegistry.recordWarn('kalshi-rest', err instanceof Error ? err.message : String(err));
     }
