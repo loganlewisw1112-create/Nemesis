@@ -14,6 +14,7 @@ import {
   type KalshiMarket,
 } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
+import { selectExecutableMarkets } from './kalshiLiquidity.js';
 
 const UNIVERSE_STALE_MS = 5 * 60_000;
 const ORDERBOOK_TTL_MS = 12_000;
@@ -132,9 +133,7 @@ export class DiscoveryOrchestrator {
       } while (pages < 10);
 
       this.registry.recordSuccess('kalshi-rest', Date.now() - start);
-      this.universe = merged
-        .sort((a, b) => (b.volume_24h ?? b.volume ?? 0) - (a.volume_24h ?? a.volume ?? 0))
-        .slice(0, this.settings.maxTrackedTickers);
+      this.universe = selectExecutableMarkets(merged).slice(0, this.settings.maxTrackedTickers);
       this.universeUpdatedAt = Date.now();
       this.universePages = pages;
       this.liveUniverseLoaded = true;

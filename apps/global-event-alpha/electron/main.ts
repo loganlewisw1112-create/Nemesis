@@ -14,13 +14,16 @@ import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import WebSocket, { type RawData } from 'ws';
 import type { BrainRole, ExitRecommendation, NemesisBridgeMessage, BridgeStatus, NoTradeWarning, NemesisCloseResult, NemesisStateMirror } from '@nemesis/bridge-contracts';
-import { fetchMarkets, fetchOrderbook } from '@nemesis/core';
+import { fetchMarkets, fetchOrderbook, type KalshiMarket, type KalshiTrade } from '@nemesis/core';
 import {
   ConnectorRegistry,
   FeedHub,
   PublicDataMesh,
   fetchEiaEnergySnapshot,
   fetchSecEdgarRss,
+  hasExecutableOrderbook,
+  selectExecutableMarkets,
+  selectKalshiTapeTickers,
   KalshiStream,
   KalshiTapeEngine,
   publicDataSource,
@@ -116,6 +119,7 @@ const connectorRegistry = new ConnectorRegistry();
 let localStore: GeaLocalStore | null = null;
 let tapeEngine: KalshiTapeEngine | null = null;
 let tapeRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let tapeRefreshInFlight: Promise<void> | null = null;
 let tapeStreamStarted = false;
 let tapeState: KalshiTapeState = emptyTapeState();
 const feedHub = new FeedHub(connectorRegistry);
@@ -512,35 +516,53 @@ function startTapeStream(tickers: string[]) {
   tapeStreamStarted = true;
 }
 
-async function refreshKalshiTape() {
-  if (!tapeEngine || process.env.GEA_TAPE_REST === 'false') return;
+function refreshKalshiTape(): Promise<void> {
+  if (!tapeEngine || process.env.GEA_TAPE_REST === 'false') return Promise.resolve();
+  if (tapeRefreshInFlight) return tapeRefreshInFlight;
+  tapeRefreshInFlight = refreshKalshiTapeOnce().finally(() => {
+    tapeRefreshInFlight = null;
+  });
+  return tapeRefreshInFlight;
+}
+
+async function refreshKalshiTapeOnce(): Promise<void> {
+  const engine = tapeEngine;
+  if (!engine) return;
+  let trades: KalshiTrade[] = [];
+  try {
+    trades = await feedHub.refreshTradeTape();
+    for (const trade of trades) engine.ingestTrade(trade);
+  } catch (err) {
+    connectorRegistry.recordWarn('kalshi-trades', err instanceof Error ? err.message : String(err));
+  }
+
+  let markets: KalshiMarket[] = [];
   try {
     const limit = Number(process.env.GEA_TAPE_MARKET_LIMIT ?? 25);
     const marketRes = await fetchMarkets({ limit: Number.isFinite(limit) ? limit : 25, status: 'open' });
-    const markets = marketRes.markets ?? [];
-    for (const market of markets) tapeEngine.ingestMarket(market);
+    markets = marketRes.markets ?? [];
+  } catch (err) {
+    connectorRegistry.recordWarn('kalshi-rest', err instanceof Error ? err.message : String(err));
+  }
 
-    const topTickers = markets.slice(0, 12).map((market) => market.ticker);
-    if (topTickers.length > 0) startTapeStream(topTickers);
+  const liquidMarkets = selectExecutableMarkets(markets);
+  for (const market of liquidMarkets) engine.ingestMarket(market);
+  const selection = selectKalshiTapeTickers(liquidMarkets, trades, {
+    trackLimit: Number(process.env.GEA_TAPE_TRACK_LIMIT ?? 12),
+    orderbookLimit: Number(process.env.GEA_TAPE_ORDERBOOK_LIMIT ?? 6),
+    minTradeNotionalUsd: Number(process.env.GEA_TAPE_MIN_TRADE_NOTIONAL_USD ?? 50),
+  });
+  if (selection.trackedTickers.length > 0) startTapeStream(selection.trackedTickers);
 
-    for (const ticker of topTickers.slice(0, 6)) {
-      try {
-        tapeEngine.ingestOrderbook(await fetchOrderbook(ticker));
-      } catch (err) {
-        connectorRegistry.recordWarn('kalshi-rest', err instanceof Error ? err.message : String(err));
-      }
-    }
-
+  for (const ticker of selection.orderbookTickers) {
     try {
-      const trades = await feedHub.refreshTradeTape();
-      for (const trade of trades) tapeEngine.ingestTrade(trade);
+      const book = await fetchOrderbook(ticker);
+      if (hasExecutableOrderbook(book)) engine.ingestOrderbook(book);
     } catch (err) {
       connectorRegistry.recordWarn('kalshi-rest', err instanceof Error ? err.message : String(err));
     }
-  } catch (err) {
-    connectorRegistry.recordWarn('kalshi-rest', err instanceof Error ? err.message : String(err));
-    pushTapeState();
   }
+  pushTapeState();
 }
 
 function startPublicDataMesh() {

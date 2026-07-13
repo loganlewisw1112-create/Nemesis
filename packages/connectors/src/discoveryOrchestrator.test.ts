@@ -66,6 +66,48 @@ describe('DiscoveryOrchestrator fixture fallback', () => {
     expect(discovery.hasLiveUniverse()).toBe(true);
   });
 
+  it('pre-filters zero-volume and unquoted markets before depth requests', async () => {
+    fetchMarketsMock.mockResolvedValue({
+      markets: [
+        {
+          ticker: 'KXMVE-DEAD',
+          title: 'Unquoted combination',
+          status: 'active',
+          yes_bid_dollars: '0.0000',
+          yes_ask_dollars: '0.0000',
+          volume: 0,
+          volume_24h: 0,
+        },
+        {
+          ticker: 'KXLIQUID-LOW',
+          title: 'Lower-volume market',
+          status: 'active',
+          yes_bid_dollars: '0.4000',
+          yes_ask_dollars: '0.4100',
+          volume: 500,
+          volume_24h: 100,
+        },
+        {
+          ticker: 'KXLIQUID-HIGH',
+          title: 'Higher-volume market',
+          status: 'active',
+          yes_bid_dollars: '0.6200',
+          yes_ask_dollars: '0.6300',
+          volume: 5_000,
+          volume_24h: 2_000,
+        },
+      ],
+    });
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+
+    await discovery.refreshUniverse();
+
+    expect(discovery.getUniverse().map((market) => market.ticker)).toEqual([
+      'KXLIQUID-HIGH',
+      'KXLIQUID-LOW',
+    ]);
+  });
+
   it('does not treat fixtures as a stale live snapshot after a failed refresh', async () => {
     fetchMarketsMock.mockRejectedValue(new Error('rate limited'));
     const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());

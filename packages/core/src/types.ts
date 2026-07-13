@@ -19,6 +19,9 @@ export interface KalshiMarket {
   volume?: number;
   volume_24h?: number;
   open_interest?: number;
+  volume_fp?: string;
+  volume_24h_fp?: string;
+  open_interest_fp?: string;
   category?: string;
   close_time?: string;
   event_ticker?: string;

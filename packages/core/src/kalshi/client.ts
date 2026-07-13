@@ -87,6 +87,24 @@ export function normalizeMarketPrice(market: KalshiMarket, side: 'yes' | 'no' = 
   );
 }
 
+/**
+ * Convert Kalshi's current fixed-point liquidity strings into the legacy numeric
+ * fields used internally. Keeping this at the REST boundary prevents callers
+ * from silently ranking every current-schema market as zero-volume.
+ */
+export function normalizeKalshiMarket(market: KalshiMarket): KalshiMarket {
+  const volume = finiteNumber(market.volume_fp ?? market.volume);
+  const volume24h = finiteNumber(market.volume_24h_fp ?? market.volume_24h);
+  const openInterest = finiteNumber(market.open_interest_fp ?? market.open_interest);
+
+  return {
+    ...market,
+    volume: volume ?? market.volume,
+    volume_24h: volume24h ?? market.volume_24h,
+    open_interest: openInterest ?? market.open_interest,
+  };
+}
+
 export function parseOrderbook(ticker: string, raw: Record<string, unknown>): KalshiOrderbook {
   const books = [raw.orderbook, raw.orderbook_fp, raw]
     .filter((book): book is Record<string, unknown> => typeof book === 'object' && book !== null);
@@ -232,7 +250,11 @@ export async function fetchMarkets(opts: FetchOptions = {}): Promise<KalshiMarke
   params.set('limit', String(opts.limit ?? 50));
   if (opts.status) params.set('status', opts.status);
   if (opts.cursor) params.set('cursor', opts.cursor);
-  return kalshiFetch<KalshiMarketsResponse>(`/markets?${params}`, opts);
+  const raw = await kalshiFetch<KalshiMarketsResponse>(`/markets?${params}`, opts);
+  return {
+    ...raw,
+    markets: (raw.markets ?? []).map(normalizeKalshiMarket),
+  };
 }
 
 export async function fetchOrderbook(
@@ -254,7 +276,7 @@ export async function fetchMarket(
     `/markets/${encodeURIComponent(ticker)}`,
     opts,
   );
-  return raw.market;
+  return normalizeKalshiMarket(raw.market);
 }
 
 export async function fetchTrades(

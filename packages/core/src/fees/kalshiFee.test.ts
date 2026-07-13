@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { kalshiFeePerContract, computeNetEdge, walkBookFill } from './kalshiFee.js';
 import {
   isExecutablePrice,
+  fetchMarkets,
   fetchTrades,
   normalizeExecutablePrice,
   parseOrderbook,
@@ -63,6 +64,32 @@ describe('kalshi client', () => {
   it('normalizes cent market prices', () => {
     const m: KalshiMarket = { ticker: 'T', title: 'T', status: 'open', yes_ask: 34 };
     expect(normalizeMarketPrice(m)).toBeCloseTo(0.34);
+  });
+
+  it('normalizes current fixed-point market liquidity at the REST boundary', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      markets: [{
+        ticker: 'KXBTC15M-26JUL131915-15',
+        title: 'Bitcoin price in fifteen minutes',
+        status: 'active',
+        yes_bid_dollars: '0.8300',
+        yes_ask_dollars: '0.8400',
+        volume_fp: '896616.69',
+        volume_24h_fp: '157179.24',
+        open_interest_fp: '12450.50',
+      }],
+      cursor: 'next-page',
+    }), { status: 200 }));
+
+    await expect(fetchMarkets({ fetchFn, limit: 1 })).resolves.toMatchObject({
+      markets: [{
+        ticker: 'KXBTC15M-26JUL131915-15',
+        volume: 896616.69,
+        volume_24h: 157179.24,
+        open_interest: 12450.5,
+      }],
+      cursor: 'next-page',
+    });
   });
 
   it('rejects non-executable prices instead of treating zero as tradable', () => {
