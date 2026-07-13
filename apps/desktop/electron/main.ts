@@ -95,7 +95,7 @@ import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalTo
 import { DiscoveryOrchestrator } from './discovery.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
-import { createSingleFlight } from './singleFlight.js';
+import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
 import { startupTrace } from './startupTrace.js';
 import { createBridgeAuth, isBridgeRequestAuthenticated, resolveBridgeHost } from './bridgeSecurity.js';
 import { resolveNemesisUserDataPath } from './userDataPath.js';
@@ -127,6 +127,7 @@ const BOOK_CACHE_TTL_MS = 600;
 const MARKET_BROADCAST_THROTTLE_MS = 750;
 const PAPER_BROADCAST_THROTTLE_MS = 1_000;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
+const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
@@ -146,6 +147,7 @@ let theses: ThesisCard[] = [];
 let geaTheses: ThesisCard[] = [];
 let reviewOnly = false;
 let marketsCache: KalshiMarket[] = [];
+let marketFeedReady = false;
 let geaMarkets: KalshiMarket[] = [];
 const paperDesk = new PaperDesk(DEFAULT_PAPER_CASH);
 const paperOrderBook = new PaperOrderBook();
@@ -1527,13 +1529,21 @@ function certificationBlockForCard(card: Pick<ThesisCard, 'ticker' | 'side'>): s
   return 'awaiting strict profit certification';
 }
 
-async function refreshMarkets() {
+interface RefreshMarketsOptions {
+  retryLiveUniverse?: boolean;
+}
+
+const runUniverseDiscovery = createSingleFlight(() => withAbortTimeout(
+  (signal) => discovery.refreshUniverse(signal),
+  UNIVERSE_FETCH_TIMEOUT_MS,
+  'universe fetch timed out',
+));
+
+async function refreshMarkets(options: RefreshMarketsOptions = {}) {
   try {
-    // Only hit the API when we have absolutely no market data.
-    // marketsCache is always populated first (either real data or fixtures), so
-    // this branch only fires on the very first call when both sources are empty.
-    if (discovery.getUniverse().length === 0 && marketsCache.length === 0) {
-      await discovery.refreshUniverse();
+    // Fixture data keeps the UI usable, but it must never suppress live retries.
+    if (options.retryLiveUniverse !== false && !discovery.hasLiveUniverse()) {
+      await runUniverseDiscovery();
     }
     // Prefer live universe; fall back to whatever marketsCache holds (fixtures or
     // a stale snapshot) so tickets are never held hostage by a slow API.
@@ -1564,13 +1574,7 @@ async function refreshMarkets() {
 
 async function refreshUniverseLoop() {
   try {
-    // Cap at 20 s so the loop never blocks for 60–180 s on a slow connection.
-    await Promise.race([
-      discovery.refreshUniverse(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('universe loop timeout')), 20_000)
-      ),
-    ]);
+    await runUniverseDiscovery();
     marketsCache = mergeGeaMarkets(discovery.getUniverse());
     broadcastDiscovery();
   } catch {
@@ -1796,6 +1800,7 @@ function buildNemesisStateMirror(): NemesisStateMirror {
     opportunityThroughput: { ...throughputTelemetry },
     gates: gates.map((g) => g.id),
     activeRegimes,
+    marketFeedReady,
     timestamp: Date.now(),
   };
 }
@@ -2533,7 +2538,7 @@ app.whenReady().then(() => {
   createWindow();
   startupTrace('window-created');
   spawnGlobalEventAlpha();
-  startupTrace('gea-spawned');
+  startupTrace('gea-spawned-feed-held');
   kalshiStream.start();
   startupTrace('kalshi-stream');
   feedHub.startBackgroundPolling(8_000);
@@ -2550,16 +2555,12 @@ app.whenReady().then(() => {
     })
     .catch((err) => registry.recordError('kalshi-rest', err instanceof Error ? err.message : String(err)));
 
-  // Startup market discovery must not hold app readiness hostage. Slow Kalshi
-  // paging or connector calls update the already-open window when they finish.
+  // GEA opens immediately, but its tape waits on marketFeedReady. The initial
+  // NEMESIS discovery is truly aborted at the timeout so the two processes never
+  // leave overlapping cold-start /markets requests behind.
   void (async () => {
     try {
-      await Promise.race([
-        discovery.refreshUniverse(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('startup universe fetch timed out')), 10_000)
-        ),
-      ]);
+      await runUniverseDiscovery();
       const universe = discovery.getUniverse();
       if (universe.length > 0) marketsCache = mergeGeaMarkets(universe);
     } catch (startupErr) {
@@ -2572,10 +2573,16 @@ app.whenReady().then(() => {
       }
     }
     broadcast('connectors:update', registry.getAll());
-    await runMarketRefresh();
+    try {
+      await refreshMarkets({ retryLiveUniverse: false });
+    } finally {
+      marketFeedReady = true;
+      broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
+      startupTrace('market-feed-ready');
+      setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
+      setInterval(() => { void runUniverseRefresh(); }, 60_000);
+    }
   })();
-  setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
-  setInterval(() => { void runUniverseRefresh(); }, 60_000);
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
   setTimeout(() => { void sweepSettledPositions(); }, 20_000);
   setInterval(() => { void sweepSettledPositions(); }, SETTLEMENT_SWEEP_MS);

@@ -35,6 +35,7 @@ export function createGeaChildEnv(
     ...env,
     NEMESIS_BRIDGE_URL: bridgeUrl,
     NEMESIS_BRIDGE_TOKEN: bridgeToken,
+    GEA_COORDINATE_TAPE_WITH_NEMESIS: 'true',
   };
   delete childEnv.VITE_DEV_SERVER_URL;
   return childEnv;

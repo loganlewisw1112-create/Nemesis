@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createSingleFlight } from './singleFlight.js';
+import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
 
 describe('createSingleFlight', () => {
   it('shares an in-flight run instead of starting duplicate work', async () => {
@@ -30,5 +30,19 @@ describe('createSingleFlight', () => {
 
     await expect(run()).resolves.toBe(1);
     await expect(run()).resolves.toBe(2);
+  });
+});
+
+describe('withAbortTimeout', () => {
+  it('aborts the underlying work instead of only abandoning its promise', async () => {
+    const startedAt = Date.now();
+    await expect(withAbortTimeout(
+      (signal) => new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+      10,
+      'universe timed out',
+    )).rejects.toThrow('universe timed out');
+    expect(Date.now() - startedAt).toBeLessThan(500);
   });
 });

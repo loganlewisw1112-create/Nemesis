@@ -24,13 +24,21 @@ export async function resilientFetch(
     retryDelayMs = 400,
     label = url,
     headers,
+    signal: externalSignal,
     ...init
   } = opts;
 
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (externalSignal?.aborted) {
+      throw externalSignal.reason instanceof Error
+        ? externalSignal.reason
+        : new Error(`${label} aborted`);
+    }
     const controller = new AbortController();
+    const abortFromExternal = () => controller.abort(externalSignal?.reason);
+    externalSignal?.addEventListener('abort', abortFromExternal, { once: true });
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetch(url, {
@@ -39,6 +47,7 @@ export async function resilientFetch(
         signal: controller.signal,
       });
       clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', abortFromExternal);
       if (res.status === 429 || res.status >= 500) {
         lastError = new Error(`${label} HTTP ${res.status}`);
         if (attempt < retries) {
@@ -49,7 +58,11 @@ export async function resilientFetch(
       return res;
     } catch (e) {
       clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', abortFromExternal);
       lastError = e instanceof Error ? e : new Error(String(e));
+      if (externalSignal?.aborted) {
+        throw externalSignal.reason instanceof Error ? externalSignal.reason : lastError;
+      }
       if (attempt < retries) {
         await sleep(retryDelayMs * (attempt + 1));
         continue;

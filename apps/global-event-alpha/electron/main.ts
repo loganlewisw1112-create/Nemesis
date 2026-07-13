@@ -13,7 +13,7 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import WebSocket, { type RawData } from 'ws';
-import type { BrainRole, ExitRecommendation, NemesisBridgeMessage, BridgeStatus, NoTradeWarning, NemesisCloseResult } from '@nemesis/bridge-contracts';
+import type { BrainRole, ExitRecommendation, NemesisBridgeMessage, BridgeStatus, NoTradeWarning, NemesisCloseResult, NemesisStateMirror } from '@nemesis/bridge-contracts';
 import { fetchMarkets, fetchOrderbook } from '@nemesis/core';
 import {
   ConnectorRegistry,
@@ -63,6 +63,7 @@ import { createEntryRecommendationPacket } from './bridgePublisher.js';
 import { resolveNemesisBridgeUrl } from './bridgeClient.js';
 import { resolveGeaUserDataPath } from './userDataPath.js';
 import { copyLegacyGeaDatabaseIfMissing, legacyGeaDatabasePath, resolveGeaDatabasePath } from './localDb.js';
+import { TapeStartupCoordinator } from './tapeStartup.js';
 
 if (process.env.GEA_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -125,6 +126,11 @@ let intelligenceState: GlobalEventAlphaIntelligenceState = createIntelligenceSta
 let lastEntrySignature = '';
 let lastNoTradeSignature = '';
 let lastExitSignature = '';
+const tapeStartup = new TapeStartupCoordinator({
+  coordinated: process.env.GEA_COORDINATE_TAPE_WITH_NEMESIS === 'true',
+  fallbackMs: 30_000,
+  startTape: () => startKalshiTape(),
+});
 
 function createBrainInstances(now: number): BrainInstance[] {
   return BRAIN_ROLES.map((role) => ({
@@ -690,6 +696,7 @@ function connectBridge() {
       bridgeStatus.lastSeenAt = Date.now();
 
       if (msg.type === 'nemesis:state') {
+        tapeStartup.observeNemesisState(msg.payload as NemesisStateMirror);
         broadcast('gea:nemesisState', msg.payload);
       } else if (msg.type === 'brain:recommendation') {
         broadcast('gea:recommendation', msg.payload);
@@ -763,9 +770,9 @@ app.whenReady().then(async () => {
   createWindow();
   startBrainCluster();
   await initializeLocalDb();
-  startKalshiTape();
   startPublicDataMesh();
   connectBridge();
+  tapeStartup.begin();
 
   setInterval(() => {
     sendToNemesis({ type: 'bridge:ping', payload: {} });
@@ -777,6 +784,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  tapeStartup.dispose();
   if (process.platform !== 'darwin') app.quit();
 });
 

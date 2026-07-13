@@ -3,12 +3,16 @@ import { DiscoveryOrchestrator } from './discoveryOrchestrator.js';
 import { ConnectorRegistry } from './registry.js';
 import type { KalshiMarket, KalshiOrderbook } from '@nemesis/core';
 
-const fetchOrderbookMock = vi.hoisted(() => vi.fn());
+const { fetchMarketsMock, fetchOrderbookMock } = vi.hoisted(() => ({
+  fetchMarketsMock: vi.fn(),
+  fetchOrderbookMock: vi.fn(),
+}));
 
 vi.mock('@nemesis/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@nemesis/core')>();
   return {
     ...actual,
+    fetchMarkets: fetchMarketsMock,
     fetchOrderbook: fetchOrderbookMock,
   };
 });
@@ -35,6 +39,7 @@ const fixtures: KalshiMarket[] = [
 describe('DiscoveryOrchestrator fixture fallback', () => {
   beforeEach(() => {
     fetchOrderbookMock.mockReset();
+    fetchMarketsMock.mockReset();
   });
 
   it('seeds the universe and depth metrics together so UI does not report zero markets', () => {
@@ -43,11 +48,32 @@ describe('DiscoveryOrchestrator fixture fallback', () => {
     discovery.seedFixtureDepth(fixtures);
 
     expect(discovery.getUniverse()).toEqual(fixtures);
+    expect(discovery.hasLiveUniverse()).toBe(false);
     expect(discovery.getState().metrics).toMatchObject({
       trackedTickers: 2,
       scoutCount: 2,
       depthPending: 0,
     });
+  });
+
+  it('distinguishes a successful live universe from fixture fallback data', async () => {
+    fetchMarketsMock.mockResolvedValue({ markets: fixtures });
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    discovery.seedFixtureDepth(fixtures);
+
+    await discovery.refreshUniverse();
+
+    expect(discovery.hasLiveUniverse()).toBe(true);
+  });
+
+  it('does not treat fixtures as a stale live snapshot after a failed refresh', async () => {
+    fetchMarketsMock.mockRejectedValue(new Error('rate limited'));
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    discovery.seedFixtureDepth(fixtures);
+
+    await expect(discovery.refreshUniverse()).rejects.toThrow('rate limited');
+
+    expect(discovery.hasLiveUniverse()).toBe(false);
   });
 
   it('coalesces overlapping depth passes so market refreshes do not duplicate orderbook scans', async () => {

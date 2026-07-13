@@ -23,6 +23,7 @@ export interface FetchOptions {
   status?: string;
   cursor?: string;
   authHeaders?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 function centsToProb(v: number | undefined): number | undefined {
@@ -175,6 +176,11 @@ async function kalshiFetch<T>(
   for (const base of bases) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        if (opts.signal?.aborted) {
+          throw opts.signal.reason instanceof Error
+            ? opts.signal.reason
+            : new Error(`Kalshi ${path} aborted`);
+        }
         const url = `${base}${path}`;
         const headers: Record<string, string> = {
           Accept: 'application/json',
@@ -182,11 +188,11 @@ async function kalshiFetch<T>(
           ...opts.authHeaders,
         };
         const res = opts.fetchFn
-          ? await fetchFn(url, { headers })
+          ? await fetchFn(url, { headers, signal: opts.signal })
           // retries:0 → one attempt per outer loop iteration, 10 s abort.
           // Worst case: 3 bases × 3 outer attempts × 10 s = 90 s (was 180 s with
           // retries:1).  App-level timeouts in main.ts cap real blocking to ≤20 s.
-          : await resilientFetch(url, { headers, label: `Kalshi ${path}`, retries: 0, timeoutMs: 10_000 });
+          : await resilientFetch(url, { headers, signal: opts.signal, label: `Kalshi ${path}`, retries: 0, timeoutMs: 10_000 });
         if (!res.ok) {
           lastError = new KalshiHttpError(res.status, path);
           // A 4xx applies to the request, not to one hostname. In particular,
@@ -203,6 +209,7 @@ async function kalshiFetch<T>(
         return res.json() as Promise<T>;
       } catch (e) {
         lastError = e instanceof Error ? e : new Error(String(e));
+        if (opts.signal?.aborted) throw lastError;
         // Don't retry SSL/connection errors — move to next base immediately
         if (lastError instanceof KalshiHttpError && lastError.status >= 400 && lastError.status < 500) {
           throw lastError;

@@ -21,6 +21,7 @@ const ORDERBOOK_TTL_MS = 12_000;
 export class DiscoveryOrchestrator {
   settings: DiscoverySettings = { ...DEFAULT_DISCOVERY_SETTINGS };
   private universe: KalshiMarket[] = [];
+  private liveUniverseLoaded = false;
   private universeUpdatedAt = 0;
   private universePages = 0;
   private depthByTicker = new Map<string, TickerDepthResult>();
@@ -69,6 +70,10 @@ export class DiscoveryOrchestrator {
     return this.universe;
   }
 
+  hasLiveUniverse(): boolean {
+    return this.liveUniverseLoaded;
+  }
+
   getDepth(ticker: string): TickerDepthResult | undefined {
     return this.depthByTicker.get(ticker);
   }
@@ -101,7 +106,7 @@ export class DiscoveryOrchestrator {
     return { spread: 0.04, depthUsd: 200 };
   }
 
-  async refreshUniverse(): Promise<KalshiMarket[]> {
+  async refreshUniverse(signal?: AbortSignal): Promise<KalshiMarket[]> {
     if (this.paused) return this.universe;
     const start = Date.now();
     const merged: KalshiMarket[] = [];
@@ -113,6 +118,7 @@ export class DiscoveryOrchestrator {
           limit: this.settings.universePageSize,
           status: 'open',
           cursor,
+          signal,
         });
         merged.push(...res.markets);
         cursor = res.cursor;
@@ -131,9 +137,10 @@ export class DiscoveryOrchestrator {
         .slice(0, this.settings.maxTrackedTickers);
       this.universeUpdatedAt = Date.now();
       this.universePages = pages;
+      this.liveUniverseLoaded = true;
     } catch (e) {
       this.registry.recordError('kalshi-rest', e instanceof Error ? e.message : String(e));
-      if (this.universe.length === 0 || Date.now() - this.universeUpdatedAt > UNIVERSE_STALE_MS) {
+      if (!this.liveUniverseLoaded || Date.now() - this.universeUpdatedAt > UNIVERSE_STALE_MS) {
         throw e;
       }
     }
@@ -216,6 +223,7 @@ export class DiscoveryOrchestrator {
 
   seedFixtureDepth(markets: KalshiMarket[]) {
     this.universe = markets;
+    this.liveUniverseLoaded = false;
     this.universeUpdatedAt = Date.now();
     this.universePages = markets.length > 0 ? 1 : 0;
     this.depthPending = 0;
