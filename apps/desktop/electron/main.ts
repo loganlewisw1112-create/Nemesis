@@ -93,6 +93,7 @@ import {
 import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
 import { DiscoveryOrchestrator } from './discovery.js';
+import { BookFetchCoordinator, isBookFetchBackoffError } from './bookFetchCoordinator.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
 import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
@@ -157,7 +158,22 @@ const opportunityQueue = new OpportunityThroughputQueue(DEFAULT_OPPORTUNITY_THRO
 const tickHistory = new Map<string, PriceTick[]>();
 const autoCloseStates = new Map<string, AutoCloseState>();
 const latestExitSignals = new Map<string, AutoCloseExitSignal>();
-const bookCache = new Map<string, { book: KalshiOrderbook; fetchedAt: number }>();
+const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
+  async (ticker) => {
+    const raw = await fetchOrderbook(ticker);
+    const book = sanitizeExecutableBook(raw);
+    const hasAnyExecutableSurface =
+      isExecutablePrice(book.yesAsk) ||
+      isExecutablePrice(book.noAsk) ||
+      book.yes.length > 0 ||
+      book.no.length > 0;
+    if (!hasAnyExecutableSurface) {
+      throw new Error('book unavailable: no executable depth');
+    }
+    return book;
+  },
+  { successTtlMs: BOOK_CACHE_TTL_MS },
+);
 let opportunityRadarRows: OpportunityRadarRow[] = [];
 let watchedTicker: string | null = null;
 let activeRegimes: string[] = [];
@@ -347,6 +363,10 @@ function isRetryableExecutionCode(code?: string): boolean {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function describeBookFetchError(error: unknown): string {
+  return isBookFetchBackoffError(error) ? error.reason : describeError(error);
 }
 
 function recordPaperBlock(input: {
@@ -700,28 +720,11 @@ function snapshotEquity(force = false) {
 }
 
 async function fetchBookForCard(card: ThesisCard) {
-  const raw = await fetchOrderbook(card.ticker);
-  const book = sanitizeExecutableBook(raw);
-  const hasAnyExecutableSurface =
-    isExecutablePrice(book.yesAsk) ||
-    isExecutablePrice(book.noAsk) ||
-    book.yes.length > 0 ||
-    book.no.length > 0;
-  if (!hasAnyExecutableSurface) {
-    throw new Error('book unavailable: no executable depth');
-  }
-  bookCache.set(card.ticker, { book, fetchedAt: Date.now() });
-  return book;
+  return bookFetchCoordinator.fetch(card.ticker, { allowCachedSuccess: false });
 }
 
 function cachedBookForTicker(ticker: string): KalshiOrderbook | null {
-  const cached = bookCache.get(ticker);
-  if (!cached || Date.now() - cached.fetchedAt > BOOK_CACHE_TTL_MS) return null;
-  return cached.book;
-}
-
-function prefetchBookForCard(card: ThesisCard) {
-  void fetchBookForCard(card).catch(() => undefined);
+  return bookFetchCoordinator.peek(ticker);
 }
 
 function opportunityKey(card: Pick<ThesisCard, 'ticker' | 'side'>): string {
@@ -774,18 +777,21 @@ async function executeStrictPaperBuyForCard(
     book = await fetchBookForCard(card);
     opportunityQueue.markBookFetched(key);
   } catch (error) {
-    const reason = describeError(error);
-    sessionStatsData.abortCount += 1;
+    const reason = describeBookFetchError(error);
+    const backoffActive = isBookFetchBackoffError(error);
     opportunityQueue.markBlocked(key, `book unavailable: ${reason}`, true);
-    recordPaperBlock({
-      thesisId,
-      ticker: card.ticker,
-      detail: `${source} paper buy blocked: book unavailable (${reason})`,
-      code: 'book_unavailable',
-      severity: 'warning',
-      blocksLiveUnlock: false,
-    });
-    saveSessionStats();
+    if (!backoffActive) {
+      sessionStatsData.abortCount += 1;
+      recordPaperBlock({
+        thesisId,
+        ticker: card.ticker,
+        detail: `${source} paper buy blocked: book unavailable (${reason})`,
+        code: 'book_unavailable',
+        severity: 'warning',
+        blocksLiveUnlock: false,
+      });
+      saveSessionStats();
+    }
     return {
       ok: false,
       aborted: true,
@@ -958,15 +964,17 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
   try {
     book = cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
   } catch (error) {
-    const reason = describeError(error);
-    recordPaperBlock({
-      ticker: pos.ticker,
-      detail: `auto-${decision.action} blocked: book unavailable (${reason})`,
-      code: 'book_unavailable',
-      severity: 'warning',
-      blocksLiveUnlock: false,
-    });
-    saveAutoCloseState();
+    if (!isBookFetchBackoffError(error)) {
+      const reason = describeBookFetchError(error);
+      recordPaperBlock({
+        ticker: pos.ticker,
+        detail: `auto-${decision.action} blocked: book unavailable (${reason})`,
+        code: 'book_unavailable',
+        severity: 'warning',
+        blocksLiveUnlock: false,
+      });
+      saveAutoCloseState();
+    }
     return false;
   }
   const result = simulatePaperClose(
@@ -1133,7 +1141,6 @@ async function evaluateAutoClosePositions(_trigger: string) {
     for (const pos of paperDesk.snapshot().positions) {
       openIds.add(pos.id);
       const card = cardForPosition(pos);
-      if (card) prefetchBookForCard(card);
       const mark = positionMark(pos, card);
       const tickCount = Math.max(tickHistory.get(pos.ticker)?.length ?? 0, autoCloseStates.get(pos.id)?.tickCount ?? 0);
       const currentEdge = card?.netEdge ?? latestExitSignals.get(pos.ticker)?.currentEdge ?? 0;
@@ -1258,9 +1265,6 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
       opportunityRadarRows = hotOpportunityIndex.top(25);
     }
     recordTick(ticker, yesPrice, spread, card?.netEdge ?? 0);
-    const openPos = paperDesk.snapshot().positions.find((p) => p.ticker === ticker);
-    const closeCard = openPos ? cardForPosition(openPos) : undefined;
-    if (closeCard) prefetchBookForCard(closeCard);
     scheduleMarketStatePublish();
     void evaluateAutoClosePositions('quote');
     schedulePaperUpdate();
@@ -2250,14 +2254,16 @@ function setupIpc() {
     try {
       book = cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
     } catch (error) {
-      const reason = describeError(error);
-      recordPaperBlock({
-        ticker: pos.ticker,
-        detail: `manual close blocked: book unavailable (${reason})`,
-        code: 'book_unavailable',
-        severity: 'warning',
-        blocksLiveUnlock: false,
-      });
+      const reason = describeBookFetchError(error);
+      if (!isBookFetchBackoffError(error)) {
+        recordPaperBlock({
+          ticker: pos.ticker,
+          detail: `manual close blocked: book unavailable (${reason})`,
+          code: 'book_unavailable',
+          severity: 'warning',
+          blocksLiveUnlock: false,
+        });
+      }
       return { ok: false, error: `book unavailable: ${reason}`, abortCode: 'book_unavailable', wouldMutate: false };
     }
     const result = simulatePaperClose(paperDesk, positionId, book, pos.side, expectedPrice, qty, settings);
