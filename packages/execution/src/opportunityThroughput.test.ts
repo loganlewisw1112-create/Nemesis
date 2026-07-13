@@ -59,6 +59,18 @@ describe('OpportunityThroughputQueue', () => {
     expect(queue.nextCertified()?.ticker).toBe('KXOTHER');
   });
 
+  it('does not admit research-only cards into the execution queue', () => {
+    const queue = new OpportunityThroughputQueue();
+
+    queue.discover([
+      card(),
+      card({ ticker: 'KXGLOBAL', playbook: 'global-pulse' }),
+    ], 1_000);
+
+    expect(queue.snapshot().items.map((item) => item.key)).toEqual(['KXTHRU:yes']);
+    expect(queue.snapshot().telemetry.candidatesScanned).toBe(2);
+  });
+
   it('retries only retryable blocks after cooldown and leaves final blocks quiet', () => {
     const queue = new OpportunityThroughputQueue({ retryableBlockCooldownMs: 5_000 });
     queue.discover([card(), card({ ticker: 'KXFINAL' })], 1_000);
@@ -82,7 +94,7 @@ describe('OpportunityThroughputQueue', () => {
     const annotated = annotateCardsWithCertification([
       card(),
       card({ ticker: 'KXBLOCKED', status: 'tradeable' }),
-      card({ ticker: 'KXEXPIRED', status: 'qualified' }),
+      card({ ticker: 'KXEXPIRED', status: 'tradeable' }),
     ], queue.snapshot(), 2_000);
 
     expect(annotated[0].executionQueueState).toBe('certified');
@@ -97,5 +109,20 @@ describe('OpportunityThroughputQueue', () => {
     expect(annotated[2].executionQueueState).toBe('blocked_retryable');
     expect(annotated[2].executionBlockReason).toMatch(/expired/i);
     expect(annotated[2].profitCertificate).toBeUndefined();
+  });
+
+  it('surfaces research-only cards as final signal blocks instead of pending certification', () => {
+    const annotated = annotateCardsWithCertification([
+      card({ playbook: 'global-pulse', status: 'tradeable' }),
+      card({ ticker: 'KXWATCH', status: 'watch-only' }),
+    ], new OpportunityThroughputQueue().snapshot(), 2_000);
+
+    expect(annotated[0].status).toBe('watch-only');
+    expect(annotated[0].executionQueueState).toBe('blocked_final');
+    expect(annotated[0].executionBlockReason).toBe('playbook global-pulse is research-only');
+    expect(annotated[0].executionAbortCode).toBe('signal_eligibility_block');
+
+    expect(annotated[1].executionQueueState).toBe('blocked_final');
+    expect(annotated[1].executionBlockReason).toBe('status watch-only is research-only');
   });
 });

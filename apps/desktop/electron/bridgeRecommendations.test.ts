@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { RecommendationPacket } from '@nemesis/bridge-contracts';
+import { isEntryEligible } from '@nemesis/execution';
 import {
   recommendationToThesis,
   upsertRecommendationThesis,
@@ -49,6 +50,7 @@ describe('NEMESIS bridge recommendation mapping', () => {
     expect(card.marketPrice).toBeCloseTo(0.45);
     expect(card.signalReason).toContain('GEA elite');
     expect(card.externalSummary).toContain('model alpha-v1');
+    expect(isEntryEligible(card)).toBe(false);
   });
 
   it('upserts refreshed GEA tickets instead of duplicating them', () => {

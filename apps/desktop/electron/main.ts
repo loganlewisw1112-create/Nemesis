@@ -83,6 +83,9 @@ import {
   ProfitabilityBenchmark,
   OpportunityThroughputQueue,
   annotateCardsWithCertification,
+  entryEligibilityBlockReason,
+  isEntryEligible,
+  isResearchSimulationEligible,
   type AutoCloseExitSignal,
   type LiveCredentials,
   type PaperBuyResult,
@@ -116,7 +119,6 @@ const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
 const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json');
 
 const MAX_TICKS = 120;
-const PAPER_OK = new Set(['tradeable', 'qualified', 'watch-only']);
 const LIQUIDITY_PREFILTER_MAX_AGE_MS = 45_000;
 const MARKET_REFRESH_MS = 15_000;
 const WATCHED_TICK_MS = 1_000;
@@ -733,6 +735,18 @@ async function executeStrictPaperBuyForCard(
   contracts?: number,
   source: 'manual' | 'working-order' | 'throughput' = 'manual',
 ): Promise<PaperBuyResult> {
+  const eligibilityBlock = entryEligibilityBlockReason(card);
+  if (eligibilityBlock) {
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: eligibilityBlock,
+      error: eligibilityBlock,
+      abortCode: 'signal_eligibility_block',
+      queueState: 'blocked_final',
+      wouldMutate: false,
+    };
+  }
   const thesisId = card.id;
   opportunityQueue.discover([card]);
   const key = opportunityKey(card);
@@ -1204,7 +1218,8 @@ function finalizeThesis(card: ThesisCard): ThesisCard {
     && card.netEdge >= 0.008
     && !['blocked', 'stale'].includes(card.status)
   ) {
-    return { ...card, status: 'tradeable' };
+    const promoted = { ...card, status: 'tradeable' as const };
+    return isEntryEligible(promoted) ? promoted : card;
   }
   return card;
 }
@@ -1286,8 +1301,7 @@ async function runThroughputCertification(trigger: string) {
     if (remaining <= 0) return;
 
     const candidates = theses
-      .filter((card) => PAPER_OK.has(card.status)
-        && card.netEdge > 0
+      .filter((card) => isEntryEligible(card)
         && hasRealExecutableDepth(card)
         && !openKeys.has(opportunityKey(card)))
       .sort((a, b) => {
@@ -1420,8 +1434,7 @@ function applyBridgeRecommendation(packet: RecommendationPacket) {
   marketsCache = mergeGeaMarkets(marketsCache);
   geaTheses = upsertRecommendationThesis(geaTheses, packet, market).map(applyDepthToCard);
   theses = replaceGeaTheses(theses);
-  opportunityQueue.discover(geaTheses.filter((c) => PAPER_OK.has(c.status)
-    && c.netEdge > 0
+  opportunityQueue.discover(geaTheses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
   publishMarketState();
@@ -1705,8 +1718,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
     built = withTier.length > 0 ? withTier : built;
   }
   theses = replaceGeaTheses(built);
-  opportunityQueue.discover(theses.filter((c) => PAPER_OK.has(c.status)
-    && c.netEdge > 0
+  opportunityQueue.discover(theses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
 
@@ -2075,7 +2087,7 @@ function setupIpc() {
 
   ipcMain.handle('nemesis:dryRun', async (_e, thesisId: string) => {
     const card = theses.find((t) => t.id === thesisId);
-    if (!card || !PAPER_OK.has(card.status)) {
+    if (!card || !isResearchSimulationEligible(card)) {
       recordDryRunInvalidation();
       return { aborted: true, abortReason: 'not tradeable' };
     }
@@ -2176,7 +2188,7 @@ function setupIpc() {
     const creds = getLiveCreds();
     if (!creds) return { ok: false, error: 'Kalshi credentials not configured' };
     const card = theses.find((t) => t.id === thesisId);
-    if (!card || !PAPER_OK.has(card.status)) {
+    if (!card || !isEntryEligible(card)) {
       return { ok: false, error: 'thesis not eligible for live trading' };
     }
     const risk = checkPaperRisk(card, paperDesk.snapshot(), settings, getDailyPnl());
@@ -2202,8 +2214,9 @@ function setupIpc() {
 
   ipcMain.handle('nemesis:paperBuy', async (_e, thesisId: string, contracts?: number) => {
     const card = theses.find((t) => t.id === thesisId);
-    if (!card || card.netEdge <= 0) {
-      return { ok: false, error: 'thesis not eligible for paper trading' };
+    const eligibilityBlock = card ? entryEligibilityBlockReason(card) : 'thesis not found';
+    if (!card || eligibilityBlock) {
+      return { ok: false, error: `thesis not eligible for paper trading: ${eligibilityBlock}` };
     }
     const certified = certifiedQueueItemForCard(card);
     if (!certified) {
@@ -2287,6 +2300,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:paperPlaceLimit', (_e, thesisId: string, contracts: number, limitPrice: number) => {
     const card = theses.find((t) => t.id === thesisId);
     if (!card) return { ok: false, error: 'thesis not found' };
+    const eligibilityBlock = entryEligibilityBlockReason(card);
+    if (eligibilityBlock) return { ok: false, error: `thesis not eligible for paper trading: ${eligibilityBlock}` };
     const order: PaperOrder = {
       id: `po-${Date.now()}`,
       thesisId,

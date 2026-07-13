@@ -14,3 +14,4 @@ export * from './profitabilityBenchmark.js';
 export * from './exchangeLatency.js';
 export * from './tradeLearning.js';
 export * from './opportunityThroughput.js';
+export * from './entryEligibility.js';

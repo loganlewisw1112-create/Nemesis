@@ -69,6 +69,22 @@ describe('executionRouter', () => {
     expect(desk.snapshot().positions.length).toBe(1);
   });
 
+  it('blocks research-only signals before mutating paper positions', () => {
+    const desk = new PaperDesk(1000);
+    const researchCard: ThesisCard = {
+      ...highEdgeCard,
+      playbook: 'global-pulse',
+      status: 'tradeable',
+      invalidations: [],
+    };
+
+    const result = simulatePaperBuy(desk, researchCard, crossedProfitBook, DEFAULT_GUARDRAILS, 2);
+
+    expect(result.abortCode).toBe('signal_eligibility_block');
+    expect(result.wouldMutate).toBe(false);
+    expect(desk.snapshot().positions).toHaveLength(0);
+  });
+
   it('blocks zero-price books before mutating paper positions', () => {
     const desk = new PaperDesk(1000);
     const zeroBook: KalshiOrderbook = {
@@ -190,9 +206,9 @@ describe('executionRouter', () => {
     const zeroEdgeCard = { ...card, netEdge: 0 };
     const result = simulatePaperBuy(desk, zeroEdgeCard, book, DEFAULT_GUARDRAILS, 2);
     expect(result.ok).toBe(false);
-    // The capital allocator refuses to size a zero-edge thesis before certification
-    // even runs; a forced contract count would instead hit strict_profit_block.
-    expect(result.abortCode).toBe('capital_allocator_block');
+    // The entry eligibility contract rejects a zero-edge thesis before capital
+    // allocation or strict-profit certification can authorize a mutation.
+    expect(result.abortCode).toBe('signal_eligibility_block');
     expect(result.wouldMutate).toBe(false);
   });
 

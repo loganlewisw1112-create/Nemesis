@@ -16,6 +16,7 @@ import {
 import { allocateSize, checkConcentration, decideCapitalAllocation, type CapitalDecision } from '@nemesis/capital';
 import { dryRunCloseFill, dryRunFill, type DryRunOrder } from './dryRun.js';
 import type { PaperDesk } from './paperDesk.js';
+import { entryEligibilityBlockReason } from './entryEligibility.js';
 
 export interface FillQuality {
   expectedPrice: number;
@@ -331,6 +332,8 @@ export function simulatePaperBuy(
   settings: GuardrailSettings,
   contracts?: number,
 ): PaperBuyResult {
+  const eligibilityBlock = entryEligibilityBlockReason(card);
+  if (eligibilityBlock) return abortBuy(eligibilityBlock, 'signal_eligibility_block');
   const portfolio = desk.snapshot();
   const cleanBook = sanitizeExecutableBook(book);
   const expectedPrice = card.side === 'yes' ? card.marketPrice : 1 - card.marketPrice;

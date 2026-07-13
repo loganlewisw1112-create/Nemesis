@@ -5,6 +5,7 @@ import type {
   ThesisCard,
 } from '@nemesis/core';
 import { DEFAULT_OPPORTUNITY_THROUGHPUT } from '@nemesis/core';
+import { entryEligibilityBlockReason } from './entryEligibility.js';
 
 export type OpportunityQueueState = ExecutionQueueState;
 
@@ -55,6 +56,19 @@ export function annotateCardsWithCertification(
 ): ThesisCard[] {
   const byKey = new Map(snapshot.items.map((item) => [item.key, item]));
   return cards.map((card) => {
+    const eligibilityBlock = entryEligibilityBlockReason(card);
+    if (eligibilityBlock) {
+      return {
+        ...card,
+        status: downgradeActionableStatus(card),
+        executionQueueState: 'blocked_final',
+        executionBlockReason: eligibilityBlock,
+        executionAbortCode: 'signal_eligibility_block',
+        certifiedNetPnlUsd: undefined,
+        profitCertificate: undefined,
+      };
+    }
+
     const item = byKey.get(keyFor(card));
     if (!item) {
       return {
@@ -140,6 +154,7 @@ export class OpportunityThroughputQueue {
   discover(cards: ThesisCard[], now = Date.now()) {
     for (const card of cards) {
       this.telemetry.candidatesScanned += 1;
+      if (entryEligibilityBlockReason(card)) continue;
       const key = keyFor(card);
       const existing = this.items.get(key);
       if (existing) {
