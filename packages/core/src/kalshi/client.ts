@@ -2,6 +2,7 @@ import type {
   KalshiMarket,
   KalshiMarketsResponse,
   KalshiOrderbook,
+  KalshiTrade,
   KalshiTradesResponse,
   OrderbookLevel,
 } from '../types.js';
@@ -256,7 +257,86 @@ export async function fetchTrades(
   params.set('limit', String(opts.limit ?? 50));
   if (opts.ticker) params.set('ticker', opts.ticker);
   if (opts.cursor) params.set('cursor', opts.cursor);
-  return kalshiFetch<KalshiTradesResponse>(`/markets/trades?${params}`, opts);
+  const raw = await kalshiFetch<{ trades?: unknown; cursor?: unknown }>(
+    `/markets/trades?${params}`,
+    opts,
+  );
+  if (!Array.isArray(raw.trades)) {
+    throw new Error('Kalshi trade payload missing trades array');
+  }
+
+  const trades = raw.trades
+    .map(normalizeKalshiTrade)
+    .filter((trade): trade is KalshiTrade => trade !== null);
+  if (raw.trades.length > 0 && trades.length === 0) {
+    throw new Error('Kalshi trade payload contained no valid records');
+  }
+
+  return {
+    trades,
+    cursor: typeof raw.cursor === 'string' ? raw.cursor : undefined,
+  };
+}
+
+function normalizeKalshiTrade(value: unknown): KalshiTrade | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const tradeId = nonEmptyString(raw.trade_id);
+  const ticker = nonEmptyString(raw.ticker);
+  const createdTime = nonEmptyString(raw.created_time);
+  const yesPrice = tradePriceCents(raw.yes_price_dollars, raw.yes_price);
+  const noPrice = tradePriceCents(raw.no_price_dollars, raw.no_price);
+  const count = finiteNumber(raw.count_fp ?? raw.count);
+  const takerSide = tradeTakerSide(raw);
+
+  if (
+    tradeId === null
+    || ticker === null
+    || createdTime === null
+    || yesPrice === null
+    || noPrice === null
+    || count === null
+    || count <= 0
+    || takerSide === null
+  ) return null;
+
+  return {
+    trade_id: tradeId,
+    ticker,
+    yes_price: yesPrice,
+    no_price: noPrice,
+    count,
+    taker_side: takerSide,
+    created_time: createdTime,
+  };
+}
+
+function finiteNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string' || value.trim().length === 0) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+function tradePriceCents(dollars: unknown, legacyCents: unknown): number | null {
+  const dollarValue = finiteNumber(dollars);
+  if (dollarValue !== null && dollarValue >= 0 && dollarValue <= 1) {
+    return Number((dollarValue * 100).toFixed(6));
+  }
+  const cents = finiteNumber(legacyCents);
+  return cents !== null && cents >= 0 && cents <= 100 ? cents : null;
+}
+
+function tradeTakerSide(raw: Record<string, unknown>): 'yes' | 'no' | null {
+  const outcomeSide = raw.taker_outcome_side ?? raw.taker_side;
+  if (outcomeSide === 'yes' || outcomeSide === 'no') return outcomeSide;
+  if (raw.taker_book_side === 'bid') return 'yes';
+  if (raw.taker_book_side === 'ask') return 'no';
+  return null;
 }
 
 export interface KalshiBalance {

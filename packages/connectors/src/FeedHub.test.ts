@@ -95,13 +95,23 @@ describe('FeedHub trade tape degradation', () => {
       ticker: 'KXDEMO',
       yes_price: 64,
       no_price: 36,
-      count: 100,
+      count: 100.25,
       taker_side: 'yes',
+      created_time: '2026-06-27T11:59:00.000Z',
+    };
+    const currentTradePayload = {
+      trade_id: 'tr-1',
+      ticker: 'KXDEMO',
+      yes_price_dollars: '0.6400',
+      no_price_dollars: '0.3600',
+      count_fp: '100.25',
+      taker_outcome_side: 'yes',
+      taker_book_side: 'bid',
       created_time: '2026-06-27T11:59:00.000Z',
     };
     const fetchFn = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(response({ trades: [whaleTrade] }))
+      .mockResolvedValueOnce(response({ trades: [currentTradePayload] }))
       .mockRejectedValue(new Error('fetch failed: trade endpoint timeout'));
     const { hub } = makeHub(fetchFn);
 

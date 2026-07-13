@@ -47,8 +47,10 @@ export interface KalshiOrderbook {
 export interface KalshiTrade {
   trade_id: string;
   ticker: string;
+  /** Internal cent price (0-100); fixed-point dollar API fields are normalized at fetch. */
   yes_price: number;
   no_price: number;
+  /** Contract quantity; Kalshi fixed-point responses may contain fractional contracts. */
   count: number;
   taker_side: 'yes' | 'no';
   created_time: string;

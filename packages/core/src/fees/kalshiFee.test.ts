@@ -105,6 +105,61 @@ describe('kalshi client', () => {
     await expect(fetchTrades({ fetchFn })).rejects.toThrow('Kalshi API 429');
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+
+  it('normalizes the current fixed-point trade response into cent-based internal trades', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      trades: [{
+        trade_id: 'tr-current',
+        ticker: 'KXBTC15M-26JUL131315-15',
+        count_fp: '5.37',
+        yes_price_dollars: '0.9540',
+        no_price_dollars: '0.0460',
+        taker_outcome_side: 'yes',
+        taker_book_side: 'bid',
+        created_time: '2026-07-13T17:10:24Z',
+      }],
+      cursor: 'next-page',
+    }), { status: 200 }));
+
+    await expect(fetchTrades({ fetchFn, limit: 1 })).resolves.toEqual({
+      trades: [{
+        trade_id: 'tr-current',
+        ticker: 'KXBTC15M-26JUL131315-15',
+        yes_price: 95.4,
+        no_price: 4.6,
+        count: 5.37,
+        taker_side: 'yes',
+        created_time: '2026-07-13T17:10:24Z',
+      }],
+      cursor: 'next-page',
+    });
+  });
+
+  it('keeps legacy cent-based trade responses compatible', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      trades: [{
+        trade_id: 'tr-legacy',
+        ticker: 'KXLEGACY',
+        count: 12,
+        yes_price: 47,
+        no_price: 53,
+        taker_side: 'no',
+        created_time: '2026-06-25T12:00:00Z',
+      }],
+    }), { status: 200 }));
+
+    await expect(fetchTrades({ fetchFn })).resolves.toMatchObject({
+      trades: [{ yes_price: 47, no_price: 53, count: 12, taker_side: 'no' }],
+    });
+  });
+
+  it('rejects an unsupported non-empty trade payload instead of reporting a healthy empty tape', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      trades: [{ ticker: 'KXBROKEN', count_fp: '10.00' }],
+    }), { status: 200 }));
+
+    await expect(fetchTrades({ fetchFn })).rejects.toThrow('Kalshi trade payload contained no valid records');
+  });
 });
 
 describe('qualification', () => {
