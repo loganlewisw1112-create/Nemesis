@@ -1,6 +1,12 @@
 import type { BinanceQuote } from '@nemesis/connectors';
 import type { CryptoThesisContext, ThesisCard, ThesisDriver } from '@nemesis/core';
-import { qualifyThesis, computeNetEdge, detectSourceDisagreement, kalshiFeePerContract } from '@nemesis/core';
+import {
+  qualifyThesis,
+  computeNetEdge,
+  detectSourceDisagreement,
+  kalshiFeePerContract,
+  selectedSidePricing,
+} from '@nemesis/core';
 
 export interface CryptoLeadInput {
   ticker: string;
@@ -121,10 +127,11 @@ export function cryptoToThesis(input: CryptoLeadInput): ThesisCard {
     [{ value: spotPrice }, { value: kalshiSpot }],
     input.strike * 0.02,
   );
-  const breakdown = computeNetEdge(implied, input.marketPrice, input.spread);
+  const pricing = selectedSidePricing(input.marketPrice, implied);
+  const breakdown = computeNetEdge(pricing.impliedPrice, pricing.marketPrice, input.spread);
   const qual = qualifyThesis({
-    impliedPrice: implied,
-    marketPrice: input.marketPrice,
+    impliedPrice: pricing.impliedPrice,
+    marketPrice: pricing.marketPrice,
     spread: input.spread,
     depthUsd: input.depthUsd,
     predictability: score.predictability,
@@ -142,15 +149,15 @@ export function cryptoToThesis(input: CryptoLeadInput): ThesisCard {
     category: 'crypto',
     playbook: 'crypto-lead',
     status: disagree ? 'uncertain' : qual.status,
-    side: implied > input.marketPrice ? 'yes' : 'no',
-    marketPrice: input.marketPrice,
-    impliedPrice: implied,
+    side: pricing.side,
+    marketPrice: pricing.marketPrice,
+    impliedPrice: pricing.impliedPrice,
     grossEdge: breakdown.grossEdge,
     netEdge: breakdown.netEdge,
     spread: input.spread,
     depthUsd: input.depthUsd,
     predictability: score.predictability,
-    feeEstimate: kalshiFeePerContract(input.marketPrice),
+    feeEstimate: kalshiFeePerContract(pricing.marketPrice),
     signalReason: `Binance ${score.context.symbol} spot lead ${lagMs}ms; momentum ${signedBps(score.context.momentumBps)}, vol ${score.context.volatilityBps.toFixed(1)} bps`,
     externalSummary: `${score.context.symbol} spot $${formatUsd(spotPrice)} vs strike $${formatUsd(input.strike)} (${signedBps(score.context.distanceBps)}) · momentum ${signedBps(score.context.momentumBps)} · vol ${score.context.volatilityBps.toFixed(1)} bps`,
     createdAt: now,

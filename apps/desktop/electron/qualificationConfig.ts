@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { DiscoverySettings, GuardrailSettings } from '@nemesis/core';
 
-export const PAPER_STRATEGY_ENGINE_VERSION = 2;
+export const PAPER_STRATEGY_ENGINE_VERSION = 3;
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;

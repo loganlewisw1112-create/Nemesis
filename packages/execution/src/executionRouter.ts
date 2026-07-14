@@ -17,6 +17,7 @@ import { allocateSize, checkConcentration, decideCapitalAllocation, type Capital
 import { dryRunCloseFill, dryRunFill, type DryRunOrder } from './dryRun.js';
 import type { PaperDesk } from './paperDesk.js';
 import { entryEligibilityBlockReason } from './entryEligibility.js';
+import { calculateEntryEconomics } from './tradeEconomics.js';
 
 export interface FillQuality {
   expectedPrice: number;
@@ -178,13 +179,23 @@ function certifyOpenProfit(
     }
   }
 
-  // Path B: thesis-edge certification. card.netEdge is the scorer's own fee/spread/
-  // slippage-aware probability-gap estimate (see AlphaScorer / edge-scanner). This
-  // certifies a modeled expected-value edge realized by holding toward settlement,
-  // not a locked-in outcome -- it can still lose. hasCloseDepth above already proved
-  // an exit path exists so the position won't be stranded.
+  // Path B: conditional model-target certification. Actual fill price and fees are
+  // authoritative. Screening costs inside card.netEdge are not subtracted again.
   if (!Number.isFinite(card.netEdge) || card.netEdge <= 0) return null;
-  const thesisNetPnlUsd = Number((card.netEdge * entryFill.filled - entryFill.fees).toFixed(4));
+  const economics = calculateEntryEconomics({
+    entryPrice: entryFill.fillPrice,
+    entryFeesUsd: entryFill.fees,
+    contracts: entryFill.filled,
+    sideFairPrice: card.impliedPrice,
+    marketPrice: card.marketPrice,
+    grossEdge: card.grossEdge,
+    screeningNetEdge: card.netEdge,
+    executableEntryNetEdge: entryFill.netEdge,
+    spread: card.spread,
+    fillSlippage: entryFill.slippage,
+  });
+  if (economics.targetExitPrice <= entryFill.fillPrice) return null;
+  const thesisNetPnlUsd = Number(economics.targetRewardUsd.toFixed(4));
   if (thesisNetPnlUsd < strict.minNetPnlUsd) return null;
   const now = Date.now();
   return {
@@ -193,14 +204,21 @@ function certifyOpenProfit(
     side: card.side,
     contracts: entryFill.filled,
     entryPrice: entryFill.fillPrice,
-    exitPrice: entryFill.fillPrice,
+    exitPrice: economics.targetExitPrice,
     entryFees: entryFill.fees,
-    exitFees: 0,
+    exitFees: economics.targetExitFeesUsd,
     netPnlUsd: thesisNetPnlUsd,
     bookTimestamp: now,
     expiresAt: now + strict.maxBookAgeMs,
-    reason: 'thesis edge certified (modeled, not locked-in)',
+    reason: 'conditional model target certified (modeled, not locked-in)',
     classification: 'research_only',
+    targetExitPrice: economics.targetExitPrice,
+    breakEvenExitPrice: economics.breakEvenExitPrice,
+    targetRewardUsd: economics.targetRewardUsd,
+    expectedRewardUsd: economics.targetRewardUsd,
+    plannedLossUsd: economics.plannedLossUsd,
+    rewardRiskRatio: economics.rewardRiskRatio,
+    stressedNetPnlUsd: economics.stressedNetPnlUsd,
   };
 }
 

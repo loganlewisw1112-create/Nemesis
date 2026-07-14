@@ -16,6 +16,7 @@ export * from './tradeLearning.js';
 export * from './opportunityThroughput.js';
 export * from './strategyValidation.js';
 export * from './entryConfirmation.js';
+export * from './tradeEconomics.js';
 export * from './entryEligibility.js';
 export * from './paperQualification.js';
 export * from './paperRunArchive.js';

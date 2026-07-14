@@ -5,6 +5,7 @@ export * from './http/resilientFetch.js';
 export * from './fees/kalshiFee.js';
 export * from './stats/calibration.js';
 export * from './thesis/qualification.js';
+export * from './thesis/sidePricing.js';
 export * from './guardrails/engine.js';
 export * from './guardrails/liveUnlock.js';
 export * from './guardrails/shutdownCounters.js';

@@ -19,6 +19,7 @@
     "stage:windows-package": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stage-windows-package.ps1",
     "smoke:desktop-pair": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-desktop-pair.ps1",
     "paper:archive-reset": "node scripts/archive-and-reset-paper.cjs",
+    "paper:rescore": "node scripts/rescore-strategy-validation.cjs",
     "ci:build": "npm run build",
     "ci:typecheck": "npm run typecheck",
     "ci:unit": "npm test -- --run",

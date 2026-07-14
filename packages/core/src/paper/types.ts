@@ -42,7 +42,10 @@ export interface ProfitCertificate {
   edgeRetention?: number;
   bookAgeMs?: number;
   targetExitPrice?: number;
-  breakEvenExitPrice?: number;
+  breakEvenExitPrice?: number | null;
+  /** Conditional net reward if targetExitPrice is reached; not probability-weighted EV. */
+  targetRewardUsd?: number;
+  /** @deprecated Read compatibility for pre-schema-2 evidence. */
   expectedRewardUsd?: number;
   plannedLossUsd?: number;
   rewardRiskRatio?: number;

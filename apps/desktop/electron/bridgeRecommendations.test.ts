@@ -61,4 +61,19 @@ describe('NEMESIS bridge recommendation mapping', () => {
     expect(second[0].netEdge).toBe(0.09);
     expect(second[0].updatedAt).toBe(2);
   });
+
+  it('maps a NO recommendation into selected-contract price terms', () => {
+    const card = recommendationToThesis(packet({
+      nemesis_probability: 0.3,
+      entry_zone_low: 0.42,
+      entry_zone_high: 0.48,
+    }));
+
+    expect(card).toMatchObject({
+      side: 'no',
+      marketPrice: 0.55,
+      impliedPrice: 0.7,
+    });
+    expect(card.impliedPrice).toBeGreaterThan(card.marketPrice);
+  });
 });

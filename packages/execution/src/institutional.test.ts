@@ -203,6 +203,32 @@ describe('executionRouter', () => {
     expect(desk.snapshot().positions).toHaveLength(0);
   });
 
+  it('certifies conditional target dollars without subtracting screening costs twice', () => {
+    const normalBook: KalshiOrderbook = {
+      ...book,
+      yes: [{ price: 0.44, quantity: 200 }],
+    };
+    const first = previewPaperBuy(
+      new PaperDesk(1000).snapshot(),
+      highEdgeCard,
+      normalBook,
+      DEFAULT_GUARDRAILS,
+      10,
+    );
+    const lowerScreeningEdge = previewPaperBuy(
+      new PaperDesk(1000).snapshot(),
+      { ...highEdgeCard, netEdge: 0.01 },
+      normalBook,
+      DEFAULT_GUARDRAILS,
+      10,
+    );
+
+    expect(first.ok).toBe(true);
+    expect(first.profitCertificate?.targetExitPrice).toBe(0.75);
+    expect(first.profitCertificate?.targetRewardUsd).toBe(2.58);
+    expect(lowerScreeningEdge.profitCertificate?.targetRewardUsd).toBe(2.58);
+  });
+
   it('uses a NO thesis contract price directly instead of inverting it twice', () => {
     const noCard: ThesisCard = {
       ...highEdgeCard,

@@ -100,6 +100,7 @@ export interface EntryQualificationSettings {
   minEdgeRetention: number;
   maxBookAgeMs: number;
   maxSpreadWideningPp: number;
+  /** Minimum conditional target reward; legacy field name retained for saved settings. */
   minExpectedNetPnlUsd: number;
   minRewardRiskRatio: number;
   minStressedNetPnlUsd: number;
@@ -247,7 +248,9 @@ export interface ThesisCard {
   playbook: PlaybookId;
   status: ThesisStatus;
   side: 'yes' | 'no';
+  /** Executable/reference price for the selected side, never an unconditional YES price. */
   marketPrice: number;
+  /** Model fair price for the selected side. */
   impliedPrice: number;
   grossEdge: number;
   netEdge: number;

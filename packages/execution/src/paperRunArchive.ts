@@ -174,7 +174,7 @@ export function archiveAndResetPaper(input: ArchiveAndResetPaperInput): ArchiveA
     createdAt: new Date(now).toISOString(),
     gitCommit: input.gitCommit,
     appVersion: input.appVersion,
-    strategyEngineVersion: input.strategyEngineVersion ?? 2,
+    strategyEngineVersion: input.strategyEngineVersion ?? 3,
     startingCash: portfolioBefore.startingCash,
     cash: portfolioBefore.cash,
     realizedPnl: portfolioBefore.realizedPnl,
@@ -204,7 +204,7 @@ export function archiveAndResetPaper(input: ArchiveAndResetPaperInput): ArchiveA
   const validationTracker = StrategyValidationTracker.create(
     'shadow',
     input.strategyConfigHash,
-    input.strategyEngineVersion ?? 2,
+    input.strategyEngineVersion ?? 3,
     now,
     `svr-${newRunId}`,
   );

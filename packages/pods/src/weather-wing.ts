@@ -6,6 +6,7 @@ import {
   kalshiFeePerContract,
   sigmoidProbability,
   clampProbability,
+  selectedSidePricing,
 } from '@nemesis/core';
 
 export interface WeatherInput {
@@ -59,10 +60,11 @@ export function weatherToThesis(input: WeatherInput): ThesisCard {
   const distance = input.nwsForecast - input.strike;
   const sigma = 1.5 * Math.sqrt(Math.max(1, input.hoursToSettle) / 12);
   const implied = clampProbability(sigmoidProbability(distance, sigma));
-  const breakdown = computeNetEdge(implied, input.marketPrice, input.spread);
+  const pricing = selectedSidePricing(input.marketPrice, implied);
+  const breakdown = computeNetEdge(pricing.impliedPrice, pricing.marketPrice, input.spread);
   const qual = qualifyThesis({
-    impliedPrice: implied,
-    marketPrice: input.marketPrice,
+    impliedPrice: pricing.impliedPrice,
+    marketPrice: pricing.marketPrice,
     spread: input.spread,
     depthUsd: input.depthUsd,
     predictability: disagree ? 40 : 75,
@@ -80,15 +82,15 @@ export function weatherToThesis(input: WeatherInput): ThesisCard {
     category: 'weather',
     playbook: 'weather-wing',
     status: disagree ? 'uncertain' : qual.status,
-    side: implied > input.marketPrice ? 'yes' : 'no',
-    marketPrice: input.marketPrice,
-    impliedPrice: implied,
+    side: pricing.side,
+    marketPrice: pricing.marketPrice,
+    impliedPrice: pricing.impliedPrice,
     grossEdge: breakdown.grossEdge,
     netEdge: breakdown.netEdge,
     spread: input.spread,
     depthUsd: input.depthUsd,
     predictability: disagree ? 40 : 75,
-    feeEstimate: kalshiFeePerContract(input.marketPrice),
+    feeEstimate: kalshiFeePerContract(pricing.marketPrice),
     signalReason: `NWS ${input.nwsForecast}°F vs strike ${input.strike}°F`,
     externalSummary: `Open-Meteo ${input.openMeteoForecast}°F`,
     createdAt: now,

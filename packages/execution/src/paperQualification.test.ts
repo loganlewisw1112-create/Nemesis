@@ -71,7 +71,9 @@ describe('PaperQualificationTracker', () => {
     });
     const result = tracker.snapshot(50);
     expect(result.completedPositionCount).toBe(1);
-    expect(result.entryRiskUsd).toBeCloseTo(6.8, 2);
+    const expectedEntryRisk = 0.4 * 10 + kalshiFeeForOrder(0.4, 10)
+      + 0.5 * 5 + kalshiFeeForOrder(0.5, 5);
+    expect(result.entryRiskUsd).toBeCloseTo(expectedEntryRisk, 6);
     expect(result.realizedPnlUsd).toBeGreaterThan(2);
   });
 
@@ -208,7 +210,10 @@ describe('PaperQualificationTracker', () => {
     expect(result.grossLossUsd).toBeGreaterThan(0);
     expect(result.profitFactor).toBeCloseTo(result.grossProfitUsd / result.grossLossUsd, 6);
     expect(result.averageNetPnlUsd).toBeCloseTo(result.realizedPnlUsd / 3, 6);
-    expect(result.largestWinShare).toBeCloseTo(2.6 / 4.2, 6);
+    const entryCost = 0.4 * 10 + kalshiFeeForOrder(0.4, 10);
+    const winA = 0.7 * 10 - kalshiFeeForOrder(0.7, 10) - entryCost;
+    const winB = 0.6 * 10 - kalshiFeeForOrder(0.6, 10) - entryCost;
+    expect(result.largestWinShare).toBeCloseTo(winA / (winA + winB), 6);
     expect(result.stressedNetPnlUsd).toBeLessThan(result.realizedPnlUsd);
     expect(result.stressedProfitFactor).toBeLessThan(result.profitFactor);
   });

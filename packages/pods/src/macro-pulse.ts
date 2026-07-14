@@ -5,6 +5,7 @@ import {
   kalshiFeePerContract,
   sigmoidProbability,
   clampProbability,
+  selectedSidePricing,
 } from '@nemesis/core';
 
 // Typical consensus-vs-actual error scale for a headline macro release
@@ -29,10 +30,11 @@ export function macroToThesis(event: MacroEvent): ThesisCard {
   const implied = event.actual !== undefined
     ? clampProbability(sigmoidProbability(surprise, SURPRISE_SCALE))
     : 0.5;
-  const breakdown = computeNetEdge(implied, event.marketPrice, event.spread);
+  const pricing = selectedSidePricing(event.marketPrice, implied);
+  const breakdown = computeNetEdge(pricing.impliedPrice, pricing.marketPrice, event.spread);
   const qual = qualifyThesis({
-    impliedPrice: implied,
-    marketPrice: event.marketPrice,
+    impliedPrice: pricing.impliedPrice,
+    marketPrice: pricing.marketPrice,
     spread: event.spread,
     depthUsd: event.depthUsd,
     predictability: event.minutesToRelease < 30 ? 55 : 70,
@@ -50,15 +52,15 @@ export function macroToThesis(event: MacroEvent): ThesisCard {
     category: 'economics',
     playbook: 'macro-pulse',
     status: qual.status,
-    side: implied > event.marketPrice ? 'yes' : 'no',
-    marketPrice: event.marketPrice,
-    impliedPrice: implied,
+    side: pricing.side,
+    marketPrice: pricing.marketPrice,
+    impliedPrice: pricing.impliedPrice,
     grossEdge: breakdown.grossEdge,
     netEdge: breakdown.netEdge,
     spread: event.spread,
     depthUsd: event.depthUsd,
     predictability: event.minutesToRelease < 30 ? 55 : 70,
-    feeEstimate: kalshiFeePerContract(event.marketPrice),
+    feeEstimate: kalshiFeePerContract(pricing.marketPrice),
     signalReason: event.actual !== undefined
       ? `${event.releaseName} surprise ${surprise > 0 ? '+' : ''}${surprise.toFixed(2)}`
       : `T-${event.minutesToRelease}m ${event.releaseName}`,

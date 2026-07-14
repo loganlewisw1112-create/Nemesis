@@ -1168,10 +1168,12 @@ async function executeReservedStrictPaperBuyForCard(
     samples: confirmation.samples,
     windowMs: confirmation.windowMs,
     edgeRetention: confirmation.edgeRetention,
+    targetRewardUsd: confirmation.targetRewardUsd,
     expectedRewardUsd: confirmation.expectedRewardUsd,
     plannedLossUsd: confirmation.plannedLossUsd,
     rewardRiskRatio: confirmation.rewardRiskRatio,
     stressedNetPnlUsd: confirmation.stressedNetPnlUsd,
+    economics: confirmation.economics,
   }));
   if (!confirmationRecorded) {
     const reason = 'entry confirmation evidence could not be persisted';
@@ -1214,10 +1216,12 @@ async function executeReservedStrictPaperBuyForCard(
       contracts: preview.fill!.filled,
       entryPrice: preview.fill!.fillPrice,
       entryFeesUsd: preview.fill!.fees,
-      initialNetEdge: card.netEdge,
+      initialNetEdge: confirmation.certificate!.initialNetEdge ?? preview.fill!.netEdge,
+      targetRewardUsd: confirmation.targetRewardUsd,
       expectedRewardUsd: confirmation.expectedRewardUsd,
       plannedLossUsd: confirmation.plannedLossUsd,
       rewardRiskRatio: confirmation.rewardRiskRatio,
+      stressedTargetNetPnlUsd: confirmation.stressedNetPnlUsd,
       stressedExpectedNetPnlUsd: confirmation.stressedNetPnlUsd,
     }));
     if (!candidateRecorded) {
@@ -1564,7 +1568,8 @@ async function evaluateStrategyValidationFollowUps(): Promise<void> {
         ));
         const observations = strategyValidationStore.tracker.recentObservations(candidate.id, 3);
         const edgeGone = observations.length >= 3 && observations.every((observation) => observation.netEdge <= 0);
-        const hitTarget = executableNetPnlUsd >= candidate.expectedRewardUsd;
+        const targetRewardUsd = candidate.targetRewardUsd ?? candidate.expectedRewardUsd;
+        const hitTarget = Number.isFinite(targetRewardUsd) && executableNetPnlUsd >= targetRewardUsd!;
         const hitLoss = executableNetPnlUsd <= -candidate.plannedLossUsd;
         const due = now >= candidate.dueAt;
         if (hitTarget || hitLoss || edgeGone || due) {

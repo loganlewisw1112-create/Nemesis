@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_ENTRY_QUALIFICATION } from '@nemesis/core';
 import { StrategyValidationTracker, type ShadowCandidateEvidence } from './strategyValidation.js';
+import { calculateEntryEconomics } from './tradeEconomics.js';
 
 const day = 24 * 60 * 60_000;
 const start = Date.UTC(2026, 6, 13, 16, 0, 0);
@@ -26,6 +27,63 @@ function candidate(index: number, at: number): ShadowCandidateEvidence {
 }
 
 describe('StrategyValidationTracker', () => {
+  it('writes schema-2 raw economics and replays schema-1 ledgers without mutation', () => {
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start, 'schema-2');
+    const economics = calculateEntryEconomics({
+      entryPrice: 0.4,
+      entryFeesUsd: 0.34,
+      contracts: 20,
+      sideFairPrice: 0.55,
+      marketPrice: 0.4,
+      grossEdge: 0.15,
+      screeningNetEdge: 0.11,
+      executableEntryNetEdge: 0.13,
+      spread: 0.02,
+      fillSlippage: 0,
+    });
+    tracker.recordEntryConfirmation({
+      sourceSignalId: 'source-raw',
+      ticker: 'KXRAW',
+      side: 'yes',
+      status: 'pending',
+      reason: 'collecting evidence',
+      samples: 1,
+      windowMs: 0,
+      edgeRetention: 1,
+      targetRewardUsd: economics.targetRewardUsd,
+      plannedLossUsd: economics.plannedLossUsd,
+      rewardRiskRatio: economics.rewardRiskRatio,
+      stressedNetPnlUsd: economics.stressedNetPnlUsd,
+      economics,
+      at: start + 1,
+    });
+    const event = tracker.allEvents()[1];
+    expect(event).toMatchObject({
+      schemaVersion: 2,
+      type: 'entry_confirmation_observed',
+      targetRewardUsd: economics.targetRewardUsd,
+      expectedRewardUsd: economics.targetRewardUsd,
+      economics: {
+        entryPrice: 0.4,
+        contracts: 20,
+        sideFairPrice: 0.55,
+        grossEdge: 0.15,
+        feeModel: 'kalshi-base-taker-cent-whole-v2',
+      },
+    });
+    expect(StrategyValidationTracker.replay(tracker.allEvents()).integrityFailure()).toBeUndefined();
+
+    const legacy = StrategyValidationTracker.create('shadow', 'legacy-config', 2, start, 'schema-1', 1);
+    legacy.pause('archived legacy run', start + 1);
+    const replayedLegacy = StrategyValidationTracker.replay(legacy.allEvents());
+    expect(replayedLegacy.integrityFailure()).toBeUndefined();
+    expect(replayedLegacy.snapshot(DEFAULT_ENTRY_QUALIFICATION)).toMatchObject({
+      schemaVersion: 1,
+      runId: 'schema-1',
+      paused: true,
+    });
+  });
+
   it('replays the same shadow totals and passes only after the full stable sample', () => {
     const tracker = StrategyValidationTracker.create('shadow', 'config-a', 2, start, 'shadow-run');
     for (let index = 0; index < 100; index += 1) {

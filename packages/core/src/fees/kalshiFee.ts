@@ -1,12 +1,33 @@
-/** Kalshi taker fee: ceil(rate * P * (1-P)) per contract, default rate 0.07 */
+function ceilToCent(value: number): number {
+  if (value <= 0) return 0;
+  const epsilon = Number.EPSILON * Math.max(1, Math.abs(value)) * 8;
+  return Math.ceil((value - epsilon) * 100) / 100;
+}
+
+/**
+ * Conservative one-contract taker-fee estimate used by pre-fill edge screening.
+ * Executed order accounting must use kalshiFeeForOrder so rounding happens once.
+ */
 export function kalshiFeePerContract(price: number, rate = 0.07): number {
   const p = Math.max(0, Math.min(1, price));
   const raw = rate * p * (1 - p);
-  return Math.ceil(raw * 100) / 100;
+  return ceilToCent(raw);
 }
 
 export function kalshiFeeForOrder(price: number, contracts: number, rate = 0.07): number {
-  return kalshiFeePerContract(price, rate) * contracts;
+  const p = Math.max(0, Math.min(1, price));
+  const quantity = Math.max(0, contracts);
+  return ceilToCent(rate * quantity * p * (1 - p));
+}
+
+/** Qualification currently models whole-contract fills on one-cent price grids only. */
+export function isSupportedQualificationFeeOrder(price: number, contracts: number): boolean {
+  return Number.isFinite(price)
+    && Number.isFinite(contracts)
+    && price > 0
+    && price < 1
+    && Number.isInteger(contracts)
+    && Math.abs(price * 100 - Math.round(price * 100)) < 1e-8;
 }
 
 export interface EdgeBreakdown {

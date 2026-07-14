@@ -76,10 +76,11 @@ describe('archiveAndResetPaper', () => {
     expect(fs.readFileSync(path.join(dataDir, 'paper-qualification-events.jsonl'), 'utf8')).toContain(result.newRunId);
     const validationEvent = JSON.parse(fs.readFileSync(path.join(dataDir, 'paper-strategy-validation-events.jsonl'), 'utf8').trim());
     expect(validationEvent).toMatchObject({
+      schemaVersion: 2,
       type: 'validation_run_started',
       stage: 'shadow',
       strategyConfigHash: 'config',
-      strategyEngineVersion: 2,
+      strategyEngineVersion: 3,
     });
   });
 

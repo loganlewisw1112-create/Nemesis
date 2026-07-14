@@ -15,8 +15,8 @@ function card(overrides: Partial<ThesisCard> = {}): ThesisCard {
     status: 'tradeable',
     side: 'yes',
     marketPrice: 0.4,
-    impliedPrice: 0.5,
-    grossEdge: 0.14,
+    impliedPrice: 0.55,
+    grossEdge: 0.15,
     netEdge: 0.12,
     spread: 0.02,
     depthUsd: 500,
@@ -73,7 +73,7 @@ function observe(engine: EntryConfirmationEngine, index: number, overrides: Part
   const observedAt = startedAt + index * 6_000;
   return engine.observe({
     card: card({ updatedAt: observedAt, ...overrides }),
-    fill: fill(),
+    fill: fill({ netEdge: overrides.netEdge ?? 0.09 }),
     baseCertificate: certificate(),
     bookTimestamp: observedAt,
     observedAt,
@@ -91,10 +91,12 @@ describe('EntryConfirmationEngine', () => {
     expect(result.samples).toBe(6);
     expect(result.windowMs).toBe(30_000);
     expect(result.edgeRetention).toBe(1);
+    expect(result.targetRewardUsd).toBe(result.expectedRewardUsd);
     expect(result.expectedRewardUsd).toBeGreaterThanOrEqual(1);
     expect(result.rewardRiskRatio).toBeGreaterThanOrEqual(2);
     expect(result.stressedNetPnlUsd).toBeGreaterThan(0);
     expect(result.certificate?.classification).toBe('modeled_confirmed');
+    expect(result.certificate?.targetRewardUsd).toBe(result.targetRewardUsd);
   });
 
   it('rejects stale, reused, non-flow, and cooldown-blocked sources', () => {
@@ -139,7 +141,7 @@ describe('EntryConfirmationEngine', () => {
       minRewardRiskRatio: -100,
     });
     const result = engine.observe({
-      card: card({ netEdge: 0.01 }),
+      card: card({ impliedPrice: 0.42, grossEdge: 0.02, netEdge: 0.01 }),
       fill: fill({ filled: 1, contracts: 1, fees: 0.02 }),
       baseCertificate: { ...certificate(), contracts: 1, entryFees: 0.02 },
       bookTimestamp: startedAt,
@@ -147,5 +149,64 @@ describe('EntryConfirmationEngine', () => {
     });
     expect(result.status).toBe('rejected');
     expect(result.reason).toMatch(/stressed/i);
+  });
+
+  it('fails closed on fractional or subpenny qualification fills', () => {
+    const engine = new EntryConfirmationEngine();
+    const fractional = engine.observe({
+      card: card(),
+      fill: fill({ contracts: 1.5, filled: 1.5, fees: 0.03 }),
+      baseCertificate: { ...certificate(), contracts: 1.5 },
+      bookTimestamp: startedAt,
+      observedAt: startedAt,
+    });
+    expect(fractional.reason).toMatch(/whole contracts/i);
+
+    const subpenny = engine.observe({
+      card: card(),
+      fill: fill({ fillPrice: 0.405, fees: 0.42 }),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      observedAt: startedAt,
+    });
+    expect(subpenny.reason).toMatch(/one-cent/i);
+  });
+
+  it('keeps target, reward-risk, and stress gates inclusive at their exact boundaries', () => {
+    const relaxed = {
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      minExpectedNetPnlUsd: -100,
+      minRewardRiskRatio: -100,
+      minStressedNetPnlUsd: -100,
+    };
+    const probe = observe(new EntryConfirmationEngine(relaxed), 0);
+    expect(probe.status).toBe('pending');
+
+    expect(observe(new EntryConfirmationEngine({
+      ...relaxed,
+      minExpectedNetPnlUsd: probe.targetRewardUsd,
+    }), 0).status).toBe('pending');
+    expect(observe(new EntryConfirmationEngine({
+      ...relaxed,
+      minExpectedNetPnlUsd: probe.targetRewardUsd + 0.000001,
+    }), 0).reason).toMatch(/target net reward/i);
+
+    expect(observe(new EntryConfirmationEngine({
+      ...relaxed,
+      minRewardRiskRatio: probe.rewardRiskRatio,
+    }), 0).status).toBe('pending');
+    expect(observe(new EntryConfirmationEngine({
+      ...relaxed,
+      minRewardRiskRatio: probe.rewardRiskRatio + 0.000001,
+    }), 0).reason).toMatch(/reward-to-risk/i);
+
+    expect(observe(new EntryConfirmationEngine({
+      ...relaxed,
+      minStressedNetPnlUsd: probe.stressedNetPnlUsd,
+    }), 0).status).toBe('pending');
+    expect(observe(new EntryConfirmationEngine({
+      ...relaxed,
+      minStressedNetPnlUsd: probe.stressedNetPnlUsd + 0.000001,
+    }), 0).reason).toMatch(/stressed/i);
   });
 });

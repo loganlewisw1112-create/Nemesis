@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { EntryQualificationSettings, StrategyValidationStage } from '@nemesis/core';
+import type { EntryEconomicsEvidence } from './tradeEconomics.js';
 
-export const STRATEGY_VALIDATION_SCHEMA_VERSION = 1;
+export const STRATEGY_VALIDATION_SCHEMA_VERSION = 2;
+const SUPPORTED_STRATEGY_VALIDATION_SCHEMAS = new Set([1, STRATEGY_VALIDATION_SCHEMA_VERSION]);
 
 export interface ShadowCandidateEvidence {
   id: string;
@@ -15,14 +17,19 @@ export interface ShadowCandidateEvidence {
   entryPrice: number;
   entryFeesUsd: number;
   initialNetEdge: number;
-  expectedRewardUsd: number;
+  /** Conditional reward if the model target is reached. */
+  targetRewardUsd?: number;
+  /** @deprecated Schema-1 compatibility alias. */
+  expectedRewardUsd?: number;
   plannedLossUsd: number;
   rewardRiskRatio: number;
-  stressedExpectedNetPnlUsd: number;
+  stressedTargetNetPnlUsd?: number;
+  /** @deprecated Schema-1 compatibility alias. */
+  stressedExpectedNetPnlUsd?: number;
 }
 
 interface ValidationEventBase {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   runId: string;
   sequence: number;
   at: number;
@@ -48,10 +55,12 @@ export type StrategyValidationEvent = ValidationEventBase & (
     samples: number;
     windowMs: number;
     edgeRetention: number;
+    targetRewardUsd?: number;
     expectedRewardUsd: number;
     plannedLossUsd: number;
     rewardRiskRatio: number;
     stressedNetPnlUsd: number;
+    economics?: EntryEconomicsEvidence;
   }
   | {
     type: 'shadow_candidate_observed';
@@ -72,6 +81,7 @@ export type StrategyValidationEvent = ValidationEventBase & (
 );
 
 export interface StrategyValidationSnapshot {
+  schemaVersion: 1 | 2;
   runId: string;
   stage: StrategyValidationStage;
   strategyConfigHash: string;
@@ -144,6 +154,7 @@ export class StrategyValidationTracker {
     stage: StrategyValidationStage,
     readonly strategyConfigHash: string,
     readonly strategyEngineVersion: number,
+    readonly schemaVersion: 1 | 2,
   ) {
     this.stage = stage;
   }
@@ -154,8 +165,15 @@ export class StrategyValidationTracker {
     strategyEngineVersion: number,
     now = Date.now(),
     runId = `svr-${now}-${randomUUID()}`,
+    schemaVersion: 1 | 2 = STRATEGY_VALIDATION_SCHEMA_VERSION,
   ): StrategyValidationTracker {
-    const tracker = new StrategyValidationTracker(runId, stage, strategyConfigHash, strategyEngineVersion);
+    const tracker = new StrategyValidationTracker(
+      runId,
+      stage,
+      strategyConfigHash,
+      strategyEngineVersion,
+      schemaVersion,
+    );
     tracker.add('validation_run_started', { stage, strategyConfigHash, strategyEngineVersion }, now);
     return tracker;
   }
@@ -163,15 +181,26 @@ export class StrategyValidationTracker {
   static replay(events: StrategyValidationEvent[]): StrategyValidationTracker {
     const first = events[0];
     if (!first || first.type !== 'validation_run_started') {
-      const broken = new StrategyValidationTracker('invalid', 'shadow', '', 0);
+      const broken = new StrategyValidationTracker('invalid', 'shadow', '', 0, STRATEGY_VALIDATION_SCHEMA_VERSION);
       broken.integrityError = 'strategy validation ledger missing validation_run_started event';
       return broken;
     }
-    const tracker = new StrategyValidationTracker(first.runId, first.stage, first.strategyConfigHash, first.strategyEngineVersion);
+    const schemaVersion = first.schemaVersion;
+    const tracker = new StrategyValidationTracker(
+      first.runId,
+      first.stage,
+      first.strategyConfigHash,
+      first.strategyEngineVersion,
+      schemaVersion,
+    );
+    if (!SUPPORTED_STRATEGY_VALIDATION_SCHEMAS.has(schemaVersion)) {
+      tracker.integrityError = 'strategy validation ledger schema mismatch';
+      return tracker;
+    }
     let previousHash = 'GENESIS';
     for (let index = 0; index < events.length; index += 1) {
       const event = events[index];
-      if (event.schemaVersion !== STRATEGY_VALIDATION_SCHEMA_VERSION) {
+      if (event.schemaVersion !== schemaVersion) {
         tracker.integrityError = 'strategy validation ledger schema mismatch';
         break;
       }
@@ -198,7 +227,7 @@ export class StrategyValidationTracker {
   ): Extract<StrategyValidationEvent, { type: T }> {
     if (this.integrityError) throw new Error(this.integrityError);
     const unsigned = {
-      schemaVersion: STRATEGY_VALIDATION_SCHEMA_VERSION,
+      schemaVersion: this.schemaVersion,
       runId: this.runId,
       sequence: this.events.length + 1,
       at,
@@ -226,7 +255,18 @@ export class StrategyValidationTracker {
   startShadowCandidate(candidate: ShadowCandidateEvidence): StrategyValidationEvent {
     if (this.usedSources.has(candidate.sourceSignalId)) throw new Error('source signal already used');
     if (this.stage !== 'shadow') throw new Error('shadow candidates require shadow stage');
-    return this.add('shadow_candidate_started', { candidate }, candidate.startedAt);
+    const targetRewardUsd = candidate.targetRewardUsd ?? candidate.expectedRewardUsd;
+    if (!Number.isFinite(targetRewardUsd)) throw new Error('shadow candidate target reward is missing');
+    const stressedTargetNetPnlUsd = candidate.stressedTargetNetPnlUsd ?? candidate.stressedExpectedNetPnlUsd;
+    if (!Number.isFinite(stressedTargetNetPnlUsd)) throw new Error('shadow candidate stressed target result is missing');
+    const normalized = {
+      ...candidate,
+      targetRewardUsd: targetRewardUsd!,
+      expectedRewardUsd: targetRewardUsd!,
+      stressedTargetNetPnlUsd: stressedTargetNetPnlUsd!,
+      stressedExpectedNetPnlUsd: stressedTargetNetPnlUsd!,
+    };
+    return this.add('shadow_candidate_started', { candidate: normalized }, candidate.startedAt);
   }
 
   recordEntryConfirmation(input: {
@@ -238,13 +278,19 @@ export class StrategyValidationTracker {
     samples: number;
     windowMs: number;
     edgeRetention: number;
-    expectedRewardUsd: number;
+    targetRewardUsd: number;
+    expectedRewardUsd?: number;
     plannedLossUsd: number;
     rewardRiskRatio: number;
     stressedNetPnlUsd: number;
+    economics: EntryEconomicsEvidence;
     at?: number;
   }): StrategyValidationEvent {
-    const { at, ...payload } = input;
+    const { at, ...rest } = input;
+    const payload = {
+      ...rest,
+      expectedRewardUsd: input.expectedRewardUsd ?? input.targetRewardUsd,
+    };
     return this.add('entry_confirmation_observed', payload, at);
   }
 
@@ -362,6 +408,7 @@ export class StrategyValidationTracker {
       && !this.integrityError;
 
     return {
+      schemaVersion: this.schemaVersion,
       runId: this.runId,
       stage: this.stage,
       strategyConfigHash: this.strategyConfigHash,

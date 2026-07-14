@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { kalshiFeePerContract, computeNetEdge, walkBookFill } from './kalshiFee.js';
+import {
+  kalshiFeeForOrder,
+  kalshiFeePerContract,
+  computeNetEdge,
+  isSupportedQualificationFeeOrder,
+  walkBookFill,
+} from './kalshiFee.js';
 import {
   isExecutablePrice,
   fetchMarkets,
@@ -15,6 +21,17 @@ import type { KalshiMarket, KalshiOrderbook } from '../types.js';
 describe('kalshiFee', () => {
   it('computes fee at 50c', () => {
     expect(kalshiFeePerContract(0.5)).toBe(0.02);
+  });
+
+  it('rounds the aggregate order fee once', () => {
+    expect(kalshiFeeForOrder(0.5, 100)).toBe(1.75);
+    expect(kalshiFeeForOrder(0.5, 1)).toBe(0.02);
+  });
+
+  it('identifies the cent-price whole-contract scope used by qualification', () => {
+    expect(isSupportedQualificationFeeOrder(0.5, 100)).toBe(true);
+    expect(isSupportedQualificationFeeOrder(0.505, 100)).toBe(false);
+    expect(isSupportedQualificationFeeOrder(0.5, 1.5)).toBe(false);
   });
 
   it('computes net edge with costs', () => {

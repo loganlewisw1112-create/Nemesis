@@ -1,11 +1,12 @@
 import {
   DEFAULT_ENTRY_QUALIFICATION,
-  kalshiFeeForOrder,
+  isSupportedQualificationFeeOrder,
   type EntryQualificationSettings,
   type ProfitCertificate,
   type ThesisCard,
 } from '@nemesis/core';
 import type { DryRunOrder } from './dryRun.js';
+import { calculateEntryEconomics, type EntryEconomicsEvidence } from './tradeEconomics.js';
 
 export interface EntryConfirmationObservation {
   card: ThesisCard;
@@ -37,43 +38,20 @@ export interface EntryConfirmationResult {
   samples: number;
   windowMs: number;
   edgeRetention: number;
+  /** Conditional target reward, not probability-weighted expected value. */
+  targetRewardUsd: number;
+  /** @deprecated Compatibility alias for schema-1 callers. */
   expectedRewardUsd: number;
   plannedLossUsd: number;
   rewardRiskRatio: number;
   stressedNetPnlUsd: number;
+  economics: EntryEconomicsEvidence;
   certificate?: ProfitCertificate;
 }
 
 function round(value: number, digits = 6): number {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
-}
-
-function economics(card: ThesisCard, fill: DryRunOrder) {
-  const contracts = fill.filled;
-  const entryPrice = fill.fillPrice;
-  const targetExitPrice = Math.max(0.01, Math.min(0.99, entryPrice + Math.max(0, card.netEdge)));
-  const targetExitFees = kalshiFeeForOrder(targetExitPrice, contracts);
-  const entryCost = entryPrice * contracts + fill.fees;
-  const expectedRewardUsd = targetExitPrice * contracts - targetExitFees - entryCost;
-  const stopPrice = Math.max(0.01, entryPrice - 0.01);
-  const stopFees = kalshiFeeForOrder(stopPrice, contracts);
-  const plannedLossUsd = Math.max(0.01, entryCost - (stopPrice * contracts - stopFees));
-  const stressedEntryPrice = Math.min(0.99, entryPrice + 0.01);
-  const stressedEntryFees = kalshiFeeForOrder(stressedEntryPrice, contracts);
-  const stressedExitPrice = Math.max(0.01, targetExitPrice - 0.01);
-  const stressedExitFees = kalshiFeeForOrder(stressedExitPrice, contracts);
-  const stressedNetPnlUsd = stressedExitPrice * contracts - stressedExitFees
-    - (stressedEntryPrice * contracts + stressedEntryFees);
-  const breakEvenExitPrice = Math.min(0.99, (entryCost + kalshiFeeForOrder(entryPrice, contracts)) / Math.max(1, contracts));
-  return {
-    targetExitPrice: round(targetExitPrice),
-    breakEvenExitPrice: round(breakEvenExitPrice),
-    expectedRewardUsd: round(expectedRewardUsd),
-    plannedLossUsd: round(plannedLossUsd),
-    rewardRiskRatio: round(expectedRewardUsd / plannedLossUsd),
-    stressedNetPnlUsd: round(stressedNetPnlUsd),
-  };
 }
 
 export class EntryConfirmationEngine {
@@ -99,12 +77,28 @@ export class EntryConfirmationEngine {
   observe(input: EntryConfirmationObservation): EntryConfirmationResult {
     const now = input.observedAt ?? Date.now();
     const config = this.settings;
-    const metrics = economics(input.card, input.fill);
+    const metrics = calculateEntryEconomics({
+      entryPrice: input.fill.fillPrice,
+      entryFeesUsd: input.fill.fees,
+      contracts: input.fill.filled,
+      sideFairPrice: input.card.impliedPrice,
+      marketPrice: input.card.marketPrice,
+      grossEdge: input.card.grossEdge,
+      screeningNetEdge: input.card.netEdge,
+      executableEntryNetEdge: input.fill.netEdge,
+      spread: input.card.spread,
+      fillSlippage: input.fill.slippage,
+    });
     const base = {
       samples: 0,
       windowMs: 0,
       edgeRetention: 0,
-      ...metrics,
+      targetRewardUsd: metrics.targetRewardUsd,
+      expectedRewardUsd: metrics.targetRewardUsd,
+      plannedLossUsd: metrics.plannedLossUsd,
+      rewardRiskRatio: metrics.rewardRiskRatio,
+      stressedNetPnlUsd: metrics.stressedNetPnlUsd,
+      economics: metrics,
     };
     const reject = (reason: string): EntryConfirmationResult => ({ status: 'rejected', reason, ...base });
 
@@ -122,13 +116,21 @@ export class EntryConfirmationEngine {
     if (sourceAgeMs > config.maxSourceAgeMs) return reject('source signal is stale');
     const bookAgeMs = Math.max(0, now - input.bookTimestamp);
     if (bookAgeMs > config.maxBookAgeMs) return reject('entry book is stale');
-    if (!Number.isFinite(input.card.netEdge) || input.card.netEdge <= 0) return reject('net edge is not positive');
+    if (!Number.isFinite(input.fill.netEdge) || input.fill.netEdge <= 0) {
+      return reject('executable entry edge is not positive');
+    }
+    if (!isSupportedQualificationFeeOrder(input.fill.fillPrice, input.fill.filled)) {
+      return reject('qualification fee model requires whole contracts at one-cent entry prices');
+    }
+    if (!Number.isFinite(input.card.impliedPrice) || metrics.targetExitPrice <= input.fill.fillPrice) {
+      return reject('selected-side fair price does not exceed the executable entry');
+    }
     if (
       input.lastTickerExecutionAt != null
       && now - input.lastTickerExecutionAt < config.tickerCooldownMs
     ) return reject('ticker-side cooldown is active');
-    if (metrics.expectedRewardUsd < config.minExpectedNetPnlUsd) return reject('expected net reward is below the minimum');
-    if (metrics.rewardRiskRatio < config.minRewardRiskRatio) return reject('expected reward-to-risk ratio is below the minimum');
+    if (metrics.targetRewardUsd < config.minExpectedNetPnlUsd) return reject('target net reward is below the minimum');
+    if (metrics.rewardRiskRatio < config.minRewardRiskRatio) return reject('target reward-to-risk ratio is below the minimum');
     if (metrics.stressedNetPnlUsd < config.minStressedNetPnlUsd) return reject('one-cent stressed expected result is not profitable');
 
     let state = this.states.get(input.card.id);
@@ -143,7 +145,7 @@ export class EntryConfirmationEngine {
     const minSpacingMs = Math.max(1, Math.floor(config.minWindowMs / Math.max(1, config.minSamples)));
     const last = state.samples.at(-1);
     if (!last || now - last.at >= minSpacingMs) {
-      state.samples.push({ at: now, netEdge: input.card.netEdge, spread: input.card.spread, bookTimestamp: input.bookTimestamp });
+      state.samples.push({ at: now, netEdge: input.fill.netEdge, spread: input.card.spread, bookTimestamp: input.bookTimestamp });
     }
     const first = state.samples[0];
     const latest = state.samples.at(-1)!;
@@ -154,7 +156,12 @@ export class EntryConfirmationEngine {
       samples: state.samples.length,
       windowMs,
       edgeRetention: round(edgeRetention),
-      ...metrics,
+      targetRewardUsd: metrics.targetRewardUsd,
+      expectedRewardUsd: metrics.targetRewardUsd,
+      plannedLossUsd: metrics.plannedLossUsd,
+      rewardRiskRatio: metrics.rewardRiskRatio,
+      stressedNetPnlUsd: metrics.stressedNetPnlUsd,
+      economics: metrics,
     };
     if (spreadWidening > config.maxSpreadWideningPp) {
       this.states.delete(input.card.id);
@@ -181,7 +188,8 @@ export class EntryConfirmationEngine {
       bookAgeMs,
       targetExitPrice: metrics.targetExitPrice,
       breakEvenExitPrice: metrics.breakEvenExitPrice,
-      expectedRewardUsd: metrics.expectedRewardUsd,
+      targetRewardUsd: metrics.targetRewardUsd,
+      expectedRewardUsd: metrics.targetRewardUsd,
       plannedLossUsd: metrics.plannedLossUsd,
       rewardRiskRatio: metrics.rewardRiskRatio,
       stressedNetPnlUsd: metrics.stressedNetPnlUsd,

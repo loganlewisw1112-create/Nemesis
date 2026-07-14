@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { weatherToThesis } from '../src/weather-wing.js';
+import { cryptoToThesis } from '../src/crypto-lead.js';
+import { macroToThesis } from '../src/macro-pulse.js';
+import { sportsToThesis } from '../src/sports-live.js';
 import { globalToThesis } from '../src/global-pulse.js';
 import { infraToThesis } from '../src/infra-watch.js';
 import { StrategyQuarantine } from '@nemesis/capital';
@@ -19,6 +22,32 @@ describe('pods', () => {
     });
     expect(t.playbook).toBe('weather-wing');
     expect(t.ticker).toBe('WX-1');
+  });
+
+  it('keeps every dynamic NO thesis in selected-contract price terms', () => {
+    const weather = weatherToThesis({
+      ticker: 'WX-NO', title: 'High above 90', strike: 90, nwsForecast: 80,
+      openMeteoForecast: 80, marketPrice: 0.7, spread: 0.02, depthUsd: 300, hoursToSettle: 4,
+    });
+    const macro = macroToThesis({
+      ticker: 'MACRO-NO', title: 'Release beats', releaseName: 'Test release', consensus: 1,
+      actual: 0, marketPrice: 0.7, spread: 0.02, depthUsd: 300, minutesToRelease: 30,
+    });
+    const sports = sportsToThesis({
+      ticker: 'SPORT-NO', title: 'Home wins', homeScore: 1, awayScore: 2,
+      impliedWinProb: 0.3, marketPrice: 0.6, spread: 0.02, depthUsd: 300,
+    });
+    const crypto = cryptoToThesis({
+      ticker: 'CRYPTO-NO', title: 'Bitcoin above strike', spotPrice: 90_000, strike: 100_000,
+      marketPrice: 0.7, spread: 0.02, depthUsd: 300, lagMs: 10,
+    });
+
+    for (const thesis of [weather, macro, sports, crypto]) {
+      expect(thesis.side).toBe('no');
+      expect(thesis.marketPrice).toBeLessThan(0.5);
+      expect(thesis.impliedPrice).toBeGreaterThan(thesis.marketPrice);
+      expect(thesis.grossEdge).toBeGreaterThan(0);
+    }
   });
 
   it('keeps heuristic global pulse cards out of direct execution', () => {

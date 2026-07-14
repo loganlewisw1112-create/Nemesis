@@ -1,5 +1,5 @@
 import type { ThesisCard } from '@nemesis/core';
-import { qualifyThesis, computeNetEdge, kalshiFeePerContract } from '@nemesis/core';
+import { qualifyThesis, computeNetEdge, kalshiFeePerContract, selectedSidePricing } from '@nemesis/core';
 
 export interface SportsLiveInput {
   ticker: string;
@@ -14,10 +14,11 @@ export interface SportsLiveInput {
 
 export function sportsToThesis(input: SportsLiveInput): ThesisCard {
   const implied = input.impliedWinProb;
-  const breakdown = computeNetEdge(implied, input.marketPrice, input.spread);
+  const pricing = selectedSidePricing(input.marketPrice, implied);
+  const breakdown = computeNetEdge(pricing.impliedPrice, pricing.marketPrice, input.spread);
   const qual = qualifyThesis({
-    impliedPrice: implied,
-    marketPrice: input.marketPrice,
+    impliedPrice: pricing.impliedPrice,
+    marketPrice: pricing.marketPrice,
     spread: input.spread,
     depthUsd: input.depthUsd,
     predictability: 65,
@@ -35,15 +36,15 @@ export function sportsToThesis(input: SportsLiveInput): ThesisCard {
     category: 'sports',
     playbook: 'sports-live',
     status: qual.status,
-    side: implied > input.marketPrice ? 'yes' : 'no',
-    marketPrice: input.marketPrice,
-    impliedPrice: implied,
+    side: pricing.side,
+    marketPrice: pricing.marketPrice,
+    impliedPrice: pricing.impliedPrice,
     grossEdge: breakdown.grossEdge,
     netEdge: breakdown.netEdge,
     spread: input.spread,
     depthUsd: input.depthUsd,
     predictability: 65,
-    feeEstimate: kalshiFeePerContract(input.marketPrice),
+    feeEstimate: kalshiFeePerContract(pricing.marketPrice),
     signalReason: `Live ${input.homeScore}-${input.awayScore}`,
     externalSummary: `Implied ${(implied * 100).toFixed(0)}%`,
     createdAt: now,
