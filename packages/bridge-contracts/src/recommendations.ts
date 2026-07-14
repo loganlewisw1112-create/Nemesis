@@ -50,6 +50,7 @@ export interface NoTradeWarning {
 
 export interface ExitRecommendation {
   ticker: string;
+  side: 'yes' | 'no';
   action: 'hold' | 'trim' | 'exit' | 'add-only-on-pullback';
   current_edge: number;
   captured_edge: number;

@@ -1,8 +1,9 @@
-import type { GateStatus, LiveUnlockCertificate } from '../types.js';
+import type { GateStatus, LiveUnlockCertificate, StrategyValidationStage } from '../types.js';
 
 export type LiveUnlockTargetStage = 'manual-live' | 'auto-live';
 
 export interface PaperUnlockMetrics {
+  validationStage: StrategyValidationStage;
   completedPositionCount: number;
   profitableWeekCount: number;
   profitFactor: number;
@@ -83,6 +84,7 @@ function addPaperBlockers(input: LiveUnlockInput, blockers: string[]) {
     if (!gate.passed) blockers.push(`${gate.name}: ${gate.detail}`);
   }
   const p = input.paper;
+  if (p.validationStage !== 'qualification') blockers.push('strategy validation stage has not reached qualification');
   if (p.completedPositionCount < 100) blockers.push('completed paper position sample below 100');
   if (p.profitableWeekCount < 4) blockers.push('fewer than four consecutive profitable weeks');
   if (p.profitFactor < 1.5) blockers.push('paper profit factor below 1.50');

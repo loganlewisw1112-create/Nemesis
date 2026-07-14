@@ -12,6 +12,7 @@ export { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
 
 export interface AutoCloseExitSignal {
   ticker: string;
+  side: 'yes' | 'no';
   action: 'hold' | 'trim' | 'exit' | 'add-only-on-pullback';
   confidence: number;
   currentEdge: number;
@@ -135,14 +136,19 @@ export function updateAutoCloseState(input: UpdateAutoCloseStateInput): AutoClos
     markVelocityPct: 0,
     edgeVelocityPct: 0,
     consecutiveDownTicks: 0,
+    consecutiveEdgeLossTicks: input.currentEdge <= 0 ? 1 : 0,
     earlyTrimContracts: 0,
     tier: input.tier ?? input.position.tier ?? 'scalp',
   };
 
-  const direction = input.position.side === 'yes' ? 1 : -1;
-  const markDelta = base.lastMark > 0 ? ((input.mark - base.lastMark) / base.lastMark) * direction : 0;
+  // mark is always the executable price of the contract actually held. A price
+  // increase is favorable for both YES and NO positions.
+  const markDelta = base.lastMark > 0 ? (input.mark - base.lastMark) / base.lastMark : 0;
   const edgeDelta = Math.abs(base.lastEdge) > 0 ? (input.currentEdge - base.lastEdge) / Math.abs(base.lastEdge) : 0;
   const consecutiveDownTicks = markDelta < 0 ? (base.consecutiveDownTicks ?? 0) + 1 : 0;
+  const consecutiveEdgeLossTicks = input.currentEdge <= 0
+    ? (base.consecutiveEdgeLossTicks ?? 0) + (prior ? 1 : 0)
+    : 0;
 
   const next: AutoCloseState = {
     ...base,
@@ -152,6 +158,7 @@ export function updateAutoCloseState(input: UpdateAutoCloseStateInput): AutoClos
     markVelocityPct: Number(markDelta.toFixed(6)),
     edgeVelocityPct: Number(edgeDelta.toFixed(6)),
     consecutiveDownTicks,
+    consecutiveEdgeLossTicks,
     earlyTrimContracts: base.earlyTrimContracts ?? 0,
     tier: input.tier ?? input.position.tier ?? base.tier ?? 'scalp',
   };
@@ -176,14 +183,16 @@ export function computeExitScore(input: EvaluateAutoCloseInput): ExitScore {
   const edgeCompression = edgeCompressionRate(input.state, input.currentEdge);
   const downsideToEntryUsd = Math.max(0, (input.position.entryPrice - input.mark) * input.position.contracts);
   const expectedRemainingUpsideUsd = Math.max(0, input.currentEdge) * input.position.contracts;
-  const signalCloseSlippageUsd = input.exitSignal?.ticker === input.position.ticker
-    ? Math.max(0, input.mark - input.exitSignal.executableClosePrice) * input.position.contracts
+  const signalMatchesPosition = input.exitSignal?.ticker === input.position.ticker
+    && input.exitSignal.side === input.position.side;
+  const signalCloseSlippageUsd = signalMatchesPosition
+    ? Math.max(0, input.mark - (input.exitSignal?.executableClosePrice ?? input.mark)) * input.position.contracts
     : 0;
   const bookSlippageToCloseUsd = Math.max(
     Math.max(0, input.slippagePp ?? 0) * input.position.contracts,
     signalCloseSlippageUsd,
   );
-  const geaAction = input.exitSignal?.action ?? 'none';
+  const geaAction = signalMatchesPosition ? input.exitSignal?.action ?? 'none' : 'none';
   const geaScore = geaAction === 'exit' ? 1 : geaAction === 'trim' ? 0.65 : 0;
   const adverseVelocity = clamp(Math.max(0, -(input.state.markVelocityPct ?? 0)) * 10);
   const profitBias = pnl.usd > 0 ? clamp(pnl.pct * 3) : 0;
@@ -218,6 +227,11 @@ export function evaluateAutoClosePosition(input: EvaluateAutoCloseInput): AutoCl
     return decision(input, 'hold', 0, 0.2, 'auto-close disabled');
   }
 
+  const immediatePnl = currentPnl(input.position, input.mark);
+  if (immediatePnl.usd <= -Math.max(0.01, settings.hardLossUsd)) {
+    return decision(input, 'close', input.position.contracts, 0.99, 'emergency close: executable hard-loss limit', 1);
+  }
+
   if (ageMs < settings.minAgeMs || tickCount < settings.minTicks) {
     return decision(input, 'hold', 0, 0.35, 'warming up: waiting for minimum age and tick count');
   }
@@ -248,6 +262,7 @@ export function evaluateAutoClosePosition(input: EvaluateAutoCloseInput): AutoCl
 
   if (
     input.exitSignal?.ticker === input.position.ticker &&
+    input.exitSignal.side === input.position.side &&
     geaFresh &&
     input.exitSignal.action === 'exit' &&
     input.exitSignal.confidence >= settings.geaExitConfidence
@@ -295,7 +310,10 @@ export function evaluateAutoClosePosition(input: EvaluateAutoCloseInput): AutoCl
     return decision(input, 'trim', trimContracts(input.position, 0.5), 0.8, 'velocity trim: profitable position moving against us', exitScore.score);
   }
 
-  if (input.currentEdge <= settings.emergencyEdgeExit) {
+  if (
+    input.currentEdge <= settings.emergencyEdgeExit
+    && (input.state.consecutiveEdgeLossTicks ?? 0) >= settings.emergencyEdgeConfirmTicks
+  ) {
     return decision(input, 'close', input.position.contracts, 0.96, 'emergency close: edge gone', exitScore.score);
   }
 
@@ -309,6 +327,7 @@ export function evaluateAutoClosePosition(input: EvaluateAutoCloseInput): AutoCl
 
   if (
     input.exitSignal?.ticker === input.position.ticker &&
+    input.exitSignal.side === input.position.side &&
     geaFresh &&
     input.exitSignal.action === 'trim' &&
     input.exitSignal.confidence >= settings.geaExitConfidence &&

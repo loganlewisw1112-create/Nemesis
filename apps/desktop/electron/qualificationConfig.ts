@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { DiscoverySettings, GuardrailSettings } from '@nemesis/core';
 
+export const PAPER_STRATEGY_ENGINE_VERSION = 2;
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') {
@@ -27,6 +29,10 @@ export function buildStrategyConfigHash(
     'backtestPassed',
   ]) delete qualificationSettings[key];
   return createHash('sha256')
-    .update(stableJson({ guardrails: qualificationSettings, discovery: discoverySettings }))
+    .update(stableJson({
+      strategyEngineVersion: PAPER_STRATEGY_ENGINE_VERSION,
+      guardrails: qualificationSettings,
+      discovery: discoverySettings,
+    }))
     .digest('hex');
 }

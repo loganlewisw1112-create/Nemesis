@@ -113,8 +113,8 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
     }
 
     for (const pos of portfolio.positions) {
-      const card = theses.find((c) => c.ticker === pos.ticker);
-      const mark = marks[pos.ticker] ?? pos.entryPrice;
+      const card = theses.find((c) => c.ticker === pos.ticker && c.side === pos.side);
+      const mark = marks[`${pos.ticker}:${pos.side}`] ?? marks[pos.ticker] ?? pos.entryPrice;
       const pct = pnlPct(pos, mark);
 
       if (card && card.netEdge <= 0)

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
 import { PaperDesk } from './paperDesk.js';
-import { simulatePaperBuy, simulatePaperClose, checkPaperRisk, mutualExclusionBlock } from './executionRouter.js';
+import { previewPaperBuy, previewPaperClose, simulatePaperBuy, simulatePaperClose, checkPaperRisk, mutualExclusionBlock } from './executionRouter.js';
 import { positionUnrealizedPnl, markToMarketPortfolio } from './pnlEngine.js';
 import { runFeeAwareBacktest } from './backtestRunner.js';
 import { DEFAULT_GUARDRAILS, DEFAULT_STRICT_PROFIT_MODE, type KalshiOrderbook, type ThesisCard } from '@nemesis/core';
@@ -191,14 +191,39 @@ describe('executionRouter', () => {
     expect(block).toBeUndefined();
   });
 
-  it('certifies thesis-edge entry when the round-trip is flat but modeled edge clears the threshold', () => {
+  it('requires persistent confirmation before a modeled thesis-edge entry can mutate paper', () => {
     const desk = new PaperDesk(1000);
-    // `book` nets ~$0.00 on an instant round-trip (below minNetPnlUsd), so this only
-    // certifies through the thesis-edge path, not the instant-flip path.
+    const preview = previewPaperBuy(desk.snapshot(), highEdgeCard, book, DEFAULT_GUARDRAILS, 2);
+    expect(preview.ok).toBe(true);
+    expect(preview.profitCertificate?.classification).toBe('research_only');
     const result = simulatePaperBuy(desk, highEdgeCard, book, DEFAULT_GUARDRAILS, 2);
-    expect(result.ok).toBe(true);
-    expect(result.profitCertificate?.reason).toBe('thesis edge certified (modeled, not locked-in)');
-    expect(result.wouldMutate).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.abortCode).toBe('entry_confirmation_required');
+    expect(result.wouldMutate).toBe(false);
+    expect(desk.snapshot().positions).toHaveLength(0);
+  });
+
+  it('uses a NO thesis contract price directly instead of inverting it twice', () => {
+    const noCard: ThesisCard = {
+      ...highEdgeCard,
+      id: 'no-flow',
+      side: 'no',
+      marketPrice: 0.6,
+      impliedPrice: 0.72,
+      grossEdge: 0.12,
+      netEdge: 0.08,
+    };
+    const noBook: KalshiOrderbook = {
+      ticker: noCard.ticker,
+      yes: [{ price: 0.39, quantity: 20 }],
+      no: [{ price: 0.58, quantity: 20 }],
+      yesAsk: 0.42,
+      noAsk: 0.61,
+    };
+    const preview = previewPaperBuy(new PaperDesk(1000).snapshot(), noCard, noBook, DEFAULT_GUARDRAILS, 5);
+    expect(preview.ok).toBe(true);
+    expect(preview.fillQuality?.expectedPrice).toBe(0.6);
+    expect(preview.fill?.fillPrice).toBe(0.61);
   });
 
   it('still blocks entry when the thesis carries no modeled edge and the round-trip is not profitable', () => {
@@ -261,6 +286,22 @@ describe('executionRouter', () => {
 
     expect(result.ok).toBe(false);
     expect(result.abortCode).toBe('strict_profit_block');
+  });
+
+  it('previews a real executable close fill without mutating the paper desk', () => {
+    const desk = new PaperDesk(1000);
+    desk.openPosition(card, 5, 0.4);
+    const before = desk.snapshot();
+    const result = previewPaperClose(
+      { ticker: 'TEST-1', yes: [{ price: 0.45, quantity: 5 }], no: [{ price: 0.55, quantity: 5 }] },
+      'yes',
+      5,
+      DEFAULT_GUARDRAILS,
+    );
+    expect(result.ok).toBe(true);
+    expect(result.fill?.fillPrice).toBe(0.45);
+    expect(result.wouldMutate).toBe(false);
+    expect(desk.snapshot()).toEqual(before);
   });
 });
 

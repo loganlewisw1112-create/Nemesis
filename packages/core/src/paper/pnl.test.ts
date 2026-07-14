@@ -80,4 +80,19 @@ describe('pnl fee math', () => {
     const mtm = markToMarketPortfolio([pos], new Map(), 900);
     expect(mtm.unrealized).toBeCloseTo(positionUnrealizedPnl(pos, pos.entryPrice), 6);
   });
+
+  it('marks opposite sides of one ticker independently', () => {
+    const yes = samplePosition({ id: 'yes', ticker: 'SAME', side: 'yes', entryPrice: 0.4 });
+    const no = samplePosition({ id: 'no', ticker: 'SAME', side: 'no', entryPrice: 0.6 });
+    const marks = new Map([
+      ['SAME', 0.01],
+      ['SAME:yes', 0.5],
+      ['SAME:no', 0.7],
+    ]);
+    const result = markToMarketPortfolio([yes, no], marks, 100);
+    expect(result.unrealized).toBeCloseTo(
+      positionUnrealizedPnl(yes, 0.5) + positionUnrealizedPnl(no, 0.7),
+      6,
+    );
+  });
 });

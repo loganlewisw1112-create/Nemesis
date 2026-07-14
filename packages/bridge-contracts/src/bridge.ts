@@ -21,6 +21,12 @@ export interface NemesisStateMirror {
   activeRegimes: string[];
   opportunityThroughput?: Record<string, number>;
   throughputTrigger?: string;
+  paperPositions?: Array<{
+    ticker: string;
+    side: 'yes' | 'no';
+    contracts: number;
+    entryPrice: number;
+  }>;
   marketFeedReady?: boolean;
   timestamp: number;
 }

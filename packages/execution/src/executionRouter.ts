@@ -143,6 +143,7 @@ function certifyOpenProfit(
       bookTimestamp: Date.now(),
       expiresAt: Date.now() + strict.maxBookAgeMs,
       reason: 'strict profit mode disabled',
+      classification: 'research_only',
     };
   }
 
@@ -172,6 +173,7 @@ function certifyOpenProfit(
         bookTimestamp: now,
         expiresAt: now + strict.maxBookAgeMs,
         reason: 'instant round-trip certified',
+        classification: 'immediate_executable',
       };
     }
   }
@@ -198,6 +200,7 @@ function certifyOpenProfit(
     bookTimestamp: now,
     expiresAt: now + strict.maxBookAgeMs,
     reason: 'thesis edge certified (modeled, not locked-in)',
+    classification: 'research_only',
   };
 }
 
@@ -325,8 +328,8 @@ export function checkPaperRisk(
   return { ok: true };
 }
 
-export function simulatePaperBuy(
-  desk: PaperDesk,
+export function previewPaperBuy(
+  portfolio: PaperPortfolio,
   card: ThesisCard,
   book: KalshiOrderbook,
   settings: GuardrailSettings,
@@ -334,9 +337,10 @@ export function simulatePaperBuy(
 ): PaperBuyResult {
   const eligibilityBlock = entryEligibilityBlockReason(card);
   if (eligibilityBlock) return abortBuy(eligibilityBlock, 'signal_eligibility_block');
-  const portfolio = desk.snapshot();
   const cleanBook = sanitizeExecutableBook(book);
-  const expectedPrice = card.side === 'yes' ? card.marketPrice : 1 - card.marketPrice;
+  // Thesis prices are expressed in the contract side being traded. NO cards
+  // therefore carry a NO price and must not be inverted again here.
+  const expectedPrice = card.marketPrice;
   const executableEntry = entryAsk(cleanBook, card.side);
   if (!isExecutablePrice(expectedPrice) || !isExecutablePrice(executableEntry)) {
     return abortBuy('invalid executable price', 'invalid_price');
@@ -368,10 +372,56 @@ export function simulatePaperBuy(
   }
 
   const quality = fillQualityFromDryRun(fill, expectedPrice);
+  return {
+    ok: true,
+    fill,
+    fillQuality: quality,
+    capitalDecision,
+    profitCertificate: certificate,
+    queueState: 'certified',
+    wouldMutate: false,
+  };
+}
+
+export function simulatePaperBuy(
+  desk: PaperDesk,
+  card: ThesisCard,
+  book: KalshiOrderbook,
+  settings: GuardrailSettings,
+  contracts?: number,
+  profitCertificateOverride?: ProfitCertificate,
+): PaperBuyResult {
+  const portfolio = desk.snapshot();
+  const preview = previewPaperBuy(portfolio, card, book, settings, contracts);
+  if (!preview.ok || !preview.fill || !preview.fillQuality || !preview.profitCertificate) return preview;
+  const baseCertificate = preview.profitCertificate;
+  const overrideValid = profitCertificateOverride
+    && profitCertificateOverride.kind === 'open'
+    && profitCertificateOverride.ticker === card.ticker
+    && profitCertificateOverride.side === card.side
+    && profitCertificateOverride.contracts === preview.fill.filled
+    && profitCertificateOverride.expiresAt >= Date.now()
+    && profitCertificateOverride.classification === 'modeled_confirmed';
+  if (
+    settings.entryQualification?.enabled !== false
+    && baseCertificate.classification !== 'immediate_executable'
+    && !overrideValid
+  ) {
+    return abortBuy(
+      'modeled edge requires persistent executable entry confirmation',
+      'entry_confirmation_required',
+      preview.capitalDecision,
+      preview.fill,
+      true,
+    );
+  }
+  const certificate = overrideValid ? profitCertificateOverride : baseCertificate;
+  const quality = preview.fillQuality;
+  const fill = preview.fill;
   const meta = fillMeta(fill, quality, certificate);
   const result = desk.openPosition(card, fill.filled, fill.fillPrice, meta, card.category);
-  if (!result.ok) return { ok: false, error: result.error, capitalDecision, queueState: 'blocked_final', wouldMutate: false };
-  return { ok: true, fill, fillQuality: quality, capitalDecision, profitCertificate: certificate, queueState: 'executed', wouldMutate: true };
+  if (!result.ok) return { ok: false, error: result.error, capitalDecision: preview.capitalDecision, queueState: 'blocked_final', wouldMutate: false };
+  return { ok: true, fill, fillQuality: quality, capitalDecision: preview.capitalDecision, profitCertificate: certificate, queueState: 'executed', wouldMutate: true };
 }
 
 export function simulatePaperClose(
@@ -410,5 +460,28 @@ export function simulatePaperClose(
     profitCertificate: certified.certificate,
     queueState: 'executed',
     wouldMutate: true,
+  };
+}
+
+export function previewPaperClose(
+  book: KalshiOrderbook,
+  side: 'yes' | 'no',
+  contracts: number,
+  settings: GuardrailSettings,
+): PaperCloseResult {
+  const cleanBook = sanitizeExecutableBook(book);
+  const levels = side === 'yes' ? cleanBook.yes : cleanBook.no;
+  const bestBid = levels
+    .filter((level) => isExecutablePrice(level.price) && level.quantity > 0)
+    .reduce<number | undefined>((best, level) => best == null || level.price > best ? level.price : best, undefined);
+  if (!bestBid || contracts < 1) return abortClose('no executable close-side depth', 'invalid_price', undefined, true);
+  const fill = dryRunCloseFill(cleanBook, side, contracts, bestBid, settings.maxSlippagePp);
+  if (fill.aborted) return abortClose(fill.abortReason ?? 'fill aborted', 'fill_aborted', fill, true);
+  return {
+    ok: true,
+    fill,
+    fillQuality: fillQualityFromDryRun(fill, bestBid),
+    queueState: 'certified',
+    wouldMutate: false,
   };
 }

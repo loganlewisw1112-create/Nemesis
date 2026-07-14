@@ -21,6 +21,7 @@ function fixture(): string {
   fs.writeFileSync(path.join(dataDir, 'discovery-settings.json'), '{"preset":"balanced"}');
   fs.writeFileSync(path.join(dataDir, 'journal.json'), '[{"secret":"history"}]');
   fs.writeFileSync(path.join(dataDir, 'kalshi-credentials.v1.json'), '{"encrypted":"secret"}');
+  fs.writeFileSync(path.join(dataDir, 'paper-strategy-validation-events.jsonl'), '{"prior":true}\n');
   return dataDir;
 }
 
@@ -37,6 +38,7 @@ describe('archiveAndResetPaper', () => {
       gitCommit: 'abc',
       appVersion: '0.1.0',
       strategyConfigHash: 'config',
+      strategyEngineVersion: 2,
       now: 100,
     })).toThrow('applications are open');
     expect(fs.existsSync(path.join(dataDir, 'archives'))).toBe(false);
@@ -60,6 +62,7 @@ describe('archiveAndResetPaper', () => {
     expect(result.manifest.openPositionCount).toBe(1);
     expect(result.manifest.realizedPnl).toBe(-50);
     expect(fs.existsSync(path.join(result.archivePath, 'paper-portfolio.json'))).toBe(true);
+    expect(fs.readFileSync(path.join(result.archivePath, 'paper-strategy-validation-events.jsonl'), 'utf8')).toContain('prior');
     expect(fs.existsSync(path.join(result.archivePath, 'settings.json'))).toBe(false);
     expect(fs.existsSync(path.join(result.archivePath, 'kalshi-credentials.v1.json'))).toBe(false);
     expect(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8')).toBe(settingsBefore);
@@ -71,6 +74,13 @@ describe('archiveAndResetPaper', () => {
       manualOverrides: 0,
     });
     expect(fs.readFileSync(path.join(dataDir, 'paper-qualification-events.jsonl'), 'utf8')).toContain(result.newRunId);
+    const validationEvent = JSON.parse(fs.readFileSync(path.join(dataDir, 'paper-strategy-validation-events.jsonl'), 'utf8').trim());
+    expect(validationEvent).toMatchObject({
+      type: 'validation_run_started',
+      stage: 'shadow',
+      strategyConfigHash: 'config',
+      strategyEngineVersion: 2,
+    });
   });
 
   it('requires live to be locked without modifying settings', () => {

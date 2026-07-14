@@ -90,6 +90,66 @@ export interface OpportunityThroughputSettings {
   minCertifiedProfitPerTradeUsd: number;
 }
 
+export type StrategyValidationStage = 'shadow' | 'pilot' | 'qualification';
+
+export interface EntryQualificationSettings {
+  enabled: boolean;
+  minSamples: number;
+  minWindowMs: number;
+  maxSourceAgeMs: number;
+  minEdgeRetention: number;
+  maxBookAgeMs: number;
+  maxSpreadWideningPp: number;
+  minExpectedNetPnlUsd: number;
+  minRewardRiskRatio: number;
+  minStressedNetPnlUsd: number;
+  tickerCooldownMs: number;
+  maxPendingCandidates: number;
+  shadowFollowUpMs: number;
+  shadowMinScored: number;
+  shadowMinDistinctDays: number;
+  shadowMinProfitFactor: number;
+  shadowMinWinRate: number;
+  shadowMinStressedProfitFactor: number;
+  pilotMaxEntryRiskUsd: number;
+  pilotLossBudgetUsd: number;
+  pilotMinCompleted: number;
+  pilotMinProfitFactor: number;
+  pilotMinWinRate: number;
+  pilotMaxDrawdownUsd: number;
+  pilotMaxFalseExitRate: number;
+  pilotMaxAverageRegretUsd: number;
+}
+
+export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
+  enabled: true,
+  minSamples: 6,
+  minWindowMs: 30_000,
+  maxSourceAgeMs: 60_000,
+  minEdgeRetention: 0.7,
+  maxBookAgeMs: 1_000,
+  maxSpreadWideningPp: 0.01,
+  minExpectedNetPnlUsd: 1,
+  minRewardRiskRatio: 2,
+  minStressedNetPnlUsd: 0.01,
+  tickerCooldownMs: 15 * 60_000,
+  maxPendingCandidates: 8,
+  shadowFollowUpMs: 15 * 60_000,
+  shadowMinScored: 100,
+  shadowMinDistinctDays: 3,
+  shadowMinProfitFactor: 1.25,
+  shadowMinWinRate: 0.55,
+  shadowMinStressedProfitFactor: 1.1,
+  pilotMaxEntryRiskUsd: 10,
+  pilotLossBudgetUsd: 20,
+  pilotMinCompleted: 20,
+  pilotMinProfitFactor: 1.25,
+  pilotMinWinRate: 0.55,
+  pilotMaxDrawdownUsd: 20,
+  pilotMaxFalseExitRate: 0.15,
+  pilotMaxAverageRegretUsd: 0.5,
+};
+
 export interface GuardrailSettings {
   demoMode: boolean;
   dryRun: boolean;
@@ -109,13 +169,14 @@ export interface GuardrailSettings {
   autoClose?: AutoCloseSettings;
   strictProfitMode?: StrictProfitModeSettings;
   opportunityThroughput?: OpportunityThroughputSettings;
+  entryQualification?: EntryQualificationSettings;
 }
 
 export const DEFAULT_STRICT_PROFIT_MODE: StrictProfitModeSettings = {
   enabled: true,
   minNetPnlUsd: 0.01,
   requireEntryLiquidationPath: true,
-  allowEmergencyLossClose: false,
+  allowEmergencyLossClose: true,
   maxBookAgeMs: 2_000,
 };
 
@@ -144,6 +205,7 @@ export const DEFAULT_GUARDRAILS: GuardrailSettings = {
   autoClose: { ...DEFAULT_AUTO_CLOSE_SETTINGS },
   strictProfitMode: { ...DEFAULT_STRICT_PROFIT_MODE },
   opportunityThroughput: { ...DEFAULT_OPPORTUNITY_THROUGHPUT },
+  entryQualification: { ...DEFAULT_ENTRY_QUALIFICATION },
 };
 
 export type ThesisStatus =

@@ -7,6 +7,7 @@ function baseInput() {
     hasCredentials: true,
     gates: [{ id: 'api-health', name: 'API health', passed: true, detail: 'ok' }],
     paper: {
+      validationStage: 'qualification' as const,
       completedPositionCount: 100,
       profitableWeekCount: 4,
       profitFactor: 1.5,
@@ -39,6 +40,17 @@ function baseInput() {
 }
 
 describe('evaluateLiveUnlock', () => {
+  it.each(['shadow', 'pilot'] as const)('blocks live while strategy validation is in %s', (validationStage) => {
+    const result = evaluateLiveUnlock({
+      ...baseInput(),
+      targetStage: 'manual-live',
+      paper: { ...baseInput().paper, validationStage },
+      confirmationText: 'ENABLE LIVE MANUAL',
+    });
+    expect(result.passed).toBe(false);
+    expect(result.blockers).toContain('strategy validation stage has not reached qualification');
+  });
+
   it('does not unlock manual live from credentials alone', () => {
     const result = evaluateLiveUnlock({
       ...baseInput(),

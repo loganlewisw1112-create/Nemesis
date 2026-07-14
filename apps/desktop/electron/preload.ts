@@ -28,6 +28,8 @@ contextBridge.exposeInMainWorld('nemesis', {
   paperCancelOrder: (orderId: string) => ipcRenderer.invoke('nemesis:paperCancelOrder', orderId),
   getPaperPortfolio: () => ipcRenderer.invoke('nemesis:getPaperPortfolio'),
   resetPaper: (confirmation: string) => ipcRenderer.invoke('nemesis:resetPaper', confirmation),
+  advanceStrategyStage: (stage: string, confirmation: string) =>
+    ipcRenderer.invoke('nemesis:advanceStrategyStage', stage, confirmation),
   getTickHistory: (ticker: string) => ipcRenderer.invoke('nemesis:getTickHistory', ticker),
   watchTicker: (ticker: string | null) => ipcRenderer.invoke('nemesis:watchTicker', ticker),
   getDiscoveryState: () => ipcRenderer.invoke('nemesis:getDiscoveryState'),

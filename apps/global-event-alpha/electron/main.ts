@@ -67,6 +67,7 @@ import { resolveNemesisBridgeUrl } from './bridgeClient.js';
 import { resolveGeaUserDataPath } from './userDataPath.js';
 import { copyLegacyGeaDatabaseIfMissing, legacyGeaDatabasePath, resolveGeaDatabasePath } from './localDb.js';
 import { TapeStartupCoordinator } from './tapeStartup.js';
+import { buildExitExecutionContext } from './exitExecutionContext.js';
 
 if (process.env.GEA_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -129,7 +130,8 @@ let publicDataState: PublicDataMeshState = emptyPublicDataState();
 let intelligenceState: GlobalEventAlphaIntelligenceState = createIntelligenceState();
 let lastEntrySignature = '';
 let lastNoTradeSignature = '';
-let lastExitSignature = '';
+const lastExitSignatures = new Map<string, string>();
+let latestNemesisState: NemesisStateMirror | null = null;
 const tapeStartup = new TapeStartupCoordinator({
   coordinated: process.env.GEA_COORDINATE_TAPE_WITH_NEMESIS === 'true',
   fallbackMs: 30_000,
@@ -195,51 +197,6 @@ function latestMarketContext() {
   const tradeFlow = tapeState.latestTrades.length > 0 ? 0.03 : 0.01;
 
   return { ticker, marketPrice, spread, title, category, tapeAge, dataFreshness, liquidity, bookPressure, tradeFlow };
-}
-
-function parsedBookDepth(levelsJson: string): number {
-  try {
-    const levels = JSON.parse(levelsJson) as Array<{ quantity?: unknown }>;
-    if (!Array.isArray(levels)) return 0;
-    return levels.reduce((sum, level) => {
-      const quantity = typeof level.quantity === 'number' && Number.isFinite(level.quantity) ? level.quantity : 0;
-      return sum + Math.max(0, quantity);
-    }, 0);
-  } catch {
-    return 0;
-  }
-}
-
-function exitExecutionContext(
-  ticker: string,
-  issuedAt: number,
-): Pick<ExitRecommendation, 'executable_close_price' | 'book_timestamp' | 'book_depth' | 'price_source' | 'expires_at'> | null {
-  const book = tapeState.latestOrderbooks.find((entry) => entry.ticker === ticker);
-  if (book?.best_yes_bid != null) {
-    const depth = parsedBookDepth(book.yes_levels_json);
-    if (depth > 0) {
-      return {
-        executable_close_price: clamp(book.best_yes_bid),
-        book_timestamp: book.timestamp,
-        book_depth: depth,
-        price_source: 'kalshi-orderbook',
-        expires_at: issuedAt + EXIT_PACKET_TTL_MS,
-      };
-    }
-  }
-
-  const snapshot = tapeState.latestSnapshots.find((entry) => entry.ticker === ticker);
-  if (snapshot?.yes_bid != null && snapshot.volume > 0) {
-    return {
-      executable_close_price: clamp(snapshot.yes_bid),
-      book_timestamp: snapshot.timestamp,
-      book_depth: Math.max(1, Math.round(snapshot.volume)),
-      price_source: 'kalshi-snapshot',
-      expires_at: issuedAt + EXIT_PACKET_TTL_MS,
-    };
-  }
-
-  return null;
 }
 
 function createIntelligenceState(): GlobalEventAlphaIntelligenceState {
@@ -426,13 +383,19 @@ function publishIntelligencePackets(state: GlobalEventAlphaIntelligenceState) {
   }
 
   if (state.retention.action !== 'hold') {
-    const context = exitExecutionContext(state.retention.ticker, issuedAt);
-    if (!context) return;
-    const signature = `${state.retention.ticker}:${state.retention.action}:${state.retention.current_edge}:${state.retention.captured_edge}:${context.executable_close_price}:${context.book_timestamp}`;
-    if (signature !== lastExitSignature) {
-      lastExitSignature = signature;
+    const matchingPositions = latestNemesisState?.paperPositions?.filter(
+      (position) => position.ticker === state.retention.ticker && position.contracts > 0,
+    ) ?? [];
+    for (const position of matchingPositions) {
+      const context = buildExitExecutionContext(tapeState, state.retention.ticker, position.side, issuedAt, EXIT_PACKET_TTL_MS);
+      if (!context) continue;
+      const positionKey = `${state.retention.ticker}:${position.side}`;
+      const signature = `${positionKey}:${state.retention.action}:${state.retention.current_edge}:${state.retention.captured_edge}:${context.executable_close_price}:${context.book_timestamp}`;
+      if (signature === lastExitSignatures.get(positionKey)) continue;
+      lastExitSignatures.set(positionKey, signature);
       const recommendation: ExitRecommendation = {
         ticker: state.retention.ticker,
+        side: position.side,
         action: state.retention.action,
         current_edge: state.retention.current_edge,
         captured_edge: state.retention.captured_edge,
@@ -718,7 +681,8 @@ function connectBridge() {
       bridgeStatus.lastSeenAt = Date.now();
 
       if (msg.type === 'nemesis:state') {
-        tapeStartup.observeNemesisState(msg.payload as NemesisStateMirror);
+        latestNemesisState = msg.payload as NemesisStateMirror;
+        tapeStartup.observeNemesisState(latestNemesisState);
         broadcast('gea:nemesisState', msg.payload);
       } else if (msg.type === 'brain:recommendation') {
         broadcast('gea:recommendation', msg.payload);

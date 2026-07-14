@@ -140,7 +140,7 @@ export function PaperDeskPanel({
             <PositionRow
               key={p.id}
               pos={p}
-              mark={marks[p.ticker] ?? p.entryPrice}
+              mark={marks[`${p.ticker}:${p.side}`] ?? marks[p.ticker] ?? p.entryPrice}
               equity={equity}
               closeQty={closeQty[p.id] ?? String(p.contracts)}
               autoCloseState={autoCloseStateByPosition[p.id]}

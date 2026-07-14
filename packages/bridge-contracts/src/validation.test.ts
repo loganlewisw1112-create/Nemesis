@@ -37,6 +37,7 @@ function exitPacket(overrides: Partial<ExitRecommendation> = {}): ExitRecommenda
   const now = Date.now();
   return {
     ticker: 'KXTEST-26',
+    side: 'yes',
     action: 'trim',
     current_edge: 0.03,
     captured_edge: 0.07,
@@ -119,6 +120,8 @@ describe('bridge validation', () => {
     const exit = exitPacket();
     expect(validateExitRecommendation({ ...exit, executable_close_price: 1.2 }).reason).toBe('invalid executable close price');
     expect(validateExitRecommendation({ ...exit, book_depth: 0 }).reason).toBe('invalid book depth');
+    expect(validateExitRecommendation({ ...exit, book_depth: 1.5 }).ok).toBe(true);
+    expect(validateExitRecommendation({ ...exit, side: 'invalid' }).reason).toBe('invalid side');
     expect(validateExitRecommendation({ ...exit, price_source: 'model-midpoint' }).reason).toBe('invalid price source');
   });
   it('validates NEMESIS close-result packets for GEA feedback', () => {

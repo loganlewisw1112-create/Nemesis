@@ -128,6 +128,7 @@ export function validateExitRecommendation(
 ): ValidationResult<ExitRecommendation> {
   if (!isRecord(value)) return fail('invalid schema');
   if (!isNonEmptyString(value.ticker)) return fail('missing ticker');
+  if (value.side !== 'yes' && value.side !== 'no') return fail('invalid side');
   if (!['hold', 'trim', 'exit', 'add-only-on-pullback'].includes(String(value.action))) return fail('invalid action');
   if (!isFiniteNumber(value.current_edge) || !isFiniteNumber(value.captured_edge)) return fail('invalid edge');
   const executableClosePrice = value.executable_close_price;
@@ -138,7 +139,7 @@ export function validateExitRecommendation(
     return fail('invalid timestamps');
   }
   const bookDepth = value.book_depth;
-  if (!Number.isInteger(bookDepth) || (bookDepth as number) < 1) return fail('invalid book depth');
+  if (!isFiniteNumber(bookDepth) || bookDepth < 1) return fail('invalid book depth');
   if (typeof value.price_source !== 'string' || !EXIT_PRICE_SOURCES.has(value.price_source)) return fail('invalid price source');
   if (!isNonEmptyString(value.reason)) return fail('missing reason');
   if (!isBrainRole(value.issued_by)) return fail('invalid brain role');

@@ -37,7 +37,7 @@ export function markToMarketPortfolio(
   let unrealized = 0;
   let deployed = 0;
   for (const pos of positions) {
-    const mark = markPrices.get(pos.ticker) ?? pos.entryPrice;
+    const mark = markPrices.get(`${pos.ticker}:${pos.side}`) ?? markPrices.get(pos.ticker) ?? pos.entryPrice;
     unrealized += positionUnrealizedPnl(pos, mark);
     deployed += pos.entryPrice * pos.contracts;
   }

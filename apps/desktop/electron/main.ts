@@ -19,6 +19,7 @@ import {
   DEFAULT_GUARDRAILS,
   DEFAULT_AUTO_CLOSE_SETTINGS,
   DEFAULT_OPPORTUNITY_THROUGHPUT,
+  DEFAULT_ENTRY_QUALIFICATION,
   DEFAULT_STRICT_PROFIT_MODE,
   DEFAULT_PAPER_CASH,
   fetchOrderbook,
@@ -45,11 +46,13 @@ import {
   HotOpportunityIndex,
   evaluateLiveUnlock,
   kalshiFeeForOrder,
+  positionUnrealizedPnl,
   type AutoCloseDecision,
   type AutoCloseSettings,
   type AutoCloseState,
   type DiscoverySettings,
   type GuardrailSettings,
+  type StrategyValidationStage,
   type ThesisCard,
   type KalshiMarket,
   type KalshiOrderbook,
@@ -69,7 +72,9 @@ import {
   dryRunCloseFill,
   PaperDesk,
   simulatePaperBuy,
+  previewPaperBuy,
   simulatePaperClose,
+  previewPaperClose,
   checkPaperRisk,
   resolveContractCount,
   AuditLog,
@@ -96,6 +101,9 @@ import {
   type PaperCloseResult,
   type PaperQualificationEvent,
   type PaperQualificationSnapshot,
+  EntryConfirmationEngine,
+  type StrategyValidationEvent,
+  type StrategyValidationSnapshot,
 } from '@nemesis/execution';
 import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
@@ -104,7 +112,8 @@ import { BookFetchCoordinator, isBookFetchBackoffError } from './bookFetchCoordi
 import { dedupeByExecutionKey } from './executionConcurrency.js';
 import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
 import { PaperQualificationStore } from './paperQualificationStore.js';
-import { buildStrategyConfigHash } from './qualificationConfig.js';
+import { StrategyValidationStore } from './strategyValidationStore.js';
+import { buildStrategyConfigHash, PAPER_STRATEGY_ENGINE_VERSION } from './qualificationConfig.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
 import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
@@ -130,6 +139,7 @@ const DISCOVERY_SETTINGS_PATH = path.join(DATA_DIR, 'discovery-settings.json');
 const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
 const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json');
 const PAPER_QUALIFICATION_PATH = path.join(DATA_DIR, 'paper-qualification-events.jsonl');
+const STRATEGY_VALIDATION_PATH = path.join(DATA_DIR, 'paper-strategy-validation-events.jsonl');
 
 const MAX_TICKS = 120;
 const LIQUIDITY_PREFILTER_MAX_AGE_MS = 45_000;
@@ -169,6 +179,8 @@ const paperOrderBook = new PaperOrderBook();
 const auditLog = new AuditLog();
 const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
 const opportunityQueue = new OpportunityThroughputQueue(DEFAULT_OPPORTUNITY_THROUGHPUT);
+let entryConfirmationEngine = new EntryConfirmationEngine(DEFAULT_ENTRY_QUALIFICATION);
+const lastTickerSideExecutionAt = new Map<string, number>();
 const tickHistory = new Map<string, PriceTick[]>();
 const autoCloseStates = new Map<string, AutoCloseState>();
 const latestExitSignals = new Map<string, AutoCloseExitSignal>();
@@ -197,7 +209,9 @@ let autoCloseRunning = false;
 let autoCloseQueued = false;
 let throughputRunning = false;
 let qualificationStore: PaperQualificationStore | null = null;
+let strategyValidationStore: StrategyValidationStore | null = null;
 let qualificationFollowUpRunning = false;
+let strategyValidationFollowUpRunning = false;
 let shutdownEvidenceRecorded = false;
 let lastQualificationEquity: number | null = null;
 let sessionStatsData: SessionStats = {
@@ -377,7 +391,7 @@ function isAbnormalExecutionCode(code?: string): boolean {
 }
 
 function isRetryableExecutionCode(code?: string): boolean {
-  return code === 'book_unavailable' || code === 'fill_aborted';
+  return code === 'book_unavailable' || code === 'fill_aborted' || code === 'entry_confirmation_pending';
 }
 
 function describeError(error: unknown): string {
@@ -426,6 +440,99 @@ function initializePaperQualification(): void {
         'pre-upgrade portfolio is excluded; archive and reset before qualification',
       ));
     }
+  }
+}
+
+function initializeStrategyValidation(): void {
+  strategyValidationStore = StrategyValidationStore.open(STRATEGY_VALIDATION_PATH, {
+    stage: 'shadow',
+    strategyConfigHash: strategyConfigHash(),
+    strategyEngineVersion: PAPER_STRATEGY_ENGINE_VERSION,
+  });
+  entryConfirmationEngine = new EntryConfirmationEngine({
+    ...DEFAULT_ENTRY_QUALIFICATION,
+    ...(settings.entryQualification ?? {}),
+  });
+  for (const event of strategyValidationStore.tracker.allEvents()) {
+    if (event.type === 'shadow_candidate_started') entryConfirmationEngine.markSourceUsed(event.candidate.sourceSignalId);
+  }
+  for (const trade of paperDesk.snapshot().trades) {
+    if (trade.type !== 'open' || !trade.profitCertificate?.sourceSignalId) continue;
+    entryConfirmationEngine.markSourceUsed(trade.profitCertificate.sourceSignalId);
+    lastTickerSideExecutionAt.set(`${trade.ticker}:${trade.side}`, trade.timestamp);
+  }
+}
+
+function entryQualificationSettings() {
+  return { ...DEFAULT_ENTRY_QUALIFICATION, ...(settings.entryQualification ?? {}) };
+}
+
+function strategyValidationSnapshot(): StrategyValidationSnapshot | null {
+  if (!strategyValidationStore) return null;
+  const snapshot = strategyValidationStore.snapshot(entryQualificationSettings());
+  if (snapshot.integrityError) return snapshot;
+  if (
+    !snapshot.paused
+    && (snapshot.strategyConfigHash !== strategyConfigHash() || snapshot.strategyEngineVersion !== PAPER_STRATEGY_ENGINE_VERSION)
+  ) {
+    try {
+      strategyValidationStore.record((tracker) => tracker.pause('strategy configuration or engine version changed'));
+    } catch (error) {
+      console.error('[nemesis] strategy validation invalidation could not be persisted', error);
+    }
+    return strategyValidationStore.snapshot(entryQualificationSettings());
+  }
+  return snapshot;
+}
+
+function pilotValidationSnapshot() {
+  const validation = strategyValidationSnapshot();
+  const qualification = qualificationSnapshot();
+  const config = entryQualificationSettings();
+  const completedPositionCount = qualification?.completedPositionCount ?? 0;
+  const realizedPnlUsd = qualification?.realizedPnlUsd ?? 0;
+  const profitFactor = qualification?.profitFactor ?? 0;
+  const winRate = qualification?.winRate ?? 0;
+  const maxDrawdownUsd = qualification?.maxDrawdownUsd ?? 0;
+  const falseExitRate = qualification?.automaticFalseExitRate ?? 0;
+  const averageRegretUsd = qualification?.automaticAvgCloseRegretUsd ?? 0;
+  const stressedNetPnlUsd = qualification?.stressedNetPnlUsd ?? 0;
+  const passed = validation?.stage === 'pilot'
+    && !validation.paused
+    && completedPositionCount >= config.pilotMinCompleted
+    && realizedPnlUsd > 0
+    && profitFactor >= config.pilotMinProfitFactor
+    && winRate >= config.pilotMinWinRate
+    && stressedNetPnlUsd > 0
+    && maxDrawdownUsd <= config.pilotMaxDrawdownUsd
+    && falseExitRate <= config.pilotMaxFalseExitRate
+    && averageRegretUsd <= config.pilotMaxAverageRegretUsd
+    && (qualification?.blockingSafetyEventCount ?? 1) === 0
+    && qualification?.configurationValid === true;
+  return {
+    completedPositionCount,
+    realizedPnlUsd,
+    profitFactor,
+    winRate,
+    stressedNetPnlUsd,
+    maxDrawdownUsd,
+    falseExitRate,
+    averageRegretUsd,
+    lossBudgetRemainingUsd: Math.max(0, config.pilotLossBudgetUsd + Math.min(0, realizedPnlUsd)),
+    passed,
+  };
+}
+
+function recordStrategyValidation(
+  mutation: (tracker: StrategyValidationStore['tracker']) => StrategyValidationEvent | StrategyValidationEvent[],
+): boolean {
+  if (!strategyValidationStore) return false;
+  try {
+    strategyValidationStore.record(mutation);
+    return true;
+  } catch (error) {
+    console.error('[nemesis] strategy validation evidence append failed', error);
+    return false;
   }
 }
 
@@ -520,12 +627,18 @@ function normalizeGuardrailSettings(raw: Partial<GuardrailSettings> = {}): Guard
     ...(settings.opportunityThroughput ?? {}),
     ...(raw.opportunityThroughput ?? {}),
   };
+  const entryQualification = {
+    ...DEFAULT_ENTRY_QUALIFICATION,
+    ...(settings.entryQualification ?? {}),
+    ...(raw.entryQualification ?? {}),
+  };
   return {
     ...DEFAULT_GUARDRAILS,
     ...raw,
     autoClose,
     strictProfitMode,
     opportunityThroughput,
+    entryQualification,
   };
 }
 
@@ -783,7 +896,18 @@ function savePaperPortfolio() {
 function getMarkPrices(): Map<string, number> {
   const marks = new Map<string, number>();
   for (const t of theses) {
-    marks.set(t.ticker, t.side === 'yes' ? t.marketPrice : 1 - t.marketPrice);
+    marks.set(opportunityKey(t), t.marketPrice);
+    if (t.side === 'yes' || !marks.has(t.ticker)) marks.set(t.ticker, t.marketPrice);
+  }
+  for (const position of paperDesk.snapshot().positions) {
+    const book = cachedBookForTicker(position.ticker);
+    const preview = book
+      ? previewPaperClose(book, position.side, position.contracts, { ...settings, maxSlippagePp: 1 })
+      : null;
+    marks.set(
+      opportunityKey(position),
+      preview?.ok && preview.fill && !preview.fill.aborted ? preview.fill.fillPrice : position.entryPrice,
+    );
   }
   return marks;
 }
@@ -893,6 +1017,17 @@ async function executeReservedStrictPaperBuyForCard(
     });
     return { ok: false, error: reason, abortCode: 'rolling_loss_pause', queueState: 'blocked_final', wouldMutate: false };
   }
+  const validation = strategyValidationSnapshot();
+  if (!validation || validation.integrityError) {
+    const reason = `strategy validation evidence is unavailable or corrupt: ${validation?.integrityError ?? 'store unavailable'}`;
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
+  }
+  if (validation.paused) {
+    const reason = `strategy validation paused: ${validation.pauseReason ?? 'manual review required'}`;
+    opportunityQueue.markBlocked(opportunityKey(card), reason, false);
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_paused', queueState: 'blocked_final', wouldMutate: false };
+  }
+  const validationStage: StrategyValidationStage = validation.stage;
   const eligibilityBlock = entryEligibilityBlockReason(card);
   if (eligibilityBlock) {
     recordPaperBlock({
@@ -964,8 +1099,166 @@ async function executeReservedStrictPaperBuyForCard(
   }
 
   const startedAt = Date.now();
+  if (
+    validationStage === 'pilot'
+    && (qualificationSnapshot()?.realizedPnlUsd ?? 0) <= -entryQualificationSettings().pilotLossBudgetUsd
+  ) {
+    const reason = 'pilot loss budget reached';
+    if (!recordStrategyValidation((tracker) => tracker.pause(reason))) {
+      const evidenceReason = 'pilot loss pause could not be persisted';
+      reviewOnly = true;
+      return { ok: false, aborted: true, abortReason: evidenceReason, error: evidenceReason, abortCode: 'strategy_validation_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
+    }
+    reviewOnly = true;
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'pilot_loss_budget', queueState: 'blocked_final', wouldMutate: false };
+  }
+  if (
+    validationStage === 'pilot'
+    && (qualificationSnapshot()?.completedPositionCount ?? 0) >= entryQualificationSettings().pilotMinCompleted
+  ) {
+    const reason = 'pilot sample complete; manual stage review required';
+    opportunityQueue.markBlocked(key, reason, false);
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'pilot_review_required', queueState: 'blocked_final', wouldMutate: false };
+  }
+  const entryConfig = entryQualificationSettings();
+  let effectiveContracts = contracts;
+  if (validationStage === 'shadow' || validationStage === 'pilot') {
+    const rawAsk = card.side === 'yes' ? book.yesAsk : book.noAsk;
+    if (!isExecutablePrice(rawAsk)) {
+      return { ok: false, aborted: true, abortReason: 'pilot entry ask is not executable', error: 'pilot entry ask is not executable', abortCode: 'invalid_price', queueState: 'blocked_final', wouldMutate: false };
+    }
+    const maxPilotContracts = Math.max(1, Math.floor(entryConfig.pilotMaxEntryRiskUsd / (rawAsk + kalshiFeeForOrder(rawAsk, 1))));
+    const desiredContracts = contracts ?? resolveContractCount(card, paperDesk.snapshot(), settings);
+    effectiveContracts = Math.max(1, Math.min(maxPilotContracts, desiredContracts));
+  }
+
   const beforeTradeCount = paperDesk.snapshot().trades.length;
-  const result = simulatePaperBuy(paperDesk, card, book, settings, contracts);
+  const preview = previewPaperBuy(paperDesk.snapshot(), card, book, settings, effectiveContracts);
+  if (!preview.ok || !preview.fill || !preview.profitCertificate) {
+    const blockReason = preview.abortReason ?? preview.error ?? preview.abortCode ?? 'paper buy preview blocked';
+    opportunityQueue.markBlocked(key, blockReason, retryableFromResult(preview));
+    recordPaperBlock({
+      thesisId,
+      ticker: card.ticker,
+      detail: blockReason,
+      code: preview.abortCode,
+      severity: preview.abortCode === 'strict_profit_block' ? 'info' : 'warning',
+      blocksLiveUnlock: isAbnormalExecutionCode(preview.abortCode),
+    });
+    sessionStatsData.abortCount += 1;
+    saveSessionStats();
+    return preview;
+  }
+
+  const confirmation = entryConfirmationEngine.observe({
+    card,
+    fill: preview.fill,
+    baseCertificate: preview.profitCertificate,
+    bookTimestamp: Date.now(),
+    observedAt: Date.now(),
+    sourceAlreadyUsed: strategyValidationStore?.tracker.hasUsedSource(card.id),
+    lastTickerExecutionAt: lastTickerSideExecutionAt.get(key),
+  });
+  const confirmationRecorded = recordStrategyValidation((tracker) => tracker.recordEntryConfirmation({
+    sourceSignalId: card.id,
+    ticker: card.ticker,
+    side: card.side,
+    status: confirmation.status,
+    reason: confirmation.reason,
+    samples: confirmation.samples,
+    windowMs: confirmation.windowMs,
+    edgeRetention: confirmation.edgeRetention,
+    expectedRewardUsd: confirmation.expectedRewardUsd,
+    plannedLossUsd: confirmation.plannedLossUsd,
+    rewardRiskRatio: confirmation.rewardRiskRatio,
+    stressedNetPnlUsd: confirmation.stressedNetPnlUsd,
+  }));
+  if (!confirmationRecorded) {
+    const reason = 'entry confirmation evidence could not be persisted';
+    opportunityQueue.markBlocked(key, reason, false);
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
+  }
+  if (confirmation.status !== 'ready' || !confirmation.certificate) {
+    const retryable = confirmation.status === 'pending';
+    const code = retryable ? 'entry_confirmation_pending' : 'entry_confirmation_rejected';
+    opportunityQueue.markBlocked(key, confirmation.reason, retryable);
+    recordPaperBlock({
+      thesisId,
+      ticker: card.ticker,
+      detail: confirmation.reason,
+      code,
+      severity: 'info',
+      blocksLiveUnlock: false,
+    });
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: confirmation.reason,
+      error: confirmation.reason,
+      abortCode: code,
+      queueState: retryable ? 'blocked_retryable' : 'blocked_final',
+      wouldMutate: false,
+    };
+  }
+
+  if (validationStage === 'shadow') {
+    const candidateId = `shadow-${card.id}`;
+    const candidateRecorded = recordStrategyValidation((tracker) => tracker.startShadowCandidate({
+      id: candidateId,
+      sourceSignalId: card.id,
+      ticker: card.ticker,
+      side: card.side,
+      playbook: card.playbook,
+      startedAt: Date.now(),
+      dueAt: Date.now() + entryConfig.shadowFollowUpMs,
+      contracts: preview.fill!.filled,
+      entryPrice: preview.fill!.fillPrice,
+      entryFeesUsd: preview.fill!.fees,
+      initialNetEdge: card.netEdge,
+      expectedRewardUsd: confirmation.expectedRewardUsd,
+      plannedLossUsd: confirmation.plannedLossUsd,
+      rewardRiskRatio: confirmation.rewardRiskRatio,
+      stressedExpectedNetPnlUsd: confirmation.stressedNetPnlUsd,
+    }));
+    if (!candidateRecorded) {
+      const reason = 'shadow candidate evidence could not be persisted';
+      opportunityQueue.markBlocked(key, reason, false);
+      return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
+    }
+    entryConfirmationEngine.markSourceUsed(card.id);
+    opportunityQueue.markBlocked(key, 'shadow candidate started without paper mutation', false);
+    auditLog.append({
+      action: 'gate_block',
+      thesisId,
+      ticker: card.ticker,
+      detail: 'shadow candidate started without paper mutation',
+      ok: false,
+      code: 'shadow_candidate_started',
+      severity: 'info',
+      blocksLiveUnlock: false,
+    });
+    saveAuditLog();
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: 'shadow candidate started without paper mutation',
+      abortCode: 'shadow_candidate_started',
+      queueState: 'blocked_final',
+      wouldMutate: false,
+      fill: preview.fill,
+      fillQuality: preview.fillQuality,
+      profitCertificate: confirmation.certificate,
+    };
+  }
+
+  const result = simulatePaperBuy(
+    paperDesk,
+    card,
+    book,
+    settings,
+    effectiveContracts,
+    confirmation.certificate,
+  );
   const afterPortfolio = paperDesk.snapshot();
   if (!result.ok) {
     if (afterPortfolio.trades.length !== beforeTradeCount) {
@@ -994,6 +1287,8 @@ async function executeReservedStrictPaperBuyForCard(
     opportunityQueue.markCertified(key, result.profitCertificate, Date.now(), Date.now() - startedAt);
     if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('certified'));
   }
+  entryConfirmationEngine.markSourceUsed(card.id);
+  lastTickerSideExecutionAt.set(key, Date.now());
   opportunityQueue.markExecuted(key);
   if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('executed'));
   if (afterPortfolio.trades.length > beforeTradeCount + 1) {
@@ -1060,13 +1355,18 @@ function fallbackCardForPosition(pos: PaperPosition, mark = pos.entryPrice): The
   };
 }
 
+function cardForTickerSide(ticker: string, side: 'yes' | 'no'): ThesisCard | undefined {
+  return theses.find((card) => card.ticker === ticker && card.side === side)
+    ?? geaTheses.find((card) => card.ticker === ticker && card.side === side);
+}
+
 function cardForPosition(pos: PaperPosition): ThesisCard | undefined {
-  return theses.find((t) => t.ticker === pos.ticker) ?? geaTheses.find((t) => t.ticker === pos.ticker);
+  return cardForTickerSide(pos.ticker, pos.side);
 }
 
 function positionMark(pos: PaperPosition, card = cardForPosition(pos)): number {
-  if (!card) return getMarkPrices().get(pos.ticker) ?? pos.entryPrice;
-  return card.side === pos.side ? card.marketPrice : 1 - card.marketPrice;
+  const marks = getMarkPrices();
+  return marks.get(opportunityKey(pos)) ?? (card ? card.marketPrice : pos.entryPrice);
 }
 
 function autoCloseSnapshot() {
@@ -1098,6 +1398,7 @@ function exitSignalFromRecommendation(packet: ExitRecommendation): AutoCloseExit
   const edgePressure = packet.current_edge <= 0 ? 0.08 : packet.captured_edge > packet.current_edge ? 0.03 : 0;
   return {
     ticker: packet.ticker,
+    side: packet.side,
     action: packet.action,
     confidence: clamp01(baseConfidence + edgePressure),
     currentEdge: packet.current_edge,
@@ -1193,6 +1494,21 @@ function recordQualificationClose(
     ));
     reviewOnly = true;
   }
+  const validation = strategyValidationSnapshot();
+  if (validation?.stage === 'pilot' && snapshot) {
+    const pilotConfig = entryQualificationSettings();
+    const budgetFailed = snapshot.realizedPnlUsd <= -pilotConfig.pilotLossBudgetUsd;
+    const earlyFailed = snapshot.completedPositionCount >= 10
+      && snapshot.realizedPnlUsd <= 0
+      && snapshot.profitFactor < 0.75;
+    if ((budgetFailed || earlyFailed) && !validation.paused) {
+      const reason = budgetFailed
+        ? 'pilot loss budget reached'
+        : 'pilot first 10 positions have non-positive P&L and profit factor below 0.75';
+      recordStrategyValidation((tracker) => tracker.pause(reason, trade.timestamp));
+      reviewOnly = true;
+    }
+  }
   if (remainingContracts === 0) worstUnrealizedLossByPosition.delete(pos.id);
   void evaluateQualificationFollowUps();
 }
@@ -1220,16 +1536,76 @@ async function evaluateQualificationFollowUps(): Promise<void> {
   }
 }
 
-async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseDecision): Promise<boolean> {
+async function evaluateStrategyValidationFollowUps(): Promise<void> {
+  if (!strategyValidationStore || strategyValidationFollowUpRunning) return;
+  const snapshot = strategyValidationSnapshot();
+  if (!snapshot || snapshot.stage !== 'shadow' || snapshot.paused) return;
+  strategyValidationFollowUpRunning = true;
+  try {
+    const now = Date.now();
+    for (const candidate of strategyValidationStore.tracker.pendingCandidates()) {
+      try {
+        const book = await bookFetchCoordinator.fetch(candidate.ticker, { allowCachedSuccess: false });
+        const fill = dryRunCloseFill(book, candidate.side, candidate.contracts, candidate.entryPrice, settings.maxSlippagePp);
+        if (fill.aborted || fill.filled !== candidate.contracts || !isExecutablePrice(fill.fillPrice)) continue;
+        const entryCost = candidate.entryPrice * candidate.contracts + candidate.entryFeesUsd;
+        const executableNetPnlUsd = fill.fillPrice * fill.filled - fill.fees - entryCost;
+        const stressedPrice = Math.max(0.01, fill.fillPrice - 0.01);
+        const stressedNetPnlUsd = stressedPrice * fill.filled
+          - kalshiFeeForOrder(stressedPrice, fill.filled)
+          - entryCost;
+        const currentEdge = cardForTickerSide(candidate.ticker, candidate.side)?.netEdge ?? 0;
+        recordStrategyValidation((tracker) => tracker.observeShadowCandidate(
+          candidate.id,
+          executableNetPnlUsd,
+          stressedNetPnlUsd,
+          currentEdge,
+          now,
+        ));
+        const observations = strategyValidationStore.tracker.recentObservations(candidate.id, 3);
+        const edgeGone = observations.length >= 3 && observations.every((observation) => observation.netEdge <= 0);
+        const hitTarget = executableNetPnlUsd >= candidate.expectedRewardUsd;
+        const hitLoss = executableNetPnlUsd <= -candidate.plannedLossUsd;
+        const due = now >= candidate.dueAt;
+        if (hitTarget || hitLoss || edgeGone || due) {
+          const closeReason = hitTarget
+            ? 'shadow target reached'
+            : hitLoss
+              ? 'shadow planned-loss limit reached'
+              : edgeGone
+                ? 'shadow edge gone for three executable observations'
+                : 'shadow 15-minute follow-up complete';
+          recordStrategyValidation((tracker) => tracker.scoreShadowCandidate(
+            candidate.id,
+            executableNetPnlUsd,
+            stressedNetPnlUsd,
+            closeReason,
+            now,
+          ));
+        }
+      } catch {
+        // Missing executable books remain pending and never count as scored evidence.
+      }
+    }
+  } finally {
+    strategyValidationFollowUpRunning = false;
+  }
+}
+
+async function executeAutoCloseDecision(
+  pos: PaperPosition,
+  decision: AutoCloseDecision,
+  prepared?: { book: KalshiOrderbook; mark: number },
+): Promise<boolean> {
   if (decision.action === 'hold' || decision.contracts < 1) return false;
   if (settings.killSwitchActive) return false;
   const card = cardForPosition(pos);
-  const mark = positionMark(pos, card);
+  const mark = prepared?.mark ?? positionMark(pos, card);
   const closeCard = card ?? fallbackCardForPosition(pos, mark);
   const qty = Math.min(pos.contracts, decision.contracts);
   let book: KalshiOrderbook;
   try {
-    book = cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
+    book = prepared?.book ?? cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
   } catch (error) {
     if (!isBookFetchBackoffError(error)) {
       const reason = describeBookFetchError(error);
@@ -1244,6 +1620,17 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
     }
     return false;
   }
+  const closeSettings = /^emergency close:/i.test(decision.reason)
+    ? {
+      ...settings,
+      maxSlippagePp: 1,
+      strictProfitMode: {
+        ...DEFAULT_STRICT_PROFIT_MODE,
+        ...(settings.strictProfitMode ?? {}),
+        allowEmergencyLossClose: true,
+      },
+    }
+    : settings;
   const result = simulatePaperClose(
     paperDesk,
     pos.id,
@@ -1251,7 +1638,7 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
     pos.side,
     mark,
     qty,
-    settings,
+    closeSettings,
     {
       autoCloseDecisionId: decision.id,
       autoCloseReason: decision.reason,
@@ -1404,16 +1791,32 @@ async function evaluateAutoClosePositions(_trigger: string) {
   try {
     const now = Date.now();
     const openIds = new Set<string>();
-    const closable: Array<{ pos: PaperPosition; decision: AutoCloseDecision }> = [];
+    const closable: Array<{ pos: PaperPosition; decision: AutoCloseDecision; book: KalshiOrderbook; mark: number }> = [];
     const acSettings = autoCloseSettings();
+    const bookByTicker = new Map<string, Promise<KalshiOrderbook>>();
 
     for (const pos of paperDesk.snapshot().positions) {
       openIds.add(pos.id);
       const card = cardForPosition(pos);
-      const mark = positionMark(pos, card);
+      const closeCard = card ?? fallbackCardForPosition(pos);
+      let bookPromise = bookByTicker.get(pos.ticker);
+      if (!bookPromise) {
+        bookPromise = fetchBookForCard(closeCard);
+        bookByTicker.set(pos.ticker, bookPromise);
+      }
+      let book: KalshiOrderbook;
+      try {
+        book = await bookPromise;
+      } catch {
+        continue;
+      }
+      const closePreview = previewPaperClose(book, pos.side, pos.contracts, { ...settings, maxSlippagePp: 1 });
+      if (!closePreview.ok || !closePreview.fill || closePreview.fill.aborted) continue;
+      const mark = closePreview.fill.fillPrice;
       const tickCount = Math.max(tickHistory.get(pos.ticker)?.length ?? 0, autoCloseStates.get(pos.id)?.tickCount ?? 0);
-      const currentEdge = card?.netEdge ?? latestExitSignals.get(pos.ticker)?.currentEdge ?? 0;
-      const unrealizedPnl = (mark - pos.entryPrice) * pos.contracts - pos.fees;
+      const exitSignal = latestExitSignals.get(opportunityKey(pos));
+      const currentEdge = card?.netEdge ?? exitSignal?.currentEdge ?? 0;
+      const unrealizedPnl = positionUnrealizedPnl(pos, mark);
       const priorWorstLoss = Math.max(
         worstUnrealizedLossByPosition.get(pos.id) ?? 0,
         qualificationStore?.tracker.worstLossForPosition(pos.id) ?? 0,
@@ -1442,9 +1845,9 @@ async function evaluateAutoClosePositions(_trigger: string) {
         now,
         state: nextState,
         settings: acSettings,
-        exitSignal: latestExitSignals.get(pos.ticker),
+        exitSignal,
         freshnessMs: card?.freshnessMs,
-        slippagePp: card?.slippagePp ?? card?.spread,
+        slippagePp: closePreview.fill.slippage,
       });
 
       if (decision.action === 'hold') continue;
@@ -1454,10 +1857,12 @@ async function evaluateAutoClosePositions(_trigger: string) {
       if (nextState.lastDecisionAt && now - nextState.lastDecisionAt < cooldownMs) continue;
       nextState.lastDecisionAt = now;
       autoCloseStates.set(pos.id, nextState);
-      closable.push({ pos, decision });
+      closable.push({ pos, decision, book, mark });
     }
 
-    const results = await Promise.all(closable.map(({ pos, decision }) => executeAutoCloseDecision(pos, decision)));
+    recordQualificationEquity(now);
+    const results = await Promise.all(closable.map(({ pos, decision, book, mark }) =>
+      executeAutoCloseDecision(pos, decision, { book, mark })));
     executed = results.some(Boolean);
 
     let pruned = false;
@@ -1611,8 +2016,16 @@ async function runThroughputCertification(trigger: string) {
     if (duplicateCount > 0) {
       recordQualification((tracker) => tracker.recordFunnel('duplicates_removed', duplicateCount, 'duplicate_execution_key'));
     }
+    const validation = strategyValidationSnapshot();
+    const pendingCapacity = validation?.stage === 'shadow'
+      ? Math.max(0, entryQualificationSettings().maxPendingCandidates - validation.shadowPendingCount)
+      : entryQualificationSettings().maxPendingCandidates;
     const candidates = deduplicatedCandidates
-      .slice(0, Math.min(rankedCandidates.length, remaining));
+      .slice(0, Math.min(
+        rankedCandidates.length,
+        remaining,
+        pendingCapacity,
+      ));
 
     opportunityQueue.discover(candidates);
     const concurrency = Math.max(1, throughput.maxConcurrentBookFetches);
@@ -1654,6 +2067,8 @@ function broadcastPaperUpdate(forceSnapshot = false) {
     opportunityRadar: opportunityRadarRows,
     opportunityThroughput: opportunityQueue.snapshot(),
     paperQualification: qualificationSnapshot(),
+    strategyValidation: strategyValidationSnapshot(),
+    pilotValidation: pilotValidationSnapshot(),
     ...autoCloseSnapshot(),
   });
 }
@@ -1749,7 +2164,7 @@ function applyBridgeRecommendation(packet: RecommendationPacket) {
 }
 
 function applyBridgeExitRecommendation(packet: ExitRecommendation) {
-  latestExitSignals.set(packet.ticker, exitSignalFromRecommendation(packet));
+  latestExitSignals.set(opportunityKey(packet), exitSignalFromRecommendation(packet));
   void evaluateAutoClosePositions('bridge-exit');
   broadcastPaperUpdate();
 }
@@ -2111,6 +2526,12 @@ function buildNemesisStateMirror(): NemesisStateMirror {
     paperEquity: mtm.equity,
     dailyPnl: sessionStatsData.dailyPnl,
     opportunityThroughput: { ...throughputTelemetry },
+    paperPositions: paperDesk.snapshot().positions.map((position) => ({
+      ticker: position.ticker,
+      side: position.side,
+      contracts: position.contracts,
+      entryPrice: position.entryPrice,
+    })),
     gates: gates.map((g) => g.id),
     activeRegimes,
     marketFeedReady,
@@ -2277,6 +2698,7 @@ function buildLiveUnlockReadiness(targetStage: 'manual-live' | 'auto-live', conf
     gates,
     confirmationText,
     paper: {
+      validationStage: strategyValidationSnapshot()?.stage ?? 'shadow',
       completedPositionCount: qualification?.completedPositionCount ?? 0,
       profitableWeekCount: qualification?.profitableWeekCount ?? 0,
       profitFactor: qualification?.profitFactor ?? 0,
@@ -2335,6 +2757,8 @@ function setupIpc() {
       opportunityRadar: opportunityRadarRows,
       activeRegimes,
       paperQualification: qualificationSnapshot(),
+      strategyValidation: strategyValidationSnapshot(),
+      pilotValidation: pilotValidationSnapshot(),
       dailyPnl: sessionStatsData.dailyPnl,
       humanQuizPassed: settings.humanQuizPassed ?? false,
       backtestPassed: settings.backtestPassed ?? false,
@@ -2489,6 +2913,8 @@ function setupIpc() {
       sessionStats: sessionStatsData,
       autoClose: autoCloseSnapshot(),
       paperQualification: qualificationSnapshot(),
+      strategyValidation: strategyValidationSnapshot(),
+      pilotValidation: pilotValidationSnapshot(),
       equity: mtm.equity,
       csv: journal.exportCsv(),
     };
@@ -2579,9 +3005,8 @@ function setupIpc() {
     const pos = paperDesk.snapshot().positions.find((p) => p.id === positionId);
     if (!pos) return { ok: false, error: 'position not found' };
     const card = cardForPosition(pos);
-    const expectedPrice = positionMark(pos, card);
     const qty = contracts ?? pos.contracts;
-    const closeCard = card ?? fallbackCardForPosition(pos, expectedPrice);
+    const closeCard = card ?? fallbackCardForPosition(pos);
     let book: KalshiOrderbook;
     try {
       book = cachedBookForTicker(pos.ticker) ?? await fetchBookForCard(closeCard);
@@ -2598,7 +3023,11 @@ function setupIpc() {
       }
       return { ok: false, error: `book unavailable: ${reason}`, abortCode: 'book_unavailable', wouldMutate: false };
     }
-    const result = simulatePaperClose(paperDesk, positionId, book, pos.side, expectedPrice, qty, settings);
+    const closePreview = previewPaperClose(book, pos.side, qty, settings);
+    if (!closePreview.ok || !closePreview.fill || closePreview.fill.aborted) {
+      return { ok: false, error: closePreview.error ?? closePreview.fill?.abortReason ?? 'no executable close fill', abortCode: closePreview.abortCode, wouldMutate: false };
+    }
+    const result = simulatePaperClose(paperDesk, positionId, book, pos.side, closePreview.fill.fillPrice, qty, settings);
     if (result.ok) {
       recordBenchmarkSample('baseline', pos, qty, result.pnl ?? 0, result.fillQuality?.implementationShortfall ?? 0);
       recordQualificationClose('baseline', pos, qty, result);
@@ -2688,8 +3117,35 @@ function setupIpc() {
       dailyPnl: sessionStatsData.dailyPnl,
       activeRegimes,
       paperQualification: qualificationSnapshot(),
+      strategyValidation: strategyValidationSnapshot(),
+      pilotValidation: pilotValidationSnapshot(),
       ...autoCloseSnapshot(),
     };
+  });
+
+  ipcMain.handle('nemesis:advanceStrategyStage', (_e, stage: StrategyValidationStage, confirmation: string) => {
+    try {
+      if (!strategyValidationStore) throw new Error('strategy validation store is unavailable');
+      const current = strategyValidationSnapshot();
+      if (!current || current.integrityError || current.paused) throw new Error('strategy validation evidence is not eligible for advancement');
+      if (paperDesk.snapshot().positions.length > 0) throw new Error('close all paper positions before advancing the stage');
+      if (stage === 'pilot') {
+        if (current.stage !== 'shadow') throw new Error('only a shadow run can advance to pilot');
+        if (!current.shadowPassed) throw new Error('shadow thresholds have not passed');
+      } else if (stage === 'qualification') {
+        if (current.stage !== 'pilot') throw new Error('only a pilot run can advance to qualification');
+        if (!pilotValidationSnapshot().passed) throw new Error('pilot thresholds have not passed');
+      } else {
+        throw new Error('shadow is created only by archive and reset');
+      }
+      strategyValidationStore.record((tracker) => tracker.changeStage(stage, confirmation));
+      const strategyValidation = strategyValidationSnapshot();
+      const pilotValidation = pilotValidationSnapshot();
+      broadcastPaperUpdate(true);
+      return { ok: true, strategyValidation, pilotValidation };
+    } catch (error) {
+      return { ok: false, error: describeError(error) };
+    }
   });
 
   ipcMain.handle('nemesis:resetPaper', (_e, confirmation: string) => {
@@ -2701,6 +3157,7 @@ function setupIpc() {
         gitCommit: process.env.NEMESIS_GIT_COMMIT ?? 'unknown',
         appVersion: app.getVersion(),
         strategyConfigHash: strategyConfigHash(),
+        strategyEngineVersion: PAPER_STRATEGY_ENGINE_VERSION,
       });
       paperDesk.load(result.portfolio);
       paperOrderBook.load([]);
@@ -2724,6 +3181,14 @@ function setupIpc() {
         startingCash: 5_000,
         strategyConfigHash: strategyConfigHash(),
       });
+      strategyValidationStore = StrategyValidationStore.open(STRATEGY_VALIDATION_PATH, {
+        stage: 'shadow',
+        strategyConfigHash: strategyConfigHash(),
+        strategyEngineVersion: PAPER_STRATEGY_ENGINE_VERSION,
+      });
+      entryConfirmationEngine = new EntryConfirmationEngine(entryQualificationSettings());
+      lastTickerSideExecutionAt.clear();
+      reviewOnly = false;
       lastQualificationEquity = 5_000;
       broadcastPaperUpdate(true);
       return {
@@ -2890,6 +3355,8 @@ app.whenReady().then(() => {
   startupTrace('audit-log');
   initializePaperQualification();
   startupTrace('paper-qualification');
+  initializeStrategyValidation();
+  startupTrace('strategy-validation');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
   setupIpc();
   startupTrace('ipc');
@@ -2903,6 +3370,8 @@ app.whenReady().then(() => {
     processWorkingOrders();
     void evaluateAutoClosePositions('health-tick');
     void evaluateQualificationFollowUps();
+    void evaluateStrategyValidationFollowUps();
+    void runThroughputCertification('entry-confirmation-tick');
     broadcast('connectors:update', registry.getAll());
     if (paperDesk.snapshot().positions.length > 0) {
       broadcastPaperUpdate();

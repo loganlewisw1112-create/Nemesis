@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { DEFAULT_SHUTDOWN_COUNTERS, type PaperPortfolio } from '@nemesis/core';
 import { PaperQualificationTracker } from './paperQualification.js';
+import { StrategyValidationTracker } from './strategyValidation.js';
 
 export const ARCHIVE_RESET_CONFIRMATION = 'ARCHIVE_AND_RESET_PAPER';
 
@@ -15,8 +16,11 @@ const ARCHIVED_RUNTIME_FILES = [
   'auto-close-state.json',
   'audit-log.json',
   'paper-qualification-events.jsonl',
+  'paper-strategy-validation-events.jsonl',
   path.join('reports', 'weekly-report.md'),
   path.join('reports', 'weekly-report-cursor.json'),
+  path.join('reports', 'qualification-failure-report.json'),
+  path.join('reports', 'qualification-failure-report.md'),
 ] as const;
 
 const PROTECTED_FILES = [
@@ -32,6 +36,7 @@ export interface PaperArchiveManifest {
   createdAt: string;
   gitCommit: string;
   appVersion: string;
+  strategyEngineVersion: number;
   startingCash: number;
   cash: number;
   realizedPnl: number;
@@ -47,6 +52,7 @@ export interface ArchiveAndResetPaperInput {
   gitCommit: string;
   appVersion: string;
   strategyConfigHash: string;
+  strategyEngineVersion?: number;
   now?: number;
 }
 
@@ -168,6 +174,7 @@ export function archiveAndResetPaper(input: ArchiveAndResetPaperInput): ArchiveA
     createdAt: new Date(now).toISOString(),
     gitCommit: input.gitCommit,
     appVersion: input.appVersion,
+    strategyEngineVersion: input.strategyEngineVersion ?? 2,
     startingCash: portfolioBefore.startingCash,
     cash: portfolioBefore.cash,
     realizedPnl: portfolioBefore.realizedPnl,
@@ -194,6 +201,13 @@ export function archiveAndResetPaper(input: ArchiveAndResetPaperInput): ArchiveA
     realizedPnl: 0,
   };
   const tracker = PaperQualificationTracker.create(startingCash, input.strategyConfigHash, now, newRunId);
+  const validationTracker = StrategyValidationTracker.create(
+    'shadow',
+    input.strategyConfigHash,
+    input.strategyEngineVersion ?? 2,
+    now,
+    `svr-${newRunId}`,
+  );
   const reportsDir = path.join(input.dataDir, 'reports');
   fs.mkdirSync(reportsDir, { recursive: true });
 
@@ -215,6 +229,11 @@ export function archiveAndResetPaper(input: ArchiveAndResetPaperInput): ArchiveA
   fs.writeFileSync(
     path.join(input.dataDir, 'paper-qualification-events.jsonl'),
     `${tracker.allEvents().map((event) => JSON.stringify(event)).join('\n')}\n`,
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(input.dataDir, 'paper-strategy-validation-events.jsonl'),
+    `${validationTracker.allEvents().map((event) => JSON.stringify(event)).join('\n')}\n`,
     'utf8',
   );
   fs.writeFileSync(

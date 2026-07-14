@@ -32,6 +32,22 @@ export interface ProfitCertificate {
   bookTimestamp: number;
   expiresAt: number;
   reason: string;
+  classification?: 'immediate_executable' | 'modeled_confirmed' | 'research_only';
+  sourceSignalId?: string;
+  sourceAgeMs?: number;
+  confirmationSamples?: number;
+  confirmationWindowMs?: number;
+  initialNetEdge?: number;
+  finalNetEdge?: number;
+  edgeRetention?: number;
+  bookAgeMs?: number;
+  targetExitPrice?: number;
+  breakEvenExitPrice?: number;
+  expectedRewardUsd?: number;
+  plannedLossUsd?: number;
+  rewardRiskRatio?: number;
+  stressedNetPnlUsd?: number;
+  holdHorizonMs?: number;
 }
 
 export interface PaperPosition {
@@ -109,6 +125,8 @@ export interface AutoCloseSettings {
   finalCloseProfitPct: number;
   finalCloseGivebackPct: number;
   emergencyEdgeExit: number;
+  emergencyEdgeConfirmTicks: number;
+  hardLossUsd: number;
   geaExitConfidence: number;
   staleSignalMs: number;
   badLiquiditySlippagePp: number;
@@ -150,6 +168,7 @@ export interface AutoCloseState {
   markVelocityPct: number;
   edgeVelocityPct: number;
   consecutiveDownTicks: number;
+  consecutiveEdgeLossTicks?: number;
   earlyTrimContracts: number;
   tier: PositionTier;
 }
@@ -190,6 +209,8 @@ export const DEFAULT_AUTO_CLOSE_SETTINGS: AutoCloseSettings = {
   finalCloseProfitPct: 0.12,
   finalCloseGivebackPct: 0.25,
   emergencyEdgeExit: 0,
+  emergencyEdgeConfirmTicks: 3,
+  hardLossUsd: 1,
   geaExitConfidence: 0.85,
   staleSignalMs: 90_000,
   badLiquiditySlippagePp: 0.07,

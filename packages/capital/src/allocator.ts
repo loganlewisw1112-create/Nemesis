@@ -79,10 +79,6 @@ function clamp(value: number, min = 0, max = 1): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function sidePrice(card: ThesisCard, value: number): number {
-  return card.side === 'yes' ? value : 1 - value;
-}
-
 function equity(portfolio: PaperPortfolio): number {
   const deployed = portfolio.positions.reduce((sum, pos) => sum + pos.entryPrice * pos.contracts + pos.fees, 0);
   return Math.max(0, portfolio.cash + deployed);
@@ -117,7 +113,7 @@ function fillableContracts(
 }
 
 function bookEntryPrice(book: KalshiOrderbook | undefined, card: ThesisCard): number {
-  const fallback = sidePrice(card, card.marketPrice);
+  const fallback = card.marketPrice;
   if (!book) return fallback;
   if (card.side === 'yes') return book.yesAsk ?? fallback;
   return book.noAsk ?? fallback;
@@ -156,7 +152,7 @@ export function decideCapitalAllocation(input: CapitalDecisionInput): CapitalDec
   const entryPrice = bookEntryPrice(input.book, input.card);
   const slippagePp = input.card.slippagePp ?? Math.max(0, input.card.spread / 2);
   const feePerContract = kalshiFeePerContract(entryPrice);
-  const impliedSidePrice = sidePrice(input.card, input.card.impliedPrice);
+  const impliedSidePrice = input.card.impliedPrice;
   const edgePerContract = impliedSidePrice - entryPrice - feePerContract - slippagePp;
   const minProfitUsd = allocation.minExpectedProfitCents / 100;
   const protectiveExit = Math.min(0.99, entryPrice + feePerContract + minProfitUsd);

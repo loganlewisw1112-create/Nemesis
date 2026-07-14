@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_AUTO_CLOSE_SETTINGS,
   DEFAULT_DISCOVERY_SETTINGS,
+  DEFAULT_ENTRY_QUALIFICATION,
   DEFAULT_GUARDRAILS,
   DEFAULT_OPPORTUNITY_THROUGHPUT,
   DEFAULT_STRICT_PROFIT_MODE,
@@ -16,7 +17,7 @@ import {
   archiveAndResetPaper,
   detectRunningNemesisApplications,
 } from '../packages/execution/src/paperRunArchive.ts';
-import { buildStrategyConfigHash } from '../apps/desktop/electron/qualificationConfig.ts';
+import { buildStrategyConfigHash, PAPER_STRATEGY_ENGINE_VERSION } from '../apps/desktop/electron/qualificationConfig.ts';
 
 const repoRoot = process.env.NEMESIS_REPO_ROOT
   ? path.resolve(process.env.NEMESIS_REPO_ROOT)
@@ -40,6 +41,7 @@ const settings = {
   autoClose: { ...DEFAULT_AUTO_CLOSE_SETTINGS, ...(rawSettings.autoClose ?? {}) },
   strictProfitMode: { ...DEFAULT_STRICT_PROFIT_MODE, ...(rawSettings.strictProfitMode ?? {}) },
   opportunityThroughput: { ...DEFAULT_OPPORTUNITY_THROUGHPUT, ...(rawSettings.opportunityThroughput ?? {}) },
+  entryQualification: { ...DEFAULT_ENTRY_QUALIFICATION, ...(rawSettings.entryQualification ?? {}) },
 };
 const discovery = {
   ...DEFAULT_DISCOVERY_SETTINGS,
@@ -59,6 +61,7 @@ const result = archiveAndResetPaper({
   gitCommit,
   appVersion: desktopPackage.version,
   strategyConfigHash: buildStrategyConfigHash(settings, discovery),
+  strategyEngineVersion: PAPER_STRATEGY_ENGINE_VERSION,
 });
 
 process.stdout.write(`${JSON.stringify({

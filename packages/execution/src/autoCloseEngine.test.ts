@@ -79,6 +79,27 @@ describe('AutoCloseEngine', () => {
     expect(higherProfitLowerEdge.peakEdge).toBe(0.05);
   });
 
+  it('treats a rising executable NO-contract bid as favorable', () => {
+    const first = updateAutoCloseState({
+      position: position({ side: 'no', entryPrice: 0.4 }),
+      mark: 0.45,
+      currentEdge: 0.05,
+      tickCount: 1,
+      now,
+    });
+    const next = updateAutoCloseState({
+      position: position({ side: 'no', entryPrice: 0.4 }),
+      mark: 0.5,
+      currentEdge: 0.05,
+      tickCount: 2,
+      now: now + 1_000,
+      prior: first,
+    });
+    expect(next.markVelocityPct).toBeGreaterThan(0);
+    expect(next.consecutiveDownTicks).toBe(0);
+    expect(next.peakMark).toBe(0.5);
+  });
+
   it('does not close before minimum age and tick count', () => {
     const young = evaluateAutoClosePosition({
       position: position(),
@@ -92,6 +113,65 @@ describe('AutoCloseEngine', () => {
 
     expect(young.action).toBe('hold');
     expect(young.reason).toContain('warming up');
+  });
+
+  it('enforces the executable one-dollar hard-loss stop before warmup completes', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position(),
+      mark: 0.38,
+      currentEdge: 0.05,
+      tickCount: 1,
+      now: openedAt + 1_000,
+      state: state({ tickCount: 1, peakPnlUsd: 0, peakPnlPct: 0 }),
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
+    });
+    expect(decision.action).toBe('close');
+    expect(decision.reason).toMatch(/hard-loss/i);
+  });
+
+  it('requires three edge-loss observations before the edge-gone close', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 5 }),
+      mark: 0.41,
+      currentEdge: 0,
+      tickCount: 5,
+      now,
+      state: state({
+        peakPnlUsd: 0,
+        peakPnlPct: 0,
+        peakEdge: 0.01,
+        tickCount: 5,
+        consecutiveEdgeLossTicks: 2,
+      }),
+      settings: {
+        ...DEFAULT_AUTO_CLOSE_SETTINGS,
+        enabled: true,
+        profitLockEnabled: false,
+        predictiveCrossingEnabled: false,
+        exitScoreTrimThreshold: 1,
+        exitScoreCloseThreshold: 1,
+      },
+    });
+    expect(decision.reason).not.toMatch(/edge gone/i);
+  });
+
+  it('ignores a GEA exit for the opposite contract side', () => {
+    const decision = evaluateAutoClosePosition({
+      position: position({ contracts: 5 }),
+      mark: 0.41,
+      currentEdge: 0.05,
+      tickCount: 5,
+      now,
+      state: state({ peakPnlUsd: 0, peakPnlPct: 0, peakEdge: 0.05, tickCount: 5 }),
+      settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, profitLockEnabled: false },
+      exitSignal: {
+        ticker: 'TEST-1', side: 'no', action: 'exit', confidence: 0.99,
+        currentEdge: 0, capturedEdge: 0.1, executableClosePrice: 0.59,
+        bookTimestamp: now, bookDepth: 5, priceSource: 'kalshi-orderbook',
+        expiresAt: now + 500, reason: 'opposite side', issuedAt: now,
+      },
+    });
+    expect(decision.reason).not.toMatch(/GEA exit confirmed/i);
   });
 
   it('trims half after 12 percent peak profit and 25 percent giveback', () => {
@@ -141,7 +221,7 @@ describe('AutoCloseEngine', () => {
       currentEdge: 0,
       tickCount: 4,
       now,
-      state: state({ peakPnlPct: 0.12, peakPnlUsd: 0.5, tickCount: 4 }),
+      state: state({ peakPnlPct: 0.12, peakPnlUsd: 0.5, tickCount: 4, consecutiveEdgeLossTicks: 3 }),
       settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
     });
 
@@ -160,6 +240,7 @@ describe('AutoCloseEngine', () => {
       settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
       exitSignal: {
         ticker: 'TEST-1',
+        side: 'yes',
         action: 'exit',
         confidence: 0.92,
         currentEdge: 0.04,
@@ -188,6 +269,7 @@ describe('AutoCloseEngine', () => {
       settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true, maxBridgeLatencyMs: 500, profitLockEnabled: false },
       exitSignal: {
         ticker: 'TEST-1',
+        side: 'yes',
         action: 'exit',
         confidence: 0.97,
         currentEdge: 0.04,
@@ -352,6 +434,7 @@ describe('AutoCloseEngine', () => {
       settings: { ...DEFAULT_AUTO_CLOSE_SETTINGS, enabled: true },
       exitSignal: {
         ticker: 'TEST-1',
+        side: 'yes',
         action: 'exit',
         confidence: 0.95,
         currentEdge: 0.02,
