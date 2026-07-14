@@ -94,6 +94,7 @@ import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
 import { DiscoveryOrchestrator } from './discovery.js';
 import { BookFetchCoordinator, isBookFetchBackoffError } from './bookFetchCoordinator.js';
+import { dedupeByExecutionKey, ExecutionReservation } from './executionConcurrency.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
 import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
@@ -152,6 +153,7 @@ let marketsCache: KalshiMarket[] = [];
 let marketFeedReady = false;
 let geaMarkets: KalshiMarket[] = [];
 const paperDesk = new PaperDesk(DEFAULT_PAPER_CASH);
+const paperBuyExecutionReservations = new ExecutionReservation();
 const paperOrderBook = new PaperOrderBook();
 const auditLog = new AuditLog();
 const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
@@ -741,6 +743,32 @@ async function executeStrictPaperBuyForCard(
   contracts?: number,
   source: 'manual' | 'working-order' | 'throughput' = 'manual',
 ): Promise<PaperBuyResult> {
+  const release = paperBuyExecutionReservations.tryAcquire(opportunityKey(card));
+  if (!release) {
+    const reason = 'execution already in flight for ticker-side';
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: reason,
+      error: reason,
+      abortCode: 'execution_in_flight',
+      queueState: 'blocked_retryable',
+      wouldMutate: false,
+    };
+  }
+
+  try {
+    return await executeReservedStrictPaperBuyForCard(card, contracts, source);
+  } finally {
+    release();
+  }
+}
+
+async function executeReservedStrictPaperBuyForCard(
+  card: ThesisCard,
+  contracts: number | undefined,
+  source: 'manual' | 'working-order' | 'throughput',
+): Promise<PaperBuyResult> {
   const eligibilityBlock = entryEligibilityBlockReason(card);
   if (eligibilityBlock) {
     return {
@@ -1307,7 +1335,7 @@ async function runThroughputCertification(trigger: string) {
       : Math.max(0, throughput.maxDailyCertifiedTrades - executed);
     if (remaining <= 0) return;
 
-    const candidates = theses
+    const rankedCandidates = theses
       .filter((card) => isEntryEligible(card)
         && hasRealExecutableDepth(card)
         && !openKeys.has(opportunityKey(card)))
@@ -1315,8 +1343,9 @@ async function runThroughputCertification(trigger: string) {
         const edgeDelta = b.netEdge - a.netEdge;
         if (edgeDelta !== 0) return edgeDelta;
         return (a.freshnessMs ?? 0) - (b.freshnessMs ?? 0);
-      })
-      .slice(0, Math.min(theses.length, remaining));
+      });
+    const candidates = dedupeByExecutionKey(rankedCandidates, opportunityKey)
+      .slice(0, Math.min(rankedCandidates.length, remaining));
 
     opportunityQueue.discover(candidates);
     const concurrency = Math.max(1, throughput.maxConcurrentBookFetches);
