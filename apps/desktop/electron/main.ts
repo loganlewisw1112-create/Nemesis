@@ -61,7 +61,7 @@ import {
   type GeoMarket,
   type WorldEventsPayload,
 } from '@nemesis/core';
-import { ConnectorRegistry, FeedHub, KalshiStream, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -139,6 +139,7 @@ const widgetWindows = new Set<BrowserWindow>();
 const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
 const feedHub = new FeedHub(registry);
+const activeTradeMarketResolver = new ActiveTradeMarketResolver();
 const kalshiStream = new KalshiStream(registry);
 const hotOpportunityIndex = new HotOpportunityIndex({ maxRows: 25, targetDecisionMs: 3 });
 const journal = new JournalStore();
@@ -1596,6 +1597,17 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
     new Promise<boolean>((resolve) => setTimeout(() => resolve(true), FEED_WAIT_MS)),
   ]);
   if (feedTimedOut) feedHub.kickRefresh(markets);
+
+  const activeTradeMarkets = await activeTradeMarketResolver.resolve(feedHub.getTradeTape(), markets);
+  if (activeTradeMarkets.length > 0) {
+    discovery.prioritizeMarkets(activeTradeMarkets);
+    const activeTickers = new Set(activeTradeMarkets.map((market) => market.ticker));
+    markets = [...activeTradeMarkets, ...markets.filter((market) => !activeTickers.has(market.ticker))];
+    marketsCache = mergeGeaMarkets([
+      ...activeTradeMarkets,
+      ...marketsCache.filter((market) => !activeTickers.has(market.ticker)),
+    ]);
+  }
 
   const cards: ThesisCard[] = [];
   const slice = markets;

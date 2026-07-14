@@ -14,7 +14,11 @@ import {
   type KalshiMarket,
 } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
-import { selectExecutableMarkets } from './kalshiLiquidity.js';
+import {
+  hasExecutableMarketQuote,
+  marketLiquidityScore,
+  selectExecutableMarkets,
+} from './kalshiLiquidity.js';
 
 const UNIVERSE_STALE_MS = 5 * 60_000;
 const ORDERBOOK_TTL_MS = 12_000;
@@ -90,6 +94,27 @@ export class DiscoveryOrchestrator {
     });
     if (qualified.length > 0) return qualified;
     return this.universe.slice(0, Math.min(30, this.universe.length));
+  }
+
+  /** Put active trade-tape markets first so the existing depth pass verifies their books. */
+  prioritizeMarkets(markets: KalshiMarket[]): KalshiMarket[] {
+    const seen = new Set<string>();
+    const prioritized = markets.filter((market) => {
+      if (seen.has(market.ticker)) return false;
+      seen.add(market.ticker);
+      const status = market.status.toLowerCase();
+      return (status === 'active' || status === 'open')
+        && marketLiquidityScore(market) > 0
+        && hasExecutableMarketQuote(market);
+    });
+    if (prioritized.length === 0) return this.universe;
+
+    const priorityTickers = new Set(prioritized.map((market) => market.ticker));
+    this.universe = [
+      ...prioritized,
+      ...this.universe.filter((market) => !priorityTickers.has(market.ticker)),
+    ].slice(0, this.settings.maxTrackedTickers);
+    return this.universe;
   }
 
   getMicrostructure(ticker: string, fallbackPrice: number) {

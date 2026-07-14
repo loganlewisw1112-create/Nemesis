@@ -192,6 +192,10 @@ export class FeedHub {
     return this.trades.filter((t) => t.ticker === ticker);
   }
 
+  getTradeTape(): KalshiTrade[] {
+    return [...this.trades];
+  }
+
   getTradeFeedState(): FeedHubTradeFeedState {
     return { ...this.tradeFeedState, cachedTradeCount: this.trades.length };
   }

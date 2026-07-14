@@ -8,13 +8,20 @@ const WHALE_THRESHOLD = 50;
 // every qualifying trade producing the same fixed nudge regardless of size.
 const BASE_IMPACT = 0.02;
 const MAX_IMPACT = 0.08;
+const MAX_FUTURE_CLOCK_SKEW_MS = 30_000;
 
-export function tradeToThesis(trade: KalshiTrade, market?: KalshiMarket): ThesisCard | null {
-  const notional = trade.count * (trade.yes_price / 100);
+export function tradeToThesis(trade: KalshiTrade, market?: KalshiMarket, now = Date.now()): ThesisCard | null {
+  const parsedTradeAt = Date.parse(trade.created_time);
+  const tradeAgeMs = now - parsedTradeAt;
+  const validTradeTime = Number.isFinite(parsedTradeAt) && tradeAgeMs >= -MAX_FUTURE_CLOCK_SKEW_MS;
+  const tradeAt = validTradeTime ? parsedTradeAt : now;
+  const freshnessMs = validTradeTime ? Math.max(0, tradeAgeMs) : Number.MAX_SAFE_INTEGER;
+  const sidePriceCents = trade.taker_side === 'yes' ? trade.yes_price : trade.no_price;
+  const notional = trade.count * (sidePriceCents / 100);
   if (notional < WHALE_THRESHOLD) return null;
-  const marketPrice = trade.taker_side === 'yes' ? trade.yes_price / 100 : trade.no_price / 100;
+  const marketPrice = sidePriceCents / 100;
   const impact = Math.min(MAX_IMPACT, BASE_IMPACT * Math.sqrt(notional / WHALE_THRESHOLD));
-  const implied = clampProbability(marketPrice + (trade.taker_side === 'yes' ? impact : -impact));
+  const implied = clampProbability(marketPrice + impact);
   const spread = 0.04;
   const breakdown = computeNetEdge(implied, marketPrice, spread, 0);
   const qual = qualifyThesis({
@@ -23,13 +30,12 @@ export function tradeToThesis(trade: KalshiTrade, market?: KalshiMarket): Thesis
     spread,
     depthUsd: notional,
     predictability: 65,
-    freshnessMs: 0,
+    freshnessMs,
     sourceAgreement: 0.85,
     regimeBlocked: false,
     concentrationBlocked: false,
     executionHealthy: true,
   });
-  const now = Date.now();
   return {
     id: `flow-${trade.trade_id}`,
     ticker: trade.ticker,
@@ -48,9 +54,9 @@ export function tradeToThesis(trade: KalshiTrade, market?: KalshiMarket): Thesis
     feeEstimate: kalshiFeePerContract(marketPrice),
     signalReason: `Whale ${trade.taker_side.toUpperCase()} ${trade.count} @ ${marketPrice.toFixed(2)}`,
     externalSummary: `Large taker flow $${notional.toFixed(0)}`,
-    createdAt: now,
+    createdAt: tradeAt,
     updatedAt: now,
-    freshnessMs: 0,
+    freshnessMs,
     edgeHistory: [breakdown.netEdge],
     drivers: [{ label: 'Whale flow', impact: 0.8, detail: `${trade.count} contracts` }],
     invalidations: qual.failedGates,

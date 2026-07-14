@@ -7,5 +7,6 @@ export * from './binanceStream.js';
 export * from './kalshiStream.js';
 export * from './kalshiTape.js';
 export * from './kalshiLiquidity.js';
+export * from './activeTradeMarkets.js';
 export * from './discoveryOrchestrator.js';
 export * from './publicDataMesh.js';

@@ -118,6 +118,27 @@ describe('DiscoveryOrchestrator fixture fallback', () => {
     expect(discovery.hasLiveUniverse()).toBe(false);
   });
 
+  it('prioritizes active trade-tape markets for the next depth pass', () => {
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    discovery.seedFixtureDepth(fixtures);
+    const active = {
+      ticker: 'KXACTIVE-TRADE',
+      title: 'Active trade market',
+      status: 'active',
+      yes_bid: 40,
+      yes_ask: 41,
+      volume: 2_000,
+    } satisfies KalshiMarket;
+
+    discovery.prioritizeMarkets([active]);
+
+    expect(discovery.getUniverse().map((market) => market.ticker)).toEqual([
+      'KXACTIVE-TRADE',
+      'KXFIXTURE-1',
+      'KXFIXTURE-2',
+    ]);
+  });
+
   it('coalesces overlapping depth passes so market refreshes do not duplicate orderbook scans', async () => {
     let releaseOrderbooks: (() => void) | undefined;
     const book: KalshiOrderbook = {
