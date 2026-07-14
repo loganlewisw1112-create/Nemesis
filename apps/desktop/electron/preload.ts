@@ -27,7 +27,7 @@ contextBridge.exposeInMainWorld('nemesis', {
     ipcRenderer.invoke('nemesis:paperPlaceLimit', id, contracts, limitPrice),
   paperCancelOrder: (orderId: string) => ipcRenderer.invoke('nemesis:paperCancelOrder', orderId),
   getPaperPortfolio: () => ipcRenderer.invoke('nemesis:getPaperPortfolio'),
-  resetPaper: (startingCash?: number) => ipcRenderer.invoke('nemesis:resetPaper', startingCash),
+  resetPaper: (confirmation: string) => ipcRenderer.invoke('nemesis:resetPaper', confirmation),
   getTickHistory: (ticker: string) => ipcRenderer.invoke('nemesis:getTickHistory', ticker),
   watchTicker: (ticker: string | null) => ipcRenderer.invoke('nemesis:watchTicker', ticker),
   getDiscoveryState: () => ipcRenderer.invoke('nemesis:getDiscoveryState'),

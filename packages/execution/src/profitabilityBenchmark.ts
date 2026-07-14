@@ -73,7 +73,7 @@ function metrics(rows: BenchmarkDecision[]): BenchmarkMetrics {
     pnlPerRiskDollar: riskUsd > 0 ? round(netPnlUsd / riskUsd) : 0,
     maxDrawdownUsd: round(Math.max(...rows.map((row) => row.maxDrawdownUsd), 0)),
     closeRegretUsd: round(rows.reduce((sum, row) => sum + row.closeRegretUsd, 0) / rows.length),
-    slippageUsd: round(rows.reduce((sum, row) => sum + row.slippageUsd, 0)),
+    slippageUsd: round(rows.reduce((sum, row) => sum + row.slippageUsd, 0) / rows.length),
     falseExitRate: round(falseExits / rows.length),
   };
 }

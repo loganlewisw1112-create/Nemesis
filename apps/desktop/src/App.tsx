@@ -35,6 +35,7 @@ import type {
 } from '@nemesis/core';
 import { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
 import type { FeedHubTradeFeedState } from '@nemesis/connectors';
+import type { PaperQualificationSnapshot } from '@nemesis/execution';
 
 interface AppState {
   settings: GuardrailSettings;
@@ -57,6 +58,7 @@ interface AppState {
     manualOverrides: number;
     apiDegradedMinutes: number;
   };
+  paperQualification?: PaperQualificationSnapshot | null;
 }
 
 interface PaperState {
@@ -71,6 +73,7 @@ interface PaperState {
   autoCloseStateByPosition?: Record<string, AutoCloseState>;
   autoCloseDecisions?: AutoCloseDecision[];
   profitabilityBenchmark?: unknown;
+  paperQualification?: PaperQualificationSnapshot | null;
 }
 
 interface KalshiCredentialStatus {
@@ -108,7 +111,13 @@ declare global {
       paperPlaceLimit: (id: string, contracts: number, limitPrice: number) => Promise<{ ok: boolean; error?: string }>;
       paperCancelOrder: (orderId: string) => Promise<{ ok: boolean }>;
       getPaperPortfolio: () => Promise<PaperState>;
-      resetPaper: (startingCash?: number) => Promise<PaperPortfolio>;
+      resetPaper: (confirmation: string) => Promise<{
+        ok: boolean;
+        error?: string;
+        archivePath?: string;
+        newRunId?: string;
+        portfolio?: PaperPortfolio;
+      }>;
       getTickHistory: (ticker: string) => Promise<PriceTick[]>;
       watchTicker: (ticker: string | null) => Promise<boolean>;
       getDiscoveryState: () => Promise<DiscoveryState>;
@@ -156,7 +165,6 @@ export default function App() {
   const [settingsSubTab, setSettingsSubTab] = useState<'guardrails' | 'discovery'>('guardrails');
   const [apiKeyId, setApiKeyId] = useState('');
   const [apiPrivateKey, setApiPrivateKey] = useState('');
-  const [paperCashInput, setPaperCashInput] = useState('1000');
   const [bridgeConnected, setBridgeConnected] = useState(false);
 
   const loadPaper = useCallback(async () => {
@@ -509,8 +517,12 @@ export default function App() {
                   loadPaper();
                 }}
                 onReset={async () => {
-                  await window.nemesis.resetPaper();
-                  setPaperResult('Paper wallet reset to $1,000');
+                  const confirmation = window.prompt('Type ARCHIVE_AND_RESET_PAPER to archive the current run and create a clean $5,000 run.');
+                  if (!confirmation) return;
+                  const result = await window.nemesis.resetPaper(confirmation);
+                  setPaperResult(result.ok
+                    ? `Archived current run and created clean $5,000 run ${result.newRunId}`
+                    : `Reset blocked: ${result.error}`);
                   loadPaper();
                 }}
               />
@@ -758,27 +770,20 @@ export default function App() {
                   <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                     Current balance: <span style={{ color: 'var(--text)', fontWeight: 600 }}>${paper?.portfolio.cash.toFixed(2) ?? '—'}</span>
                   </div>
-                  <label style={labelStyle}>
-                    Reset with starting cash ($)
-                    <input
-                      type="number"
-                      min={1}
-                      step={100}
-                      value={paperCashInput}
-                      onChange={(e) => setPaperCashInput(e.target.value)}
-                      style={inputStyle}
-                    />
-                  </label>
                   <button
                     type="button"
                     onClick={async () => {
-                      const cash = Math.max(1, Number(paperCashInput) || 1000);
-                      await window.nemesis.resetPaper(cash);
+                      const confirmation = window.prompt('Type ARCHIVE_AND_RESET_PAPER to archive the current run and create a clean $5,000 run.');
+                      if (!confirmation) return;
+                      const result = await window.nemesis.resetPaper(confirmation);
+                      setPaperResult(result.ok
+                        ? `Archived current run and created clean $5,000 run ${result.newRunId}`
+                        : `Reset blocked: ${result.error}`);
                       await loadPaper();
                     }}
                     style={chipStyle(false)}
                   >
-                    Reset paper wallet
+                    Archive and reset to $5,000
                   </button>
                 </div>
 

@@ -1,22 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 
-// Reads NEMESIS's real, auto-populated runtime state (session stats, paper
-// portfolio, audit log, auto-close decisions) and appends one dated delta
-// entry to docs/paper-trading-week-log.md, using a cursor file so each run
-// only reports what's new since the previous check-in. journal.json is
-// intentionally not read here -- it only populates on a manual UI action
-// and won't reflect unattended trading activity.
+// Generated reports are runtime evidence. They stay under nemesis-data/reports;
+// docs/paper-trading-week-log.md is preserved as read-only historical evidence.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { createHash } = require('node:crypto');
 
 const APPDATA = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-const DATA_DIR = path.join(APPDATA, '@nemesis', 'desktop', 'nemesis-data');
-const DOCS_DIR = path.join(__dirname, '..', 'docs');
-const CURSOR_PATH = path.join(DOCS_DIR, '.weekly-report-cursor.json');
-const LOG_PATH = path.join(DOCS_DIR, 'paper-trading-week-log.md');
+const DEFAULT_DATA_DIR = process.env.NEMESIS_DATA_DIR
+  || path.join(APPDATA, '@nemesis', 'desktop', 'nemesis-data');
 
 function readJson(file, fallback) {
   try {
@@ -26,20 +21,39 @@ function readJson(file, fallback) {
   }
 }
 
-function loadCursor() {
-  return readJson(CURSOR_PATH, {
-    lastAuditTimestamp: 0,
-    lastDecisionTimestamp: 0,
-    lastTradeCount: 0,
-    lastAbortCount: 0,
-    lastRealizedPnl: 0,
-    lastRunAt: null,
+function readQualificationEvents(dataDir) {
+  const file = path.join(dataDir, 'paper-qualification-events.jsonl');
+  const text = fs.readFileSync(file, 'utf8');
+  const events = text.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  if (events.length === 0 || events[0].type !== 'run_started') {
+    throw new Error('qualification evidence is missing run_started');
+  }
+  const runId = events[0].runId;
+  let previousHash = 'GENESIS';
+  events.forEach((event, index) => {
+    if (event.runId !== runId || event.sequence !== index + 1) {
+      throw new Error('qualification evidence has an inconsistent run or event number');
+    }
+    const { hash, ...unsignedEvent } = event;
+    const expectedHash = createHash('sha256').update(stableJson(unsignedEvent)).digest('hex');
+    if (event.previousHash !== previousHash || hash !== expectedHash) {
+      throw new Error('qualification evidence hash chain is invalid');
+    }
+    previousHash = hash;
   });
+  return events;
 }
 
-function saveCursor(cursor) {
-  fs.mkdirSync(DOCS_DIR, { recursive: true });
-  fs.writeFileSync(CURSOR_PATH, JSON.stringify(cursor, null, 2));
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function groupCounts(items, keyFn) {
@@ -51,95 +65,84 @@ function groupCounts(items, keyFn) {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]);
 }
 
-function main() {
-  const sessionStats = readJson(path.join(DATA_DIR, 'session-stats.json'), {
-    tradeCount: 0,
-    abortCount: 0,
-    dailyPnl: 0,
-    startingEquity: 0,
-  });
-  const portfolio = readJson(path.join(DATA_DIR, 'paper-portfolio.json'), {
+function generateWeeklyReport(dataDir = DEFAULT_DATA_DIR, now = new Date()) {
+  const reportsDir = path.join(dataDir, 'reports');
+  const cursorPath = path.join(reportsDir, 'weekly-report-cursor.json');
+  const reportPath = path.join(reportsDir, 'weekly-report.md');
+  const events = readQualificationEvents(dataDir);
+  const runId = events[0].runId;
+  const cursor = readJson(cursorPath, { runId: null, lastEventNumber: 0, lastRunAt: null });
+  const sameRun = cursor.runId === runId;
+  const lastEventNumber = sameRun && Number.isInteger(cursor.lastEventNumber)
+    ? Math.max(0, cursor.lastEventNumber)
+    : 0;
+  const newEvents = events.filter((event) => event.sequence > lastEventNumber);
+  const portfolio = readJson(path.join(dataDir, 'paper-portfolio.json'), {
     cash: 0,
     startingCash: 0,
     positions: [],
     trades: [],
     realizedPnl: 0,
   });
-  const auditLog = readJson(path.join(DATA_DIR, 'audit-log.json'), []);
-  const autoCloseState = readJson(path.join(DATA_DIR, 'auto-close-state.json'), {
-    states: [],
-    decisions: [],
-  });
 
-  const cursor = loadCursor();
-  const isFirstRun = !cursor.lastRunAt;
-
-  const newTradeCount = sessionStats.tradeCount - cursor.lastTradeCount;
-  const newAbortCount = sessionStats.abortCount - cursor.lastAbortCount;
-  const pnlDelta = portfolio.realizedPnl - cursor.lastRealizedPnl;
-
-  // audit-log.json is a ring buffer capped at 5000 entries (auditLog.ts:18)
-  // that shifts from the front once full -- already true here, since total
-  // events run well past that cap. An array-index cursor would silently go
-  // stale once the buffer wraps, so filter by each entry's own timestamp
-  // instead, which is correct regardless of shifting or array length.
-  const newAuditEntries = auditLog.filter((e) => (e.t ?? 0) > cursor.lastAuditTimestamp);
-
-  // auto-close-state.json's decisions are capped at 40 and prepended
-  // newest-first (main.ts:987), not appended -- so index/count-based
-  // slicing would look at the wrong end of the array. Filter by
-  // `triggeredAt` for the same reason as the audit log above.
-  const decisions = Array.isArray(autoCloseState.decisions) ? autoCloseState.decisions : [];
-  const newDecisions = decisions.filter((d) => (d.triggeredAt ?? 0) > cursor.lastDecisionTimestamp);
-  const emergencyCloses = newDecisions.filter((d) => /emergency close:/i.test(d.reason || ''));
-
-  const maxAuditTimestamp = auditLog.reduce((max, e) => Math.max(max, e.t ?? 0), cursor.lastAuditTimestamp);
-  const maxDecisionTimestamp = decisions.reduce((max, d) => Math.max(max, d.triggeredAt ?? 0), cursor.lastDecisionTimestamp);
-
-  const blockReasonCounts = groupCounts(
-    newAuditEntries.filter((e) => e.ok === false),
-    (e) => e.detail || e.action,
+  const completed = newEvents.filter((event) => event.type === 'position_completed');
+  const mutations = newEvents.filter((event) => event.type === 'paper_open' || event.type === 'paper_close');
+  const aborts = newEvents.filter((event) => event.type === 'paper_abort');
+  const blocking = newEvents.filter((event) => event.type === 'safety_block'
+    || (event.type === 'paper_abort' && event.blocking));
+  const realizedPnl = completed.reduce((sum, event) => sum + Number(event.position?.netPnlUsd || 0), 0);
+  const funnel = {};
+  for (const event of newEvents.filter((row) => row.type === 'funnel_increment')) {
+    funnel[event.stage] = (funnel[event.stage] || 0) + Math.max(0, Number(event.count) || 0);
+  }
+  const rejectionCounts = groupCounts(
+    newEvents.filter((event) => (event.type === 'paper_abort' && !event.blocking)
+      || (event.type === 'funnel_increment' && event.reason)),
+    (event) => event.code || event.reason,
   );
 
-  const now = new Date();
-  const lines = [];
-  lines.push(`## ${now.toISOString().slice(0, 10)} check-in (${now.toISOString()})`);
-  lines.push('');
-  if (isFirstRun) {
-    lines.push('_First check-in of this run._');
-    lines.push('');
+  const iso = now.toISOString();
+  const eventCoverage = newEvents.length > 0
+    ? `${newEvents[0].sequence}-${newEvents.at(-1).sequence}`
+    : 'none';
+  const lines = [
+    `## ${iso.slice(0, 10)} check-in (${iso})`,
+    '',
+    `- Qualification run: ${runId}`,
+    `- Events covered: ${newEvents.length} (${eventCoverage})`,
+    `- Paper mutations: ${mutations.length}`,
+    `- Completed positions: ${completed.length}`,
+    `- Realized P&L from completed positions: ${realizedPnl >= 0 ? '+' : ''}${realizedPnl.toFixed(2)}`,
+    `- Blocked/aborted attempts: ${aborts.length}`,
+    `- Blocking safety events: ${blocking.length}`,
+    `- Open positions: ${Array.isArray(portfolio.positions) ? portfolio.positions.length : 0}, cash: $${Number(portfolio.cash || 0).toFixed(2)}`,
+  ];
+  const funnelRows = Object.entries(funnel);
+  if (funnelRows.length > 0) {
+    lines.push(`- Feed stages: ${funnelRows.map(([stage, count]) => `${stage}=${count}`).join(', ')}`);
   }
-  lines.push(`- New paper trades this period: **${newTradeCount}**`);
-  lines.push(`- New blocked/aborted attempts this period: **${newAbortCount}**`);
-  lines.push(`- Realized P&L change: **${pnlDelta >= 0 ? '+' : ''}${pnlDelta.toFixed(2)}**`);
-  lines.push(`- Open positions: ${portfolio.positions.length}, cash: $${Number(portfolio.cash).toFixed(2)}`);
-  lines.push(
-    `- Auto-close decisions this period: ${newDecisions.length}` +
-      (emergencyCloses.length ? ` (${emergencyCloses.length} emergency close)` : ''),
-  );
-  if (blockReasonCounts.length > 0) {
-    lines.push('- Top block/abort reasons this period:');
-    for (const [reason, count] of blockReasonCounts.slice(0, 5)) {
-      lines.push(`  - ${reason}: ${count}`);
-    }
-  } else if (newAuditEntries.length === 0 && newTradeCount === 0) {
-    lines.push('- No new activity recorded since the last check-in.');
+  if (rejectionCounts.length > 0) {
+    lines.push('- Rejection reasons:');
+    for (const [reason, count] of rejectionCounts.slice(0, 8)) lines.push(`  - ${reason}: ${count}`);
   }
+  if (newEvents.length === 0) lines.push('- No new qualification events since the last report.');
   lines.push('');
 
-  fs.mkdirSync(DOCS_DIR, { recursive: true });
-  fs.appendFileSync(LOG_PATH, lines.join('\n') + '\n');
-
-  saveCursor({
-    lastAuditTimestamp: maxAuditTimestamp,
-    lastDecisionTimestamp: maxDecisionTimestamp,
-    lastTradeCount: sessionStats.tradeCount,
-    lastAbortCount: sessionStats.abortCount,
-    lastRealizedPnl: portfolio.realizedPnl,
-    lastRunAt: now.toISOString(),
-  });
-
-  process.stdout.write(lines.join('\n') + '\n');
+  fs.mkdirSync(reportsDir, { recursive: true });
+  fs.appendFileSync(reportPath, `${lines.join('\n')}\n`, 'utf8');
+  fs.writeFileSync(cursorPath, JSON.stringify({
+    runId,
+    lastEventNumber: events.at(-1).sequence,
+    lastRunAt: iso,
+  }, null, 2), 'utf8');
+  return { runId, newEventCount: newEvents.length, lines, reportPath, cursorPath };
 }
 
-main();
+function main() {
+  const result = generateWeeklyReport();
+  process.stdout.write(`${result.lines.join('\n')}\n`);
+}
+
+if (require.main === module) main();
+
+module.exports = { generateWeeklyReport, readQualificationEvents };

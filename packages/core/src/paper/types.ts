@@ -227,4 +227,4 @@ export interface SessionStats {
   shutdown?: ShutdownCounters;
 }
 
-export const DEFAULT_PAPER_CASH = 1000;
+export const DEFAULT_PAPER_CASH = 5000;

@@ -61,4 +61,20 @@ describe('ProfitabilityBenchmark', () => {
       'close regret worse than baseline',
     ]));
   });
+
+  it('compares average slippage fairly when sample counts differ', () => {
+    const benchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
+    benchmark.recordBaseline({
+      id: 'b1', riskUsd: 10, netPnlUsd: 1, maxDrawdownUsd: 1, closeRegretUsd: 1, slippageUsd: 1,
+    });
+    for (let index = 0; index < 3; index += 1) {
+      benchmark.recordUpgraded({
+        id: `u${index}`, riskUsd: 10, netPnlUsd: 2, maxDrawdownUsd: 1, closeRegretUsd: 1, slippageUsd: 0.5,
+      });
+    }
+    const report = benchmark.report();
+    expect(report.baseline.slippageUsd).toBe(1);
+    expect(report.upgraded.slippageUsd).toBe(0.5);
+    expect(report.target.blockers).not.toContain('slippage worse than baseline');
+  });
 });

@@ -44,6 +44,7 @@ import {
   scoreOpportunityForCard,
   HotOpportunityIndex,
   evaluateLiveUnlock,
+  kalshiFeeForOrder,
   type AutoCloseDecision,
   type AutoCloseSettings,
   type AutoCloseState,
@@ -65,6 +66,7 @@ import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, is
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
+  dryRunCloseFill,
   PaperDesk,
   simulatePaperBuy,
   simulatePaperClose,
@@ -83,18 +85,26 @@ import {
   ProfitabilityBenchmark,
   OpportunityThroughputQueue,
   annotateCardsWithCertification,
+  archiveAndResetPaper,
+  detectRunningNemesisApplications,
   entryEligibilityBlockReason,
   isEntryEligible,
   isResearchSimulationEligible,
   type AutoCloseExitSignal,
   type LiveCredentials,
   type PaperBuyResult,
+  type PaperCloseResult,
+  type PaperQualificationEvent,
+  type PaperQualificationSnapshot,
 } from '@nemesis/execution';
 import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
 import { DiscoveryOrchestrator } from './discovery.js';
 import { BookFetchCoordinator, isBookFetchBackoffError } from './bookFetchCoordinator.js';
-import { dedupeByExecutionKey, ExecutionReservation } from './executionConcurrency.js';
+import { dedupeByExecutionKey } from './executionConcurrency.js';
+import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
+import { PaperQualificationStore } from './paperQualificationStore.js';
+import { buildStrategyConfigHash } from './qualificationConfig.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
 import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
@@ -119,6 +129,7 @@ const AUDIT_PATH = path.join(DATA_DIR, 'audit-log.json');
 const DISCOVERY_SETTINGS_PATH = path.join(DATA_DIR, 'discovery-settings.json');
 const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
 const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json');
+const PAPER_QUALIFICATION_PATH = path.join(DATA_DIR, 'paper-qualification-events.jsonl');
 
 const MAX_TICKS = 120;
 const LIQUIDITY_PREFILTER_MAX_AGE_MS = 45_000;
@@ -153,7 +164,7 @@ let marketsCache: KalshiMarket[] = [];
 let marketFeedReady = false;
 let geaMarkets: KalshiMarket[] = [];
 const paperDesk = new PaperDesk(DEFAULT_PAPER_CASH);
-const paperBuyExecutionReservations = new ExecutionReservation();
+const paperBuyExecutionCoordinator = new PaperExecutionCoordinator();
 const paperOrderBook = new PaperOrderBook();
 const auditLog = new AuditLog();
 const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
@@ -161,6 +172,7 @@ const opportunityQueue = new OpportunityThroughputQueue(DEFAULT_OPPORTUNITY_THRO
 const tickHistory = new Map<string, PriceTick[]>();
 const autoCloseStates = new Map<string, AutoCloseState>();
 const latestExitSignals = new Map<string, AutoCloseExitSignal>();
+const worstUnrealizedLossByPosition = new Map<string, number>();
 const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
   async (ticker) => {
     const raw = await fetchOrderbook(ticker);
@@ -184,6 +196,10 @@ let autoCloseDecisions: AutoCloseDecision[] = [];
 let autoCloseRunning = false;
 let autoCloseQueued = false;
 let throughputRunning = false;
+let qualificationStore: PaperQualificationStore | null = null;
+let qualificationFollowUpRunning = false;
+let shutdownEvidenceRecorded = false;
+let lastQualificationEquity: number | null = null;
 let sessionStatsData: SessionStats = {
   dayStart: Date.now(),
   dailyPnl: 0,
@@ -372,6 +388,78 @@ function describeBookFetchError(error: unknown): string {
   return isBookFetchBackoffError(error) ? error.reason : describeError(error);
 }
 
+function strategyConfigHash(): string {
+  return buildStrategyConfigHash(settings, discovery.settings);
+}
+
+function initializePaperQualification(): void {
+  const existed = fs.existsSync(PAPER_QUALIFICATION_PATH);
+  const portfolio = paperDesk.snapshot();
+  qualificationStore = PaperQualificationStore.open(PAPER_QUALIFICATION_PATH, {
+    startingCash: portfolio.startingCash,
+    strategyConfigHash: strategyConfigHash(),
+  });
+  const initialQualification = qualificationStore.snapshot();
+  lastQualificationEquity = initialQualification.endingEquity;
+  worstUnrealizedLossByPosition.clear();
+  for (const position of portfolio.positions) {
+    worstUnrealizedLossByPosition.set(
+      position.id,
+      qualificationStore.tracker.worstLossForPosition(position.id),
+    );
+  }
+  if (!initialQualification.integrityError) {
+    const portfolioTradeIds = new Set(portfolio.trades.map((trade) => trade.id));
+    const evidenceTradeIds = new Set(qualificationStore.tracker.allEvents().flatMap((event) =>
+      event.type === 'paper_open' || event.type === 'paper_close' ? [event.trade.id] : []));
+    const evidenceMismatch = portfolioTradeIds.size !== evidenceTradeIds.size
+      || [...portfolioTradeIds].some((tradeId) => !evidenceTradeIds.has(tradeId));
+    if (evidenceMismatch) {
+      qualificationStore.record((tracker) => tracker.recordSafetyBlock(
+        'qualification_evidence_incomplete',
+        'paper portfolio mutations do not match the append-only qualification ledger',
+      ));
+    }
+    if (!existed && (portfolio.trades.length > 0 || portfolio.positions.length > 0)) {
+      qualificationStore.record((tracker) => tracker.recordSafetyBlock(
+        'incomplete_pre_upgrade_evidence',
+        'pre-upgrade portfolio is excluded; archive and reset before qualification',
+      ));
+    }
+  }
+}
+
+function qualificationSnapshot(now = Date.now()): PaperQualificationSnapshot | null {
+  if (!qualificationStore) return null;
+  const snapshot = qualificationStore.snapshot(now);
+  if (snapshot.integrityError) return snapshot;
+  const actualHash = strategyConfigHash();
+  if (snapshot.configurationValid && snapshot.strategyConfigHash !== actualHash) {
+    try {
+      qualificationStore.record((tracker) => tracker.invalidateConfiguration(actualHash, now));
+    } catch (error) {
+      console.error('[nemesis] qualification configuration invalidation could not be persisted', error);
+    }
+    return qualificationStore.snapshot(now);
+  }
+  return snapshot;
+}
+
+function recordQualification(
+  mutation: (tracker: PaperQualificationStore['tracker']) => PaperQualificationEvent | PaperQualificationEvent[],
+): void {
+  if (!qualificationStore) return;
+  try {
+    qualificationStore.record(mutation);
+  } catch (error) {
+    console.error('[nemesis] qualification evidence append failed', error);
+  }
+}
+
+function recordQualificationSafety(code: string, detail: string): void {
+  recordQualification((tracker) => tracker.recordSafetyBlock(code, detail));
+}
+
 function recordPaperBlock(input: {
   thesisId?: string;
   ticker?: string;
@@ -381,6 +469,7 @@ function recordPaperBlock(input: {
   blocksLiveUnlock?: boolean;
 }) {
   if (isAbnormalExecutionCode(input.code)) recordDryRunAbnormalExecution();
+  const blocksLiveUnlock = input.blocksLiveUnlock ?? isAbnormalExecutionCode(input.code);
   auditLog.append({
     action: 'paper_abort',
     thesisId: input.thesisId,
@@ -389,8 +478,13 @@ function recordPaperBlock(input: {
     ok: false,
     code: input.code,
     severity: input.severity ?? (isAbnormalExecutionCode(input.code) ? 'error' : 'info'),
-    blocksLiveUnlock: input.blocksLiveUnlock ?? isAbnormalExecutionCode(input.code),
+    blocksLiveUnlock,
   });
+  recordQualification((tracker) => tracker.recordAbort(
+    input.code ?? 'paper_abort',
+    input.detail,
+    blocksLiveUnlock,
+  ));
   saveAuditLog();
 }
 
@@ -694,6 +788,15 @@ function getMarkPrices(): Map<string, number> {
   return marks;
 }
 
+function recordQualificationEquity(at = Date.now()): number {
+  const equity = paperDesk.markToMarket(getMarkPrices()).equity;
+  if (lastQualificationEquity === null || Math.abs(equity - lastQualificationEquity) > 0.000001) {
+    recordQualification((tracker) => tracker.recordEquity(equity, at));
+    lastQualificationEquity = equity;
+  }
+  return equity;
+}
+
 function recordTick(ticker: string, yesPrice: number, spread: number, netEdge: number) {
   const tick: PriceTick = { t: Date.now(), yesPrice, spread, netEdge };
   const list = tickHistory.get(ticker) ?? [];
@@ -717,6 +820,10 @@ function snapshotEquity(force = false) {
   const port = paperDesk.snapshot();
   equityHistory.push({ t: now, equity, deployed, cash: port.cash });
   if (equityHistory.length > 2000) equityHistory.shift();
+  if (lastQualificationEquity === null || Math.abs(equity - lastQualificationEquity) > 0.000001) {
+    recordQualification((tracker) => tracker.recordEquity(equity, now));
+    lastQualificationEquity = equity;
+  }
   saveEquityHistory();
   refreshDailyPnl();
   saveSessionStats();
@@ -743,25 +850,30 @@ async function executeStrictPaperBuyForCard(
   contracts?: number,
   source: 'manual' | 'working-order' | 'throughput' = 'manual',
 ): Promise<PaperBuyResult> {
-  const release = paperBuyExecutionReservations.tryAcquire(opportunityKey(card));
-  if (!release) {
-    const reason = 'execution already in flight for ticker-side';
-    return {
-      ok: false,
-      aborted: true,
-      abortReason: reason,
-      error: reason,
-      abortCode: 'execution_in_flight',
-      queueState: 'blocked_retryable',
-      wouldMutate: false,
-    };
-  }
-
-  try {
-    return await executeReservedStrictPaperBuyForCard(card, contracts, source);
-  } finally {
-    release();
-  }
+  return paperBuyExecutionCoordinator.execute(
+    opportunityKey(card),
+    () => executeReservedStrictPaperBuyForCard(card, contracts, source),
+    () => {
+      const reason = 'execution already in flight for ticker-side';
+      recordPaperBlock({
+        thesisId: card.id,
+        ticker: card.ticker,
+        detail: reason,
+        code: 'execution_in_flight',
+        severity: 'info',
+        blocksLiveUnlock: false,
+      });
+      return {
+        ok: false,
+        aborted: true,
+        abortReason: reason,
+        error: reason,
+        abortCode: 'execution_in_flight',
+        queueState: 'blocked_retryable',
+        wouldMutate: false,
+      };
+    },
+  );
 }
 
 async function executeReservedStrictPaperBuyForCard(
@@ -769,8 +881,28 @@ async function executeReservedStrictPaperBuyForCard(
   contracts: number | undefined,
   source: 'manual' | 'working-order' | 'throughput',
 ): Promise<PaperBuyResult> {
+  if (source !== 'manual' && qualificationSnapshot()?.rollingLossPaused) {
+    const reason = 'automatic entries paused by the rolling 20-position loss rule';
+    recordPaperBlock({
+      thesisId: card.id,
+      ticker: card.ticker,
+      detail: reason,
+      code: 'rolling_loss_pause',
+      severity: 'warning',
+      blocksLiveUnlock: false,
+    });
+    return { ok: false, error: reason, abortCode: 'rolling_loss_pause', queueState: 'blocked_final', wouldMutate: false };
+  }
   const eligibilityBlock = entryEligibilityBlockReason(card);
   if (eligibilityBlock) {
+    recordPaperBlock({
+      thesisId: card.id,
+      ticker: card.ticker,
+      detail: eligibilityBlock,
+      code: 'signal_eligibility_block',
+      severity: 'info',
+      blocksLiveUnlock: false,
+    });
     return {
       ok: false,
       aborted: true,
@@ -786,18 +918,15 @@ async function executeReservedStrictPaperBuyForCard(
   const key = opportunityKey(card);
   const risk = checkPaperRisk(card, paperDesk.snapshot(), settings, getDailyPnl());
   if (!risk.ok) {
-    auditLog.append({
-      action: 'gate_block',
+    recordPaperBlock({
       thesisId,
       ticker: card.ticker,
       detail: risk.error ?? 'blocked',
-      ok: false,
       code: 'risk_gate_block',
       severity: 'warning',
-      blocksLiveUnlock: true,
+      blocksLiveUnlock: false,
     });
     opportunityQueue.markBlocked(key, risk.error ?? 'risk gate blocked', false);
-    saveAuditLog();
     return { ok: false, error: risk.error, abortCode: 'risk_gate_block', queueState: 'blocked_final', wouldMutate: false };
   }
 
@@ -805,10 +934,12 @@ async function executeReservedStrictPaperBuyForCard(
   try {
     book = await fetchBookForCard(card);
     opportunityQueue.markBookFetched(key);
+    if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('books_fetched'));
   } catch (error) {
     const reason = describeBookFetchError(error);
     const backoffActive = isBookFetchBackoffError(error);
     opportunityQueue.markBlocked(key, `book unavailable: ${reason}`, true);
+    if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('books_unavailable', 1, 'book_unavailable'));
     if (!backoffActive) {
       sessionStatsData.abortCount += 1;
       recordPaperBlock({
@@ -833,8 +964,13 @@ async function executeReservedStrictPaperBuyForCard(
   }
 
   const startedAt = Date.now();
+  const beforeTradeCount = paperDesk.snapshot().trades.length;
   const result = simulatePaperBuy(paperDesk, card, book, settings, contracts);
+  const afterPortfolio = paperDesk.snapshot();
   if (!result.ok) {
+    if (afterPortfolio.trades.length !== beforeTradeCount) {
+      recordQualificationSafety('mutation_after_failed_gate', `${card.ticker}:${card.side} changed paper trades after a failed buy`);
+    }
     sessionStatsData.abortCount += 1;
     const blockReason = result.abortReason ?? result.error ?? result.abortCode ?? 'paper buy blocked';
     opportunityQueue.markBlocked(
@@ -856,8 +992,22 @@ async function executeReservedStrictPaperBuyForCard(
 
   if (result.profitCertificate) {
     opportunityQueue.markCertified(key, result.profitCertificate, Date.now(), Date.now() - startedAt);
+    if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('certified'));
   }
   opportunityQueue.markExecuted(key);
+  if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('executed'));
+  if (afterPortfolio.trades.length > beforeTradeCount + 1) {
+    recordQualificationSafety('duplicate_paper_mutation', `${card.ticker}:${card.side} paper buy created more than one trade`);
+  } else if (afterPortfolio.trades.length !== beforeTradeCount + 1) {
+    recordQualificationSafety('accounting_mismatch', `${card.ticker}:${card.side} paper buy did not create exactly one trade`);
+  }
+  const openedTrade = afterPortfolio.trades[0];
+  if (openedTrade?.type === 'open' && openedTrade.ticker === card.ticker && openedTrade.side === card.side) {
+    recordQualification((tracker) => tracker.recordOpen(openedTrade));
+    worstUnrealizedLossByPosition.set(openedTrade.positionId, worstUnrealizedLossByPosition.get(openedTrade.positionId) ?? 0);
+  } else {
+    recordQualificationSafety('accounting_mismatch', `${card.ticker}:${card.side} paper buy trade evidence is missing or inconsistent`);
+  }
   sessionStatsData.tradeCount += 1;
   auditLog.append({
     action: 'paper_buy',
@@ -982,6 +1132,94 @@ function recordBenchmarkSample(
   });
 }
 
+function recordQualificationClose(
+  strategy: 'baseline' | 'upgraded' | 'settlement',
+  pos: PaperPosition,
+  contracts: number,
+  result: PaperCloseResult,
+): void {
+  const portfolio = paperDesk.snapshot();
+  const trade = portfolio.trades[0];
+  const remainingContracts = portfolio.positions.find((row) => row.id === pos.id)?.contracts ?? 0;
+  if (!trade || trade.type !== 'close' || trade.positionId !== pos.id || trade.contracts !== contracts) {
+    recordQualificationSafety('accounting_mismatch', `${pos.ticker}:${pos.side} close trade evidence is missing or inconsistent`);
+    return;
+  }
+
+  const feePortion = pos.contracts > 0 ? (pos.fees * contracts) / pos.contracts : 0;
+  const entryRiskUsd = pos.entryPrice * contracts + feePortion;
+  const maxDrawdownUsd = Math.max(
+    worstUnrealizedLossByPosition.get(pos.id) ?? 0,
+    qualificationStore?.tracker.worstLossForPosition(pos.id) ?? 0,
+  );
+  recordQualification((tracker) => tracker.recordClose({
+    trade,
+    strategy,
+    entryRiskUsd,
+    maxDrawdownUsd,
+    remainingContracts,
+  }));
+
+  if (strategy !== 'settlement') {
+    const sequence = qualificationStore?.snapshot().lastSequence ?? trade.timestamp;
+    recordQualification((tracker) => tracker.startCloseFollowUp({
+      id: `qfu-${trade.id}-${strategy}-${sequence}`,
+      strategy,
+      positionId: pos.id,
+      ticker: pos.ticker,
+      side: pos.side,
+      contracts,
+      actualNetProceedsUsd: trade.price * contracts - trade.fees,
+      entryRiskUsd,
+      netPnlUsd: trade.pnl ?? result.pnl ?? 0,
+      maxDrawdownUsd,
+      slippageUsd: result.fillQuality?.implementationShortfall
+        ?? Math.abs(trade.slippage ?? 0) * contracts,
+      startedAt: trade.timestamp,
+    }));
+  }
+
+  recordQualificationEquity(trade.timestamp);
+  const snapshot = qualificationSnapshot(trade.timestamp);
+  if (
+    snapshot
+    && snapshot.completedPositionCount >= 20
+    && !snapshot.rollingLossPaused
+    && (snapshot.rollingTwentyPnlUsd <= 0 || snapshot.rollingTwentyProfitFactor <= 1)
+  ) {
+    recordQualification((tracker) => tracker.recordRollingLossPause(
+      `latest 20 positions: net $${snapshot.rollingTwentyPnlUsd.toFixed(2)}, profit factor ${snapshot.rollingTwentyProfitFactor.toFixed(3)}`,
+      trade.timestamp,
+    ));
+    reviewOnly = true;
+  }
+  if (remainingContracts === 0) worstUnrealizedLossByPosition.delete(pos.id);
+  void evaluateQualificationFollowUps();
+}
+
+async function evaluateQualificationFollowUps(): Promise<void> {
+  if (!qualificationStore || qualificationFollowUpRunning) return;
+  qualificationFollowUpRunning = true;
+  try {
+    const now = Date.now();
+    for (const followUp of qualificationStore.tracker.pendingFollowUps()) {
+      try {
+        const book = await bookFetchCoordinator.fetch(followUp.ticker, { allowCachedSuccess: false });
+        const fill = dryRunCloseFill(book, followUp.side, followUp.contracts, 0, 1);
+        if (!fill.aborted && fill.filled === followUp.contracts && isExecutablePrice(fill.fillPrice)) {
+          const hypotheticalNetProceedsUsd = fill.fillPrice * fill.filled - kalshiFeeForOrder(fill.fillPrice, fill.filled);
+          recordQualification((tracker) => tracker.observeCloseFollowUp(followUp.id, hypotheticalNetProceedsUsd, now));
+        }
+      } catch {
+        // Missing executable follow-up books remain pending until the 15-minute scoring deadline.
+      }
+    }
+    recordQualification((tracker) => tracker.scoreDueFollowUps(now));
+  } finally {
+    qualificationFollowUpRunning = false;
+  }
+}
+
 async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseDecision): Promise<boolean> {
   if (decision.action === 'hold' || decision.contracts < 1) return false;
   if (settings.killSwitchActive) return false;
@@ -1050,6 +1288,7 @@ async function executeAutoCloseDecision(pos: PaperPosition, decision: AutoCloseD
     result.fillQuality?.implementationShortfall ?? 0,
     Math.max(0, decision.peakPnlUsd - decision.currentPnlUsd),
   );
+  recordQualificationClose('upgraded', pos, qty, result);
   sessionStatsData.tradeCount += 1;
   auditLog.append({
     action: 'paper_close',
@@ -1115,6 +1354,7 @@ async function sweepSettledPositions() {
           autoCloseReason: `settlement: market resolved ${decision.result.toUpperCase()}`,
         });
         if (!closed.ok) continue;
+        recordQualificationClose('settlement', pos, pos.contracts, closed);
         settledCount += 1;
         autoCloseStates.delete(pos.id);
         sessionStatsData.tradeCount += 1;
@@ -1173,6 +1413,16 @@ async function evaluateAutoClosePositions(_trigger: string) {
       const mark = positionMark(pos, card);
       const tickCount = Math.max(tickHistory.get(pos.ticker)?.length ?? 0, autoCloseStates.get(pos.id)?.tickCount ?? 0);
       const currentEdge = card?.netEdge ?? latestExitSignals.get(pos.ticker)?.currentEdge ?? 0;
+      const unrealizedPnl = (mark - pos.entryPrice) * pos.contracts - pos.fees;
+      const priorWorstLoss = Math.max(
+        worstUnrealizedLossByPosition.get(pos.id) ?? 0,
+        qualificationStore?.tracker.worstLossForPosition(pos.id) ?? 0,
+      );
+      const nextWorstLoss = Math.max(priorWorstLoss, Math.max(0, -unrealizedPnl));
+      worstUnrealizedLossByPosition.set(pos.id, nextWorstLoss);
+      if (nextWorstLoss > priorWorstLoss) {
+        recordQualification((tracker) => tracker.recordPositionWorstLoss(pos.id, nextWorstLoss, now));
+      }
       const nextState = updateAutoCloseState({
         position: pos,
         mark,
@@ -1245,6 +1495,10 @@ function computeRegimeState(spread: number, depthUsd: number, freshnessMs: numbe
   });
   activeRegimes = regime.active;
   const shutdown = shouldShutdownSession(getShutdownCounters());
+  if (shutdown && !shutdownEvidenceRecorded) {
+    shutdownEvidenceRecorded = true;
+    recordQualificationSafety('shutdown_event', 'session shutdown counters triggered');
+  }
   return { ...regime, reviewOnly: regime.reviewOnly || shutdown };
 }
 
@@ -1294,6 +1548,7 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
       opportunityRadarRows = hotOpportunityIndex.top(25);
     }
     recordTick(ticker, yesPrice, spread, card?.netEdge ?? 0);
+    recordQualificationEquity();
     scheduleMarketStatePublish();
     void evaluateAutoClosePositions('quote');
     schedulePaperUpdate();
@@ -1325,7 +1580,12 @@ function processWorkingOrders() {
 
 async function runThroughputCertification(trigger: string) {
   const throughput = { ...DEFAULT_OPPORTUNITY_THROUGHPUT, ...(settings.opportunityThroughput ?? {}) };
-  if (!throughput.enabled || throughputRunning || settings.killSwitchActive) return;
+  if (
+    !throughput.enabled
+    || throughputRunning
+    || settings.killSwitchActive
+    || qualificationSnapshot()?.rollingLossPaused
+  ) return;
   throughputRunning = true;
   try {
     const openKeys = new Set(paperDesk.snapshot().positions.map((p) => `${p.ticker}:${p.side}`));
@@ -1335,6 +1595,7 @@ async function runThroughputCertification(trigger: string) {
       : Math.max(0, throughput.maxDailyCertifiedTrades - executed);
     if (remaining <= 0) return;
 
+    recordQualification((tracker) => tracker.recordFunnel('raw_candidates', theses.length));
     const rankedCandidates = theses
       .filter((card) => isEntryEligible(card)
         && hasRealExecutableDepth(card)
@@ -1344,7 +1605,13 @@ async function runThroughputCertification(trigger: string) {
         if (edgeDelta !== 0) return edgeDelta;
         return (a.freshnessMs ?? 0) - (b.freshnessMs ?? 0);
       });
-    const candidates = dedupeByExecutionKey(rankedCandidates, opportunityKey)
+    recordQualification((tracker) => tracker.recordFunnel('entry_eligible', rankedCandidates.length));
+    const deduplicatedCandidates = dedupeByExecutionKey(rankedCandidates, opportunityKey);
+    const duplicateCount = rankedCandidates.length - deduplicatedCandidates.length;
+    if (duplicateCount > 0) {
+      recordQualification((tracker) => tracker.recordFunnel('duplicates_removed', duplicateCount, 'duplicate_execution_key'));
+    }
+    const candidates = deduplicatedCandidates
       .slice(0, Math.min(rankedCandidates.length, remaining));
 
     opportunityQueue.discover(candidates);
@@ -1386,6 +1653,7 @@ function broadcastPaperUpdate(forceSnapshot = false) {
     activeRegimes,
     opportunityRadar: opportunityRadarRows,
     opportunityThroughput: opportunityQueue.snapshot(),
+    paperQualification: qualificationSnapshot(),
     ...autoCloseSnapshot(),
   });
 }
@@ -1999,13 +2267,7 @@ function spawnGlobalEventAlpha() {
 
 function buildLiveUnlockReadiness(targetStage: 'manual-live' | 'auto-live', confirmationText: string) {
   const gates = evaluateGates(settings, journal.count(), settings.backtestPassed ?? false, registry.isHealthy('kalshi-rest'), settings.humanQuizPassed ?? false);
-  const port = paperDesk.snapshot();
-  const closeTrades = port.trades.filter((t) => t.type === 'close');
-  const wins = closeTrades.filter((t) => (t.pnl ?? 0) > 0).length;
-  const riskUsd = closeTrades.reduce((sum, trade) => sum + Math.max(0, trade.price * trade.contracts), 0);
-  const pnl = closeTrades.reduce((sum, trade) => sum + (trade.pnl ?? 0), 0);
-  const slippageRows = port.trades.filter((t) => t.slippage !== undefined);
-  const benchmark = profitabilityBenchmark.report();
+  const qualification = qualificationSnapshot();
   const shutdown = getShutdownCounters();
   return evaluateLiveUnlock({
     now: Date.now(),
@@ -2015,23 +2277,33 @@ function buildLiveUnlockReadiness(targetStage: 'manual-live' | 'auto-live', conf
     gates,
     confirmationText,
     paper: {
-      tradeCount: port.trades.length,
-      autoCloseDecisionCount: autoCloseDecisions.length,
-      realizedPnlUsd: port.realizedPnl,
-      equityAboveStart: paperDesk.markToMarket(getMarkPrices()).equity > port.startingCash,
-      pnlPerRiskDollar: riskUsd > 0 ? pnl / riskUsd : 0,
-      winRate: closeTrades.length > 0 ? wins / closeTrades.length : 0,
-      falseExitRate: benchmark.upgraded.falseExitRate,
-      avgCloseRegretUsd: benchmark.upgraded.closeRegretUsd,
-      avgSlippagePp: slippageRows.length > 0
-        ? slippageRows.reduce((sum, trade) => sum + Math.abs(trade.slippage ?? 0), 0) / slippageRows.length
-        : 0,
-      maxDrawdownUsd: Math.max(0, -sessionStatsData.dailyPnl),
-      dailyLossCapUsd: settings.dailyLossCapUsd,
+      completedPositionCount: qualification?.completedPositionCount ?? 0,
+      profitableWeekCount: qualification?.profitableWeekCount ?? 0,
+      profitFactor: qualification?.profitFactor ?? 0,
+      averageNetPnlUsd: qualification?.averageNetPnlUsd ?? 0,
+      realizedPnlUsd: qualification?.realizedPnlUsd ?? 0,
+      equityAboveStart: Boolean(qualification && qualification.endingEquity > qualification.startingCash),
+      pnlPerRiskDollar: qualification?.pnlPerRiskDollar ?? 0,
+      winRate: qualification?.winRate ?? 0,
+      largestWinShare: qualification?.largestWinShare ?? 1,
+      profitConfidenceRate: qualification?.profitConfidenceRate ?? 0,
+      stressedNetPnlUsd: qualification?.stressedNetPnlUsd ?? 0,
+      stressedProfitFactor: qualification?.stressedProfitFactor ?? 0,
+      rollingLossPaused: qualification?.rollingLossPaused ?? true,
+      configurationValid: qualification?.configurationValid ?? false,
+      manualScoredCloseCount: qualification?.manualScoredCloseCount ?? 0,
+      automaticScoredCloseCount: qualification?.automaticScoredCloseCount ?? 0,
+      benchmarkPassed: qualification?.benchmarkPassed ?? false,
+      falseExitRate: qualification?.automaticFalseExitRate ?? 1,
+      avgCloseRegretUsd: qualification?.automaticAvgCloseRegretUsd ?? Number.POSITIVE_INFINITY,
+      avgSlippagePp: qualification?.avgSlippagePp ?? Number.POSITIVE_INFINITY,
+      maxDrawdownUsd: qualification?.maxDrawdownUsd ?? Number.POSITIVE_INFINITY,
+      dailyLossCapUsd: Math.min(150, settings.dailyLossCapUsd),
       shutdownTriggered: shouldShutdownSession(shutdown),
       killSwitchActive: settings.killSwitchActive,
       apiHealthy: registry.isHealthy('kalshi-rest'),
-      cleanAudit: auditLog.list().slice(-100).every((entry) => entry.ok || entry.blocksLiveUnlock === false),
+      cleanAudit: qualification?.auditClean ?? false,
+      blockingSafetyEventCount: qualification?.blockingSafetyEventCount ?? 1,
     },
     manualLive: { orderCount: 0, reconciled: false, riskBreaches: 0, unresolvedRejects: 0, avgSlippagePp: 0, modeledSlippagePp: settings.maxSlippagePp },
     shadowAuto: { decisions: 0, expectancy: 0, manualExpectancy: 0, falseExitRate: 0, missedTicketReduction: 0 },
@@ -2062,6 +2334,7 @@ function setupIpc() {
       liveUnlock,
       opportunityRadar: opportunityRadarRows,
       activeRegimes,
+      paperQualification: qualificationSnapshot(),
       dailyPnl: sessionStatsData.dailyPnl,
       humanQuizPassed: settings.humanQuizPassed ?? false,
       backtestPassed: settings.backtestPassed ?? false,
@@ -2094,6 +2367,7 @@ function setupIpc() {
         ? { ...autoCloseSettings(), ...partial.autoClose }
         : autoCloseSettings(),
     });
+    qualificationSnapshot();
     if (riskOverride) recordSettingsManualOverride();
     feedHub.setKalshiApiKey(currentKalshiApiKeyId());
     saveSettings();
@@ -2214,6 +2488,7 @@ function setupIpc() {
       audit: auditLog.list(),
       sessionStats: sessionStatsData,
       autoClose: autoCloseSnapshot(),
+      paperQualification: qualificationSnapshot(),
       equity: mtm.equity,
       csv: journal.exportCsv(),
     };
@@ -2266,11 +2541,27 @@ function setupIpc() {
     const card = theses.find((t) => t.id === thesisId);
     const eligibilityBlock = card ? entryEligibilityBlockReason(card) : 'thesis not found';
     if (!card || eligibilityBlock) {
+      recordPaperBlock({
+        thesisId,
+        ticker: card?.ticker,
+        detail: `manual paper buy rejected: ${eligibilityBlock}`,
+        code: 'signal_eligibility_block',
+        severity: 'info',
+        blocksLiveUnlock: false,
+      });
       return { ok: false, error: `thesis not eligible for paper trading: ${eligibilityBlock}` };
     }
     const certified = certifiedQueueItemForCard(card);
     if (!certified) {
       const reason = certificationBlockForCard(card);
+      recordPaperBlock({
+        thesisId,
+        ticker: card.ticker,
+        detail: `not strict-profit certified: ${reason}`,
+        code: 'not_certified',
+        severity: 'info',
+        blocksLiveUnlock: false,
+      });
       return {
         ok: false,
         aborted: true,
@@ -2310,6 +2601,7 @@ function setupIpc() {
     const result = simulatePaperClose(paperDesk, positionId, book, pos.side, expectedPrice, qty, settings);
     if (result.ok) {
       recordBenchmarkSample('baseline', pos, qty, result.pnl ?? 0, result.fillQuality?.implementationShortfall ?? 0);
+      recordQualificationClose('baseline', pos, qty, result);
       sessionStatsData.tradeCount += 1;
       auditLog.append({
         action: 'paper_close',
@@ -2395,23 +2687,54 @@ function setupIpc() {
       workingOrders: paperOrderBook.working(),
       dailyPnl: sessionStatsData.dailyPnl,
       activeRegimes,
+      paperQualification: qualificationSnapshot(),
       ...autoCloseSnapshot(),
     };
   });
 
-  ipcMain.handle('nemesis:resetPaper', (_e, startingCash?: number) => {
-    const cash = (startingCash && startingCash > 0) ? startingCash : DEFAULT_PAPER_CASH;
-    paperDesk.reset(cash);
-    autoCloseStates.clear();
-    autoCloseDecisions = [];
-    latestExitSignals.clear();
-    equityHistory = [{ t: Date.now(), equity: cash, deployed: 0, cash }];
-    resetDailySession();
-    savePaperPortfolio();
-    saveEquityHistory();
-    saveAutoCloseState();
-    broadcastPaperUpdate(true);
-    return paperDesk.snapshot();
+  ipcMain.handle('nemesis:resetPaper', (_e, confirmation: string) => {
+    try {
+      const result = archiveAndResetPaper({
+        dataDir: DATA_DIR,
+        confirmation,
+        runningApplications: detectRunningNemesisApplications(process.pid),
+        gitCommit: process.env.NEMESIS_GIT_COMMIT ?? 'unknown',
+        appVersion: app.getVersion(),
+        strategyConfigHash: strategyConfigHash(),
+      });
+      paperDesk.load(result.portfolio);
+      paperOrderBook.load([]);
+      autoCloseStates.clear();
+      autoCloseDecisions = [];
+      latestExitSignals.clear();
+      worstUnrealizedLossByPosition.clear();
+      const now = Date.now();
+      equityHistory = [{ t: now, equity: 5_000, deployed: 0, cash: 5_000 }];
+      sessionStatsData = {
+        dayStart: now,
+        dailyPnl: 0,
+        tradeCount: 0,
+        abortCount: 0,
+        startingEquity: 5_000,
+        shutdown: { ...DEFAULT_SHUTDOWN_COUNTERS },
+      };
+      shutdownEvidenceRecorded = false;
+      auditLog.load([]);
+      qualificationStore = PaperQualificationStore.open(PAPER_QUALIFICATION_PATH, {
+        startingCash: 5_000,
+        strategyConfigHash: strategyConfigHash(),
+      });
+      lastQualificationEquity = 5_000;
+      broadcastPaperUpdate(true);
+      return {
+        ok: true,
+        archivePath: result.archivePath,
+        newRunId: result.newRunId,
+        portfolio: result.portfolio,
+      };
+    } catch (error) {
+      return { ok: false, error: describeError(error) };
+    }
   });
 
   ipcMain.handle('nemesis:getTickHistory', (_e, ticker: string) => tickHistory.get(ticker) ?? []);
@@ -2428,6 +2751,7 @@ function setupIpc() {
 
   ipcMain.handle('nemesis:updateDiscoverySettings', (_e, partial: Partial<DiscoverySettings>) => {
     discovery.updateSettings(partial);
+    qualificationSnapshot();
     saveDiscoverySettings();
     broadcastDiscovery();
     return { ok: true, state: discovery.getState() };
@@ -2564,6 +2888,8 @@ app.whenReady().then(() => {
   startupTrace('paper-orders');
   loadAuditLog();
   startupTrace('audit-log');
+  initializePaperQualification();
+  startupTrace('paper-qualification');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
   setupIpc();
   startupTrace('ipc');
@@ -2576,6 +2902,7 @@ app.whenReady().then(() => {
     tickApiHealthDegraded();
     processWorkingOrders();
     void evaluateAutoClosePositions('health-tick');
+    void evaluateQualificationFollowUps();
     broadcast('connectors:update', registry.getAll());
     if (paperDesk.snapshot().positions.length > 0) {
       broadcastPaperUpdate();

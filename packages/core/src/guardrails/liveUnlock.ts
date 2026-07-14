@@ -3,12 +3,23 @@ import type { GateStatus, LiveUnlockCertificate } from '../types.js';
 export type LiveUnlockTargetStage = 'manual-live' | 'auto-live';
 
 export interface PaperUnlockMetrics {
-  tradeCount: number;
-  autoCloseDecisionCount: number;
+  completedPositionCount: number;
+  profitableWeekCount: number;
+  profitFactor: number;
+  averageNetPnlUsd: number;
   realizedPnlUsd: number;
   equityAboveStart: boolean;
   pnlPerRiskDollar: number;
   winRate: number;
+  largestWinShare: number;
+  profitConfidenceRate: number;
+  stressedNetPnlUsd: number;
+  stressedProfitFactor: number;
+  rollingLossPaused: boolean;
+  configurationValid: boolean;
+  manualScoredCloseCount: number;
+  automaticScoredCloseCount: number;
+  benchmarkPassed: boolean;
   falseExitRate: number;
   avgCloseRegretUsd: number;
   avgSlippagePp: number;
@@ -18,6 +29,7 @@ export interface PaperUnlockMetrics {
   killSwitchActive: boolean;
   apiHealthy: boolean;
   cleanAudit: boolean;
+  blockingSafetyEventCount: number;
 }
 
 export interface ManualLiveMetrics {
@@ -71,12 +83,23 @@ function addPaperBlockers(input: LiveUnlockInput, blockers: string[]) {
     if (!gate.passed) blockers.push(`${gate.name}: ${gate.detail}`);
   }
   const p = input.paper;
-  if (p.tradeCount < 50) blockers.push('paper trade sample below 50');
-  if (p.autoCloseDecisionCount < 0) blockers.push('paper auto-close decision count invalid');
+  if (p.completedPositionCount < 100) blockers.push('completed paper position sample below 100');
+  if (p.profitableWeekCount < 4) blockers.push('fewer than four consecutive profitable weeks');
+  if (p.profitFactor < 1.5) blockers.push('paper profit factor below 1.50');
+  if (p.averageNetPnlUsd <= 0) blockers.push('average paper position P&L must be positive');
   if (p.realizedPnlUsd <= 0) blockers.push('paper realized P&L must be positive');
   if (!p.equityAboveStart) blockers.push('paper equity must be above start');
   if (p.pnlPerRiskDollar <= 0) blockers.push('paper P&L per risk dollar must be positive');
   if (p.winRate < 0.65) blockers.push('paper win rate below 65%');
+  if (p.largestWinShare > 0.2) blockers.push('largest paper win exceeds 20% of winning dollars');
+  if (p.profitConfidenceRate < 0.95) blockers.push('profit resampling confidence below 95%');
+  if (p.stressedNetPnlUsd <= 0) blockers.push('one-cent stressed paper P&L must be positive');
+  if (p.stressedProfitFactor < 1.1) blockers.push('one-cent stressed profit factor below 1.10');
+  if (p.rollingLossPaused) blockers.push('qualification run has a rolling-loss pause');
+  if (!p.configurationValid) blockers.push('qualification settings changed during the run');
+  if (p.manualScoredCloseCount < 30) blockers.push('scored manual-close sample below 30');
+  if (p.automaticScoredCloseCount < 30) blockers.push('scored automatic-close sample below 30');
+  if (!p.benchmarkPassed) blockers.push('automatic-close improvement target not passed');
   if (p.falseExitRate > 0.1) blockers.push('paper false-exit rate above 10%');
   if (p.avgCloseRegretUsd > 0.5) blockers.push('paper close regret above $0.50');
   if (p.avgSlippagePp > 0.03) blockers.push('paper slippage above 3pp');
@@ -85,6 +108,7 @@ function addPaperBlockers(input: LiveUnlockInput, blockers: string[]) {
   if (p.killSwitchActive) blockers.push('kill switch active');
   if (!p.apiHealthy) blockers.push('API health degraded');
   if (!p.cleanAudit) blockers.push('audit log has unresolved failures');
+  if (p.blockingSafetyEventCount > 0) blockers.push('blocking safety events are present');
 }
 
 function addAutoBlockers(input: LiveUnlockInput, blockers: string[]) {
@@ -148,7 +172,7 @@ export function evaluateLiveUnlock(input: LiveUnlockInput): LiveUnlockEvaluation
         ? 'Paper proof passed; manual live unlocked.'
         : 'Manual live, shadow auto, and tiny auto pilot passed; auto live unlocked.',
       metrics: {
-        paperTrades: input.paper.tradeCount,
+        paperTrades: input.paper.completedPositionCount,
         paperWinRate: input.paper.winRate,
         paperPnlPerRiskDollar: input.paper.pnlPerRiskDollar,
         manualOrders: input.manualLive?.orderCount ?? 0,
