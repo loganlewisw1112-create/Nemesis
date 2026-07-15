@@ -5,6 +5,8 @@ import type { KalshiWebSocketHeaderProvider } from './kalshiStream.js';
 
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
+const SUBSCRIPTION_BATCH_SIZE = 50;
+const SUBSCRIPTION_BATCH_INTERVAL_MS = 250;
 
 export interface KalshiOrderbookStreamTelemetry {
   connected: boolean;
@@ -75,6 +77,7 @@ export class KalshiOrderbookStream {
   private reconnectDelayMs = 1_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private subscriptionPumpTimer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
   private reconnects = 0;
   private sequenceRegressions = 0;
@@ -103,6 +106,7 @@ export class KalshiOrderbookStream {
     this.tickersBySubscription.clear();
     this.subscriptionIdByKey.clear();
     this.pendingSnapshotRepair.clear();
+    this.clearSubscriptionPump();
     this.closeCurrentSocket();
     if (this.started) this.connect();
   }
@@ -111,6 +115,7 @@ export class KalshiOrderbookStream {
     this.started = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.clearSubscriptionPump();
     this.closeCurrentSocket();
   }
 
@@ -231,6 +236,7 @@ export class KalshiOrderbookStream {
       this.socket = null;
       this.authenticated = false;
       this.clearHeartbeatTimer();
+      this.clearSubscriptionPump();
       this.subscribed.clear();
       if (!this.started) return;
       this.reconnects += 1;
@@ -252,18 +258,31 @@ export class KalshiOrderbookStream {
   }
 
   private subscribeMissing(): void {
-    if (this.socket?.readyState !== WebSocket.OPEN) return;
-    const missing = [...this.tickers].filter((ticker) => !this.subscribed.has(ticker));
-    for (let index = 0; index < missing.length; index += 50) {
-      const batch = missing.slice(index, index + 50);
-      if (batch.length === 0) continue;
-      this.socket.send(JSON.stringify({
-        id: this.commandId++,
-        cmd: 'subscribe',
-        params: { channels: ['orderbook_delta'], market_tickers: batch },
-      }));
+    if (this.socket?.readyState !== WebSocket.OPEN || this.subscriptionPumpTimer) return;
+    const pump = () => {
+      this.subscriptionPumpTimer = null;
+      const socket = this.socket;
+      if (socket?.readyState !== WebSocket.OPEN) return;
+      const batch = [...this.tickers]
+        .filter((ticker) => !this.subscribed.has(ticker))
+        .slice(0, SUBSCRIPTION_BATCH_SIZE);
+      if (batch.length === 0) return;
+      try {
+        socket.send(JSON.stringify({
+          id: this.commandId++,
+          cmd: 'subscribe',
+          params: { channels: ['orderbook_delta'], market_tickers: batch },
+        }));
+      } catch {
+        socket.close();
+        return;
+      }
       for (const ticker of batch) this.subscribed.add(ticker);
-    }
+      if (this.subscribed.size < this.tickers.size) {
+        this.subscriptionPumpTimer = setTimeout(pump, SUBSCRIPTION_BATCH_INTERVAL_MS);
+      }
+    };
+    pump();
   }
 
   /** Ingests one official WebSocket packet; public to support deterministic replay tests. */
@@ -438,6 +457,7 @@ export class KalshiOrderbookStream {
 
   private closeCurrentSocket(): void {
     this.clearHeartbeatTimer();
+    this.clearSubscriptionPump();
     const socket = this.socket;
     this.socket = null;
     this.authenticated = false;
@@ -448,6 +468,11 @@ export class KalshiOrderbookStream {
   private clearHeartbeatTimer(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
+  }
+
+  private clearSubscriptionPump(): void {
+    if (this.subscriptionPumpTimer) clearTimeout(this.subscriptionPumpTimer);
+    this.subscriptionPumpTimer = null;
   }
 
   private isCurrent(socket: WebSocket, generation: number): boolean {

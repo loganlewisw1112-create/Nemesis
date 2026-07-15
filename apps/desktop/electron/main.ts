@@ -3859,6 +3859,9 @@ async function refreshMarkets(options: RefreshMarketsOptions = {}) {
     // a stale snapshot) so tickets are never held hostage by a slow API.
     if (discovery.getUniverse().length > 0) {
       marketsCache = mergeGeaMarkets(discovery.getUniverse());
+      const universeTickers = discovery.getUniverse().map((market) => market.ticker);
+      kalshiStream.track(universeTickers);
+      kalshiOrderbookStream.track(universeTickers);
     }
     const signalMarkets = discovery.getUniverse().length > 0
       ? discovery.getMarketsForSignals()
@@ -5105,6 +5108,7 @@ app.whenReady().then(() => {
   startupTrace('evidence-campaign');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
   kalshiOrderbookStream.onBookUpdate((book) => {
+    discovery.ingestOrderbook(book);
     const observedAt = Date.now();
     if (!campaignStore || campaignEvidencePaused) return;
     if (!Number.isInteger(book.sequence)) {

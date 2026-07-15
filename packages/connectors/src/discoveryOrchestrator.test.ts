@@ -165,4 +165,39 @@ describe('DiscoveryOrchestrator fixture fallback', () => {
     releaseOrderbooks?.();
     await Promise.all([first, second]);
   });
+
+  it('bounds REST depth fallback and reuses streamed order books', async () => {
+    const markets = Array.from({ length: 20 }, (_, index) => ({
+      ticker: `KXDEPTH-${index}`,
+      title: `Depth market ${index}`,
+      status: 'open',
+      yes_bid: 40,
+      yes_ask: 42,
+      volume: 1_000 + index,
+    } satisfies KalshiMarket));
+    const book: KalshiOrderbook = {
+      ticker: '',
+      yes: [{ price: 0.4, quantity: 100 }],
+      no: [{ price: 0.58, quantity: 100 }],
+      yesAsk: 0.42,
+      noAsk: 0.6,
+      spread: 0.02,
+    };
+    fetchMarketsMock.mockResolvedValue({ markets });
+    fetchOrderbookMock.mockImplementation(async (ticker: string) => ({ ...book, ticker }));
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    discovery.updateSettings({ depthChecksPerCycle: 20 });
+    await discovery.refreshUniverse();
+
+    await discovery.runDepthPass();
+    expect(fetchOrderbookMock).toHaveBeenCalledTimes(8);
+
+    fetchOrderbookMock.mockClear();
+    const ninthTicker = discovery.getUniverse()[8]!.ticker;
+    discovery.ingestOrderbook({ ...book, ticker: ninthTicker, sequence: 1, sourceTimestamp: Date.now() });
+    discovery.updateSettings({ depthChecksPerCycle: 9 });
+    await discovery.runDepthPass();
+    expect(fetchOrderbookMock).not.toHaveBeenCalled();
+    expect(discovery.getDepth(ninthTicker)).toBeDefined();
+  });
 });

@@ -159,6 +159,26 @@ describe('KalshiOrderbookStream', () => {
     stream.stop();
   });
 
+  it('paces 500-ticker subscription recovery in bounded batches', async () => {
+    vi.useFakeTimers();
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() };
+    Object.assign(stream as unknown as Record<string, unknown>, { socket, authenticated: true, generation: 1 });
+    const tickers = Array.from({ length: 120 }, (_, index) => `KX-${index}`);
+
+    stream.track(tickers);
+    expect(socket.send).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(socket.send.mock.calls[0]![0])).params.market_tickers).toHaveLength(50);
+    await vi.advanceTimersByTimeAsync(249);
+    expect(socket.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(socket.send).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(socket.send).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(String(socket.send.mock.calls[2]![0])).params.market_tickers).toHaveLength(20);
+    stream.stop();
+  });
+
   it('allows only the current authenticated generation to repair qualification', () => {
     vi.useFakeTimers();
     const recoveredAt = 1_700_000_200_000;

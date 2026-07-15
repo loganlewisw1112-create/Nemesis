@@ -13,6 +13,7 @@ import {
   DEFAULT_DISCOVERY_SETTINGS,
   PRESET_OVERRIDES,
   type KalshiMarket,
+  type KalshiOrderbook,
 } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
 import {
@@ -23,6 +24,7 @@ import {
 
 const UNIVERSE_STALE_MS = 5 * 60_000;
 const ORDERBOOK_TTL_MS = 12_000;
+const REST_DEPTH_FALLBACK_PER_CYCLE = 8;
 
 export class DiscoveryOrchestrator {
   settings: DiscoverySettings = { ...DEFAULT_DISCOVERY_SETTINGS };
@@ -133,6 +135,15 @@ export class DiscoveryOrchestrator {
     return { spread: 0.04, depthUsd: 200 };
   }
 
+  /** Reuse authenticated sequenced WebSocket books for discovery depth. */
+  ingestOrderbook(book: KalshiOrderbook): void {
+    const market = this.universe.find((candidate) => candidate.ticker === book.ticker);
+    if (!market) return;
+    const now = Date.now();
+    this.orderbookCache.set(book.ticker, { book, at: now });
+    this.recordDepth(market, book, now);
+  }
+
   async refreshUniverse(signal?: AbortSignal): Promise<KalshiMarket[]> {
     if (this.paused) return this.universe;
     const start = Date.now();
@@ -202,49 +213,43 @@ export class DiscoveryOrchestrator {
     this.bookMsCount = 0;
     this.belowScout = 0;
 
-    const thresholds = getTierThresholds(this.settings.preset);
-    const candidates = this.universe.slice(0, this.settings.depthChecksPerCycle);
-    this.depthPending = candidates.length;
+    const configuredCandidates = this.universe.slice(0, this.settings.depthChecksPerCycle);
+    const now = Date.now();
+    const cachedCandidates = configuredCandidates.filter((market) => {
+      const cached = this.orderbookCache.get(market.ticker);
+      return cached != null && now - cached.at < ORDERBOOK_TTL_MS;
+    });
+    const cachedTickers = new Set(cachedCandidates.map((market) => market.ticker));
+    const missingCandidates = configuredCandidates.filter((market) => !cachedTickers.has(market.ticker));
+    const candidates = [
+      ...cachedCandidates.map((market) => ({ market, fromCache: true })),
+      ...missingCandidates.slice(0, REST_DEPTH_FALLBACK_PER_CYCLE).map((market) => ({ market, fromCache: false })),
+    ];
+    this.depthPending = missingCandidates.length;
 
     // Fetch orderbooks in parallel batches (sequential was 150 × ~400ms ≈ 60 s)
     const CONCURRENCY = 8;
     for (let i = 0; i < candidates.length; i += CONCURRENCY) {
       if (this.orderbooksThisCycle >= this.settings.depthChecksPerCycle) break;
       const batch = candidates.slice(i, i + CONCURRENCY);
-      await Promise.allSettled(batch.map(async (m) => {
-        const p = normalizeMarketPrice(m);
+      await Promise.allSettled(batch.map(async ({ market: m, fromCache }) => {
         const t0 = Date.now();
         let book;
         try {
           book = await this.fetchBookCached(m.ticker);
         } catch {
-          this.depthPending = Math.max(0, this.depthPending - 1);
+          if (!fromCache) this.depthPending = Math.max(0, this.depthPending - 1);
           return;
         }
         this.orderbooksThisCycle += 1;
         this.bookMsTotal += Date.now() - t0;
         this.bookMsCount += 1;
 
-        const yesBid = book.yes[0]?.price ?? p;
-        const yesAsk = book.yesAsk ?? book.yes[book.yes.length - 1]?.price ?? p;
-        const spread = book.spread ?? Math.max(0.01, Math.abs(yesAsk - yesBid));
-        const depthUsd = (book.yes[0]?.quantity ?? 50) * p;
-
-        const yes = verifySideDepth(book, 'yes', p, thresholds);
-        const no = verifySideDepth(book, 'no', 1 - p, thresholds);
-
-        if (yes.executableTier == null && no.executableTier == null) this.belowScout += 1;
-
-        this.depthByTicker.set(m.ticker, {
-          ticker: m.ticker,
-          spread,
-          depthUsd,
-          verifiedAt: Date.now(),
-          yes,
-          no,
-        });
+        this.recordDepth(m, book, Date.now());
+        const recorded = this.depthByTicker.get(m.ticker);
+        if (recorded?.yes?.executableTier == null && recorded?.no?.executableTier == null) this.belowScout += 1;
         this.depthVerifiedCycle += 1;
-        this.depthPending = Math.max(0, candidates.length - this.depthVerifiedCycle);
+        if (!fromCache) this.depthPending = Math.max(0, this.depthPending - 1);
       }));
     }
 
@@ -314,5 +319,22 @@ export class DiscoveryOrchestrator {
     const book = await fetchOrderbook(ticker);
     this.orderbookCache.set(ticker, { book, at: Date.now() });
     return book;
+  }
+
+  private recordDepth(market: KalshiMarket, book: KalshiOrderbook, verifiedAt: number): void {
+    const price = normalizeMarketPrice(market);
+    const yesBid = book.yes[0]?.price ?? price;
+    const yesAsk = book.yesAsk ?? book.yes[book.yes.length - 1]?.price ?? price;
+    const spread = book.spread ?? Math.max(0.01, Math.abs(yesAsk - yesBid));
+    const depthUsd = (book.yes[0]?.quantity ?? 50) * price;
+    const thresholds = getTierThresholds(this.settings.preset);
+    this.depthByTicker.set(market.ticker, {
+      ticker: market.ticker,
+      spread,
+      depthUsd,
+      verifiedAt,
+      yes: verifySideDepth(book, 'yes', price, thresholds),
+      no: verifySideDepth(book, 'no', 1 - price, thresholds),
+    });
   }
 }

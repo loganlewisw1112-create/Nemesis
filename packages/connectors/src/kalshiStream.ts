@@ -4,6 +4,8 @@ import type { ConnectorRegistry } from './registry.js';
 
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
+const SUBSCRIPTION_BATCH_SIZE = 50;
+const SUBSCRIPTION_BATCH_INTERVAL_MS = 250;
 
 export type KalshiWebSocketHeaderProvider = () => Record<string, string> | null;
 
@@ -42,6 +44,7 @@ export class KalshiStream {
   private reconnectMs = 1_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private subscriptionPumpTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private generation = 0;
   private reconnects = 0;
@@ -102,6 +105,7 @@ export class KalshiStream {
   restart(): void {
     this.sequenceBySubscription.clear();
     if (!this.started) return;
+    this.clearSubscriptionPump();
     this.closeCurrentSocket();
     this.connect();
   }
@@ -109,6 +113,7 @@ export class KalshiStream {
   stop(): void {
     this.started = false;
     this.clearReconnectTimer();
+    this.clearSubscriptionPump();
     this.closeCurrentSocket();
   }
 
@@ -211,6 +216,7 @@ export class KalshiStream {
     this.authenticated = false;
     this.subscribed.clear();
     this.clearHeartbeatTimer();
+    this.clearSubscriptionPump();
     if (!this.started) return;
     this.reconnects += 1;
     this.registry.recordTelemetry('kalshi-ticker-ws', {
@@ -230,13 +236,26 @@ export class KalshiStream {
   }
 
   private subscribeMissing(): void {
-    if (this.socket?.readyState !== WebSocket.OPEN) return;
-    const missing = [...this.tickers].filter((ticker) => !this.subscribed.has(ticker));
-    for (let index = 0; index < missing.length; index += 50) {
-      const batch = missing.slice(index, index + 50);
-      this.sendSubscription(batch);
+    if (this.socket?.readyState !== WebSocket.OPEN || this.subscriptionPumpTimer) return;
+    const pump = () => {
+      this.subscriptionPumpTimer = null;
+      if (this.socket?.readyState !== WebSocket.OPEN) return;
+      const batch = [...this.tickers]
+        .filter((ticker) => !this.subscribed.has(ticker))
+        .slice(0, SUBSCRIPTION_BATCH_SIZE);
+      if (batch.length === 0) return;
+      try {
+        this.sendSubscription(batch);
+      } catch {
+        this.socket.close();
+        return;
+      }
       for (const ticker of batch) this.subscribed.add(ticker);
-    }
+      if (this.subscribed.size < this.tickers.size) {
+        this.subscriptionPumpTimer = setTimeout(pump, SUBSCRIPTION_BATCH_INTERVAL_MS);
+      }
+    };
+    pump();
   }
 
   private sendSubscription(tickers: string[]): void {
@@ -302,6 +321,7 @@ export class KalshiStream {
 
   private closeCurrentSocket(): void {
     this.clearHeartbeatTimer();
+    this.clearSubscriptionPump();
     const socket = this.socket;
     this.socket = null;
     this.authenticated = false;
@@ -321,6 +341,11 @@ export class KalshiStream {
   private clearHeartbeatTimer(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
+  }
+
+  private clearSubscriptionPump(): void {
+    if (this.subscriptionPumpTimer) clearTimeout(this.subscriptionPumpTimer);
+    this.subscriptionPumpTimer = null;
   }
 }
 
