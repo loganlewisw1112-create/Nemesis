@@ -184,7 +184,7 @@ describe('KalshiOrderbookStream', () => {
       params: { sids: [7], action: 'add_markets' },
     });
     expect(JSON.parse(String(socket.send.mock.calls[2]![0])).params.market_tickers).toHaveLength(40);
-    expect(stream.telemetry().trackedTickers).toBe(50);
+    expect(stream.telemetry()).toMatchObject({ trackedTickers: 50, subscriptionUpdates: 2 });
     stream.stop();
   });
 

@@ -431,6 +431,7 @@ export interface ConnectorHealth {
   lastCloseReason?: string | null;
   trackedTickers?: number;
   qualifiedTickers?: number;
+  subscriptionUpdates?: number;
   freshnessMs?: number | null;
   transportConnected?: boolean;
   authenticated?: boolean;

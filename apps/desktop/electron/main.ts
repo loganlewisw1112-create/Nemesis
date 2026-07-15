@@ -152,6 +152,7 @@ import { EvidenceRunSupervisor } from './evidenceRunSupervisor.js';
 import { VersionedStateStream } from './stateStreamCoalescer.js';
 import { RuntimeStatusExporter, runtimeStatusPathFromEnvironment } from './runtimeStatusExport.js';
 import { RendererHeartbeatMonitor } from './rendererHeartbeatMonitor.js';
+import { selectBoundedOrderbookTracking } from './orderbookTrackingRotation.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -195,6 +196,8 @@ const BRIDGE_TRAFFIC_TTL_MS = 15_000;
 const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
 const RENDERER_MEMORY_SAMPLE_INTERVAL_MS = 30_000;
 const ORDERBOOK_TRACKING_LIMIT = 50;
+const ORDERBOOK_ROTATION_INTERVAL_MS = 5 * 60_000;
+const ORDERBOOK_ROTATION_BATCH_SIZE = 8;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
@@ -339,6 +342,9 @@ let evidenceInvalidationInProgress = false;
 const unsupervisedRuntimeStatusExporter = new RuntimeStatusExporter(runtimeStatusPathFromEnvironment());
 let lastDiscoveryRevision = '';
 let lastWorldRevision = '';
+let orderbookTrackedTickers: string[] = [];
+let orderbookLastRotationAt = 0;
+let orderbookRotationCursor = 0;
 const campaignBookTriggerScheduler = new CampaignBookTriggerScheduler(
   CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS,
   ({ throughputTickers, confirmationTickers, diagnosticTickers }) => {
@@ -3732,11 +3738,11 @@ function schedulePaperUpdate() {
   }, PAPER_BROADCAST_THROTTLE_MS);
 }
 
-function desiredOrderbookTickers(now = Date.now()): string[] {
+function campaignCriticalOrderbookTickers(now = Date.now()): string[] {
   const ordered: string[] = [];
   const seen = new Set<string>();
   const add = (ticker: string | undefined) => {
-    if (!ticker || seen.has(ticker) || ordered.length >= ORDERBOOK_TRACKING_LIMIT) return;
+    if (!ticker || seen.has(ticker)) return;
     seen.add(ticker);
     ordered.push(ticker);
   };
@@ -3749,6 +3755,17 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
       add(candidates.get(diagnostic.candidateId)?.ticker);
     }
   }
+  return ordered.slice(0, ORDERBOOK_TRACKING_LIMIT);
+}
+
+function desiredOrderbookTickers(now = Date.now()): string[] {
+  const ordered = campaignCriticalOrderbookTickers(now);
+  const seen = new Set(ordered);
+  const add = (ticker: string | undefined) => {
+    if (!ticker || seen.has(ticker)) return;
+    seen.add(ticker);
+    ordered.push(ticker);
+  };
   const ranked = [...theses].sort((left, right) => {
     const edge = finiteCampaignNumber(right.netEdge, 0) - finiteCampaignNumber(left.netEdge, 0);
     if (edge !== 0) return edge;
@@ -3763,8 +3780,24 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
   return ordered;
 }
 
-function refreshOrderbookTracking(): void {
-  kalshiOrderbookStream.replaceTracked(desiredOrderbookTickers());
+function refreshOrderbookTracking(now = Date.now()): void {
+  const critical = campaignCriticalOrderbookTickers(now);
+  const desired = desiredOrderbookTickers(now);
+  const selection = selectBoundedOrderbookTracking({
+    critical,
+    desired,
+    current: orderbookTrackedTickers,
+    now,
+    lastRotationAt: orderbookLastRotationAt,
+    cursor: orderbookRotationCursor,
+    limit: ORDERBOOK_TRACKING_LIMIT,
+    rotationIntervalMs: ORDERBOOK_ROTATION_INTERVAL_MS,
+    rotationBatchSize: ORDERBOOK_ROTATION_BATCH_SIZE,
+  });
+  orderbookTrackedTickers = selection.tickers;
+  orderbookLastRotationAt = selection.lastRotationAt;
+  orderbookRotationCursor = selection.cursor;
+  kalshiOrderbookStream.replaceTracked(selection.tickers);
 }
 
 function applyBridgeRecommendation(packet: RecommendationPacket) {

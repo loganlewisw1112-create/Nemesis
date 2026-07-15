@@ -26,6 +26,7 @@ export interface KalshiOrderbookStreamTelemetry {
   lastCloseAt: number | null;
   lastCloseCode: number | null;
   lastCloseReason: string | null;
+  subscriptionUpdates: number;
 }
 
 interface MutableBook {
@@ -91,6 +92,7 @@ export class KalshiOrderbookStream {
   private lastCloseAt: number | null = null;
   private lastCloseCode: number | null = null;
   private lastCloseReason: string | null = null;
+  private subscriptionUpdates = 0;
   private readonly bookUpdateListeners = new Set<BookUpdateListener>();
 
   constructor(
@@ -206,6 +208,7 @@ export class KalshiOrderbookStream {
       lastCloseAt: this.lastCloseAt,
       lastCloseCode: this.lastCloseCode,
       lastCloseReason: this.lastCloseReason,
+      subscriptionUpdates: this.subscriptionUpdates,
     };
   }
 
@@ -322,6 +325,7 @@ export class KalshiOrderbookStream {
           cmd: 'update_subscription',
           params: { sids: [sid], market_tickers: marketTickers, action },
         }));
+        this.subscriptionUpdates += 1;
         return true;
       } catch {
         socket.close();
@@ -516,6 +520,7 @@ export class KalshiOrderbookStream {
       lastCloseReason: telemetry.lastCloseReason,
       trackedTickers: telemetry.trackedTickers,
       qualifiedTickers: telemetry.qualifiedTickers,
+      subscriptionUpdates: telemetry.subscriptionUpdates,
       transportConnected: telemetry.connected,
       authenticated: telemetry.authenticated,
       qualificationReady: telemetry.qualificationReady,
