@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   kalshiFeeForOrder,
+  kalshiFeeForFills,
   kalshiFeePerContract,
+  buildKalshiFeePolicy,
   computeNetEdge,
   isSupportedQualificationFeeOrder,
   walkBookFill,
@@ -19,19 +21,32 @@ import { qualifyThesis, detectSourceDisagreement } from '../thesis/qualification
 import type { KalshiMarket, KalshiOrderbook } from '../types.js';
 
 describe('kalshiFee', () => {
-  it('computes fee at 50c', () => {
-    expect(kalshiFeePerContract(0.5)).toBe(0.02);
+  it('rounds the official trading fee to a centicent', () => {
+    expect(kalshiFeePerContract(0.5)).toBe(0.0175);
   });
 
   it('rounds the aggregate order fee once', () => {
     expect(kalshiFeeForOrder(0.5, 100)).toBe(1.75);
-    expect(kalshiFeeForOrder(0.5, 1)).toBe(0.02);
+    expect(kalshiFeeForOrder(0.5, 1)).toBe(0.0175);
   });
 
-  it('identifies the cent-price whole-contract scope used by qualification', () => {
+  it('accepts four-decimal prices and two-decimal quantities', () => {
     expect(isSupportedQualificationFeeOrder(0.5, 100)).toBe(true);
-    expect(isSupportedQualificationFeeOrder(0.505, 100)).toBe(false);
-    expect(isSupportedQualificationFeeOrder(0.5, 1.5)).toBe(false);
+    expect(isSupportedQualificationFeeOrder(0.505, 100)).toBe(true);
+    expect(isSupportedQualificationFeeOrder(0.5, 1.5)).toBe(true);
+    expect(isSupportedQualificationFeeOrder(0.50555, 100)).toBe(false);
+    expect(isSupportedQualificationFeeOrder(0.5, 1.005)).toBe(false);
+  });
+
+  it('applies maker/taker multipliers and non-direct balance rounding', () => {
+    const taker = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'non_direct' });
+    const maker = buildKalshiFeePolicy({ role: 'maker', multiplier: 2, accountPrecision: 'direct' });
+    expect(kalshiFeeForFills([{ price: 0.05, quantity: 100 }], taker)).toMatchObject({
+      tradeFeeUsd: 0.3325,
+      balanceRoundingFeeUsd: 0.0075,
+      totalFeeUsd: 0.34,
+    });
+    expect(kalshiFeeForOrder(0.5, 100, maker)).toBe(0.875);
   });
 
   it('computes net edge with costs', () => {

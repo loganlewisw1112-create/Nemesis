@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_ENTRY_QUALIFICATION, type ProfitCertificate, type ThesisCard } from '@nemesis/core';
+import { buildKalshiFeePolicy, DEFAULT_ENTRY_QUALIFICATION, type ProfitCertificate, type ThesisCard } from '@nemesis/core';
 import type { DryRunOrder } from './dryRun.js';
 import { EntryConfirmationEngine } from './entryConfirmation.js';
 
 const startedAt = Date.UTC(2026, 6, 14, 12, 0, 0);
+const feePolicy = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'direct' });
 
 function card(overrides: Partial<ThesisCard> = {}): ThesisCard {
   return {
@@ -43,8 +44,10 @@ function fill(overrides: Partial<DryRunOrder> = {}): DryRunOrder {
     expectedPrice: 0.4,
     fillPrice: 0.4,
     filled: 25,
+    fillLevels: [{ price: 0.4, quantity: 25, cost: 10 }],
     slippage: 0,
     fees: 0.18,
+    feePolicyKnown: true,
     netEdge: 0.09,
     aborted: false,
     ...overrides,
@@ -76,11 +79,27 @@ function observe(engine: EntryConfirmationEngine, index: number, overrides: Part
     fill: fill({ netEdge: overrides.netEdge ?? 0.09 }),
     baseCertificate: certificate(),
     bookTimestamp: observedAt,
+    bookSequence: index + 1,
+    feePolicy,
     observedAt,
   });
 }
 
 describe('EntryConfirmationEngine', () => {
+  it('fails closed without exchange book provenance or a resolved fee policy', () => {
+    const engine = new EntryConfirmationEngine();
+    const missingProvenance = engine.observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, observedAt: startedAt, feePolicy,
+    });
+    expect(missingProvenance.reason).toMatch(/exchange-origin book timestamp and sequence/i);
+    const missingPolicy = engine.observe({
+      card: card({ id: 'flow-policy' }), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, bookSequence: 1, observedAt: startedAt,
+    });
+    expect(missingPolicy.reason).toMatch(/fee policy is unknown/i);
+  });
+
   it('requires six executable samples over at least 30 seconds before confirming', () => {
     const engine = new EntryConfirmationEngine();
     for (let index = 0; index < 5; index += 1) {
@@ -102,20 +121,20 @@ describe('EntryConfirmationEngine', () => {
   it('rejects stale, reused, non-flow, and cooldown-blocked sources', () => {
     const stale = new EntryConfirmationEngine().observe({
       card: card(), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt + 60_001, observedAt: startedAt + 60_001,
+      bookTimestamp: startedAt + 60_001, bookSequence: 1, feePolicy, observedAt: startedAt + 60_001,
     });
     expect(stale.reason).toMatch(/stale/i);
     expect(new EntryConfirmationEngine().observe({
       card: card({ sourceMove: 'news-driven' }), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt, observedAt: startedAt,
+      bookTimestamp: startedAt, bookSequence: 1, feePolicy, observedAt: startedAt,
     }).reason).toMatch(/flow-driven/i);
     expect(new EntryConfirmationEngine().observe({
       card: card(), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt, observedAt: startedAt, sourceAlreadyUsed: true,
+      bookTimestamp: startedAt, bookSequence: 1, feePolicy, observedAt: startedAt, sourceAlreadyUsed: true,
     }).reason).toMatch(/already used/i);
     expect(new EntryConfirmationEngine().observe({
       card: card(), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt, observedAt: startedAt, lastTickerExecutionAt: startedAt - 1_000,
+      bookTimestamp: startedAt, bookSequence: 1, feePolicy, observedAt: startedAt, lastTickerExecutionAt: startedAt - 1_000,
     }).reason).toMatch(/cooldown/i);
   });
 
@@ -145,31 +164,53 @@ describe('EntryConfirmationEngine', () => {
       fill: fill({ filled: 1, contracts: 1, fees: 0.02 }),
       baseCertificate: { ...certificate(), contracts: 1, entryFees: 0.02 },
       bookTimestamp: startedAt,
+      bookSequence: 1,
+      feePolicy,
       observedAt: startedAt,
     });
     expect(result.status).toBe('rejected');
     expect(result.reason).toMatch(/stressed/i);
   });
 
-  it('fails closed on fractional or subpenny qualification fills', () => {
-    const engine = new EntryConfirmationEngine();
+  it('accepts fractional/subpenny fills and rejects unsupported excess precision', () => {
+    const engine = new EntryConfirmationEngine({
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      minExpectedNetPnlUsd: -1,
+      minRewardRiskRatio: -100,
+      minStressedNetPnlUsd: -1,
+    });
     const fractional = engine.observe({
       card: card(),
       fill: fill({ contracts: 1.5, filled: 1.5, fees: 0.03 }),
       baseCertificate: { ...certificate(), contracts: 1.5 },
       bookTimestamp: startedAt,
+      bookSequence: 1,
+      feePolicy,
       observedAt: startedAt,
     });
-    expect(fractional.reason).toMatch(/whole contracts/i);
+    expect(fractional.status).toBe('pending');
 
     const subpenny = engine.observe({
-      card: card(),
+      card: card({ id: 'flow-2' }),
       fill: fill({ fillPrice: 0.405, fees: 0.42 }),
       baseCertificate: certificate(),
       bookTimestamp: startedAt,
+      bookSequence: 2,
+      feePolicy,
       observedAt: startedAt,
     });
-    expect(subpenny.reason).toMatch(/one-cent/i);
+    expect(subpenny.status).toBe('pending');
+
+    const excessPrecision = engine.observe({
+      card: card({ id: 'flow-3' }),
+      fill: fill({ contracts: 1.005, filled: 1.005, fillPrice: 0.40555 }),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      bookSequence: 3,
+      feePolicy,
+      observedAt: startedAt,
+    });
+    expect(excessPrecision.reason).toMatch(/four-decimal price and two-decimal quantity/i);
   });
 
   it('keeps target, reward-risk, and stress gates inclusive at their exact boundaries', () => {

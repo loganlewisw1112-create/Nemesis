@@ -5,6 +5,7 @@ export * from './parseMarket.js';
 export * from './geoTagger.js';
 export * from './binanceStream.js';
 export * from './kalshiStream.js';
+export * from './kalshiOrderbookStream.js';
 export * from './kalshiTape.js';
 export * from './kalshiLiquidity.js';
 export * from './activeTradeMarkets.js';

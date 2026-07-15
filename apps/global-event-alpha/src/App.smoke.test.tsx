@@ -9,6 +9,15 @@ const bridgeStatus: BridgeStatus = {
   brainRole: 'primary',
   lastSeenAt: Date.now(),
   clientCount: 1,
+  lastInboundAt: Date.now(),
+  lastOutboundAt: Date.now(),
+  lastPongAt: Date.now(),
+  lastSequenceIn: 1,
+  lastSequenceOut: 1,
+  reconnects: 0,
+  disconnects: 0,
+  failovers: 0,
+  tapeFreshnessMs: 0,
 };
 
 const brainHealth: BrainClusterSnapshot = {

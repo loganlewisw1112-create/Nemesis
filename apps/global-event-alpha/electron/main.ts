@@ -92,6 +92,15 @@ const bridgeStatus: BridgeStatus = {
   brainRole: null,
   lastSeenAt: null,
   clientCount: 0,
+  lastInboundAt: null,
+  lastOutboundAt: null,
+  lastPongAt: null,
+  lastSequenceIn: null,
+  lastSequenceOut: null,
+  reconnects: 0,
+  disconnects: 0,
+  failovers: 0,
+  tapeFreshnessMs: null,
 };
 
 export interface GlobalEventAlphaIntelligenceState {

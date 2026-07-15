@@ -2,6 +2,7 @@ import type {
   KalshiMarket,
   KalshiMarketsResponse,
   KalshiOrderbook,
+  KalshiSeries,
   KalshiTrade,
   KalshiTradesResponse,
   OrderbookLevel,
@@ -149,7 +150,32 @@ export function parseOrderbook(ticker: string, raw: Record<string, unknown>): Ka
   const noAsk = bestYesBid !== undefined ? 1 - bestYesBid : undefined;
   const spread = yesAsk !== undefined && bestYesBid !== undefined ? yesAsk - bestYesBid : undefined;
 
-  return { ticker, yes, no, yesAsk, noAsk, spread };
+  const firstMetadataValue = (...keys: string[]): unknown => {
+    for (const book of books) {
+      for (const key of keys) {
+        if (book[key] !== undefined) return book[key];
+      }
+    }
+    return undefined;
+  };
+  const parseTimestamp = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      if (value > 1_000_000_000_000) return value;
+      if (value > 1_000_000_000) return value * 1_000;
+    }
+    if (typeof value === 'string') {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) return parseTimestamp(numeric);
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return undefined;
+  };
+  const sourceTimestamp = parseTimestamp(firstMetadataValue('ts_ms', 'timestamp_ms', 'ts', 'timestamp'));
+  const rawSequence = parseNumber(firstMetadataValue('seq', 'sequence'));
+  const sequence = rawSequence == null ? undefined : Math.trunc(rawSequence);
+
+  return { ticker, yes, no, yesAsk, noAsk, spread, sourceTimestamp, sequence };
 }
 
 export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
@@ -166,7 +192,19 @@ export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
     ? book.spread
     : undefined;
 
-  return { ticker: book.ticker, yes, no, yesAsk, noAsk, spread };
+  return {
+    ticker: book.ticker,
+    yes,
+    no,
+    yesAsk,
+    noAsk,
+    spread,
+    sourceTimestamp: book.sourceTimestamp,
+    sequence: book.sequence,
+    receivedAt: book.receivedAt,
+    priceLevelStructure: book.priceLevelStructure,
+    feePolicy: book.feePolicy,
+  };
 }
 
 let _workingBase: string | null = null;
@@ -279,6 +317,18 @@ export async function fetchMarket(
   return normalizeKalshiMarket(raw.market);
 }
 
+export async function fetchSeries(
+  seriesTicker: string,
+  opts: FetchOptions = {},
+): Promise<KalshiSeries> {
+  const raw = await kalshiFetch<{ series: KalshiSeries }>(
+    `/series/${encodeURIComponent(seriesTicker)}`,
+    opts,
+  );
+  if (!raw.series?.ticker) throw new Error('Kalshi series payload missing series');
+  return raw.series;
+}
+
 export async function fetchTrades(
   opts: FetchOptions & { ticker?: string; limit?: number } = {},
 ): Promise<KalshiTradesResponse> {
@@ -384,10 +434,13 @@ export interface KalshiOrderRequest {
   ticker: string;
   action: 'buy' | 'sell';
   side: 'yes' | 'no';
-  count: number;
+  count?: number;
+  count_fp?: string;
   type: 'limit' | 'market';
   yes_price?: number;
   no_price?: number;
+  yes_price_dollars?: string;
+  no_price_dollars?: string;
   client_order_id?: string;
 }
 
@@ -396,6 +449,7 @@ export interface KalshiOrderResponse {
     order_id: string;
     status: string;
     fill_count?: number;
+    fill_count_fp?: string;
   };
 }
 

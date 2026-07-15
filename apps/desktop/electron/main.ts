@@ -46,6 +46,7 @@ import {
   HotOpportunityIndex,
   evaluateLiveUnlock,
   kalshiFeeForOrder,
+  isKnownKalshiFeePolicy,
   positionUnrealizedPnl,
   type AutoCloseDecision,
   type AutoCloseSettings,
@@ -65,7 +66,7 @@ import {
   type GeoMarket,
   type WorldEventsPayload,
 } from '@nemesis/core';
-import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -102,6 +103,10 @@ import {
   type PaperQualificationEvent,
   type PaperQualificationSnapshot,
   EntryConfirmationEngine,
+  authHeaders,
+  calculateEntryEconomics,
+  candidateEconomicIdentity,
+  type CampaignCandidateRecord,
   type StrategyValidationEvent,
   type StrategyValidationSnapshot,
 } from '@nemesis/execution';
@@ -113,6 +118,8 @@ import { dedupeByExecutionKey } from './executionConcurrency.js';
 import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
 import { PaperQualificationStore } from './paperQualificationStore.js';
 import { StrategyValidationStore } from './strategyValidationStore.js';
+import { SevenHourCampaignStore } from './sevenHourCampaignStore.js';
+import { KalshiFeePolicyResolver } from './kalshiFeePolicyResolver.js';
 import { buildStrategyConfigHash, PAPER_STRATEGY_ENGINE_VERSION } from './qualificationConfig.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
@@ -120,6 +127,7 @@ import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
 import { startupTrace } from './startupTrace.js';
 import { createBridgeAuth, isBridgeRequestAuthenticated, resolveBridgeHost } from './bridgeSecurity.js';
 import { resolveNemesisUserDataPath } from './userDataPath.js';
+import { RendererMemoryMonitor } from './rendererMemoryMonitor.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -140,6 +148,9 @@ const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
 const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json');
 const PAPER_QUALIFICATION_PATH = path.join(DATA_DIR, 'paper-qualification-events.jsonl');
 const STRATEGY_VALIDATION_PATH = path.join(DATA_DIR, 'paper-strategy-validation-events.jsonl');
+const CAMPAIGN_DIR = path.join(DATA_DIR, 'evidence-campaigns');
+const ACTIVE_CAMPAIGN_PATH = path.join(CAMPAIGN_DIR, 'active-campaign.json');
+const BRIDGE_TELEMETRY_PATH = path.join(DATA_DIR, 'bridge-telemetry.jsonl');
 
 const MAX_TICKS = 120;
 const LIQUIDITY_PREFILTER_MAX_AGE_MS = 45_000;
@@ -148,6 +159,7 @@ const WATCHED_TICK_MS = 1_000;
 const FEED_WAIT_MS = 2_000;
 const BOOK_CACHE_TTL_MS = 600;
 const MARKET_BROADCAST_THROTTLE_MS = 750;
+const DEGRADED_MARKET_BROADCAST_THROTTLE_MS = 3_000;
 const PAPER_BROADCAST_THROTTLE_MS = 1_000;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
@@ -167,6 +179,15 @@ const hotOpportunityIndex = new HotOpportunityIndex({ maxRows: 25, targetDecisio
 const journal = new JournalStore();
 const quarantine = new StrategyQuarantine();
 let settings: GuardrailSettings = { ...DEFAULT_GUARDRAILS };
+const kalshiFeePolicyResolver = new KalshiFeePolicyResolver(
+  () => settings.kalshiAccountPrecision ?? 'unknown',
+);
+const kalshiOrderbookStream = new KalshiOrderbookStream(registry, () => {
+  const credentials = getLiveCreds();
+  return credentials
+    ? authHeaders(credentials.apiKeyId, credentials.privateKeyPem, 'GET', '/trade-api/ws/v2')
+    : null;
+});
 let theses: ThesisCard[] = [];
 let geaTheses: ThesisCard[] = [];
 let reviewOnly = false;
@@ -187,8 +208,10 @@ const latestExitSignals = new Map<string, AutoCloseExitSignal>();
 const worstUnrealizedLossByPosition = new Map<string, number>();
 const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
   async (ticker) => {
-    const raw = await fetchOrderbook(ticker);
-    const book = sanitizeExecutableBook(raw);
+    const streamed = kalshiOrderbookStream.getBook(ticker);
+    const raw = streamed ?? await fetchOrderbook(ticker);
+    const feePolicy = await kalshiFeePolicyResolver.resolve(ticker);
+    const book = sanitizeExecutableBook({ ...raw, feePolicy });
     const hasAnyExecutableSurface =
       isExecutablePrice(book.yesAsk) ||
       isExecutablePrice(book.noAsk) ||
@@ -210,8 +233,11 @@ let autoCloseQueued = false;
 let throughputRunning = false;
 let qualificationStore: PaperQualificationStore | null = null;
 let strategyValidationStore: StrategyValidationStore | null = null;
+let campaignStore: SevenHourCampaignStore | null = null;
 let qualificationFollowUpRunning = false;
 let strategyValidationFollowUpRunning = false;
+let campaignConfirmationWorkerRunning = false;
+let campaignDiagnosticWorkerRunning = false;
 let shutdownEvidenceRecorded = false;
 let lastQualificationEquity: number | null = null;
 let sessionStatsData: SessionStats = {
@@ -228,6 +254,8 @@ let lastApiHealthTickAt = Date.now();
 let lastEquitySnapshotAt = 0;
 let marketBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 let paperBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+let marketBroadcastThrottleMs = MARKET_BROADCAST_THROTTLE_MS;
+const rendererMemoryMonitor = new RendererMemoryMonitor();
 
 interface StoredKalshiCredentials {
   storage: 'electron-safeStorage-v1';
@@ -254,7 +282,42 @@ const bridgeStatus: BridgeStatus = {
   brainRole: null,
   lastSeenAt: null,
   clientCount: 0,
+  lastInboundAt: null,
+  lastOutboundAt: null,
+  lastPongAt: null,
+  lastSequenceIn: null,
+  lastSequenceOut: null,
+  reconnects: 0,
+  disconnects: 0,
+  failovers: 0,
+  tapeFreshnessMs: null,
 };
+let bridgeConnectionCount = 0;
+
+function refreshBridgeConnectivity(now = Date.now()): void {
+  const stream = kalshiOrderbookStream.telemetry();
+  bridgeStatus.tapeFreshnessMs = stream.lastExchangeTimestamp == null
+    ? null
+    : Math.max(0, now - stream.lastExchangeTimestamp);
+  const inboundRecent = bridgeStatus.lastInboundAt != null && now - bridgeStatus.lastInboundAt <= 15_000;
+  const outboundRecent = bridgeStatus.lastOutboundAt != null && now - bridgeStatus.lastOutboundAt <= 15_000;
+  bridgeStatus.connected = bridgeStatus.clientCount > 0 && inboundRecent && outboundRecent;
+}
+
+function persistBridgeTelemetry(event: string, detail: Record<string, unknown> = {}): void {
+  try {
+    ensureDataDir();
+    refreshBridgeConnectivity();
+    fs.appendFileSync(BRIDGE_TELEMETRY_PATH, `${JSON.stringify({
+      at: Date.now(),
+      event,
+      ...bridgeStatus,
+      ...detail,
+    })}\n`, 'utf8');
+  } catch (error) {
+    console.error('[nemesis] bridge telemetry persistence failed', error);
+  }
+}
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -460,6 +523,170 @@ function initializeStrategyValidation(): void {
     if (trade.type !== 'open' || !trade.profitCertificate?.sourceSignalId) continue;
     entryConfirmationEngine.markSourceUsed(trade.profitCertificate.sourceSignalId);
     lastTickerSideExecutionAt.set(`${trade.ticker}:${trade.side}`, trade.timestamp);
+  }
+}
+
+interface ActiveCampaignPointer {
+  evidenceNamespace: string;
+  stage: 'instrumentation' | 'seven-hour';
+  filePath: string;
+}
+
+function readActiveCampaignPointer(): ActiveCampaignPointer | null {
+  if (!fs.existsSync(ACTIVE_CAMPAIGN_PATH)) return null;
+  try {
+    const pointer = JSON.parse(fs.readFileSync(ACTIVE_CAMPAIGN_PATH, 'utf8')) as ActiveCampaignPointer;
+    if (!pointer.evidenceNamespace || !['instrumentation', 'seven-hour'].includes(pointer.stage)) return null;
+    const expected = path.resolve(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.jsonl`);
+    if (path.resolve(pointer.filePath) !== expected) return null;
+    return pointer;
+  } catch {
+    return null;
+  }
+}
+
+function writeActiveCampaignPointer(pointer: ActiveCampaignPointer): void {
+  fs.mkdirSync(CAMPAIGN_DIR, { recursive: true });
+  fs.writeFileSync(ACTIVE_CAMPAIGN_PATH, JSON.stringify(pointer, null, 2), 'utf8');
+}
+
+function campaignNamespace(input: string): string {
+  const normalized = input.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!normalized) throw new Error('campaign evidence namespace is empty after normalization');
+  return normalized;
+}
+
+function initializeEvidenceCampaign(): void {
+  const requestedStage = process.env.NEMESIS_EVIDENCE_CAMPAIGN_STAGE;
+  const stage = requestedStage === 'instrumentation' || requestedStage === 'seven-hour'
+    ? requestedStage
+    : undefined;
+  const requestedNamespace = process.env.NEMESIS_EVIDENCE_NAMESPACE;
+  let pointer: ActiveCampaignPointer | null = requestedNamespace && stage
+    ? {
+        evidenceNamespace: campaignNamespace(requestedNamespace),
+        stage,
+        filePath: path.join(CAMPAIGN_DIR, `${campaignNamespace(requestedNamespace)}.jsonl`),
+      }
+    : readActiveCampaignPointer();
+  if (!pointer && stage) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const evidenceNamespace = campaignNamespace(`${stage}-${stamp}`);
+    pointer = { evidenceNamespace, stage, filePath: path.join(CAMPAIGN_DIR, `${evidenceNamespace}.jsonl`) };
+  }
+  if (!pointer) return;
+
+  const config = entryQualificationSettings();
+  const isNewLedger = !fs.existsSync(pointer.filePath);
+  const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
+  if (isNewLedger && !frozenCommit) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: NEMESIS_GIT_COMMIT is required');
+    return;
+  }
+  if (isNewLedger && (settings.kalshiAccountPrecision ?? 'unknown') === 'unknown') {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: account balance precision must be explicit');
+    return;
+  }
+  if (isNewLedger && paperDesk.snapshot().positions.length > 0) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: close all paper positions first');
+    return;
+  }
+  campaignStore = SevenHourCampaignStore.open(pointer.filePath, {
+    runId: pointer.evidenceNamespace,
+    evidenceNamespace: pointer.evidenceNamespace,
+    configurationHash: strategyConfigHash(),
+    gitCommit: frozenCommit ?? 'resume-from-ledger',
+    stage: pointer.stage,
+    settings: config,
+  }, config);
+  writeActiveCampaignPointer(pointer);
+  const snapshot = campaignStore.snapshot();
+  if (!snapshot.integrityError) {
+    campaignStore.record((tracker) => tracker.ensureConfiguration(strategyConfigHash()));
+    for (const candidate of campaignStore.snapshot().candidates) {
+      if (candidate.terminalState) continue;
+      entryConfirmationEngine.restoreCandidateState({
+        candidateId: candidate.candidateId,
+        sourceSignalId: candidate.originalCardId,
+        ticker: candidate.ticker,
+        side: candidate.side,
+        samples: candidate.samples,
+      });
+    }
+  }
+}
+
+function campaignSnapshot() {
+  if (!campaignStore) return null;
+  try {
+    campaignStore.record((tracker) => tracker.ensureConfiguration(strategyConfigHash()));
+    return campaignStore.snapshot();
+  } catch (error) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign failed closed', error);
+    return campaignStore.snapshot();
+  }
+}
+
+function sampleRendererMemory(): void {
+  if (!mainWindow || mainWindow.isDestroyed() || !campaignStore) return;
+  const snapshot = campaignSnapshot();
+  if (!snapshot || snapshot.manifest.status !== 'active') return;
+  if (snapshot.operationalChecks.some((check) => check.name === 'renderer_memory_stable')) return;
+  const devToolsClosed = !mainWindow.webContents.isDevToolsOpened();
+  if (!devToolsClosed) {
+    campaignStore.record((tracker) => tracker.recordOperationalCheck(
+      'renderer_memory_stable',
+      false,
+      'DevTools must remain closed during production memory evidence',
+    ));
+    return;
+  }
+  const rendererPid = mainWindow.webContents.getOSProcessId();
+  const metric = app.getAppMetrics().find((item) => item.pid === rendererPid);
+  const workingSetKb = metric?.memory.workingSetSize;
+  if (!workingSetKb) return;
+  const assessment = rendererMemoryMonitor.add({ at: Date.now(), workingSetKb });
+  if (assessment.status === 'warming') return;
+  const stable = assessment.status === 'stable';
+  marketBroadcastThrottleMs = stable
+    ? MARKET_BROADCAST_THROTTLE_MS
+    : DEGRADED_MARKET_BROADCAST_THROTTLE_MS;
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'renderer_memory_stable',
+    stable,
+    stable
+      ? assessment.detail
+      : `${assessment.detail}; full-state broadcast throttle raised to ${marketBroadcastThrottleMs}ms`,
+  ));
+}
+
+function recordCampaignOperationalTelemetry(): void {
+  if (!campaignStore) return;
+  const snapshot = campaignSnapshot();
+  if (!snapshot || snapshot.manifest.status !== 'active') return;
+  refreshBridgeConnectivity();
+  if (
+    bridgeStatus.connected
+    && !snapshot.operationalChecks.some((check) => check.name === 'bridge_bidirectional_traffic')
+  ) {
+    campaignStore.record((tracker) => tracker.recordOperationalCheck(
+      'bridge_bidirectional_traffic',
+      true,
+      `recent inbound seq ${bridgeStatus.lastSequenceIn} and outbound seq ${bridgeStatus.lastSequenceOut}`,
+    ));
+  }
+  const orderbookTelemetry = kalshiOrderbookStream.telemetry();
+  if (
+    orderbookTelemetry.sequenceRegressions > 0
+    && !snapshot.safetyFailures.some((failure) => failure.includes('order-book sequence regression'))
+  ) {
+    campaignStore.record((tracker) => tracker.recordSafetyFailure(
+      `${orderbookTelemetry.sequenceRegressions} order-book sequence regression(s) detected`,
+    ));
   }
 }
 
@@ -675,6 +902,10 @@ function loadSettings() {
     }
   } else {
     settings = normalizeGuardrailSettings(settings);
+  }
+  const campaignPrecision = process.env.NEMESIS_KALSHI_ACCOUNT_PRECISION;
+  if (campaignPrecision === 'direct' || campaignPrecision === 'non_direct') {
+    settings = normalizeGuardrailSettings({ ...settings, kalshiAccountPrecision: campaignPrecision });
   }
 }
 
@@ -965,6 +1196,40 @@ function opportunityKey(card: Pick<ThesisCard, 'ticker' | 'side'>): string {
   return `${card.ticker}:${card.side}`;
 }
 
+function findCampaignCandidate(card: ThesisCard): CampaignCandidateRecord | null {
+  const snapshot = campaignSnapshot();
+  if (!snapshot || snapshot.manifest.status !== 'active') return null;
+  const identity = candidateEconomicIdentity(card);
+  return snapshot.candidates.find((candidate) => candidate.economicIdentity === identity) ?? null;
+}
+
+function enrollCampaignCandidate(card: ThesisCard, preview: PaperBuyResult, book: KalshiOrderbook, at: number): CampaignCandidateRecord | null {
+  if (!campaignStore || !preview.fill || !preview.profitCertificate) return null;
+  const existing = findCampaignCandidate(card);
+  if (existing) return existing;
+  const economics = calculateEntryEconomics({
+    entryPrice: preview.fill.fillPrice,
+    entryFeesUsd: preview.fill.fees,
+    contracts: preview.fill.filled,
+    sideFairPrice: card.impliedPrice,
+    marketPrice: card.marketPrice,
+    grossEdge: card.grossEdge,
+    screeningNetEdge: card.netEdge,
+    executableEntryNetEdge: preview.fill.netEdge,
+    spread: card.spread,
+    fillSlippage: preview.fill.slippage,
+    feePolicy: book.feePolicy,
+  });
+  campaignStore.record((tracker) => tracker.enroll({
+    card,
+    initialFill: preview.fill!,
+    economics,
+    enrolledAt: at,
+    diagnosticDueAt: at + entryQualificationSettings().shadowFollowUpMs,
+  }));
+  return findCampaignCandidate(card);
+}
+
 function retryableFromResult(result: PaperBuyResult): boolean {
   return result.queueState === 'blocked_retryable' || isRetryableExecutionCode(result.abortCode);
 }
@@ -1150,15 +1415,50 @@ async function executeReservedStrictPaperBuyForCard(
     return preview;
   }
 
+  const observedAt = Date.now();
+  const campaignCandidate = enrollCampaignCandidate(card, preview, book, observedAt);
+  if (campaignCandidate?.terminalState) {
+    const reason = `campaign candidate already terminal: ${campaignCandidate.terminalState}`;
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_candidate_terminal', queueState: 'blocked_final', wouldMutate: false };
+  }
+  const priorCampaignSamples = campaignCandidate?.samples.length ?? 0;
+  const confirmationCard = campaignCandidate?.card ?? card;
   const confirmation = entryConfirmationEngine.observe({
-    card,
+    candidateId: campaignCandidate?.candidateId,
+    card: confirmationCard,
     fill: preview.fill,
     baseCertificate: preview.profitCertificate,
-    bookTimestamp: Date.now(),
-    observedAt: Date.now(),
-    sourceAlreadyUsed: strategyValidationStore?.tracker.hasUsedSource(card.id),
+    bookTimestamp: book.sourceTimestamp ?? Number.NaN,
+    bookSequence: book.sequence,
+    feePolicy: book.feePolicy,
+    observedAt,
+    sourceAlreadyUsed: strategyValidationStore?.tracker.hasUsedSource(confirmationCard.id),
     lastTickerExecutionAt: lastTickerSideExecutionAt.get(key),
   });
+  if (campaignCandidate && campaignStore && confirmation.samples > priorCampaignSamples && book.sequence != null && book.sourceTimestamp != null) {
+    campaignStore.record((tracker) => tracker.recordSample(campaignCandidate.candidateId, {
+      at: observedAt,
+      observedAt,
+      netEdge: preview.fill!.netEdge,
+      spread: card.spread,
+      bookTimestamp: book.sourceTimestamp!,
+      bookSequence: book.sequence!,
+      exchangeTimestamp: book.sourceTimestamp!,
+      exchangeSequence: book.sequence!,
+      fillPrice: preview.fill!.fillPrice,
+      filled: preview.fill!.filled,
+      fees: preview.fill!.fees,
+      feePolicyKnown: isKnownKalshiFeePolicy(book.feePolicy),
+    }));
+  }
+  if (campaignCandidate && campaignStore && confirmation.status !== 'pending') {
+    campaignStore.record((tracker) => tracker.terminalize(
+      campaignCandidate.candidateId,
+      confirmation.status === 'ready' ? 'ready' : 'rejected',
+      confirmation.reason,
+      observedAt,
+    ));
+  }
   const confirmationRecorded = recordStrategyValidation((tracker) => tracker.recordEntryConfirmation({
     sourceSignalId: card.id,
     ticker: card.ticker,
@@ -1200,6 +1500,21 @@ async function executeReservedStrictPaperBuyForCard(
       abortCode: code,
       queueState: retryable ? 'blocked_retryable' : 'blocked_final',
       wouldMutate: false,
+    };
+  }
+
+  if (campaignCandidate) {
+    opportunityQueue.markBlocked(key, 'campaign candidate ready without paper mutation', false);
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: 'campaign candidate ready without paper mutation',
+      abortCode: 'campaign_candidate_ready',
+      queueState: 'blocked_final',
+      wouldMutate: false,
+      fill: preview.fill,
+      fillQuality: preview.fillQuality,
+      profitCertificate: confirmation.certificate,
     };
   }
 
@@ -2053,6 +2368,108 @@ async function runThroughputCertification(trigger: string) {
   }
 }
 
+async function evaluateCampaignConfirmations(): Promise<void> {
+  if (campaignConfirmationWorkerRunning || !campaignStore) return;
+  const snapshot = campaignSnapshot();
+  if (!snapshot || snapshot.manifest.status !== 'active') return;
+  const now = Date.now();
+  if (now >= snapshot.manifest.cutoffAt) {
+    campaignStore.record((tracker) => tracker.finalize(now));
+    return;
+  }
+  const pending = snapshot.candidates.filter((candidate) => !candidate.terminalState).slice(0, 4);
+  if (pending.length === 0) return;
+  campaignConfirmationWorkerRunning = true;
+  try {
+    await Promise.all(pending.map(async (candidate) => {
+      const result = await executeStrictPaperBuyForCard(
+        candidate.card,
+        candidate.initialFill.contracts,
+        'throughput',
+      );
+      if (
+        campaignStore
+        && !['book_unavailable', 'entry_confirmation_pending', 'execution_in_flight'].includes(result.abortCode ?? '')
+        && !['campaign_candidate_ready', 'campaign_candidate_terminal'].includes(result.abortCode ?? '')
+      ) {
+        campaignStore.record((tracker) => tracker.terminalize(
+          candidate.candidateId,
+          'rejected',
+          result.abortReason ?? result.error ?? 'campaign confirmation failed closed',
+        ));
+      }
+    }));
+  } finally {
+    campaignConfirmationWorkerRunning = false;
+  }
+}
+
+async function evaluateCampaignDiagnostics(): Promise<void> {
+  if (campaignDiagnosticWorkerRunning || !campaignStore) return;
+  const snapshot = campaignSnapshot();
+  if (!snapshot || snapshot.manifest.status !== 'active') return;
+  const now = Date.now();
+  if (now >= snapshot.manifest.cutoffAt) {
+    campaignStore.record((tracker) => tracker.finalize(now));
+    return;
+  }
+  const due = snapshot.diagnostics.filter((diagnostic) =>
+    diagnostic.status === 'scheduled'
+    && diagnostic.dueAt <= now
+    && (diagnostic.lastAttemptAt == null || now - diagnostic.lastAttemptAt >= 30_000)).slice(0, 4);
+  if (due.length === 0) return;
+  campaignDiagnosticWorkerRunning = true;
+  try {
+    await Promise.all(due.map(async (diagnostic) => {
+      const candidate = snapshot.candidates.find((item) => item.candidateId === diagnostic.candidateId);
+      if (!candidate || !campaignStore) return;
+      campaignStore.record((tracker) => tracker.recordDiagnosticAttempt(
+        diagnostic.diagnosticId,
+        'executable 15-minute follow-up requested',
+        now,
+      ));
+      try {
+        const book = await fetchBookForCard(candidate.card);
+        const fill = dryRunCloseFill(
+          book,
+          candidate.side,
+          candidate.initialFill.filled,
+          candidate.initialFill.fillPrice,
+          settings.maxSlippagePp,
+        );
+        const fresh = book.sourceTimestamp != null
+          && book.sequence != null
+          && now - book.sourceTimestamp <= entryQualificationSettings().maxBookAgeMs;
+        const valid = !fill.aborted
+          && fill.filled === candidate.initialFill.filled
+          && fill.feePolicyKnown
+          && fresh;
+        if (!valid) return;
+        const entryCost = candidate.initialFill.fillPrice * candidate.initialFill.filled + candidate.initialFill.fees;
+        const netPnl = fill.fillPrice * fill.filled - fill.fees - entryCost;
+        campaignStore.record((tracker) => tracker.completeDiagnostic({
+          diagnosticId: diagnostic.diagnosticId,
+          validExecutableObservation: true,
+          exchangeTimestamp: book.sourceTimestamp,
+          exchangeSequence: book.sequence,
+          executableFollowUpMark: fill.fillPrice,
+          reconstructedExitFill: fill,
+          executableNetPnlUsd: Number(netPnl.toFixed(6)),
+          targetAt: netPnl >= candidate.economics.targetRewardUsd ? now : undefined,
+          lossAt: netPnl <= -candidate.economics.plannedLossUsd ? now : undefined,
+          edgeGoneAt: netPnl <= 0 ? now : undefined,
+          reason: 'valid executable follow-up reconstructed from exchange-sequenced depth and resolved fees',
+          completedAt: now,
+        }));
+      } catch {
+        // The scheduled diagnostic remains retryable until the fixed campaign cutoff.
+      }
+    }));
+  } finally {
+    campaignDiagnosticWorkerRunning = false;
+  }
+}
+
 function broadcastPaperUpdate(forceSnapshot = false) {
   const marks = getMarkPrices();
   const mtm = paperDesk.markToMarket(marks);
@@ -2073,6 +2490,8 @@ function broadcastPaperUpdate(forceSnapshot = false) {
     opportunityThroughput: opportunityQueue.snapshot(),
     paperQualification: qualificationSnapshot(),
     strategyValidation: strategyValidationSnapshot(),
+    evidenceCampaign: campaignSnapshot(),
+    orderbookStream: kalshiOrderbookStream.telemetry(),
     pilotValidation: pilotValidationSnapshot(),
     ...autoCloseSnapshot(),
   });
@@ -2140,7 +2559,7 @@ function scheduleMarketStatePublish() {
   marketBroadcastTimer = setTimeout(() => {
     marketBroadcastTimer = null;
     publishMarketState();
-  }, MARKET_BROADCAST_THROTTLE_MS);
+  }, marketBroadcastThrottleMs);
 }
 
 function schedulePaperUpdate() {
@@ -2161,6 +2580,7 @@ function applyBridgeRecommendation(packet: RecommendationPacket) {
   opportunityQueue.discover(geaTheses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
+  kalshiOrderbookStream.track([...new Set(theses.map((t) => t.ticker))]);
   publishMarketState();
   void evaluateAutoClosePositions('bridge-entry');
   void runThroughputCertification('bridge-entry');
@@ -2458,6 +2878,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
   opportunityQueue.discover(theses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
+  kalshiOrderbookStream.track([...new Set(theses.map((t) => t.ticker))]);
 
   for (const c of theses) {
     recordTick(c.ticker, c.marketPrice, c.spread, c.netEdge);
@@ -2501,14 +2922,25 @@ async function activateKillSwitch(source: 'ipc' | 'shortcut'): Promise<Guardrail
 }
 
 function broadcastBridgeStatus() {
+  refreshBridgeConnectivity();
   broadcast('bridge:status', { ...bridgeStatus });
 }
 
 function broadcastToGea(msg: Omit<NemesisBridgeMessage, 'seq'>) {
   const full: NemesisBridgeMessage = { ...msg, seq: ++bridgeSeq };
   const json = JSON.stringify(full);
+  let sent = false;
   for (const client of bridgeClients) {
-    if (client.readyState === WsSocket.OPEN) client.send(json);
+    if (client.readyState === WsSocket.OPEN) {
+      client.send(json);
+      sent = true;
+    }
+  }
+  if (sent) {
+    bridgeStatus.lastOutboundAt = Date.now();
+    bridgeStatus.lastSequenceOut = full.seq;
+    refreshBridgeConnectivity();
+    persistBridgeTelemetry('outbound', { messageType: full.type });
   }
 }
 
@@ -2571,8 +3003,11 @@ function setupBridgeServer() {
     }
 
     bridgeClients.add(ws);
-    bridgeStatus.connected = true;
+    bridgeConnectionCount += 1;
+    if (bridgeConnectionCount > 1) bridgeStatus.reconnects += 1;
     bridgeStatus.clientCount = bridgeClients.size;
+    refreshBridgeConnectivity();
+    persistBridgeTelemetry('client_connected');
     broadcastBridgeStatus();
 
     const hello: NemesisBridgeMessage = {
@@ -2581,13 +3016,14 @@ function setupBridgeServer() {
       seq: ++bridgeSeq,
     };
     ws.send(JSON.stringify(hello));
+    bridgeStatus.lastOutboundAt = Date.now();
+    bridgeStatus.lastSequenceOut = hello.seq;
+    persistBridgeTelemetry('outbound', { messageType: hello.type });
     broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
 
     ws.on('message', (raw: RawData) => {
       try {
         const msg = JSON.parse(raw.toString()) as NemesisBridgeMessage;
-        bridgeStatus.lastSeenAt = Date.now();
-
         const validation = validateBridgeMessage(msg, {
           now: Date.now(),
           maxExitBookAgeMs: autoCloseSettings().maxBridgeLatencyMs,
@@ -2599,8 +3035,16 @@ function setupBridgeServer() {
         }
 
         const valid = validation.value;
+        const receivedAt = Date.now();
+        bridgeStatus.lastSeenAt = receivedAt;
+        bridgeStatus.lastInboundAt = receivedAt;
+        bridgeStatus.lastSequenceIn = valid.seq;
+        refreshBridgeConnectivity(receivedAt);
+        persistBridgeTelemetry('inbound', { messageType: valid.type });
         if (valid.type === 'brain:recommendation') {
-          bridgeStatus.brainRole = (valid.payload as { brain_role: BridgeStatus['brainRole'] }).brain_role;
+          const nextRole = (valid.payload as { brain_role: BridgeStatus['brainRole'] }).brain_role;
+          if (bridgeStatus.brainRole && nextRole && bridgeStatus.brainRole !== nextRole) bridgeStatus.failovers += 1;
+          bridgeStatus.brainRole = nextRole;
           broadcastBridgeStatus();
           applyBridgeRecommendation(valid.payload as RecommendationPacket);
           broadcast('bridge:recommendation', valid.payload);
@@ -2612,6 +3056,11 @@ function setupBridgeServer() {
         } else if (valid.type === 'bridge:ping') {
           const pong: NemesisBridgeMessage = { type: 'bridge:pong', payload: {}, seq: ++bridgeSeq };
           ws.send(JSON.stringify(pong));
+          bridgeStatus.lastOutboundAt = Date.now();
+          bridgeStatus.lastPongAt = bridgeStatus.lastOutboundAt;
+          bridgeStatus.lastSequenceOut = pong.seq;
+          refreshBridgeConnectivity();
+          persistBridgeTelemetry('outbound', { messageType: pong.type });
         }
       } catch {
         auditLog.append({ action: 'gate_block', detail: 'bridge packet rejected: malformed json', ok: false });
@@ -2621,8 +3070,10 @@ function setupBridgeServer() {
 
     ws.on('close', () => {
       bridgeClients.delete(ws);
-      bridgeStatus.connected = bridgeClients.size > 0;
       bridgeStatus.clientCount = bridgeClients.size;
+      bridgeStatus.disconnects += 1;
+      refreshBridgeConnectivity();
+      persistBridgeTelemetry('client_disconnected');
       broadcastBridgeStatus();
     });
 
@@ -2763,6 +3214,8 @@ function setupIpc() {
       activeRegimes,
       paperQualification: qualificationSnapshot(),
       strategyValidation: strategyValidationSnapshot(),
+      evidenceCampaign: campaignSnapshot(),
+      orderbookStream: kalshiOrderbookStream.telemetry(),
       pilotValidation: pilotValidationSnapshot(),
       dailyPnl: sessionStatsData.dailyPnl,
       humanQuizPassed: settings.humanQuizPassed ?? false,
@@ -2796,6 +3249,7 @@ function setupIpc() {
         ? { ...autoCloseSettings(), ...partial.autoClose }
         : autoCloseSettings(),
     });
+    if (partial.kalshiAccountPrecision !== undefined) kalshiFeePolicyResolver.clear();
     qualificationSnapshot();
     if (riskOverride) recordSettingsManualOverride();
     feedHub.setKalshiApiKey(currentKalshiApiKeyId());
@@ -2815,6 +3269,7 @@ function setupIpc() {
       saveSettings();
     }
     broadcast('settings:update', settings);
+    if (result.ok) kalshiOrderbookStream.restart();
     return result;
   });
 
@@ -2824,6 +3279,7 @@ function setupIpc() {
     }
     const status = clearStoredKalshiCredentials();
     broadcast('settings:update', settings);
+    kalshiOrderbookStream.restart();
     return { ok: true, status };
   });
 
@@ -2919,6 +3375,8 @@ function setupIpc() {
       autoClose: autoCloseSnapshot(),
       paperQualification: qualificationSnapshot(),
       strategyValidation: strategyValidationSnapshot(),
+      evidenceCampaign: campaignSnapshot(),
+      orderbookStream: kalshiOrderbookStream.telemetry(),
       pilotValidation: pilotValidationSnapshot(),
       equity: mtm.equity,
       csv: journal.exportCsv(),
@@ -3246,7 +3704,10 @@ function setupIpc() {
 
   ipcMain.handle('nemesis:getWorldEvents', () => buildWorldEventsPayload());
 
-  ipcMain.handle('nemesis:getBridgeStatus', () => ({ ...bridgeStatus }));
+  ipcMain.handle('nemesis:getBridgeStatus', () => {
+    refreshBridgeConnectivity();
+    return { ...bridgeStatus };
+  });
 
   ipcMain.handle('nemesis:openWidget', (_e, type: string) => {
     const SIZES: Record<string, [number, number]> = {
@@ -3362,6 +3823,8 @@ app.whenReady().then(() => {
   startupTrace('paper-qualification');
   initializeStrategyValidation();
   startupTrace('strategy-validation');
+  initializeEvidenceCampaign();
+  startupTrace('evidence-campaign');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
   setupIpc();
   startupTrace('ipc');
@@ -3377,6 +3840,9 @@ app.whenReady().then(() => {
     void evaluateQualificationFollowUps();
     void evaluateStrategyValidationFollowUps();
     void runThroughputCertification('entry-confirmation-tick');
+    void evaluateCampaignConfirmations();
+    void evaluateCampaignDiagnostics();
+    recordCampaignOperationalTelemetry();
     broadcast('connectors:update', registry.getAll());
     if (paperDesk.snapshot().positions.length > 0) {
       broadcastPaperUpdate();
@@ -3388,6 +3854,7 @@ app.whenReady().then(() => {
   spawnGlobalEventAlpha();
   startupTrace('gea-spawned-feed-held');
   kalshiStream.start();
+  kalshiOrderbookStream.start();
   startupTrace('kalshi-stream');
   feedHub.startBackgroundPolling(8_000);
   void feedHub.refreshForMarkets(FIXTURE_MARKETS);
@@ -3432,6 +3899,7 @@ app.whenReady().then(() => {
     }
   })();
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
+  setInterval(() => sampleRendererMemory(), 30_000);
   setTimeout(() => { void sweepSettledPositions(); }, 20_000);
   setInterval(() => { void sweepSettledPositions(); }, SETTLEMENT_SWEEP_MS);
 
@@ -3446,6 +3914,8 @@ app.whenReady().then(() => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  kalshiStream.stop();
+  kalshiOrderbookStream.stop();
   if (geaProcess && !geaProcess.killed) geaProcess.kill();
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

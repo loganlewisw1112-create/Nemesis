@@ -57,4 +57,13 @@ export interface BridgeStatus {
   brainRole: BrainRole | null;
   lastSeenAt: number | null;
   clientCount: number;
+  lastInboundAt: number | null;
+  lastOutboundAt: number | null;
+  lastPongAt: number | null;
+  lastSequenceIn: number | null;
+  lastSequenceOut: number | null;
+  reconnects: number;
+  disconnects: number;
+  failovers: number;
+  tapeFreshnessMs: number | null;
 }

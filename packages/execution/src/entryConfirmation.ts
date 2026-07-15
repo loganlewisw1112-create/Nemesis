@@ -1,7 +1,9 @@
 import {
   DEFAULT_ENTRY_QUALIFICATION,
+  isKnownKalshiFeePolicy,
   isSupportedQualificationFeeOrder,
   type EntryQualificationSettings,
+  type KalshiFeePolicy,
   type ProfitCertificate,
   type ThesisCard,
 } from '@nemesis/core';
@@ -9,20 +11,24 @@ import type { DryRunOrder } from './dryRun.js';
 import { calculateEntryEconomics, type EntryEconomicsEvidence } from './tradeEconomics.js';
 
 export interface EntryConfirmationObservation {
+  candidateId?: string;
   card: ThesisCard;
   fill: DryRunOrder;
   baseCertificate: ProfitCertificate;
   bookTimestamp: number;
+  bookSequence?: number;
+  feePolicy?: KalshiFeePolicy;
   observedAt?: number;
   sourceAlreadyUsed?: boolean;
   lastTickerExecutionAt?: number;
 }
 
-interface ConfirmationSample {
+export interface ConfirmationSample {
   at: number;
   netEdge: number;
   spread: number;
   bookTimestamp: number;
+  bookSequence: number;
 }
 
 interface ConfirmationState {
@@ -74,8 +80,30 @@ export class EntryConfirmationEngine {
     else this.states.clear();
   }
 
+  restoreCandidateState(input: {
+    candidateId: string;
+    sourceSignalId: string;
+    ticker: string;
+    side: 'yes' | 'no';
+    samples: ConfirmationSample[];
+  }): void {
+    if (this.usedSources.has(input.sourceSignalId)) return;
+    const samples = [...input.samples]
+      .filter((sample) => Number.isFinite(sample.at)
+        && Number.isFinite(sample.bookTimestamp)
+        && Number.isInteger(sample.bookSequence))
+      .sort((a, b) => a.at - b.at);
+    this.states.set(input.candidateId, {
+      sourceSignalId: input.sourceSignalId,
+      ticker: input.ticker,
+      side: input.side,
+      samples,
+    });
+  }
+
   observe(input: EntryConfirmationObservation): EntryConfirmationResult {
     const now = input.observedAt ?? Date.now();
+    const candidateId = input.candidateId ?? input.card.id;
     const config = this.settings;
     const metrics = calculateEntryEconomics({
       entryPrice: input.fill.fillPrice,
@@ -88,6 +116,7 @@ export class EntryConfirmationEngine {
       executableEntryNetEdge: input.fill.netEdge,
       spread: input.card.spread,
       fillSlippage: input.fill.slippage,
+      feePolicy: input.feePolicy,
     });
     const base = {
       samples: 0,
@@ -115,12 +144,16 @@ export class EntryConfirmationEngine {
     const sourceAgeMs = Math.max(0, now - input.card.createdAt);
     if (sourceAgeMs > config.maxSourceAgeMs) return reject('source signal is stale');
     const bookAgeMs = Math.max(0, now - input.bookTimestamp);
+    if (!Number.isFinite(input.bookTimestamp) || !Number.isInteger(input.bookSequence)) {
+      return reject('confirmation requires an exchange-origin book timestamp and sequence');
+    }
     if (bookAgeMs > config.maxBookAgeMs) return reject('entry book is stale');
+    if (!isKnownKalshiFeePolicy(input.feePolicy)) return reject('account or series fee policy is unknown');
     if (!Number.isFinite(input.fill.netEdge) || input.fill.netEdge <= 0) {
       return reject('executable entry edge is not positive');
     }
     if (!isSupportedQualificationFeeOrder(input.fill.fillPrice, input.fill.filled)) {
-      return reject('qualification fee model requires whole contracts at one-cent entry prices');
+      return reject('qualification fee model requires a four-decimal price and two-decimal quantity');
     }
     if (!Number.isFinite(input.card.impliedPrice) || metrics.targetExitPrice <= input.fill.fillPrice) {
       return reject('selected-side fair price does not exceed the executable entry');
@@ -133,19 +166,26 @@ export class EntryConfirmationEngine {
     if (metrics.rewardRiskRatio < config.minRewardRiskRatio) return reject('target reward-to-risk ratio is below the minimum');
     if (metrics.stressedNetPnlUsd < config.minStressedNetPnlUsd) return reject('one-cent stressed expected result is not profitable');
 
-    let state = this.states.get(input.card.id);
+    let state = this.states.get(candidateId);
     if (!state) {
       state = { sourceSignalId: input.card.id, ticker: input.card.ticker, side: input.card.side, samples: [] };
-      this.states.set(input.card.id, state);
+      this.states.set(candidateId, state);
     }
-    if (state.ticker !== input.card.ticker || state.side !== input.card.side) {
-      this.states.delete(input.card.id);
+    if (state.ticker !== input.card.ticker || state.side !== input.card.side || state.sourceSignalId !== input.card.id) {
+      this.states.delete(candidateId);
       return reject('source signal identity changed during confirmation');
     }
-    const minSpacingMs = Math.max(1, Math.floor(config.minWindowMs / Math.max(1, config.minSamples)));
+    const minSpacingMs = Math.max(1, Math.ceil(config.minWindowMs / Math.max(1, config.minSamples - 1)));
     const last = state.samples.at(-1);
-    if (!last || now - last.at >= minSpacingMs) {
-      state.samples.push({ at: now, netEdge: input.fill.netEdge, spread: input.card.spread, bookTimestamp: input.bookTimestamp });
+    const duplicateSequence = state.samples.some((sample) => sample.bookSequence === input.bookSequence);
+    if ((!last || now - last.at >= minSpacingMs) && !duplicateSequence) {
+      state.samples.push({
+        at: now,
+        netEdge: input.fill.netEdge,
+        spread: input.card.spread,
+        bookTimestamp: input.bookTimestamp,
+        bookSequence: input.bookSequence!,
+      });
     }
     const first = state.samples[0];
     const latest = state.samples.at(-1)!;
@@ -164,11 +204,11 @@ export class EntryConfirmationEngine {
       economics: metrics,
     };
     if (spreadWidening > config.maxSpreadWideningPp) {
-      this.states.delete(input.card.id);
+      this.states.delete(candidateId);
       return { status: 'rejected', reason: 'spread widened during entry confirmation', ...current };
     }
     if (edgeRetention < config.minEdgeRetention) {
-      this.states.delete(input.card.id);
+      this.states.delete(candidateId);
       return { status: 'rejected', reason: 'edge decayed during entry confirmation', ...current };
     }
     if (state.samples.length < config.minSamples || windowMs < config.minWindowMs) {

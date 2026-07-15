@@ -24,9 +24,9 @@ describe('entry trade economics', () => {
     const result = calculateEntryEconomics(input);
 
     expect(result.targetExitPrice).toBe(0.55);
-    expect(result.targetExitFeesUsd).toBe(0.44);
+    expect(result.targetExitFeesUsd).toBe(0.4332);
     expect(result.entryCostUsd).toBe(10.42);
-    expect(result.targetRewardUsd).toBe(2.89);
+    expect(result.targetRewardUsd).toBe(2.8968);
   });
 
   it('keeps the model target fixed when the executable entry gets worse', () => {
@@ -38,7 +38,7 @@ describe('entry trade economics', () => {
     });
 
     expect(result.targetExitPrice).toBe(0.55);
-    expect(result.targetRewardUsd).toBe(1.62);
+    expect(result.targetRewardUsd).toBe(1.6336);
   });
 
   it('does not turn an externally supplied gross-edge field into an exit price', () => {
@@ -48,15 +48,15 @@ describe('entry trade economics', () => {
     expect(overridden.targetRewardUsd).toBe(baseline.targetRewardUsd);
   });
 
-  it('finds the first cent tick with non-negative net P&L', () => {
+  it('finds the first fixed-point tick with non-negative net P&L', () => {
     const result = calculateEntryEconomics(input);
     const breakEven = solveBreakEvenExitPrice(result.entryCostUsd, input.contracts);
     if (breakEven == null) throw new Error('expected a reachable break-even tick');
     const atBreakEven = breakEven * input.contracts - kalshiFeeForOrder(breakEven, input.contracts) - result.entryCostUsd;
-    const prior = breakEven - 0.01;
+    const prior = breakEven - 0.0001;
     const beforeBreakEven = prior * input.contracts - kalshiFeeForOrder(prior, input.contracts) - result.entryCostUsd;
 
-    expect(breakEven).toBe(0.44);
+    expect(breakEven).toBe(0.434);
     expect(atBreakEven).toBeGreaterThanOrEqual(-1e-9);
     expect(beforeBreakEven).toBeLessThan(0);
   });
@@ -67,8 +67,8 @@ describe('entry trade economics', () => {
 
   it('can re-score schema-2 evidence against the legacy calculation offline', () => {
     const comparison = compareLegacyEntryEconomics(input);
-    expect(comparison.legacyTargetRewardUsd).toBe(1.75);
-    expect(comparison.correctedTargetRewardUsd).toBe(2.89);
-    expect(comparison.correctionUsd).toBe(1.14);
+    expect(comparison.legacyTargetRewardUsd).toBe(1.8925);
+    expect(comparison.correctedTargetRewardUsd).toBe(2.8968);
+    expect(comparison.correctionUsd).toBe(1.0043);
   });
 });

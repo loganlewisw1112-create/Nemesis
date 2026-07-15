@@ -1,6 +1,6 @@
-import { kalshiFeeForOrder, kalshiFeePerContract } from '@nemesis/core';
+import { kalshiFeeForFills, kalshiFeeForOrder, kalshiFeePerContract, type KalshiFeePolicy } from '@nemesis/core';
 
-export const QUALIFICATION_FEE_MODEL = 'kalshi-base-taker-cent-whole-v2' as const;
+export const QUALIFICATION_FEE_MODEL = 'kalshi-fixed-point-level-fees-v3' as const;
 
 export interface EntryEconomicsInput {
   entryPrice: number;
@@ -14,6 +14,8 @@ export interface EntryEconomicsInput {
   spread: number;
   fillSlippage: number;
   feeRate?: number;
+  feePolicy?: KalshiFeePolicy;
+  priceTick?: number;
 }
 
 export interface EntryEconomicsEvidence extends EntryEconomicsInput {
@@ -49,19 +51,28 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function floorToCent(value: number): number {
-  return Math.floor((value + 1e-10) * 100) / 100;
+function floorToTick(value: number, tick: number): number {
+  return Math.floor((value + 1e-10) / tick) * tick;
 }
 
-/** Returns the lowest one-cent exit tick whose net proceeds cover entry cost. */
+function orderFee(price: number, contracts: number, input: Pick<EntryEconomicsInput, 'feePolicy' | 'feeRate'>): number {
+  if (input.feePolicy) {
+    return kalshiFeeForFills([{ price, quantity: contracts }], input.feePolicy)?.totalFeeUsd ?? Number.NaN;
+  }
+  return kalshiFeeForOrder(price, contracts, input.feeRate ?? 0.07);
+}
+
+/** Returns the lowest supported fixed-point exit tick whose net proceeds cover entry cost. */
 export function solveBreakEvenExitPrice(
   entryCostUsd: number,
   contracts: number,
   feeRate = 0.07,
+  priceTick = 0.0001,
 ): number | null {
   if (!Number.isFinite(entryCostUsd) || !Number.isFinite(contracts) || contracts <= 0) return null;
-  for (let cents = 1; cents <= 100; cents += 1) {
-    const price = cents / 100;
+  const steps = Math.round(1 / priceTick);
+  for (let step = 1; step <= steps; step += 1) {
+    const price = step * priceTick;
     const netProceeds = price * contracts - kalshiFeeForOrder(price, contracts, feeRate);
     if (netProceeds + 1e-9 >= entryCostUsd) return price;
   }
@@ -74,23 +85,32 @@ export function solveBreakEvenExitPrice(
  * authoritative; no screening spread, fee, or slippage estimate is subtracted again.
  */
 export function calculateEntryEconomics(input: EntryEconomicsInput): EntryEconomicsEvidence {
-  const feeRate = input.feeRate ?? 0.07;
   const contracts = input.contracts;
   const entryPrice = input.entryPrice;
-  const targetExitPrice = clamp(floorToCent(input.sideFairPrice), 0.01, 0.99);
-  const targetExitFeesUsd = kalshiFeeForOrder(targetExitPrice, contracts, feeRate);
+  const priceTick = input.priceTick ?? 0.0001;
+  const targetExitPrice = clamp(floorToTick(input.sideFairPrice, priceTick), priceTick, 1 - priceTick);
+  const targetExitFeesUsd = orderFee(targetExitPrice, contracts, input);
   const entryCostUsd = entryPrice * contracts + input.entryFeesUsd;
   const targetRewardUsd = targetExitPrice * contracts - targetExitFeesUsd - entryCostUsd;
-  const stopPrice = clamp(round(entryPrice - 0.01, 2), 0.01, 0.99);
-  const stopFeesUsd = kalshiFeeForOrder(stopPrice, contracts, feeRate);
+  const stopPrice = clamp(round(entryPrice - 0.01, 4), priceTick, 1 - priceTick);
+  const stopFeesUsd = orderFee(stopPrice, contracts, input);
   const plannedLossUsd = Math.max(0.01, entryCostUsd - (stopPrice * contracts - stopFeesUsd));
-  const stressedEntryPrice = clamp(round(entryPrice + 0.01, 2), 0.01, 0.99);
-  const stressedEntryFeesUsd = kalshiFeeForOrder(stressedEntryPrice, contracts, feeRate);
-  const stressedExitPrice = clamp(round(targetExitPrice - 0.01, 2), 0.01, 0.99);
-  const stressedExitFeesUsd = kalshiFeeForOrder(stressedExitPrice, contracts, feeRate);
+  const stressedEntryPrice = clamp(round(entryPrice + 0.01, 4), priceTick, 1 - priceTick);
+  const stressedEntryFeesUsd = orderFee(stressedEntryPrice, contracts, input);
+  const stressedExitPrice = clamp(round(targetExitPrice - 0.01, 4), priceTick, 1 - priceTick);
+  const stressedExitFeesUsd = orderFee(stressedExitPrice, contracts, input);
   const stressedNetPnlUsd = stressedExitPrice * contracts - stressedExitFeesUsd
     - (stressedEntryPrice * contracts + stressedEntryFeesUsd);
-  const breakEvenExitPrice = solveBreakEvenExitPrice(entryCostUsd, contracts, feeRate);
+  const breakEvenExitPrice = input.feePolicy
+    ? (() => {
+        const steps = Math.round(1 / priceTick);
+        for (let step = 1; step <= steps; step += 1) {
+          const price = step * priceTick;
+          if (price * contracts - orderFee(price, contracts, input) + 1e-9 >= entryCostUsd) return price;
+        }
+        return null;
+      })()
+    : solveBreakEvenExitPrice(entryCostUsd, contracts, input.feeRate ?? 0.07, priceTick);
   const rewardRiskRatio = targetRewardUsd / plannedLossUsd;
 
   return {

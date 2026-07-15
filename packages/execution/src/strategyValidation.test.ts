@@ -68,7 +68,7 @@ describe('StrategyValidationTracker', () => {
         contracts: 20,
         sideFairPrice: 0.55,
         grossEdge: 0.15,
-        feeModel: 'kalshi-base-taker-cent-whole-v2',
+          feeModel: 'kalshi-fixed-point-level-fees-v3',
       },
     });
     expect(StrategyValidationTracker.replay(tracker.allEvents()).integrityFailure()).toBeUndefined();

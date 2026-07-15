@@ -6,6 +6,7 @@ import {
   type GuardrailSettings,
   type LatencyMetrics,
   type ThesisCard,
+  isSupportedQualificationFeeOrder,
 } from '@nemesis/core';
 import { authHeaders } from './signer.js';
 import { reconcilePositions } from './reconcile.js';
@@ -27,6 +28,24 @@ export interface LiveOrderResult {
   error?: string;
   simulated?: boolean;
   latencyMetrics?: LatencyMetrics;
+}
+
+export function fixedPointKalshiOrder(req: LiveOrderRequest) {
+  if (!isSupportedQualificationFeeOrder(req.limitPrice, req.contracts)) {
+    throw new Error('live order requires a four-decimal price and two-decimal quantity');
+  }
+  const countFp = req.contracts.toFixed(2);
+  const priceDollars = req.limitPrice.toFixed(4);
+  return {
+    ticker: req.ticker,
+    action: req.action ?? 'buy',
+    side: req.side,
+    count_fp: countFp,
+    type: 'limit' as const,
+    yes_price_dollars: req.side === 'yes' ? priceDollars : undefined,
+    no_price_dollars: req.side === 'no' ? priceDollars : undefined,
+    client_order_id: req.clientOrderId,
+  };
 }
 
 export interface LiveCredentials {
@@ -79,21 +98,10 @@ export async function submitLiveOrder(
   }
 
   const path = '/portfolio/orders';
-  const yesPrice = req.side === 'yes' ? Math.round(req.limitPrice * 100) : undefined;
-  const noPrice = req.side === 'no' ? Math.round(req.limitPrice * 100) : undefined;
   try {
     const measured = await measureExchangeRoundTrip({
       send: () => createKalshiOrder(
-        {
-          ticker: req.ticker,
-          action: req.action ?? 'buy',
-          side: req.side,
-          count: req.contracts,
-          type: 'limit',
-          yes_price: yesPrice,
-          no_price: noPrice,
-          client_order_id: req.clientOrderId,
-        },
+        fixedPointKalshiOrder(req),
         signedOpts(creds, 'POST', path),
       ),
     });

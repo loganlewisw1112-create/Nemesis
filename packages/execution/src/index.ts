@@ -20,3 +20,4 @@ export * from './tradeEconomics.js';
 export * from './entryEligibility.js';
 export * from './paperQualification.js';
 export * from './paperRunArchive.js';
+export * from './sevenHourCampaign.js';

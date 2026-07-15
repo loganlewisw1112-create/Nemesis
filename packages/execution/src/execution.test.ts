@@ -4,7 +4,7 @@ import { dryRunCloseFill, dryRunFill, reconcilePositions } from '../src/index.js
 describe('execution', () => {
   it('dry runs fill', () => {
     const r = dryRunFill(
-      { ticker: 'T', yes: [], no: [], yesAsk: 0.35 },
+      { ticker: 'T', yes: [], no: [{ price: 0.65, quantity: 5 }], yesAsk: 0.35 },
       'yes',
       5,
       0.42,

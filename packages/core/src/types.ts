@@ -26,6 +26,13 @@ export interface KalshiMarket {
   close_time?: string;
   event_ticker?: string;
   series_ticker?: string;
+  price_level_structure?: 'linear_cent' | 'tapered_deci_cent' | 'deci_cent' | string;
+  fractional_trading_enabled?: boolean;
+  fee_waiver_expiration_time?: string;
+  fee_type?: string;
+  fee_multiplier?: number;
+  fee_type_override?: string;
+  fee_multiplier_override?: number;
 }
 
 export interface KalshiMarketsResponse {
@@ -38,6 +45,28 @@ export interface OrderbookLevel {
   quantity: number;
 }
 
+export type KalshiFeeRole = 'maker' | 'taker';
+export type KalshiAccountPrecision = 'direct' | 'non_direct' | 'unknown';
+
+/** Exchange fee inputs frozen with each evidence run. Unknown inputs fail qualification closed. */
+export interface KalshiFeePolicy {
+  known: boolean;
+  role: KalshiFeeRole;
+  multiplier: number;
+  accountPrecision: KalshiAccountPrecision;
+  seriesTicker?: string;
+  feeType?: string;
+  scheduleVersion: string;
+  source: string;
+}
+
+export interface KalshiSeries {
+  ticker: string;
+  fee_type?: string;
+  fee_multiplier?: number;
+  last_updated_ts?: string;
+}
+
 export interface KalshiOrderbook {
   ticker: string;
   yes: OrderbookLevel[];
@@ -45,6 +74,13 @@ export interface KalshiOrderbook {
   yesAsk?: number;
   noAsk?: number;
   spread?: number;
+  /** Exchange-origin book time. Never populated from local post-fetch time. */
+  sourceTimestamp?: number;
+  /** Exchange WebSocket sequence. REST books normally cannot supply this. */
+  sequence?: number;
+  receivedAt?: number;
+  priceLevelStructure?: string;
+  feePolicy?: KalshiFeePolicy;
 }
 
 export interface KalshiTrade {
@@ -120,6 +156,16 @@ export interface EntryQualificationSettings {
   pilotMaxDrawdownUsd: number;
   pilotMaxFalseExitRate: number;
   pilotMaxAverageRegretUsd: number;
+  instrumentationDurationMs: number;
+  instrumentationMinUniqueCandidates: number;
+  instrumentationMinTerminalCoverage: number;
+  instrumentationMinDiagnosticSchedulingCoverage: number;
+  instrumentationMinValidDiagnosticCoverage: number;
+  campaignDurationMs: number;
+  campaignEnrollmentCloseoutMs: number;
+  campaignMinValidDiagnostics: number;
+  campaignMinReadyCandidates: number;
+  campaignMinFreshSampleRate: number;
 }
 
 export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
@@ -149,6 +195,16 @@ export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
   pilotMaxDrawdownUsd: 20,
   pilotMaxFalseExitRate: 0.15,
   pilotMaxAverageRegretUsd: 0.5,
+  instrumentationDurationMs: 2 * 60 * 60_000,
+  instrumentationMinUniqueCandidates: 20,
+  instrumentationMinTerminalCoverage: 1,
+  instrumentationMinDiagnosticSchedulingCoverage: 0.95,
+  instrumentationMinValidDiagnosticCoverage: 0.9,
+  campaignDurationMs: 7 * 60 * 60_000,
+  campaignEnrollmentCloseoutMs: 15 * 60_000,
+  campaignMinValidDiagnostics: 30,
+  campaignMinReadyCandidates: 1,
+  campaignMinFreshSampleRate: 0.95,
 };
 
 export interface GuardrailSettings {
@@ -171,6 +227,7 @@ export interface GuardrailSettings {
   strictProfitMode?: StrictProfitModeSettings;
   opportunityThroughput?: OpportunityThroughputSettings;
   entryQualification?: EntryQualificationSettings;
+  kalshiAccountPrecision?: KalshiAccountPrecision;
 }
 
 export const DEFAULT_STRICT_PROFIT_MODE: StrictProfitModeSettings = {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
 import { PaperDesk } from './paperDesk.js';
-import { previewPaperBuy, previewPaperClose, simulatePaperBuy, simulatePaperClose, checkPaperRisk, mutualExclusionBlock } from './executionRouter.js';
+import { previewPaperBuy, previewPaperClose, simulatePaperBuy, simulatePaperClose, checkPaperRisk, mutualExclusionBlock, resolveContractCount } from './executionRouter.js';
 import { positionUnrealizedPnl, markToMarketPortfolio } from './pnlEngine.js';
 import { runFeeAwareBacktest } from './backtestRunner.js';
 import { DEFAULT_GUARDRAILS, DEFAULT_STRICT_PROFIT_MODE, type KalshiOrderbook, type ThesisCard } from '@nemesis/core';
@@ -34,7 +34,7 @@ const card: ThesisCard = {
 
 const book: KalshiOrderbook = {
   ticker: 'TEST-1',
-  yes: [{ price: 0.5, quantity: 200 }],
+  yes: [{ price: 0.44, quantity: 200 }],
   no: [{ price: 0.55, quantity: 200 }],
   yesAsk: 0.46,
   noAsk: 0.56,
@@ -60,6 +60,14 @@ const highEdgeCard: ThesisCard = {
 };
 
 describe('executionRouter', () => {
+  it('caps every explicit quantity override at the allocator maxSafeContracts result', () => {
+    const portfolio = new PaperDesk(1000).snapshot();
+    const automatic = resolveContractCount(highEdgeCard, portfolio, DEFAULT_GUARDRAILS);
+    const overridden = resolveContractCount(highEdgeCard, portfolio, DEFAULT_GUARDRAILS, 999_999);
+    expect(automatic).toBeGreaterThan(0);
+    expect(overridden).toBe(automatic);
+  });
+
   it('simulates paper buy via orderbook', () => {
     const desk = new PaperDesk(1000);
     const result = simulatePaperBuy(desk, highEdgeCard, crossedProfitBook, DEFAULT_GUARDRAILS, 2);
@@ -225,8 +233,8 @@ describe('executionRouter', () => {
 
     expect(first.ok).toBe(true);
     expect(first.profitCertificate?.targetExitPrice).toBe(0.75);
-    expect(first.profitCertificate?.targetRewardUsd).toBe(2.58);
-    expect(lowerScreeningEdge.profitCertificate?.targetRewardUsd).toBe(2.58);
+    expect(first.profitCertificate?.targetRewardUsd).toBe(2.6954);
+    expect(lowerScreeningEdge.profitCertificate?.targetRewardUsd).toBe(2.6954);
   });
 
   it('uses a NO thesis contract price directly instead of inverting it twice', () => {
@@ -362,6 +370,13 @@ describe('pnlEngine parity', () => {
 });
 
 describe('liveOrderAdapter', () => {
+  it('serializes subpenny prices and fractional quantities with fixed-point fields', async () => {
+    const { fixedPointKalshiOrder } = await import('./liveOrderAdapter.js');
+    expect(fixedPointKalshiOrder({
+      ticker: 'X', side: 'yes', contracts: 1.25, limitPrice: 0.4055, clientOrderId: 'test',
+    })).toMatchObject({ count_fp: '1.25', yes_price_dollars: '0.4055' });
+  });
+
   it('blocks live orders when not enabled', async () => {
     const { submitLiveOrder } = await import('./liveOrderAdapter.js');
     const result = await submitLiveOrder(
