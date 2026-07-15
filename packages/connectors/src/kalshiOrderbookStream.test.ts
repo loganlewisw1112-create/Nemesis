@@ -173,18 +173,45 @@ describe('KalshiOrderbookStream', () => {
     expect(socket.send).toHaveBeenCalledTimes(1);
 
     stream.replaceTracked(tickers.slice(40, 90));
-    expect(socket.send).toHaveBeenCalledTimes(3);
+    expect(socket.send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(String(socket.send.mock.calls[1]![0]))).toMatchObject({
       cmd: 'update_subscription',
       params: { sids: [7], action: 'delete_markets' },
     });
     expect(JSON.parse(String(socket.send.mock.calls[1]![0])).params.market_tickers).toHaveLength(40);
+    expect(stream.telemetry()).toMatchObject({
+      trackedTickers: 50,
+      subscriptionUpdates: 1,
+      subscriptionUpdateQueueDepth: 1,
+      subscriptionUpdateInFlight: true,
+    });
+    stream.ingest(JSON.stringify({
+      id: 2,
+      type: 'ok',
+      sid: 7,
+      seq: 1,
+      msg: { market_tickers: tickers.slice(0, 40) },
+    }), 1);
+    expect(socket.send).toHaveBeenCalledTimes(3);
     expect(JSON.parse(String(socket.send.mock.calls[2]![0]))).toMatchObject({
       cmd: 'update_subscription',
       params: { sids: [7], action: 'add_markets' },
     });
     expect(JSON.parse(String(socket.send.mock.calls[2]![0])).params.market_tickers).toHaveLength(40);
-    expect(stream.telemetry()).toMatchObject({ trackedTickers: 50, subscriptionUpdates: 2 });
+    expect(stream.telemetry()).toMatchObject({
+      trackedTickers: 50,
+      subscriptionUpdates: 2,
+      subscriptionUpdateQueueDepth: 0,
+      subscriptionUpdateInFlight: true,
+    });
+    stream.ingest(JSON.stringify({
+      id: 3,
+      type: 'ok',
+      sid: 7,
+      seq: 2,
+      msg: { market_tickers: tickers.slice(50, 90) },
+    }), 1);
+    expect(stream.telemetry().subscriptionUpdateInFlight).toBe(false);
     stream.stop();
   });
 
@@ -288,7 +315,7 @@ describe('KalshiOrderbookStream', () => {
     // The official sequenced OK response advances continuity without mutating
     // books or causing a false second repair request.
     stream.ingest(JSON.stringify({
-      type: 'ok', sid: 8, seq: 7,
+      id: 1, type: 'ok', sid: 8, seq: 7,
       msg: { market_tickers: ['KXA', 'KXB'] },
     }), 1);
     expect(stream.getBook('KXA')).toBeNull();

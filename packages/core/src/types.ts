@@ -432,6 +432,8 @@ export interface ConnectorHealth {
   trackedTickers?: number;
   qualifiedTickers?: number;
   subscriptionUpdates?: number;
+  subscriptionUpdateQueueDepth?: number;
+  subscriptionUpdateInFlight?: boolean;
   freshnessMs?: number | null;
   transportConnected?: boolean;
   authenticated?: boolean;

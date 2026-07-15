@@ -27,6 +27,8 @@ export interface KalshiOrderbookStreamTelemetry {
   lastCloseCode: number | null;
   lastCloseReason: string | null;
   subscriptionUpdates: number;
+  subscriptionUpdateQueueDepth: number;
+  subscriptionUpdateInFlight: boolean;
 }
 
 interface MutableBook {
@@ -40,6 +42,17 @@ interface MutableBook {
 }
 
 type BookUpdateListener = (book: KalshiOrderbook) => void;
+type SubscriptionUpdateAction = 'add_markets' | 'delete_markets' | 'get_snapshot';
+
+interface SubscriptionUpdateCommand {
+  sid: number;
+  marketTickers: string[];
+  action: SubscriptionUpdateAction;
+}
+
+interface PendingSubscriptionUpdate extends SubscriptionUpdateCommand {
+  id: number;
+}
 
 function parseNumber(value: unknown): number | undefined {
   const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
@@ -93,6 +106,8 @@ export class KalshiOrderbookStream {
   private lastCloseCode: number | null = null;
   private lastCloseReason: string | null = null;
   private subscriptionUpdates = 0;
+  private readonly subscriptionUpdateQueue: SubscriptionUpdateCommand[] = [];
+  private pendingSubscriptionUpdate: PendingSubscriptionUpdate | null = null;
   private readonly bookUpdateListeners = new Set<BookUpdateListener>();
 
   constructor(
@@ -113,6 +128,8 @@ export class KalshiOrderbookStream {
     this.tickersBySubscription.clear();
     this.subscriptionIdByKey.clear();
     this.pendingSnapshotRepair.clear();
+    this.subscriptionUpdateQueue.length = 0;
+    this.pendingSubscriptionUpdate = null;
     this.closeCurrentSocket();
     if (this.started) this.connect();
   }
@@ -209,6 +226,8 @@ export class KalshiOrderbookStream {
       lastCloseCode: this.lastCloseCode,
       lastCloseReason: this.lastCloseReason,
       subscriptionUpdates: this.subscriptionUpdates,
+      subscriptionUpdateQueueDepth: this.subscriptionUpdateQueue.length,
+      subscriptionUpdateInFlight: this.pendingSubscriptionUpdate != null,
     };
   }
 
@@ -240,6 +259,8 @@ export class KalshiOrderbookStream {
       this.tickersBySubscription.clear();
       this.subscriptionIdByKey.clear();
       this.pendingSnapshotRepair.clear();
+      this.subscriptionUpdateQueue.length = 0;
+      this.pendingSubscriptionUpdate = null;
       this.lastSequencedDeltaAt = null;
       for (const ticker of this.tickers) this.quarantined.add(ticker);
       this.lastMessageAt = Date.now();
@@ -271,6 +292,8 @@ export class KalshiOrderbookStream {
       this.authenticated = false;
       this.clearHeartbeatTimer();
       this.subscribed.clear();
+      this.subscriptionUpdateQueue.length = 0;
+      this.pendingSubscriptionUpdate = null;
       if (!this.started) return;
       this.reconnects += 1;
       this.registry.recordTelemetry('kalshi-orderbook-ws', {
@@ -317,23 +340,8 @@ export class KalshiOrderbookStream {
     const [subscription, sid] = subscriptionEntry;
     const removed = [...this.subscribed].filter((ticker) => !this.tickers.has(ticker));
     const added = [...this.tickers].filter((ticker) => !this.subscribed.has(ticker));
-    const sendUpdate = (marketTickers: string[], action: 'add_markets' | 'delete_markets'): boolean => {
-      if (marketTickers.length === 0) return true;
-      try {
-        socket.send(JSON.stringify({
-          id: this.commandId++,
-          cmd: 'update_subscription',
-          params: { sids: [sid], market_tickers: marketTickers, action },
-        }));
-        this.subscriptionUpdates += 1;
-        return true;
-      } catch {
-        socket.close();
-        return false;
-      }
-    };
-    if (!sendUpdate(removed, 'delete_markets')) return;
-    if (!sendUpdate(added, 'add_markets')) return;
+    this.enqueueSubscriptionUpdate({ sid, marketTickers: removed, action: 'delete_markets' });
+    this.enqueueSubscriptionUpdate({ sid, marketTickers: added, action: 'add_markets' });
     const subscriptionTickers = this.tickersBySubscription.get(subscription) ?? new Set<string>();
     for (const ticker of removed) {
       this.subscribed.delete(ticker);
@@ -355,6 +363,18 @@ export class KalshiOrderbookStream {
       const packet = JSON.parse(raw) as Record<string, unknown>;
       const type = String(packet.type ?? '');
       const msg = packet.msg && typeof packet.msg === 'object' ? packet.msg as Record<string, unknown> : null;
+      const packetCommandId = parseNumber(packet.id);
+      const acknowledgesPendingUpdate = type === 'ok'
+        && packetCommandId != null
+        && packetCommandId === this.pendingSubscriptionUpdate?.id;
+      if (type === 'error' && packetCommandId != null && packetCommandId === this.pendingSubscriptionUpdate?.id) {
+        const errorMessage = String((msg as { msg?: unknown } | null)?.msg ?? 'subscription update failed');
+        this.pendingSubscriptionUpdate = null;
+        this.subscriptionUpdateQueue.length = 0;
+        this.registry.recordWarn('kalshi-orderbook-ws', errorMessage);
+        this.socket?.close();
+        return;
+      }
       if (type === 'subscribed') {
         const subscribedSid = parseNumber(msg?.sid ?? packet.sid);
         if (subscribedSid != null) {
@@ -368,6 +388,11 @@ export class KalshiOrderbookStream {
       }
       const sequence = parseNumber(packet.seq);
       if (sequence == null) {
+        if (acknowledgesPendingUpdate) {
+          this.registry.recordWarn('kalshi-orderbook-ws', 'subscription update acknowledgement lacked a sequence');
+          this.socket?.close();
+          return;
+        }
         if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
         return;
       }
@@ -386,6 +411,11 @@ export class KalshiOrderbookStream {
       this.tickersBySubscription.set(subscription, subscriptionTickers);
       const previousSequence = this.sequenceBySubscription.get(subscription);
       if (previousSequence != null && sequence !== previousSequence + 1) {
+        if (acknowledgesPendingUpdate) {
+          this.registry.recordWarn('kalshi-orderbook-ws', 'subscription update acknowledgement broke sequence continuity');
+          this.socket?.close();
+          return;
+        }
         if (sequence <= previousSequence) this.sequenceRegressions += 1;
         this.sequenceGaps += 1;
         this.sequenceBySubscription.set(subscription, Math.max(previousSequence, sequence));
@@ -394,6 +424,7 @@ export class KalshiOrderbookStream {
         return;
       }
       this.sequenceBySubscription.set(subscription, sequence);
+      if (acknowledgesPendingUpdate) this.pendingSubscriptionUpdate = null;
       if (this.started && ticker && !this.tickers.has(ticker)) {
         this.books.delete(ticker);
         this.quarantined.delete(ticker);
@@ -403,6 +434,7 @@ export class KalshiOrderbookStream {
       if (!ticker || !msg) {
         if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
         this.recordHealth();
+        if (acknowledgesPendingUpdate) this.pumpSubscriptionUpdates();
         return;
       }
       if (type === 'orderbook_snapshot') this.applySnapshot(subscription, ticker, sequence, msg);
@@ -479,15 +511,11 @@ export class KalshiOrderbookStream {
     this.pendingSnapshotRepair.set(subscription, new Set(affected));
     const sid = this.subscriptionIdByKey.get(subscription);
     if (sid == null || this.socket?.readyState !== WebSocket.OPEN) return;
-    this.socket.send(JSON.stringify({
-      id: this.commandId++,
-      cmd: 'update_subscription',
-      params: {
-        sids: [sid],
-        market_tickers: [...affected].sort(),
-        action: 'get_snapshot',
-      },
-    }));
+    this.enqueueSubscriptionUpdate({
+      sid,
+      marketTickers: [...affected].sort(),
+      action: 'get_snapshot',
+    });
   }
 
   private startHeartbeat(socket: WebSocket, generation: number): void {
@@ -521,6 +549,8 @@ export class KalshiOrderbookStream {
       trackedTickers: telemetry.trackedTickers,
       qualifiedTickers: telemetry.qualifiedTickers,
       subscriptionUpdates: telemetry.subscriptionUpdates,
+      subscriptionUpdateQueueDepth: telemetry.subscriptionUpdateQueueDepth,
+      subscriptionUpdateInFlight: telemetry.subscriptionUpdateInFlight,
       transportConnected: telemetry.connected,
       authenticated: telemetry.authenticated,
       qualificationReady: telemetry.qualificationReady,
@@ -546,12 +576,43 @@ export class KalshiOrderbookStream {
     this.socket = null;
     this.authenticated = false;
     this.subscribed.clear();
+    this.subscriptionUpdateQueue.length = 0;
+    this.pendingSubscriptionUpdate = null;
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close();
   }
 
   private clearHeartbeatTimer(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
+  }
+
+  private enqueueSubscriptionUpdate(command: SubscriptionUpdateCommand): void {
+    if (command.marketTickers.length === 0) return;
+    this.subscriptionUpdateQueue.push(command);
+    this.pumpSubscriptionUpdates();
+  }
+
+  private pumpSubscriptionUpdates(): void {
+    if (this.pendingSubscriptionUpdate || this.socket?.readyState !== WebSocket.OPEN) return;
+    const command = this.subscriptionUpdateQueue.shift();
+    if (!command) return;
+    const pending: PendingSubscriptionUpdate = { ...command, id: this.commandId++ };
+    try {
+      this.socket.send(JSON.stringify({
+        id: pending.id,
+        cmd: 'update_subscription',
+        params: {
+          sids: [pending.sid],
+          market_tickers: pending.marketTickers,
+          action: pending.action,
+        },
+      }));
+      this.pendingSubscriptionUpdate = pending;
+      this.subscriptionUpdates += 1;
+    } catch {
+      this.subscriptionUpdateQueue.unshift(command);
+      this.socket.close();
+    }
   }
 
   private isCurrent(socket: WebSocket, generation: number): boolean {
