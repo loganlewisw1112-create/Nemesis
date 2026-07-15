@@ -1027,7 +1027,7 @@ function updatePreflightCycleCounts(): void {
   }
 }
 
-function preflightHealthy(): boolean {
+function preflightHealthyForStability(): boolean {
   const ticker = kalshiStream.telemetry();
   const orderbook = kalshiOrderbookStream.telemetry();
   return settings.liveEnabled !== true
@@ -1036,7 +1036,6 @@ function preflightHealthy(): boolean {
     && paperDesk.snapshot().positions.length === 0
     && paperDesk.snapshot().trades.length === 0
     && paperOrderBook.working().length === 0
-    && latestRendererMemoryAssessment.status === 'stable'
     && !latestRendererMemoryAssessment.blocked
     && preflightRestCycles >= 3
     && preflightTradeCycles >= 3
@@ -1343,7 +1342,9 @@ function processEvidenceSupervisor(now: number): void {
   }
   if (state === 'preflight') {
     updatePreflightCycleCounts();
-    const decision = evidenceRunSupervisor.observePreflight(now, preflightHealthy());
+    const continuouslyHealthy = preflightHealthyForStability();
+    const readyForStart = continuouslyHealthy && latestRendererMemoryAssessment.status === 'stable';
+    const decision = evidenceRunSupervisor.observePreflight(now, continuouslyHealthy, readyForStart);
     if (decision.state === 'invalidated') {
       invalidateEvidenceAttempt([decision.reason], now);
       return;

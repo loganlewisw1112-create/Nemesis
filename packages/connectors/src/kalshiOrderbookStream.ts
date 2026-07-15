@@ -10,6 +10,7 @@ export interface KalshiOrderbookStreamTelemetry {
   connected: boolean;
   trackedTickers: number;
   booksWithExchangeTime: number;
+  qualifiedTickers: number;
   reconnects: number;
   sequenceRegressions: number;
   sequenceGaps: number;
@@ -30,6 +31,7 @@ interface MutableBook {
   sequence: number;
   sourceTimestamp?: number;
   receivedAt: number;
+  sequencedDeltaAt?: number;
 }
 
 type BookUpdateListener = (book: KalshiOrderbook) => void;
@@ -141,19 +143,19 @@ export class KalshiOrderbookStream {
 
   telemetry(now = Date.now()): KalshiOrderbookStreamTelemetry {
     const connected = this.socket?.readyState === WebSocket.OPEN;
-    const exchangeDeltaAgeMs = this.lastSequencedDeltaAt == null
-      ? null
-      : now - this.lastSequencedDeltaAt;
+    const qualifiedTickers = [...this.books.values()].filter((book) => {
+      if (this.quarantined.has(book.ticker) || book.sourceTimestamp == null || book.sequencedDeltaAt == null) return false;
+      const ageMs = now - book.sequencedDeltaAt;
+      return ageMs >= 0 && ageMs <= DEAD_CONNECTION_MS;
+    }).length;
     const qualificationReady = connected
       && this.authenticated
-      && this.quarantined.size === 0
-      && exchangeDeltaAgeMs != null
-      && exchangeDeltaAgeMs >= 0
-      && exchangeDeltaAgeMs <= DEAD_CONNECTION_MS;
+      && qualifiedTickers > 0;
     return {
       connected,
       trackedTickers: this.tickers.size,
       booksWithExchangeTime: [...this.books.values()].filter((book) => book.sourceTimestamp != null).length,
+      qualifiedTickers,
       reconnects: this.reconnects,
       sequenceRegressions: this.sequenceRegressions,
       sequenceGaps: this.sequenceGaps,
@@ -325,6 +327,7 @@ export class KalshiOrderbookStream {
     book.sourceTimestamp = timestamp;
     book.receivedAt = Date.now();
     this.lastSequencedDeltaAt = book.receivedAt;
+    book.sequencedDeltaAt = book.receivedAt;
     this.lastExchangeTimestamp = timestamp;
     this.quarantined.delete(ticker);
   }

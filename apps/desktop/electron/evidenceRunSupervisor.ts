@@ -75,7 +75,7 @@ export class EvidenceRunSupervisor {
     };
   }
 
-  observePreflight(at: number, healthy: boolean): EvidenceSupervisorDecision {
+  observePreflight(at: number, healthy: boolean, readyForStart = healthy): EvidenceSupervisorDecision {
     if (this.manifest.status !== 'preflight') return this.decision('wait', 'preflight is no longer active');
     if (at - this.preflightStartedAt > 20 * 60_000) return this.invalidate('preflight did not stabilize within 20 minutes');
     if (!healthy) {
@@ -84,6 +84,7 @@ export class EvidenceRunSupervisor {
     }
     this.stablePreflightAt ??= at;
     if (at - this.stablePreflightAt < 10 * 60_000) return this.decision('wait', 'collecting ten continuous minutes of stable preflight');
+    if (!readyForStart) return this.decision('wait', 'stable preflight window complete; waiting for final readiness gates');
     this.manifest = { ...this.manifest, status: 'preflight-ready' };
     return this.decision('ready', 'preflight passed');
   }

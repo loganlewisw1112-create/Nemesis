@@ -192,4 +192,51 @@ describe('KalshiOrderbookStream', () => {
       qualificationReady: true,
     });
   });
+
+  it('keeps a quarantined ticker fail-closed without poisoning another healthy ticker', () => {
+    vi.useFakeTimers();
+    const recoveredAt = 1_700_000_300_000;
+    vi.setSystemTime(recoveredAt);
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const staleSocket = { readyState: WebSocket.OPEN, close: vi.fn() };
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket: staleSocket,
+      authenticated: true,
+      generation: 1,
+    });
+
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', sid: 8, seq: 1,
+      msg: { market_ticker: 'KXQUARANTINED', yes_dollars_fp: [['0.3000', '5.00']], no_dollars_fp: [] },
+    }), 1);
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', sid: 8, seq: 3,
+      msg: { market_ticker: 'KXQUARANTINED', price_dollars: '0.3100', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+    }), 1);
+    expect(staleSocket.close).toHaveBeenCalledTimes(1);
+
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket: { readyState: WebSocket.OPEN },
+      authenticated: true,
+      generation: 2,
+    });
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', sid: 9, seq: 1,
+      msg: { market_ticker: 'KXHEALTHY', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+    }), 2);
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', sid: 9, seq: 2,
+      msg: { market_ticker: 'KXHEALTHY', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+    }), 2);
+
+    expect(stream.getBook('KXQUARANTINED')).toBeNull();
+    expect(stream.getBook('KXHEALTHY')).toMatchObject({ sequence: 2, sourceTimestamp: recoveredAt });
+    expect(stream.telemetry(recoveredAt)).toMatchObject({
+      connected: true,
+      authenticated: true,
+      quarantinedTickers: 1,
+      qualifiedTickers: 1,
+      qualificationReady: true,
+    });
+  });
 });

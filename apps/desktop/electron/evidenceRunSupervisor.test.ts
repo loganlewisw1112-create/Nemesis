@@ -21,6 +21,16 @@ describe('EvidenceRunSupervisor', () => {
     expect(started.manifest.cutoffAt).toBe(137 * 60_000);
   });
 
+  it('counts healthy renderer warm-up while requiring the baseline before readiness', () => {
+    const run = supervisor();
+    expect(run.observePreflight(0, true, false).state).toBe('preflight');
+    expect(run.observePreflight(10 * 60_000, true, false)).toMatchObject({
+      state: 'preflight',
+      reason: 'stable preflight window complete; waiting for final readiness gates',
+    });
+    expect(run.observePreflight(10 * 60_000 + 5_000, true, true).state).toBe('preflight-ready');
+  });
+
   it('uses the fixed T+6:45 enrollment and T+7:00 cutoff for seven-hour runs', () => {
     const run = supervisor('seven-hour');
     run.observePreflight(0, true);
