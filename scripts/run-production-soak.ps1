@@ -33,6 +33,26 @@ function Get-Median([double[]]$Values) {
   return [double]$sorted[$middle]
 }
 
+function Get-NormalizedSlopePerHour([object[]]$Observations, [double]$BaselineMb) {
+  if ($Observations.Count -lt 2 -or $BaselineMb -le 0) { return $null }
+  $latestAt = [double]$Observations[-1].at
+  $window = @($Observations | Where-Object { [double]$_.at -ge $latestAt - 1800000 })
+  if ($window.Count -lt 2 -or ([double]$window[-1].at - [double]$window[0].at) -lt 1620000) { return $null }
+  $origin = [double]$window[0].at
+  $xs = @($window | ForEach-Object { ([double]$_.at - $origin) / 3600000 })
+  $ys = @($window | ForEach-Object { [double]$_.workingSetMb })
+  $meanX = ($xs | Measure-Object -Average).Average
+  $meanY = ($ys | Measure-Object -Average).Average
+  $numerator = 0.0
+  $denominator = 0.0
+  for ($index = 0; $index -lt $window.Count; $index += 1) {
+    $numerator += ($xs[$index] - $meanX) * ($ys[$index] - $meanY)
+    $denominator += [Math]::Pow($xs[$index] - $meanX, 2)
+  }
+  if ($denominator -le 0) { return $null }
+  return ($numerator / $denominator) / $BaselineMb
+}
+
 function Get-ProductionArtifactFingerprint {
   $artifactRoots = @(
     (Join-Path $repoRoot 'apps\desktop\dist'),
@@ -96,7 +116,8 @@ function Stop-CapturedProcessTree([int]$RootProcessId) {
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $samplesPath = Join-Path $OutputDirectory 'production-soak-samples.jsonl'
 $resultPath = Join-Path $OutputDirectory 'production-soak-result.json'
-Remove-Item -LiteralPath $samplesPath, $resultPath -Force -ErrorAction SilentlyContinue
+$runtimeStatusPath = Join-Path $OutputDirectory 'production-soak-runtime-status.json'
+Remove-Item -LiteralPath $samplesPath, $resultPath, $runtimeStatusPath -Force -ErrorAction SilentlyContinue
 
 Push-Location $repoRoot
 try {
@@ -115,11 +136,12 @@ try {
   foreach ($name in @(
     'NEMESIS_EVIDENCE_CAMPAIGN_STAGE', 'NEMESIS_EVIDENCE_NAMESPACE', 'NEMESIS_EVIDENCE_PARENT_RUN_ID',
     'NEMESIS_EVIDENCE_RESTART_ORDINAL', 'NEMESIS_EVIDENCE_PREFLIGHT', 'NEMESIS_EVIDENCE_RUNTIME_SIDECAR',
-    'NEMESIS_EVIDENCE_RUNTIME_LEDGER', 'NEMESIS_EVIDENCE_CONTROL', 'VITE_DEV_SERVER_URL'
+    'NEMESIS_EVIDENCE_RUNTIME_LEDGER', 'NEMESIS_EVIDENCE_CONTROL', 'NEMESIS_RUNTIME_STATUS_PATH', 'VITE_DEV_SERVER_URL'
   )) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
   $env:NEMESIS_DEVTOOLS = 'false'
   $env:NEMESIS_AUTO_SPAWN_GEA = 'true'
   $env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'
+  $env:NEMESIS_RUNTIME_STATUS_PATH = $runtimeStatusPath
   $devToolsDisabled = $env:NEMESIS_DEVTOOLS -eq 'false'
   $configuredTrackedTickers = [int]$env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS
 
@@ -148,7 +170,25 @@ try {
       $geaMb = @($geaRows | ForEach-Object {
         try { [Math]::Round((Get-Process -Id ([int]$_.ProcessId) -ErrorAction Stop).WorkingSet64 / 1MB, 3) } catch { }
       } | Measure-Object -Maximum).Maximum
-      $rootProcess = Get-Process -Id $process.Id -ErrorAction Stop
+      try {
+        $rootProcess = Get-Process -Id $process.Id -ErrorAction Stop
+      } catch {
+        $process.Refresh()
+        if ($process.HasExited) {
+          $runtimeFailure = "NEMESIS exited early with code $($process.ExitCode)"
+          break
+        }
+        throw
+      }
+      $externalStatus = $null
+      if (Test-Path -LiteralPath $runtimeStatusPath) {
+        try { $externalStatus = Get-Content -LiteralPath $runtimeStatusPath -Raw | ConvertFrom-Json } catch { }
+      }
+      $externalStatusAgeMs = if ($null -eq $externalStatus -or $null -eq $externalStatus.updatedAt) {
+        $null
+      } else {
+        [Math]::Max(0, $now.ToUnixTimeMilliseconds() - [double]$externalStatus.updatedAt)
+      }
       $sample = [ordered]@{
         schemaVersion = 2
         at = $now.ToUnixTimeMilliseconds()
@@ -161,11 +201,18 @@ try {
         rendererCount = $rendererRows.Count
         geaWorkingSetMb = if ($null -eq $geaMb) { $null } else { [double]$geaMb }
         geaCount = $geaRows.Count
+        externalStatusAgeMs = $externalStatusAgeMs
+        runtimeState = if ($null -eq $externalStatus) { $null } else { $externalStatus.runtime.state }
+        runtimeLeaseStatus = if ($null -eq $externalStatus) { $null } else { $externalStatus.runtime.lease.status }
+        rendererStatus = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.status }
+        rendererBlocked = if ($null -eq $externalStatus) { $null } else { [bool]$externalStatus.renderer.blocked }
+        rendererHeartbeatAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.heartbeatAgeMs }
+        rendererUnresponsiveForMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.unresponsiveForMs }
       }
       $samples.Add([pscustomobject]$sample)
       ($sample | ConvertTo-Json -Compress) | Add-Content -LiteralPath $samplesPath -Encoding utf8
       if (!$rootProcess.Responding) {
-        if ($null -eq $unresponsiveSince) { $unresponsiveSince = $now }
+        if ($null -eq $unresponsiveSince) { $unresponsiveSince = $now.AddSeconds(-2) }
         elseif (($now - $unresponsiveSince).TotalSeconds -ge 10) {
           $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
           break
@@ -187,9 +234,18 @@ try {
           break
         }
         $probeAt = [DateTimeOffset]::UtcNow
-        $probeProcess = Get-Process -Id $process.Id -ErrorAction Stop
+        try {
+          $probeProcess = Get-Process -Id $process.Id -ErrorAction Stop
+        } catch {
+          $process.Refresh()
+          if ($process.HasExited) {
+            $runtimeFailure = "NEMESIS exited early with code $($process.ExitCode)"
+            break
+          }
+          throw
+        }
         if (!$probeProcess.Responding) {
-          if ($null -eq $unresponsiveSince) { $unresponsiveSince = $probeAt }
+          if ($null -eq $unresponsiveSince) { $unresponsiveSince = $probeAt.AddSeconds(-$probeDelaySeconds) }
           elseif (($probeAt - $unresponsiveSince).TotalSeconds -ge 10) {
             $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
             break
@@ -197,6 +253,13 @@ try {
         } else { $unresponsiveSince = $null }
       }
       if ($null -ne $runtimeFailure) { break }
+      if ($null -ne $unresponsiveSince) {
+        $cutoffProbeAt = [DateTimeOffset]::UtcNow
+        if (($cutoffProbeAt - $unresponsiveSince).TotalSeconds -ge 10) {
+          $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
+          break
+        }
+      }
     }
   } finally {
     $process.Refresh()
@@ -220,17 +283,26 @@ try {
   $maxMb = if ($rendererSamples.Count -gt 0) { [double]($rendererSamples | Measure-Object -Maximum).Maximum } else { $null }
   $slopePerHour = $null
   if ($rendererObservations.Count -ge 2 -and $baselineMb -gt 0) {
-    $spanHours = [Math]::Max(1 / 3600, (($rendererObservations[-1].at - $rendererObservations[0].at) / 3600000))
-    $slopePerHour = (($rendererObservations[-1].workingSetMb - $rendererObservations[0].workingSetMb) / $baselineMb) / $spanHours
+    $slopePerHour = Get-NormalizedSlopePerHour $rendererObservations $baselineMb
   }
   $actualDurationMinutes = (([DateTimeOffset]::UtcNow - $startedAt).TotalMinutes)
   $rendererSampleCoverage = if ($samples.Count -gt 0) { $rendererObservations.Count / $samples.Count } else { 0 }
   $geaSampleCount = @($samples | Where-Object { $_.geaCount -gt 0 }).Count
   $geaSampleCoverage = if ($samples.Count -gt 0) { $geaSampleCount / $samples.Count } else { 0 }
+  $externalStatusSamples = @($samples | Where-Object {
+    $null -ne $_.externalStatusAgeMs -and [double]$_.externalStatusAgeMs -le 60000
+  })
+  $externalStatusCoverage = if ($samples.Count -gt 0) { $externalStatusSamples.Count / $samples.Count } else { 0 }
+  $rendererBlockedSamples = @($externalStatusSamples | Where-Object { $_.rendererBlocked -eq $true }).Count
+  $runtimeInvalidatedSamples = @($externalStatusSamples | Where-Object { $_.runtimeState -eq 'invalidated' }).Count
+  $latestExternalStatus = if ($externalStatusSamples.Count -gt 0) { $externalStatusSamples[-1] } else { $null }
   $durationComplete = $actualDurationMinutes -ge ($DurationMinutes - ($SampleSeconds / 60))
   $passed = $null -eq $runtimeFailure -and $rendererSamples.Count -gt 0 -and $baselineSamples.Count -gt 0 `
-    -and $p95Mb -le 384 -and $maxMb -le 512 -and $slopePerHour -le 0.02 -and $cleanShutdown `
+    -and $p95Mb -le 384 -and $maxMb -le 512 -and $null -ne $slopePerHour -and $slopePerHour -le 0.02 -and $cleanShutdown `
     -and $durationComplete -and $rendererSampleCoverage -ge 0.95 -and $geaSampleCoverage -ge 0.95 `
+    -and $externalStatusCoverage -ge 0.95 -and $rendererBlockedSamples -eq 0 -and $runtimeInvalidatedSamples -eq 0 `
+    -and $null -ne $latestExternalStatus -and $latestExternalStatus.rendererStatus -eq 'stable' `
+    -and $latestExternalStatus.runtimeState -eq 'healthy' -and $latestExternalStatus.externalStatusAgeMs -le 60000 `
     -and $devToolsDisabled -and $configuredTrackedTickers -eq 500
   $result = [ordered]@{
     schemaVersion = 2
@@ -249,6 +321,13 @@ try {
     rendererSlopePerHour = $slopePerHour
     rendererSampleCoverage = $rendererSampleCoverage
     geaSampleCoverage = $geaSampleCoverage
+    externalStatusCoverage = $externalStatusCoverage
+    rendererBlockedSampleCount = $rendererBlockedSamples
+    runtimeInvalidatedSampleCount = $runtimeInvalidatedSamples
+    finalRuntimeState = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.runtimeState }
+    finalRendererStatus = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.rendererStatus }
+    finalRendererHeartbeatAgeMs = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.rendererHeartbeatAgeMs }
+    finalRuntimeStatusAgeMs = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.externalStatusAgeMs }
     devToolsDisabled = $devToolsDisabled
     configuredTrackedTickers = $configuredTrackedTickers
     productionArtifactHash = $artifact.hash

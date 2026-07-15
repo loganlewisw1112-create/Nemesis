@@ -149,6 +149,7 @@ import { RuntimeHealthController, type RuntimeComponentHealth, type RuntimeHealt
 import { RuntimeEvidenceSidecar } from './runtimeEvidenceSidecar.js';
 import { EvidenceRunSupervisor } from './evidenceRunSupervisor.js';
 import { VersionedStateStream } from './stateStreamCoalescer.js';
+import { RuntimeStatusExporter, runtimeStatusPathFromEnvironment } from './runtimeStatusExport.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -333,6 +334,7 @@ let closeoutPrepared = false;
 let campaignFinalizationState: 'idle' | 'waiting-gea' | 'running' | 'done' = 'idle';
 let campaignFinalizationTimer: ReturnType<typeof setTimeout> | null = null;
 let evidenceInvalidationInProgress = false;
+const unsupervisedRuntimeStatusExporter = new RuntimeStatusExporter(runtimeStatusPathFromEnvironment());
 let lastDiscoveryRevision = '';
 let lastWorldRevision = '';
 const campaignBookTriggerScheduler = new CampaignBookTriggerScheduler(
@@ -742,9 +744,12 @@ function configuredCampaignPointer(stage: ActiveCampaignPointer['stage'], eviden
   };
 }
 
-function runtimeStatusPayload(state: string, detail: Record<string, unknown> = {}): Record<string, unknown> {
+function runtimeStatusPayload(
+  state: string,
+  detail: Record<string, unknown> = {},
+  now = Date.now(),
+): Record<string, unknown> {
   const pointer = pendingCampaignPointer ?? readActiveCampaignPointer();
-  const now = Date.now();
   const processes = currentProcessTelemetry(now);
   return {
     schemaVersion: 2,
@@ -754,7 +759,13 @@ function runtimeStatusPayload(state: string, detail: Record<string, unknown> = {
     updatedAt: now,
     campaign: campaignStore?.snapshot() ?? null,
     runtime: latestRuntimeDecision,
-    renderer: latestRendererMemoryAssessment,
+    renderer: {
+      ...latestRendererMemoryAssessment,
+      heartbeatAgeMs: rendererLastHeartbeatAt > 0
+        ? Math.max(0, now - rendererLastHeartbeatAt)
+        : Math.max(0, now - rendererMonitoringStartedAt),
+      unresponsiveForMs: rendererUnresponsiveAt == null ? 0 : Math.max(0, now - rendererUnresponsiveAt),
+    },
     bridge: { ...bridgeStatus },
     processes,
     feeds: feedHub.getFeedHealthSnapshot(),
@@ -1417,6 +1428,15 @@ function recordCampaignOperationalTelemetry(): void {
   if (campaignStore?.snapshot().manifest.status === 'active') {
     runtimeObservedSamples += 1;
     if (latestRuntimeDecision.lease.status === 'healthy') runtimeHealthySamples += 1;
+  }
+  try {
+    unsupervisedRuntimeStatusExporter.writeIfDue(runtimeStatusPayload(
+      latestRuntimeDecision.state,
+      { externalRuntimeStatus: true },
+      now,
+    ), now);
+  } catch (error) {
+    console.error('[nemesis] optional runtime status export failed', error);
   }
   try {
     const processes = currentProcessTelemetry(now);

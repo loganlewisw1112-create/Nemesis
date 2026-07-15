@@ -72,8 +72,15 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain("$env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'");
     expect(script).toContain('productionArtifactHash');
     expect(script).toContain('productionEntryHash');
-    expect(script).toContain('$rendererObservations[-1].at - $rendererObservations[0].at');
+    expect(script).toContain('Get-NormalizedSlopePerHour');
+    expect(script).toContain('$latestAt - 1800000');
+    expect(script).toContain("$null -ne $slopePerHour");
     expect(script).toContain('rendererSampleCoverage -ge 0.95');
     expect(script).toContain('geaSampleCoverage -ge 0.95');
+    expect(script).toContain('NEMESIS_RUNTIME_STATUS_PATH');
+    expect(script).toContain('externalStatusCoverage -ge 0.95');
+    expect(script).toContain("latestExternalStatus.rendererStatus -eq 'stable'");
+    expect(script).toContain("latestExternalStatus.runtimeState -eq 'healthy'");
+    expect(script).toContain('remained unresponsive for at least ten seconds');
   });
 });
