@@ -3850,6 +3850,11 @@ function createWindow() {
   startupTrace('window-after-create');
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
+  const forceInitialPaint = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.invalidate();
+    if (!mainWindow.isVisible()) mainWindow.show();
+  };
   mainWindow.webContents.on('did-fail-load', (_event, code, desc, url) => {
     console.error('[nemesis] did-fail-load', code, desc, url);
     if (devUrl && mainWindow) {
@@ -3858,20 +3863,35 @@ function createWindow() {
       }, 1500);
     }
   });
-  mainWindow.webContents.on('did-finish-load', () => startupTrace('renderer-did-finish-load'));
+  mainWindow.webContents.on('did-finish-load', () => {
+    startupTrace('renderer-did-finish-load');
+    forceInitialPaint();
+    setTimeout(forceInitialPaint, 250);
+    setTimeout(forceInitialPaint, 1_000);
+  });
   mainWindow.webContents.on('preload-error', (_event, preloadPath, error) => {
     console.error('[nemesis] preload-error', preloadPath, error);
   });
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error('[nemesis] render-process-gone', details.reason, details.exitCode);
   });
-  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
-    if (level >= 2) console.error('[nemesis] renderer-console', { level, message, line, sourceId });
+  mainWindow.webContents.on('console-message', (event) => {
+    if (event.level === 'warning' || event.level === 'error') {
+      console.error('[nemesis] renderer-console', {
+        level: event.level,
+        message: event.message,
+        line: event.lineNumber,
+        sourceId: event.sourceId,
+      });
+    }
   });
   mainWindow.on('unresponsive', () => console.error('[nemesis] main window became unresponsive'));
   mainWindow.on('responsive', () => console.warn('[nemesis] main window became responsive again'));
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show());
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.show();
+    forceInitialPaint();
+  });
 
   if (devUrl) {
     mainWindow.loadURL(devUrl).catch((err) => console.error('[nemesis] loadURL failed', err));
