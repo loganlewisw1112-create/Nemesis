@@ -196,4 +196,24 @@ describe('FeedHub trade tape degradation', () => {
     await hub.refreshTradeTape();
     expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
   });
+
+  it('refreshes the trade tape before the 30-second qualification lease expires', () => {
+    const { hub } = makeHub(vi.fn<typeof fetch>());
+    const firstSuccessAt = Date.now();
+    Object.assign(hub as unknown as Record<string, unknown>, {
+      tradesFetchedAt: firstSuccessAt,
+      tradeFeedState: {
+        ...hub.getTradeFeedState(),
+        status: 'ok',
+        lastSuccessAt: firstSuccessAt,
+        lastAttemptAt: firstSuccessAt,
+        nextRetryAt: null,
+      },
+    });
+    const shouldRefresh = (hub as unknown as { shouldRefreshTrades(now: number): boolean }).shouldRefreshTrades.bind(hub);
+
+    expect(shouldRefresh(firstSuccessAt + 14_999)).toBe(false);
+    expect(shouldRefresh(firstSuccessAt + 15_000)).toBe(true);
+    expect(firstSuccessAt + 15_000).toBeLessThan(firstSuccessAt + 30_000);
+  });
 });

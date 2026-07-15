@@ -57,7 +57,7 @@ const SHARED_GDELT_QUERY = 'united states economy politics';
 const TRADE_BACKOFF_BASE_MS = 30_000;
 const TRADE_BACKOFF_MAX_MS = 300_000;
 const TRADE_WARNING_THROTTLE_MS = 300_000;
-const TRADE_MIN_REQUEST_INTERVAL_MS = 30_000;
+const TRADE_MIN_REQUEST_INTERVAL_MS = 15_000;
 
 export interface FeedHubTradeFeedState {
   status: 'ok' | 'degraded';
@@ -391,7 +391,9 @@ export class FeedHub {
     if (nextRetryAt !== null && now < nextRetryAt) return false;
     const lastAttemptAt = this.tradeFeedState.lastAttemptAt;
     if (lastAttemptAt !== null && now - lastAttemptAt < TRADE_MIN_REQUEST_INTERVAL_MS) return false;
-    return this.tradeFeedState.status === 'degraded' || this.isStale(this.tradesFetchedAt, STALE_MS.trades);
+    return this.tradeFeedState.status === 'degraded'
+      || this.tradesFetchedAt === 0
+      || now - this.tradesFetchedAt >= TRADE_MIN_REQUEST_INTERVAL_MS;
   }
 
   private tradeTapeQualificationReady(now = Date.now()): boolean {

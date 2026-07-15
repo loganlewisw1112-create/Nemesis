@@ -186,6 +186,7 @@ const PAPER_BROADCAST_THROTTLE_MS = 1_000;
 const CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS = 500;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
+const REST_HEALTH_POLL_MS = 20_000;
 const BRIDGE_HEARTBEAT_MS = 5_000;
 const BRIDGE_TRAFFIC_TTL_MS = 15_000;
 const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
@@ -3812,6 +3813,7 @@ const runUniverseDiscovery = createSingleFlight(() => withAbortTimeout(
   UNIVERSE_FETCH_TIMEOUT_MS,
   'universe fetch timed out',
 ));
+const runRestHealthProbe = createSingleFlight(() => registry.pingKalshiRest());
 
 async function refreshMarkets(options: RefreshMarketsOptions = {}) {
   try {
@@ -5191,6 +5193,7 @@ app.whenReady().then(() => {
   startupTrace('kalshi-stream');
   feedHub.startBackgroundPolling(8_000);
   void feedHub.refreshForMarkets(FIXTURE_MARKETS);
+  setInterval(() => { void runRestHealthProbe().catch(() => undefined); }, REST_HEALTH_POLL_MS);
   startupTrace('feedhub-started');
 
   marketsCache = mergeGeaMarkets(FIXTURE_MARKETS);
