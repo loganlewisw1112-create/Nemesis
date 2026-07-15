@@ -185,6 +185,16 @@ declare global {
 }
 
 type Tab = 'theater' | 'paper' | 'markets' | 'journal' | 'profit' | 'settings' | 'world';
+export const DEFAULT_VISIBLE_THESIS_LIMIT = 25;
+
+export function limitVisibleItems<T>(
+  items: readonly T[],
+  limit = DEFAULT_VISIBLE_THESIS_LIMIT,
+  offset = 0,
+): T[] {
+  const start = Math.max(0, offset);
+  return items.slice(start, start + Math.max(0, limit));
+}
 
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
@@ -195,6 +205,7 @@ export default function App() {
   const [paperResult, setPaperResult] = useState<string | null>(null);
   const [liveResult, setLiveResult] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>('all');
+  const [visibleThesisOffset, setVisibleThesisOffset] = useState(0);
   const [paper, setPaper] = useState<PaperState | null>(null);
   const [ticks, setTicks] = useState<PriceTick[]>([]);
   const [backtestResult, setBacktestResult] = useState<string | null>(null);
@@ -355,6 +366,11 @@ export default function App() {
     if (filter === 'tradeable') return t.status === 'tradeable' || t.status === 'qualified' || t.status === 'watch-only';
     return t.playbook === filter || t.status === filter;
   });
+  const normalizedThesisOffset = Math.min(
+    visibleThesisOffset,
+    Math.max(0, Math.floor(Math.max(0, filtered.length - 1) / DEFAULT_VISIBLE_THESIS_LIMIT) * DEFAULT_VISIBLE_THESIS_LIMIT),
+  );
+  const visibleTheses = limitVisibleItems(filtered, DEFAULT_VISIBLE_THESIS_LIMIT, normalizedThesisOffset);
   const tierCounts = {
     scout: state.theses.filter((t) => t.executableTier === 'scout' || t.executableTier === 'solid' || t.executableTier === 'whale').length,
     solid: state.theses.filter((t) => t.executableTier === 'solid' || t.executableTier === 'whale').length,
@@ -464,7 +480,10 @@ export default function App() {
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   {['all', 'scout', 'solid', 'whale', 'tradeable', 'flow-hunter', 'weather-wing', 'crypto-lead', 'global-pulse'].map((f) => (
-                    <button key={f} type="button" onClick={() => setFilter(f)} style={chipStyle(filter === f)}>
+                    <button key={f} type="button" onClick={() => {
+                      setFilter(f);
+                      setVisibleThesisOffset(0);
+                    }} style={chipStyle(filter === f)}>
                       {f}{f === 'tradeable' ? ` (${tradableCount})` : f === 'scout' ? ` (${tierCounts.scout})` : f === 'solid' ? ` (${tierCounts.solid})` : f === 'whale' ? ` (${tierCounts.whale})` : ''}
                     </button>
                   ))}
@@ -500,7 +519,7 @@ export default function App() {
               )}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
                 <AnimatePresence>
-                {filtered.map((card) => (
+                {visibleTheses.map((card) => (
                   <motion.div
                     key={card.id}
                     initial={{ opacity: 0, y: 14, scale: 0.97 }}
@@ -547,6 +566,29 @@ export default function App() {
                 ))}
                 </AnimatePresence>
               </div>
+              {filtered.length > DEFAULT_VISIBLE_THESIS_LIMIT && (
+                <div style={{ display: 'flex', gap: 8, alignSelf: 'center', alignItems: 'center', marginTop: 12 }}>
+                  <button
+                    type="button"
+                    disabled={normalizedThesisOffset === 0}
+                    onClick={() => setVisibleThesisOffset((current) => Math.max(0, current - DEFAULT_VISIBLE_THESIS_LIMIT))}
+                    style={chipStyle(false)}
+                  >
+                    Previous 25
+                  </button>
+                  <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                    {normalizedThesisOffset + 1}–{normalizedThesisOffset + visibleTheses.length}/{filtered.length}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={normalizedThesisOffset + visibleTheses.length >= filtered.length}
+                    onClick={() => setVisibleThesisOffset((current) => Math.min(filtered.length - 1, current + DEFAULT_VISIBLE_THESIS_LIMIT))}
+                    style={chipStyle(false)}
+                  >
+                    Next 25
+                  </button>
+                </div>
+              )}
             </>
           )}
 

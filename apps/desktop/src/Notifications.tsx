@@ -61,6 +61,19 @@ export interface NemesisNotification {
   thesisId?: string;
 }
 
+export const MAX_NEW_OPPORTUNITY_NOTIFICATIONS_PER_UPDATE = 3;
+
+export function selectNewOpportunityNotifications(
+  theses: readonly ThesisCard[],
+  previousIds: ReadonlySet<string>,
+  limit = MAX_NEW_OPPORTUNITY_NOTIFICATIONS_PER_UPDATE,
+): ThesisCard[] {
+  return theses
+    .filter((card) => card.netEdge > 0.025 && card.status === 'tradeable' && !previousIds.has(card.id))
+    .sort((left, right) => right.netEdge - left.netEdge)
+    .slice(0, Math.max(0, limit));
+}
+
 interface PaperPos {
   id: string; ticker: string; title: string; side: 'yes' | 'no';
   contracts: number; entryPrice: number; fees: number;
@@ -87,6 +100,7 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
   const fired = useRef(new Map<string, number>());
   const prevPaper = useRef<PaperSlice | null>(null);
   const prevIds = useRef(new Set<string>());
+  const opportunitiesInitialized = useRef(false);
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   function push(n: Omit<NemesisNotification, 'ts'>) {
@@ -189,10 +203,16 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
 
   // New high-edge opportunity
   useEffect(() => {
-    for (const c of theses.filter((c) => c.netEdge > 0.025 && c.status === 'tradeable'))
-      if (!prevIds.current.has(c.id))
-        push({ id: `opp:${c.id}`, type: 'opportunity', severity: 'info',
-          title: 'New trade signal', body: `${c.title.slice(0, 55)} — ${(c.netEdge * 100).toFixed(1)}¢ edge`, thesisId: c.id });
+    if (!opportunitiesInitialized.current) {
+      if (theses.length === 0) return;
+      opportunitiesInitialized.current = true;
+      prevIds.current = new Set(theses.map((card) => card.id));
+      return;
+    }
+    for (const c of selectNewOpportunityNotifications(theses, prevIds.current)) {
+      push({ id: `opp:${c.id}`, type: 'opportunity', severity: 'info',
+        title: 'New trade signal', body: `${c.title.slice(0, 55)} — ${(c.netEdge * 100).toFixed(1)}¢ edge`, thesisId: c.id });
+    }
     prevIds.current = new Set(theses.map((c) => c.id));
   }, [theses]);
 

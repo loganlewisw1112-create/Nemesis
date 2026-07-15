@@ -7,18 +7,20 @@ function subscribe(channel: string, cb: (payload: unknown) => void): () => void 
 }
 
 let rendererPainted = false;
+let rendererHeartbeatSequence = 0;
 const reportRendererHeartbeat = () => ipcRenderer.send('renderer:heartbeat', {
   painted: rendererPainted,
   at: Date.now(),
+  sequence: ++rendererHeartbeatSequence,
 });
-const rendererHeartbeatTimer = setInterval(reportRendererHeartbeat, 5_000);
+reportRendererHeartbeat();
+setInterval(reportRendererHeartbeat, 5_000);
 window.addEventListener('DOMContentLoaded', () => {
   requestAnimationFrame(() => {
     rendererPainted = true;
     reportRendererHeartbeat();
   });
 }, { once: true });
-window.addEventListener('beforeunload', () => clearInterval(rendererHeartbeatTimer), { once: true });
 
 contextBridge.exposeInMainWorld('nemesis', {
   getState: () => ipcRenderer.invoke('nemesis:getState'),

@@ -150,6 +150,7 @@ import { RuntimeEvidenceSidecar } from './runtimeEvidenceSidecar.js';
 import { EvidenceRunSupervisor } from './evidenceRunSupervisor.js';
 import { VersionedStateStream } from './stateStreamCoalescer.js';
 import { RuntimeStatusExporter, runtimeStatusPathFromEnvironment } from './runtimeStatusExport.js';
+import { RendererHeartbeatMonitor } from './rendererHeartbeatMonitor.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -312,10 +313,7 @@ const rendererMemoryMonitor = new RendererMemoryMonitor();
 let latestRendererMemoryAssessment: RendererMemoryAssessment = rendererMemoryMonitor.snapshot();
 let runtimeHealthController = new RuntimeHealthController();
 let latestRuntimeDecision: RuntimeHealthDecision | null = null;
-let rendererLastHeartbeatAt = 0;
-let rendererMonitoringStartedAt = 0;
-let rendererUnresponsiveAt: number | null = null;
-let rendererHasPainted = false;
+const rendererHeartbeatMonitor = new RendererHeartbeatMonitor();
 let campaignEvidencePaused = true;
 let pendingCampaignPointer: ActiveCampaignPointer | null = null;
 let evidenceRunSupervisor: EvidenceRunSupervisor | null = null;
@@ -459,6 +457,31 @@ function currentProcessTelemetry(now = Date.now()): Record<string, unknown> {
           sampleAgeMs: Math.max(0, now - geaSampledAt),
         }
       : null,
+  };
+}
+
+function currentRendererRuntimeAssessment(now = Date.now()): RendererMemoryAssessment & Record<string, unknown> {
+  const heartbeat = rendererHeartbeatMonitor.snapshot(now);
+  const reasons = [...new Set([
+    ...latestRendererMemoryAssessment.reasons,
+    ...heartbeat.reasons,
+  ])];
+  const blocked = latestRendererMemoryAssessment.blocked || heartbeat.blocked;
+  return {
+    ...latestRendererMemoryAssessment,
+    status: blocked ? 'unstable-growth' : latestRendererMemoryAssessment.status,
+    blocked,
+    reasons,
+    detail: heartbeat.blocked
+      ? reasons.join('; ')
+      : latestRendererMemoryAssessment.detail,
+    heartbeatAgeMs: heartbeat.heartbeatAgeMs,
+    unresponsiveForMs: heartbeat.unresponsiveForMs,
+    heartbeatReceived: heartbeat.lastHeartbeatAt != null,
+    heartbeatPainted: heartbeat.painted,
+    heartbeatLoadingGraceUntil: heartbeat.loadingGraceUntil,
+    heartbeatLastReceivedAt: heartbeat.lastHeartbeatAt,
+    heartbeatLastRendererReportedAt: heartbeat.lastRendererReportedAt,
   };
 }
 
@@ -760,13 +783,7 @@ function runtimeStatusPayload(
     updatedAt: now,
     campaign: campaignStore?.snapshot() ?? null,
     runtime: latestRuntimeDecision,
-    renderer: {
-      ...latestRendererMemoryAssessment,
-      heartbeatAgeMs: rendererLastHeartbeatAt > 0
-        ? Math.max(0, now - rendererLastHeartbeatAt)
-        : Math.max(0, now - rendererMonitoringStartedAt),
-      unresponsiveForMs: rendererUnresponsiveAt == null ? 0 : Math.max(0, now - rendererUnresponsiveAt),
-    },
+    renderer: currentRendererRuntimeAssessment(now),
     bridge: { ...bridgeStatus },
     processes,
     feeds: feedHub.getFeedHealthSnapshot(),
@@ -936,16 +953,17 @@ function sampleRendererMemory(): void {
   const workingSetKb = metric?.memory.workingSetSize;
   if (!workingSetKb) return;
   const now = Date.now();
+  const heartbeat = rendererHeartbeatMonitor.snapshot(now);
   lastRendererMemorySampleAt = now;
   latestRendererMemoryAssessment = rendererMemoryMonitor.add({
     at: now,
     workingSetKb,
     rendererPid,
-    heartbeatAgeMs: rendererLastHeartbeatAt > 0
-      ? now - rendererLastHeartbeatAt
-      : Math.max(0, now - rendererMonitoringStartedAt),
-    unresponsiveForMs: rendererUnresponsiveAt == null ? 0 : now - rendererUnresponsiveAt,
-    painted: rendererHasPainted,
+    heartbeatAgeMs: heartbeat.lastHeartbeatAt == null && now <= heartbeat.loadingGraceUntil
+      ? 0
+      : heartbeat.heartbeatAgeMs,
+    unresponsiveForMs: heartbeat.unresponsiveForMs,
+    painted: heartbeat.painted,
   });
   const stable = latestRendererMemoryAssessment.status === 'stable' && !latestRendererMemoryAssessment.blocked;
   marketBroadcastThrottleMs = stable
@@ -1031,6 +1049,7 @@ function updatePreflightCycleCounts(): void {
 function preflightHealthyForStability(): boolean {
   const ticker = kalshiStream.telemetry();
   const orderbook = kalshiOrderbookStream.telemetry();
+  const heartbeat = rendererHeartbeatMonitor.snapshot();
   return settings.liveEnabled !== true
     && settings.autoLiveEnabled !== true
     && settings.dryRun === true
@@ -1038,6 +1057,9 @@ function preflightHealthyForStability(): boolean {
     && paperDesk.snapshot().trades.length === 0
     && paperOrderBook.working().length === 0
     && !latestRendererMemoryAssessment.blocked
+    && !heartbeat.blocked
+    && heartbeat.lastHeartbeatAt != null
+    && heartbeat.painted
     && preflightRestCycles >= 3
     && preflightTradeCycles >= 3
     && ticker.authenticated
@@ -1415,15 +1437,16 @@ function recordCampaignOperationalTelemetry(): void {
     return;
   }
   const components = runtimeComponents(now);
+  const rendererRuntimeAssessment = currentRendererRuntimeAssessment(now);
   const supervisorState = evidenceRunSupervisor?.snapshot().status;
   if (supervisorState === 'preflight') runtimeHealthController = new RuntimeHealthController();
   latestRuntimeDecision = runtimeHealthController.observe({
     at: now,
     components,
-    renderer: latestRendererMemoryAssessment,
+    renderer: rendererRuntimeAssessment,
     process: {
       geaRunning: process.env.NEMESIS_AUTO_SPAWN_GEA === 'false' || Boolean(geaProcess && !geaProcess.killed),
-      nemesisResponsive: rendererUnresponsiveAt == null,
+      nemesisResponsive: rendererRuntimeAssessment.blocked !== true,
     },
   });
   lastRuntimeSampleAt = now;
@@ -1446,7 +1469,7 @@ function recordCampaignOperationalTelemetry(): void {
       state: latestRuntimeDecision.state,
       lease: latestRuntimeDecision.lease,
       components,
-      renderer: latestRendererMemoryAssessment,
+      renderer: rendererRuntimeAssessment,
       bridge: { ...bridgeStatus },
       processes,
     }, now);
@@ -4372,9 +4395,13 @@ function invalidateLiveCertificate(reason: string) {
   auditLog.append({ action: 'gate_block', detail: `live certificate invalidated: ${reason}`, ok: false });
 }
 function setupIpc() {
-  ipcMain.on('renderer:heartbeat', (_event, payload: { painted?: boolean } | undefined) => {
-    rendererLastHeartbeatAt = Date.now();
-    rendererHasPainted ||= payload?.painted === true;
+  ipcMain.on('renderer:heartbeat', (event, payload: { painted?: boolean; at?: number; sequence?: number } | undefined) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    rendererHeartbeatMonitor.recordHeartbeat({
+      receivedAt: Date.now(),
+      reportedAt: payload?.at,
+      painted: payload?.painted,
+    });
   });
   ipcMain.handle('nemesis:getState', () => {
     const targetStage = settings.liveStage === 'manual-live' ? 'auto-live' : 'manual-live';
@@ -4955,7 +4982,7 @@ function setupIpc() {
 
 function createWindow() {
   startupTrace('window-before-create');
-  rendererMonitoringStartedAt = Date.now();
+  rendererHeartbeatMonitor.reset(Date.now());
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -4966,6 +4993,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
   startupTrace('window-after-create');
@@ -4986,7 +5014,6 @@ function createWindow() {
   });
   mainWindow.webContents.on('did-finish-load', () => {
     startupTrace('renderer-did-finish-load');
-    rendererLastHeartbeatAt = Date.now();
     forceInitialPaint();
     setTimeout(forceInitialPaint, 250);
     setTimeout(forceInitialPaint, 1_000);
@@ -4996,7 +5023,7 @@ function createWindow() {
   });
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error('[nemesis] render-process-gone', details.reason, details.exitCode);
-    rendererUnresponsiveAt ??= Date.now() - 11_000;
+    rendererHeartbeatMonitor.markRendererGone();
   });
   mainWindow.webContents.on('console-message', (event) => {
     if (event.level === 'warning' || event.level === 'error') {
@@ -5009,11 +5036,11 @@ function createWindow() {
     }
   });
   mainWindow.on('unresponsive', () => {
-    rendererUnresponsiveAt ??= Date.now();
+    rendererHeartbeatMonitor.markUnresponsive();
     console.error('[nemesis] main window became unresponsive');
   });
   mainWindow.on('responsive', () => {
-    rendererUnresponsiveAt = null;
+    rendererHeartbeatMonitor.markResponsive();
     console.warn('[nemesis] main window became responsive again');
   });
 
