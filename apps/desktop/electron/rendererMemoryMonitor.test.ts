@@ -44,6 +44,16 @@ describe('RendererMemoryMonitor', () => {
     expect(result.detail).toContain('rolling ten-minute window');
   });
 
+  it('excludes the five-minute warm-up from the rolling ten-minute growth gate', () => {
+    const monitor = new RendererMemoryMonitor(5 * 60_000, 1);
+    monitor.add({ at: 0, workingSetKb: 80 * MB, painted: true });
+    expect(monitor.add({ at: 5 * 60_000, workingSetKb: 100 * MB, painted: true }).status).toBe('stable');
+    expect(monitor.add({ at: 10 * 60_000, workingSetKb: 111 * MB, painted: true }).blocked).toBe(false);
+    const result = monitor.add({ at: 15 * 60_000, workingSetKb: 112 * MB, painted: true });
+    expect(result.blocked).toBe(true);
+    expect(result.growthRate).toBeCloseTo(0.12);
+  });
+
   it('blocks a thirty-minute projected slope above two percent of baseline per hour', () => {
     const monitor = new RendererMemoryMonitor(0, 1);
     monitor.add({ at: 0, workingSetKb: 100 * MB, painted: true });

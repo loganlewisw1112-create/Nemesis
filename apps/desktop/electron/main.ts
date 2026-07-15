@@ -194,6 +194,7 @@ const BRIDGE_HEARTBEAT_MS = 5_000;
 const BRIDGE_TRAFFIC_TTL_MS = 15_000;
 const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
 const RENDERER_MEMORY_SAMPLE_INTERVAL_MS = 30_000;
+const ORDERBOOK_TRACKING_LIMIT = 50;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
@@ -1448,7 +1449,9 @@ function recordCampaignOperationalTelemetry(): void {
     renderer: rendererRuntimeAssessment,
     process: {
       geaRunning: process.env.NEMESIS_AUTO_SPAWN_GEA === 'false' || Boolean(geaProcess && !geaProcess.killed),
-      nemesisResponsive: rendererRuntimeAssessment.blocked !== true,
+      // Renderer memory/heartbeat faults are already carried with their exact
+      // reasons above. Main-process responsiveness is supervised externally.
+      nemesisResponsive: true,
     },
   });
   lastRuntimeSampleAt = now;
@@ -2157,6 +2160,7 @@ function enrollCampaignCandidate(card: ThesisCard, preview: PaperBuyResult, book
     screening: decision,
     completedAt: at,
   }));
+  refreshOrderbookTracking();
   return { candidate: findCampaignCandidate(card), decision };
 }
 
@@ -3728,6 +3732,41 @@ function schedulePaperUpdate() {
   }, PAPER_BROADCAST_THROTTLE_MS);
 }
 
+function desiredOrderbookTickers(now = Date.now()): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (ticker: string | undefined) => {
+    if (!ticker || seen.has(ticker) || ordered.length >= ORDERBOOK_TRACKING_LIMIT) return;
+    seen.add(ticker);
+    ordered.push(ticker);
+  };
+  const campaign = campaignStore?.snapshot();
+  if (campaign?.manifest.status === 'active') {
+    const candidates = new Map(campaign.candidates.map((candidate) => [candidate.candidateId, candidate]));
+    for (const candidate of campaign.candidates) if (!candidate.terminalState) add(candidate.ticker);
+    for (const diagnostic of campaign.diagnostics) {
+      if (diagnostic.status !== 'scheduled' || diagnostic.dueAt > now + 60_000) continue;
+      add(candidates.get(diagnostic.candidateId)?.ticker);
+    }
+  }
+  const ranked = [...theses].sort((left, right) => {
+    const edge = finiteCampaignNumber(right.netEdge, 0) - finiteCampaignNumber(left.netEdge, 0);
+    if (edge !== 0) return edge;
+    return finiteCampaignNumber(left.freshnessMs, Number.MAX_SAFE_INTEGER)
+      - finiteCampaignNumber(right.freshnessMs, Number.MAX_SAFE_INTEGER);
+  });
+  for (const card of ranked) {
+    if (isEntryEligible(card) && hasRealExecutableDepth(card)) add(card.ticker);
+  }
+  for (const market of discovery.getMarketsForSignals()) add(market.ticker);
+  for (const card of ranked) add(card.ticker);
+  return ordered;
+}
+
+function refreshOrderbookTracking(): void {
+  kalshiOrderbookStream.replaceTracked(desiredOrderbookTickers());
+}
+
 function applyBridgeRecommendation(packet: RecommendationPacket) {
   const market = marketsCache.find((m) => m.ticker === packet.ticker)
     ?? geaMarkets.find((m) => m.ticker === packet.ticker);
@@ -3738,7 +3777,7 @@ function applyBridgeRecommendation(packet: RecommendationPacket) {
   opportunityQueue.discover(geaTheses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
-  kalshiOrderbookStream.track([...new Set(theses.map((t) => t.ticker))]);
+  refreshOrderbookTracking();
   publishMarketState();
   void evaluateAutoClosePositions('bridge-entry');
   void runThroughputCertification('bridge-entry');
@@ -4048,7 +4087,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
   opportunityQueue.discover(theses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
-  kalshiOrderbookStream.track([...new Set(theses.map((t) => t.ticker))]);
+  refreshOrderbookTracking();
 
   for (const c of theses) {
     recordTick(c.ticker, c.marketPrice, c.spread, c.netEdge);

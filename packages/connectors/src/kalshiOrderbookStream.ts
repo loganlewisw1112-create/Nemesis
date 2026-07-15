@@ -5,8 +5,7 @@ import type { KalshiWebSocketHeaderProvider } from './kalshiStream.js';
 
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
-const SUBSCRIPTION_BATCH_SIZE = 50;
-const SUBSCRIPTION_BATCH_INTERVAL_MS = 250;
+const DEFAULT_MAX_TRACKED_TICKERS = 50;
 
 export interface KalshiOrderbookStreamTelemetry {
   connected: boolean;
@@ -80,7 +79,6 @@ export class KalshiOrderbookStream {
   private reconnectDelayMs = 1_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private subscriptionPumpTimer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
   private reconnects = 0;
   private sequenceRegressions = 0;
@@ -99,6 +97,7 @@ export class KalshiOrderbookStream {
     private readonly registry: ConnectorRegistry,
     private readonly headers: KalshiWebSocketHeaderProvider,
     private readonly environment: KalshiEnvironment = 'production',
+    private readonly maxTrackedTickers = DEFAULT_MAX_TRACKED_TICKERS,
   ) {}
 
   start(): void {
@@ -112,7 +111,6 @@ export class KalshiOrderbookStream {
     this.tickersBySubscription.clear();
     this.subscriptionIdByKey.clear();
     this.pendingSnapshotRepair.clear();
-    this.clearSubscriptionPump();
     this.closeCurrentSocket();
     if (this.started) this.connect();
   }
@@ -121,12 +119,33 @@ export class KalshiOrderbookStream {
     this.started = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.clearSubscriptionPump();
     this.closeCurrentSocket();
   }
 
   track(tickers: string[]): void {
-    for (const ticker of tickers) if (ticker) this.tickers.add(ticker);
+    for (const ticker of tickers) {
+      if (!ticker || this.tickers.has(ticker) || this.tickers.size >= this.maxTrackedTickers) continue;
+      this.tickers.add(ticker);
+    }
+    this.subscribeMissing();
+  }
+
+  /** Replaces the bounded live-book working set without accumulating stale thesis tickers. */
+  replaceTracked(tickers: string[]): void {
+    const desired = new Set<string>();
+    for (const ticker of tickers) {
+      if (!ticker || desired.has(ticker)) continue;
+      desired.add(ticker);
+      if (desired.size >= this.maxTrackedTickers) break;
+    }
+    if (desired.size === this.tickers.size && [...desired].every((ticker) => this.tickers.has(ticker))) return;
+    const removed = [...this.tickers].filter((ticker) => !desired.has(ticker));
+    this.tickers.clear();
+    for (const ticker of desired) this.tickers.add(ticker);
+    for (const ticker of removed) {
+      this.books.delete(ticker);
+      this.quarantined.delete(ticker);
+    }
     this.subscribeMissing();
   }
 
@@ -248,7 +267,6 @@ export class KalshiOrderbookStream {
       this.socket = null;
       this.authenticated = false;
       this.clearHeartbeatTimer();
-      this.clearSubscriptionPump();
       this.subscribed.clear();
       if (!this.started) return;
       this.reconnects += 1;
@@ -273,31 +291,56 @@ export class KalshiOrderbookStream {
   }
 
   private subscribeMissing(): void {
-    if (this.socket?.readyState !== WebSocket.OPEN || this.subscriptionPumpTimer) return;
-    const pump = () => {
-      this.subscriptionPumpTimer = null;
-      const socket = this.socket;
-      if (socket?.readyState !== WebSocket.OPEN) return;
-      const batch = [...this.tickers]
-        .filter((ticker) => !this.subscribed.has(ticker))
-        .slice(0, SUBSCRIPTION_BATCH_SIZE);
-      if (batch.length === 0) return;
+    const socket = this.socket;
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    const subscriptionEntry = [...this.subscriptionIdByKey.entries()][0];
+    if (!subscriptionEntry) {
+      if (this.subscribed.size > 0 || this.tickers.size === 0) return;
+      const initial = [...this.tickers];
       try {
         socket.send(JSON.stringify({
           id: this.commandId++,
           cmd: 'subscribe',
-          params: { channels: ['orderbook_delta'], market_tickers: batch },
+          params: { channels: ['orderbook_delta'], market_tickers: initial },
         }));
       } catch {
         socket.close();
         return;
       }
-      for (const ticker of batch) this.subscribed.add(ticker);
-      if (this.subscribed.size < this.tickers.size) {
-        this.subscriptionPumpTimer = setTimeout(pump, SUBSCRIPTION_BATCH_INTERVAL_MS);
+      for (const ticker of initial) this.subscribed.add(ticker);
+      return;
+    }
+
+    const [subscription, sid] = subscriptionEntry;
+    const removed = [...this.subscribed].filter((ticker) => !this.tickers.has(ticker));
+    const added = [...this.tickers].filter((ticker) => !this.subscribed.has(ticker));
+    const sendUpdate = (marketTickers: string[], action: 'add_markets' | 'delete_markets'): boolean => {
+      if (marketTickers.length === 0) return true;
+      try {
+        socket.send(JSON.stringify({
+          id: this.commandId++,
+          cmd: 'update_subscription',
+          params: { sids: [sid], market_tickers: marketTickers, action },
+        }));
+        return true;
+      } catch {
+        socket.close();
+        return false;
       }
     };
-    pump();
+    if (!sendUpdate(removed, 'delete_markets')) return;
+    if (!sendUpdate(added, 'add_markets')) return;
+    const subscriptionTickers = this.tickersBySubscription.get(subscription) ?? new Set<string>();
+    for (const ticker of removed) {
+      this.subscribed.delete(ticker);
+      subscriptionTickers.delete(ticker);
+    }
+    for (const ticker of added) {
+      this.subscribed.add(ticker);
+      this.quarantined.add(ticker);
+      subscriptionTickers.add(ticker);
+    }
+    this.tickersBySubscription.set(subscription, subscriptionTickers);
   }
 
   /** Ingests one official WebSocket packet; public to support deterministic replay tests. */
@@ -307,8 +350,19 @@ export class KalshiOrderbookStream {
     try {
       const packet = JSON.parse(raw) as Record<string, unknown>;
       const type = String(packet.type ?? '');
-      const sequence = parseNumber(packet.seq);
       const msg = packet.msg && typeof packet.msg === 'object' ? packet.msg as Record<string, unknown> : null;
+      if (type === 'subscribed') {
+        const subscribedSid = parseNumber(msg?.sid ?? packet.sid);
+        if (subscribedSid != null) {
+          const subscription = String(subscribedSid);
+          this.subscriptionIdByKey.set(subscription, subscribedSid);
+          this.tickersBySubscription.set(subscription, new Set(this.subscribed));
+          this.subscribeMissing();
+        }
+        this.recordHealth();
+        return;
+      }
+      const sequence = parseNumber(packet.seq);
       if (sequence == null) {
         if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
         return;
@@ -318,11 +372,11 @@ export class KalshiOrderbookStream {
       if (numericSubscriptionId != null) this.subscriptionIdByKey.set(subscription, numericSubscriptionId);
       const subscriptionTickers = this.tickersBySubscription.get(subscription) ?? new Set<string>();
       const ticker = String(msg?.market_ticker ?? '');
-      if (ticker) subscriptionTickers.add(ticker);
+      if (ticker && (!this.started || this.subscribed.has(ticker))) subscriptionTickers.add(ticker);
       if (Array.isArray(msg?.market_tickers)) {
         for (const value of msg.market_tickers) {
           const controlTicker = String(value ?? '');
-          if (controlTicker) subscriptionTickers.add(controlTicker);
+          if (controlTicker && (!this.started || this.subscribed.has(controlTicker))) subscriptionTickers.add(controlTicker);
         }
       }
       this.tickersBySubscription.set(subscription, subscriptionTickers);
@@ -336,6 +390,12 @@ export class KalshiOrderbookStream {
         return;
       }
       this.sequenceBySubscription.set(subscription, sequence);
+      if (this.started && ticker && !this.tickers.has(ticker)) {
+        this.books.delete(ticker);
+        this.quarantined.delete(ticker);
+        this.recordHealth();
+        return;
+      }
       if (!ticker || !msg) {
         if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
         this.recordHealth();
@@ -454,6 +514,8 @@ export class KalshiOrderbookStream {
       lastCloseAt: telemetry.lastCloseAt,
       lastCloseCode: telemetry.lastCloseCode,
       lastCloseReason: telemetry.lastCloseReason,
+      trackedTickers: telemetry.trackedTickers,
+      qualifiedTickers: telemetry.qualifiedTickers,
       transportConnected: telemetry.connected,
       authenticated: telemetry.authenticated,
       qualificationReady: telemetry.qualificationReady,
@@ -475,7 +537,6 @@ export class KalshiOrderbookStream {
 
   private closeCurrentSocket(): void {
     this.clearHeartbeatTimer();
-    this.clearSubscriptionPump();
     const socket = this.socket;
     this.socket = null;
     this.authenticated = false;
@@ -486,11 +547,6 @@ export class KalshiOrderbookStream {
   private clearHeartbeatTimer(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
-  }
-
-  private clearSubscriptionPump(): void {
-    if (this.subscriptionPumpTimer) clearTimeout(this.subscriptionPumpTimer);
-    this.subscriptionPumpTimer = null;
   }
 
   private isCurrent(socket: WebSocket, generation: number): boolean {

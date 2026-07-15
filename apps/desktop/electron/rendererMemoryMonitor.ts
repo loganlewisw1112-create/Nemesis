@@ -130,7 +130,8 @@ export class RendererMemoryMonitor {
     }
 
     const firstAt = this.samples[0]!.at;
-    const baselineCandidates = this.samples.filter((item) => item.at - firstAt >= this.warmupMs);
+    const warmupCutoffAt = firstAt + this.warmupMs;
+    const baselineCandidates = this.samples.filter((item) => item.at >= warmupCutoffAt);
     if (this.baselineKb == null && baselineCandidates.length >= this.requiredBaselineSamples) {
       this.baselineKb = median(baselineCandidates.slice(0, this.requiredBaselineSamples).map((item) => item.workingSetKb));
     }
@@ -151,7 +152,9 @@ export class RendererMemoryMonitor {
     }
 
     const trendStart = sample.at - this.policy.trendWindowMs;
-    const trend = this.samples.filter((item) => item.at >= trendStart);
+    // Startup allocation is intentionally excluded. The ten-minute growth gate
+    // becomes eligible only after a full post-warm-up trend window exists.
+    const trend = this.samples.filter((item) => item.at >= Math.max(trendStart, warmupCutoffAt));
     const trendSpan = trend.length > 1 ? trend.at(-1)!.at - trend[0]!.at : 0;
     const growthRate = trendSpan >= this.policy.trendWindowMs * 0.9 ? endpointGrowth(trend) : 0;
     if (growthRate > this.policy.trendGrowthLimit) {

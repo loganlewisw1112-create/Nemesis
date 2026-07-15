@@ -429,6 +429,8 @@ export interface ConnectorHealth {
   lastCloseAt?: number | null;
   lastCloseCode?: number | null;
   lastCloseReason?: string | null;
+  trackedTickers?: number;
+  qualifiedTickers?: number;
   freshnessMs?: number | null;
   transportConnected?: boolean;
   authenticated?: boolean;

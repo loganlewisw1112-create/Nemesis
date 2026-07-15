@@ -159,23 +159,32 @@ describe('KalshiOrderbookStream', () => {
     stream.stop();
   });
 
-  it('paces 500-ticker subscription recovery in bounded batches', async () => {
-    vi.useFakeTimers();
+  it('bounds live orderbooks to one 50-ticker subscription and updates that subscription in place', () => {
     const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
     const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() };
-    Object.assign(stream as unknown as Record<string, unknown>, { socket, authenticated: true, generation: 1 });
+    Object.assign(stream as unknown as Record<string, unknown>, { socket, authenticated: true, generation: 1, started: true });
     const tickers = Array.from({ length: 120 }, (_, index) => `KX-${index}`);
 
     stream.track(tickers);
     expect(socket.send).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(socket.send.mock.calls[0]![0])).params.market_tickers).toHaveLength(50);
-    await vi.advanceTimersByTimeAsync(249);
+    expect(stream.telemetry().trackedTickers).toBe(50);
+    stream.ingest(JSON.stringify({ type: 'subscribed', msg: { channel: 'orderbook_delta', sid: 7 } }), 1);
     expect(socket.send).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(socket.send).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(250);
+
+    stream.replaceTracked(tickers.slice(40, 90));
     expect(socket.send).toHaveBeenCalledTimes(3);
-    expect(JSON.parse(String(socket.send.mock.calls[2]![0])).params.market_tickers).toHaveLength(20);
+    expect(JSON.parse(String(socket.send.mock.calls[1]![0]))).toMatchObject({
+      cmd: 'update_subscription',
+      params: { sids: [7], action: 'delete_markets' },
+    });
+    expect(JSON.parse(String(socket.send.mock.calls[1]![0])).params.market_tickers).toHaveLength(40);
+    expect(JSON.parse(String(socket.send.mock.calls[2]![0]))).toMatchObject({
+      cmd: 'update_subscription',
+      params: { sids: [7], action: 'add_markets' },
+    });
+    expect(JSON.parse(String(socket.send.mock.calls[2]![0])).params.market_tickers).toHaveLength(40);
+    expect(stream.telemetry().trackedTickers).toBe(50);
     stream.stop();
   });
 
