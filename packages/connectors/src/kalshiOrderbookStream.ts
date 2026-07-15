@@ -26,6 +26,7 @@ export interface KalshiOrderbookStreamTelemetry {
   lastCloseAt: number | null;
   lastCloseCode: number | null;
   lastCloseReason: string | null;
+  lastCloseTrigger: string | null;
   subscriptionUpdates: number;
   subscriptionUpdateQueueDepth: number;
   subscriptionUpdateInFlight: boolean;
@@ -105,6 +106,8 @@ export class KalshiOrderbookStream {
   private lastCloseAt: number | null = null;
   private lastCloseCode: number | null = null;
   private lastCloseReason: string | null = null;
+  private lastCloseTrigger: string | null = null;
+  private pendingCloseTrigger: string | null = null;
   private subscriptionUpdates = 0;
   private readonly subscriptionUpdateQueue: SubscriptionUpdateCommand[] = [];
   private pendingSubscriptionUpdate: PendingSubscriptionUpdate | null = null;
@@ -225,6 +228,7 @@ export class KalshiOrderbookStream {
       lastCloseAt: this.lastCloseAt,
       lastCloseCode: this.lastCloseCode,
       lastCloseReason: this.lastCloseReason,
+      lastCloseTrigger: this.lastCloseTrigger,
       subscriptionUpdates: this.subscriptionUpdates,
       subscriptionUpdateQueueDepth: this.subscriptionUpdateQueue.length,
       subscriptionUpdateInFlight: this.pendingSubscriptionUpdate != null,
@@ -261,6 +265,7 @@ export class KalshiOrderbookStream {
       this.pendingSnapshotRepair.clear();
       this.subscriptionUpdateQueue.length = 0;
       this.pendingSubscriptionUpdate = null;
+      this.pendingCloseTrigger = null;
       this.lastSequencedDeltaAt = null;
       for (const ticker of this.tickers) this.quarantined.add(ticker);
       this.lastMessageAt = Date.now();
@@ -282,12 +287,17 @@ export class KalshiOrderbookStream {
       this.lastPongAt = Date.now();
       this.recordHealth();
     });
-    socket.on('error', () => socket.close());
+    socket.on('error', (error) => {
+      this.pendingCloseTrigger = `socket_error:${error instanceof Error ? error.message : String(error)}`;
+      socket.close();
+    });
     socket.on('close', (code, reason) => {
       if (!this.isCurrent(socket, generation)) return;
       this.lastCloseAt = Date.now();
       this.lastCloseCode = code;
-      this.lastCloseReason = reason.toString('utf8') || null;
+      this.lastCloseTrigger = this.pendingCloseTrigger ?? 'remote_close_without_reason';
+      this.lastCloseReason = reason.toString('utf8') || this.lastCloseTrigger;
+      this.pendingCloseTrigger = null;
       this.socket = null;
       this.authenticated = false;
       this.clearHeartbeatTimer();
@@ -306,6 +316,7 @@ export class KalshiOrderbookStream {
         lastCloseAt: this.lastCloseAt,
         lastCloseCode: this.lastCloseCode,
         lastCloseReason: this.lastCloseReason,
+        lastCloseTrigger: this.lastCloseTrigger,
       });
       const waitMs = this.reconnectDelayMs;
       this.reconnectDelayMs = Math.min(30_000, this.reconnectDelayMs * 2);
@@ -330,6 +341,7 @@ export class KalshiOrderbookStream {
           params: { channels: ['orderbook_delta'], market_tickers: initial },
         }));
       } catch {
+        this.pendingCloseTrigger = 'initial_subscription_send_failed';
         socket.close();
         return;
       }
@@ -372,6 +384,7 @@ export class KalshiOrderbookStream {
         this.pendingSubscriptionUpdate = null;
         this.subscriptionUpdateQueue.length = 0;
         this.registry.recordWarn('kalshi-orderbook-ws', errorMessage);
+        this.pendingCloseTrigger = `subscription_update_error:${errorMessage}`;
         this.socket?.close();
         return;
       }
@@ -390,6 +403,7 @@ export class KalshiOrderbookStream {
       if (sequence == null) {
         if (acknowledgesPendingUpdate) {
           this.registry.recordWarn('kalshi-orderbook-ws', 'subscription update acknowledgement lacked a sequence');
+          this.pendingCloseTrigger = 'subscription_update_ack_missing_sequence';
           this.socket?.close();
           return;
         }
@@ -413,6 +427,7 @@ export class KalshiOrderbookStream {
       if (previousSequence != null && sequence !== previousSequence + 1) {
         if (acknowledgesPendingUpdate) {
           this.registry.recordWarn('kalshi-orderbook-ws', 'subscription update acknowledgement broke sequence continuity');
+          this.pendingCloseTrigger = 'subscription_update_ack_sequence_gap';
           this.socket?.close();
           return;
         }
@@ -526,6 +541,7 @@ export class KalshiOrderbookStream {
       const freshestTrafficAt = Math.max(this.lastMessageAt ?? 0, this.lastPongAt ?? 0);
       if (freshestTrafficAt === 0 || now - freshestTrafficAt > DEAD_CONNECTION_MS) {
         this.registry.recordWarn('kalshi-orderbook-ws', 'order-book websocket liveness expired');
+        this.pendingCloseTrigger = 'local_liveness_expired';
         socket.terminate();
         return;
       }
@@ -546,6 +562,7 @@ export class KalshiOrderbookStream {
       lastCloseAt: telemetry.lastCloseAt,
       lastCloseCode: telemetry.lastCloseCode,
       lastCloseReason: telemetry.lastCloseReason,
+      lastCloseTrigger: telemetry.lastCloseTrigger,
       trackedTickers: telemetry.trackedTickers,
       qualifiedTickers: telemetry.qualifiedTickers,
       subscriptionUpdates: telemetry.subscriptionUpdates,
@@ -611,6 +628,7 @@ export class KalshiOrderbookStream {
       this.subscriptionUpdates += 1;
     } catch {
       this.subscriptionUpdateQueue.unshift(command);
+      this.pendingCloseTrigger = 'subscription_update_send_failed';
       this.socket.close();
     }
   }
