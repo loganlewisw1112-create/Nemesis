@@ -40,4 +40,14 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('$MainEntryArg = \'"\' + $MainEntry + \'"\'');
     expect(script).toContain('-ArgumentList @($MainEntryArg)');
   });
+
+  it('launches evidence campaigns from a frozen production build with DevTools disabled', () => {
+    const script = fs.readFileSync(path.join(repoRoot, 'scripts', 'start-evidence-campaign.ps1'), 'utf8');
+
+    expect(script).toContain('npm run build');
+    expect(script).toContain("$env:NEMESIS_DEVTOOLS = 'false'");
+    expect(script).toContain('dist-electron\\main.js');
+    expect(script).toContain('& $electronExe $mainEntry');
+    expect(script).not.toContain('npm run dev');
+  });
 });
