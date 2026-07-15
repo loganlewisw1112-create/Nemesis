@@ -119,7 +119,12 @@ import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
 import { PaperQualificationStore } from './paperQualificationStore.js';
 import { StrategyValidationStore } from './strategyValidationStore.js';
 import { SevenHourCampaignStore } from './sevenHourCampaignStore.js';
-import { campaignPendingCapacity, isEvidenceOnlyCampaignExecution } from './campaignRuntime.js';
+import {
+  CampaignBookTriggerScheduler,
+  campaignBookUpdateWork,
+  campaignPendingCapacity,
+  isEvidenceOnlyCampaignExecution,
+} from './campaignRuntime.js';
 import { KalshiFeePolicyResolver } from './kalshiFeePolicyResolver.js';
 import { buildStrategyConfigHash, PAPER_STRATEGY_ENGINE_VERSION } from './qualificationConfig.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
@@ -162,6 +167,7 @@ const BOOK_CACHE_TTL_MS = 600;
 const MARKET_BROADCAST_THROTTLE_MS = 750;
 const DEGRADED_MARKET_BROADCAST_THROTTLE_MS = 3_000;
 const PAPER_BROADCAST_THROTTLE_MS = 1_000;
+const CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS = 500;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
 
@@ -258,6 +264,17 @@ let marketBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 let paperBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 let marketBroadcastThrottleMs = MARKET_BROADCAST_THROTTLE_MS;
 const rendererMemoryMonitor = new RendererMemoryMonitor();
+const campaignBookTriggerScheduler = new CampaignBookTriggerScheduler(
+  CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS,
+  ({ throughputTickers, confirmationTickers }) => {
+    if (throughputTickers.length > 0) {
+      void runThroughputCertification('exchange-book-delta', new Set(throughputTickers));
+    }
+    if (confirmationTickers.length > 0) {
+      void evaluateCampaignConfirmations(new Set(confirmationTickers));
+    }
+  },
+);
 
 interface StoredKalshiCredentials {
   storage: 'electron-safeStorage-v1';
@@ -804,6 +821,7 @@ function recordPaperBlock(input: {
   code?: string;
   severity?: 'info' | 'warning' | 'error';
   blocksLiveUnlock?: boolean;
+  formalQualificationEligible?: boolean;
 }) {
   if (isAbnormalExecutionCode(input.code)) recordDryRunAbnormalExecution();
   const blocksLiveUnlock = input.blocksLiveUnlock ?? isAbnormalExecutionCode(input.code);
@@ -817,11 +835,13 @@ function recordPaperBlock(input: {
     severity: input.severity ?? (isAbnormalExecutionCode(input.code) ? 'error' : 'info'),
     blocksLiveUnlock,
   });
-  recordQualification((tracker) => tracker.recordAbort(
-    input.code ?? 'paper_abort',
-    input.detail,
-    blocksLiveUnlock,
-  ));
+  if (input.formalQualificationEligible !== false) {
+    recordQualification((tracker) => tracker.recordAbort(
+      input.code ?? 'paper_abort',
+      input.detail,
+      blocksLiveUnlock,
+    ));
+  }
   saveAuditLog();
 }
 
@@ -1282,6 +1302,8 @@ async function executeReservedStrictPaperBuyForCard(
   contracts: number | undefined,
   source: 'manual' | 'working-order' | 'throughput',
 ): Promise<PaperBuyResult> {
+  const activeCampaign = source === 'throughput' ? campaignSnapshot() : null;
+  const evidenceOnlyCampaign = isEvidenceOnlyCampaignExecution(source, activeCampaign);
   if (source !== 'manual' && qualificationSnapshot()?.rollingLossPaused) {
     const reason = 'automatic entries paused by the rolling 20-position loss rule';
     recordPaperBlock({
@@ -1291,11 +1313,10 @@ async function executeReservedStrictPaperBuyForCard(
       code: 'rolling_loss_pause',
       severity: 'warning',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     return { ok: false, error: reason, abortCode: 'rolling_loss_pause', queueState: 'blocked_final', wouldMutate: false };
   }
-  const activeCampaign = source === 'throughput' ? campaignSnapshot() : null;
-  const evidenceOnlyCampaign = isEvidenceOnlyCampaignExecution(source, activeCampaign);
   const validation = evidenceOnlyCampaign ? null : strategyValidationSnapshot();
   if (!evidenceOnlyCampaign && (!validation || validation.integrityError)) {
     const reason = `strategy validation evidence is unavailable or corrupt: ${validation?.integrityError ?? 'store unavailable'}`;
@@ -1316,6 +1337,7 @@ async function executeReservedStrictPaperBuyForCard(
       code: 'signal_eligibility_block',
       severity: 'info',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     return {
       ok: false,
@@ -1339,6 +1361,7 @@ async function executeReservedStrictPaperBuyForCard(
       code: 'risk_gate_block',
       severity: 'warning',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     opportunityQueue.markBlocked(key, risk.error ?? 'risk gate blocked', false);
     return { ok: false, error: risk.error, abortCode: 'risk_gate_block', queueState: 'blocked_final', wouldMutate: false };
@@ -1348,12 +1371,16 @@ async function executeReservedStrictPaperBuyForCard(
   try {
     book = await fetchBookForCard(card);
     opportunityQueue.markBookFetched(key);
-    if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('books_fetched'));
+    if (source === 'throughput' && !evidenceOnlyCampaign) {
+      recordQualification((tracker) => tracker.recordFunnel('books_fetched'));
+    }
   } catch (error) {
     const reason = describeBookFetchError(error);
     const backoffActive = isBookFetchBackoffError(error);
     opportunityQueue.markBlocked(key, `book unavailable: ${reason}`, true);
-    if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('books_unavailable', 1, 'book_unavailable'));
+    if (source === 'throughput' && !evidenceOnlyCampaign) {
+      recordQualification((tracker) => tracker.recordFunnel('books_unavailable', 1, 'book_unavailable'));
+    }
     if (!backoffActive) {
       sessionStatsData.abortCount += 1;
       recordPaperBlock({
@@ -1363,6 +1390,7 @@ async function executeReservedStrictPaperBuyForCard(
         code: 'book_unavailable',
         severity: 'warning',
         blocksLiveUnlock: false,
+        formalQualificationEligible: !evidenceOnlyCampaign,
       });
       saveSessionStats();
     }
@@ -1423,6 +1451,7 @@ async function executeReservedStrictPaperBuyForCard(
       code: preview.abortCode,
       severity: preview.abortCode === 'strict_profit_block' ? 'info' : 'warning',
       blocksLiveUnlock: isAbnormalExecutionCode(preview.abortCode),
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     sessionStatsData.abortCount += 1;
     saveSessionStats();
@@ -1524,6 +1553,7 @@ async function executeReservedStrictPaperBuyForCard(
       code,
       severity: 'info',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     return {
       ok: false,
@@ -2336,7 +2366,7 @@ function processWorkingOrders() {
   }
 }
 
-async function runThroughputCertification(trigger: string) {
+async function runThroughputCertification(trigger: string, tickerFilter?: ReadonlySet<string>) {
   const throughput = { ...DEFAULT_OPPORTUNITY_THROUGHPUT, ...(settings.opportunityThroughput ?? {}) };
   if (
     !throughput.enabled
@@ -2353,23 +2383,35 @@ async function runThroughputCertification(trigger: string) {
       : Math.max(0, throughput.maxDailyCertifiedTrades - executed);
     if (remaining <= 0) return;
 
-    recordQualification((tracker) => tracker.recordFunnel('raw_candidates', theses.length));
-    const rankedCandidates = theses
+    const throughputCampaign = campaignSnapshot();
+    const existingCampaignIdentities = throughputCampaign?.manifest.status === 'active'
+      ? new Set(throughputCampaign.candidates.map((candidate) => candidate.economicIdentity))
+      : null;
+    const rawCandidates = tickerFilter
+      ? theses.filter((card) => tickerFilter.has(card.ticker))
+      : theses;
+    const formalQualificationEligible = throughputCampaign?.manifest.status !== 'active';
+    if (formalQualificationEligible) {
+      recordQualification((tracker) => tracker.recordFunnel('raw_candidates', rawCandidates.length));
+    }
+    const rankedCandidates = rawCandidates
       .filter((card) => isEntryEligible(card)
         && hasRealExecutableDepth(card)
-        && !openKeys.has(opportunityKey(card)))
+        && !openKeys.has(opportunityKey(card))
+        && !existingCampaignIdentities?.has(candidateEconomicIdentity(card)))
       .sort((a, b) => {
         const edgeDelta = b.netEdge - a.netEdge;
         if (edgeDelta !== 0) return edgeDelta;
         return (a.freshnessMs ?? 0) - (b.freshnessMs ?? 0);
       });
-    recordQualification((tracker) => tracker.recordFunnel('entry_eligible', rankedCandidates.length));
+    if (formalQualificationEligible) {
+      recordQualification((tracker) => tracker.recordFunnel('entry_eligible', rankedCandidates.length));
+    }
     const deduplicatedCandidates = dedupeByExecutionKey(rankedCandidates, opportunityKey);
     const duplicateCount = rankedCandidates.length - deduplicatedCandidates.length;
-    if (duplicateCount > 0) {
+    if (duplicateCount > 0 && formalQualificationEligible) {
       recordQualification((tracker) => tracker.recordFunnel('duplicates_removed', duplicateCount, 'duplicate_execution_key'));
     }
-    const throughputCampaign = campaignSnapshot();
     const validation = strategyValidationSnapshot();
     const pendingCapacity = throughputCampaign?.manifest.status === 'active'
       ? campaignPendingCapacity(throughputCampaign, entryQualificationSettings().maxPendingCandidates)
@@ -2404,7 +2446,7 @@ async function runThroughputCertification(trigger: string) {
   }
 }
 
-async function evaluateCampaignConfirmations(): Promise<void> {
+async function evaluateCampaignConfirmations(tickerFilter?: ReadonlySet<string>): Promise<void> {
   if (campaignConfirmationWorkerRunning || !campaignStore) return;
   const snapshot = campaignSnapshot();
   if (!snapshot || snapshot.manifest.status !== 'active') return;
@@ -2413,7 +2455,8 @@ async function evaluateCampaignConfirmations(): Promise<void> {
     campaignStore.record((tracker) => tracker.finalize(now));
     return;
   }
-  const pending = snapshot.candidates.filter((candidate) => !candidate.terminalState).slice(0, 4);
+  const pending = snapshot.candidates.filter((candidate) =>
+    !candidate.terminalState && (!tickerFilter || tickerFilter.has(candidate.ticker))).slice(0, 4);
   if (pending.length === 0) return;
   campaignConfirmationWorkerRunning = true;
   try {
@@ -3815,6 +3858,18 @@ function createWindow() {
       }, 1500);
     }
   });
+  mainWindow.webContents.on('did-finish-load', () => startupTrace('renderer-did-finish-load'));
+  mainWindow.webContents.on('preload-error', (_event, preloadPath, error) => {
+    console.error('[nemesis] preload-error', preloadPath, error);
+  });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[nemesis] render-process-gone', details.reason, details.exitCode);
+  });
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) console.error('[nemesis] renderer-console', { level, message, line, sourceId });
+  });
+  mainWindow.on('unresponsive', () => console.error('[nemesis] main window became unresponsive'));
+  mainWindow.on('responsive', () => console.warn('[nemesis] main window became responsive again'));
 
   mainWindow.once('ready-to-show', () => mainWindow?.show());
 
@@ -3869,8 +3924,16 @@ app.whenReady().then(() => {
       || book.sourceTimestamp == null
       || observedAt - book.sourceTimestamp > entryQualificationSettings().maxBookAgeMs
     ) return;
-    void runThroughputCertification('exchange-book-delta');
-    void evaluateCampaignConfirmations();
+    const campaign = campaignSnapshot();
+    const eligibleCards = theses.filter((card) =>
+      card.ticker === book.ticker
+      && isEntryEligible(card)
+      && hasRealExecutableDepth(card));
+    campaignBookTriggerScheduler.request(
+      book.ticker,
+      campaignBookUpdateWork(book.ticker, eligibleCards, campaign),
+      observedAt,
+    );
   });
   setupIpc();
   startupTrace('ipc');
@@ -3960,6 +4023,7 @@ app.whenReady().then(() => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  campaignBookTriggerScheduler.stop();
   kalshiStream.stop();
   kalshiOrderbookStream.stop();
   if (geaProcess && !geaProcess.killed) geaProcess.kill();
