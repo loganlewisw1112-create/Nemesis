@@ -31,6 +31,9 @@ export interface KalshiTickerStreamTelemetry {
   sequenceGaps: number;
   lastMessageAt: number | null;
   lastPongAt: number | null;
+  lastCloseAt: number | null;
+  lastCloseCode: number | null;
+  lastCloseReason: string | null;
 }
 
 type QuoteListener = (quote: KalshiTickerQuote) => void;
@@ -53,6 +56,9 @@ export class KalshiStream {
   private lastMessageAt: number | null = null;
   private lastPongAt: number | null = null;
   private authenticated = false;
+  private lastCloseAt: number | null = null;
+  private lastCloseCode: number | null = null;
+  private lastCloseReason: string | null = null;
   private readonly listeners = new Set<QuoteListener>();
 
   constructor(
@@ -88,6 +94,9 @@ export class KalshiStream {
       sequenceGaps: this.sequenceGaps,
       lastMessageAt: this.lastMessageAt,
       lastPongAt: this.lastPongAt,
+      lastCloseAt: this.lastCloseAt,
+      lastCloseCode: this.lastCloseCode,
+      lastCloseReason: this.lastCloseReason,
     };
   }
 
@@ -192,7 +201,7 @@ export class KalshiStream {
       this.recordHealthy();
     });
     socket.on('error', () => socket.close());
-    socket.on('close', () => this.handleClose(socket, generation));
+    socket.on('close', (code, reason) => this.handleClose(socket, generation, code, reason.toString('utf8') || null));
   }
 
   private startHeartbeat(socket: WebSocket, generation: number): void {
@@ -210,8 +219,11 @@ export class KalshiStream {
     }, PING_INTERVAL_MS);
   }
 
-  private handleClose(socket: WebSocket, generation: number): void {
+  private handleClose(socket: WebSocket, generation: number, code: number, reason: string | null): void {
     if (!this.isCurrent(socket, generation)) return;
+    this.lastCloseAt = Date.now();
+    this.lastCloseCode = code;
+    this.lastCloseReason = reason;
     this.socket = null;
     this.authenticated = false;
     this.subscribed.clear();
@@ -226,6 +238,9 @@ export class KalshiStream {
       transportConnected: false,
       authenticated: false,
       qualificationReady: false,
+      lastCloseAt: this.lastCloseAt,
+      lastCloseCode: this.lastCloseCode,
+      lastCloseReason: this.lastCloseReason,
     });
     const waitMs = this.reconnectMs;
     this.reconnectMs = Math.min(30_000, this.reconnectMs * 2);
@@ -302,6 +317,9 @@ export class KalshiStream {
       lastPongAt: telemetry.lastPongAt,
       reconnects: telemetry.reconnects,
       sequenceGaps: telemetry.sequenceGaps,
+      lastCloseAt: telemetry.lastCloseAt,
+      lastCloseCode: telemetry.lastCloseCode,
+      lastCloseReason: telemetry.lastCloseReason,
       transportConnected: telemetry.connected,
       authenticated: telemetry.authenticated,
       qualificationReady: telemetry.qualificationReady,

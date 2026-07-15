@@ -79,8 +79,10 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('geaSampleCoverage -ge 0.95');
     expect(script).toContain('NEMESIS_RUNTIME_STATUS_PATH');
     expect(script).toContain('externalStatusCoverage -ge 0.95');
-    expect(script).toContain("latestExternalStatus.rendererStatus -eq 'stable'");
-    expect(script).toContain("latestExternalStatus.runtimeState -eq 'healthy'");
+    expect(script).toContain('production-soak-runtime-status-at-cutoff.json');
+    expect(script).toContain("cutoffExternalStatus.runtime.state -eq 'invalidated'");
+    expect(script).toContain("finalRendererStatus -eq 'stable'");
+    expect(script).toContain("finalRuntimeState -eq 'healthy'");
     expect(script).toContain("$sample.runtimeState -eq 'invalidated'");
     expect(script).toContain('remained unresponsive for at least ten seconds');
   });

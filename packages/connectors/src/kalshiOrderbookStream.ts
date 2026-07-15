@@ -24,6 +24,9 @@ export interface KalshiOrderbookStreamTelemetry {
   lastMessageAt: number | null;
   lastSequencedDeltaAt: number | null;
   lastExchangeTimestamp: number | null;
+  lastCloseAt: number | null;
+  lastCloseCode: number | null;
+  lastCloseReason: string | null;
 }
 
 interface MutableBook {
@@ -87,6 +90,9 @@ export class KalshiOrderbookStream {
   private lastPongAt: number | null = null;
   private lastSequencedDeltaAt: number | null = null;
   private lastExchangeTimestamp: number | null = null;
+  private lastCloseAt: number | null = null;
+  private lastCloseCode: number | null = null;
+  private lastCloseReason: string | null = null;
   private readonly bookUpdateListeners = new Set<BookUpdateListener>();
 
   constructor(
@@ -178,6 +184,9 @@ export class KalshiOrderbookStream {
       lastMessageAt: this.lastMessageAt,
       lastSequencedDeltaAt: this.lastSequencedDeltaAt,
       lastExchangeTimestamp: this.lastExchangeTimestamp,
+      lastCloseAt: this.lastCloseAt,
+      lastCloseCode: this.lastCloseCode,
+      lastCloseReason: this.lastCloseReason,
     };
   }
 
@@ -231,8 +240,11 @@ export class KalshiOrderbookStream {
       this.recordHealth();
     });
     socket.on('error', () => socket.close());
-    socket.on('close', () => {
+    socket.on('close', (code, reason) => {
       if (!this.isCurrent(socket, generation)) return;
+      this.lastCloseAt = Date.now();
+      this.lastCloseCode = code;
+      this.lastCloseReason = reason.toString('utf8') || null;
       this.socket = null;
       this.authenticated = false;
       this.clearHeartbeatTimer();
@@ -247,6 +259,9 @@ export class KalshiOrderbookStream {
         transportConnected: false,
         authenticated: false,
         qualificationReady: false,
+        lastCloseAt: this.lastCloseAt,
+        lastCloseCode: this.lastCloseCode,
+        lastCloseReason: this.lastCloseReason,
       });
       const waitMs = this.reconnectDelayMs;
       this.reconnectDelayMs = Math.min(30_000, this.reconnectDelayMs * 2);
@@ -436,6 +451,9 @@ export class KalshiOrderbookStream {
       lastPongAt: telemetry.lastPongAt,
       reconnects: telemetry.reconnects,
       sequenceGaps: telemetry.sequenceGaps,
+      lastCloseAt: telemetry.lastCloseAt,
+      lastCloseCode: telemetry.lastCloseCode,
+      lastCloseReason: telemetry.lastCloseReason,
       transportConnected: telemetry.connected,
       authenticated: telemetry.authenticated,
       qualificationReady: telemetry.qualificationReady,

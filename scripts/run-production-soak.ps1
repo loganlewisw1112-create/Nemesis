@@ -117,7 +117,8 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $samplesPath = Join-Path $OutputDirectory 'production-soak-samples.jsonl'
 $resultPath = Join-Path $OutputDirectory 'production-soak-result.json'
 $runtimeStatusPath = Join-Path $OutputDirectory 'production-soak-runtime-status.json'
-Remove-Item -LiteralPath $samplesPath, $resultPath, $runtimeStatusPath -Force -ErrorAction SilentlyContinue
+$cutoffStatusPath = Join-Path $OutputDirectory 'production-soak-runtime-status-at-cutoff.json'
+Remove-Item -LiteralPath $samplesPath, $resultPath, $runtimeStatusPath, $cutoffStatusPath -Force -ErrorAction SilentlyContinue
 
 Push-Location $repoRoot
 try {
@@ -150,6 +151,8 @@ try {
   $deadline = $startedAt.AddMinutes($DurationMinutes)
   $samples = [Collections.Generic.List[object]]::new()
   $runtimeFailure = $null
+  $cutoffExternalStatus = $null
+  $cutoffCapturedAt = $null
   $unresponsiveSince = $null
   $lastProgressMinute = -1
   try {
@@ -271,6 +274,18 @@ try {
       }
     }
   } finally {
+    $cutoffCapturedAt = [DateTimeOffset]::UtcNow
+    if (Test-Path -LiteralPath $runtimeStatusPath) {
+      try { $cutoffExternalStatus = Get-Content -LiteralPath $runtimeStatusPath -Raw | ConvertFrom-Json } catch { }
+    }
+    [ordered]@{
+      schemaVersion = 2
+      capturedAt = $cutoffCapturedAt.ToUnixTimeMilliseconds()
+      status = $cutoffExternalStatus
+    } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $cutoffStatusPath -Encoding utf8
+    if ($null -eq $runtimeFailure -and $null -ne $cutoffExternalStatus -and $cutoffExternalStatus.runtime.state -eq 'invalidated') {
+      $runtimeFailure = "NEMESIS runtime health invalidated at cutoff: $(@($cutoffExternalStatus.runtime.reasons) -join '; ')"
+    }
     $process.Refresh()
     $cleanShutdown = $process.HasExited
     if (!$process.HasExited) {
@@ -305,13 +320,20 @@ try {
   $rendererBlockedSamples = @($externalStatusSamples | Where-Object { $_.rendererBlocked -eq $true }).Count
   $runtimeInvalidatedSamples = @($externalStatusSamples | Where-Object { $_.runtimeState -eq 'invalidated' }).Count
   $latestExternalStatus = if ($externalStatusSamples.Count -gt 0) { $externalStatusSamples[-1] } else { $null }
+  $finalRuntimeState = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.runtime.state } elseif ($null -ne $latestExternalStatus) { $latestExternalStatus.runtimeState } else { $null }
+  $finalRendererStatus = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.status } elseif ($null -ne $latestExternalStatus) { $latestExternalStatus.rendererStatus } else { $null }
+  $finalRendererBlocked = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.blocked } elseif ($null -ne $latestExternalStatus) { [bool]$latestExternalStatus.rendererBlocked } else { $true }
+  $finalRendererHeartbeatAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.heartbeatAgeMs } elseif ($null -ne $latestExternalStatus) { $latestExternalStatus.rendererHeartbeatAgeMs } else { $null }
+  $finalRuntimeStatusAgeMs = if ($null -ne $cutoffExternalStatus -and $null -ne $cutoffExternalStatus.updatedAt) {
+    [Math]::Max(0, $cutoffCapturedAt.ToUnixTimeMilliseconds() - [double]$cutoffExternalStatus.updatedAt)
+  } elseif ($null -ne $latestExternalStatus) { $latestExternalStatus.externalStatusAgeMs } else { $null }
   $durationComplete = $actualDurationMinutes -ge ($DurationMinutes - ($SampleSeconds / 60))
   $passed = $null -eq $runtimeFailure -and $rendererSamples.Count -gt 0 -and $baselineSamples.Count -gt 0 `
     -and $p95Mb -le 384 -and $maxMb -le 512 -and $null -ne $slopePerHour -and $slopePerHour -le 0.02 -and $cleanShutdown `
     -and $durationComplete -and $rendererSampleCoverage -ge 0.95 -and $geaSampleCoverage -ge 0.95 `
     -and $externalStatusCoverage -ge 0.95 -and $rendererBlockedSamples -eq 0 -and $runtimeInvalidatedSamples -eq 0 `
-    -and $null -ne $latestExternalStatus -and $latestExternalStatus.rendererStatus -eq 'stable' `
-    -and $latestExternalStatus.runtimeState -eq 'healthy' -and $latestExternalStatus.externalStatusAgeMs -le 60000 `
+    -and $finalRendererStatus -eq 'stable' -and !$finalRendererBlocked `
+    -and $finalRuntimeState -eq 'healthy' -and $finalRuntimeStatusAgeMs -le 60000 `
     -and $devToolsDisabled -and $configuredTrackedTickers -eq 500
   $result = [ordered]@{
     schemaVersion = 2
@@ -333,10 +355,12 @@ try {
     externalStatusCoverage = $externalStatusCoverage
     rendererBlockedSampleCount = $rendererBlockedSamples
     runtimeInvalidatedSampleCount = $runtimeInvalidatedSamples
-    finalRuntimeState = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.runtimeState }
-    finalRendererStatus = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.rendererStatus }
-    finalRendererHeartbeatAgeMs = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.rendererHeartbeatAgeMs }
-    finalRuntimeStatusAgeMs = if ($null -eq $latestExternalStatus) { $null } else { $latestExternalStatus.externalStatusAgeMs }
+    cutoffRuntimeStatusPath = $cutoffStatusPath
+    cutoffCapturedAt = if ($null -eq $cutoffCapturedAt) { $null } else { $cutoffCapturedAt.ToUnixTimeMilliseconds() }
+    finalRuntimeState = $finalRuntimeState
+    finalRendererStatus = $finalRendererStatus
+    finalRendererHeartbeatAgeMs = $finalRendererHeartbeatAgeMs
+    finalRuntimeStatusAgeMs = $finalRuntimeStatusAgeMs
     devToolsDisabled = $devToolsDisabled
     configuredTrackedTickers = $configuredTrackedTickers
     productionArtifactHash = $artifact.hash

@@ -43,6 +43,7 @@ export class DiscoveryOrchestrator {
   private belowScout = 0;
   private mode: DiscoveryMode = 'full';
   private depthPassInFlight: Promise<void> | null = null;
+  private restDepthCursor = 0;
 
   constructor(private registry: ConnectorRegistry) {}
 
@@ -221,9 +222,18 @@ export class DiscoveryOrchestrator {
     });
     const cachedTickers = new Set(cachedCandidates.map((market) => market.ticker));
     const missingCandidates = configuredCandidates.filter((market) => !cachedTickers.has(market.ticker));
+    const restFallbackCandidates: KalshiMarket[] = [];
+    if (missingCandidates.length > 0) {
+      const fallbackCount = Math.min(REST_DEPTH_FALLBACK_PER_CYCLE, missingCandidates.length);
+      const start = this.restDepthCursor % missingCandidates.length;
+      for (let offset = 0; offset < fallbackCount; offset += 1) {
+        restFallbackCandidates.push(missingCandidates[(start + offset) % missingCandidates.length]!);
+      }
+      this.restDepthCursor = (start + fallbackCount) % missingCandidates.length;
+    }
     const candidates = [
       ...cachedCandidates.map((market) => ({ market, fromCache: true })),
-      ...missingCandidates.slice(0, REST_DEPTH_FALLBACK_PER_CYCLE).map((market) => ({ market, fromCache: false })),
+      ...restFallbackCandidates.map((market) => ({ market, fromCache: false })),
     ];
     this.depthPending = missingCandidates.length;
 

@@ -426,6 +426,9 @@ export interface ConnectorHealth {
   reconnects?: number;
   disconnects?: number;
   sequenceGaps?: number;
+  lastCloseAt?: number | null;
+  lastCloseCode?: number | null;
+  lastCloseReason?: string | null;
   freshnessMs?: number | null;
   transportConnected?: boolean;
   authenticated?: boolean;

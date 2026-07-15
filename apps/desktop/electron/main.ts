@@ -3861,7 +3861,6 @@ async function refreshMarkets(options: RefreshMarketsOptions = {}) {
       marketsCache = mergeGeaMarkets(discovery.getUniverse());
       const universeTickers = discovery.getUniverse().map((market) => market.ticker);
       kalshiStream.track(universeTickers);
-      kalshiOrderbookStream.track(universeTickers);
     }
     const signalMarkets = discovery.getUniverse().length > 0
       ? discovery.getMarketsForSignals()
