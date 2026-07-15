@@ -22,6 +22,7 @@ interface MutableBook {
 }
 
 type HeaderProvider = () => Record<string, string> | null;
+type BookUpdateListener = (book: KalshiOrderbook) => void;
 
 function parseNumber(value: unknown): number | undefined {
   const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
@@ -59,6 +60,7 @@ export class KalshiOrderbookStream {
   private sequenceRegressions = 0;
   private lastMessageAt: number | null = null;
   private lastExchangeTimestamp: number | null = null;
+  private readonly bookUpdateListeners = new Set<BookUpdateListener>();
 
   constructor(
     private readonly registry: ConnectorRegistry,
@@ -87,6 +89,11 @@ export class KalshiOrderbookStream {
   track(tickers: string[]): void {
     for (const ticker of tickers) if (ticker) this.tickers.add(ticker);
     this.subscribeMissing();
+  }
+
+  onBookUpdate(listener: BookUpdateListener): () => void {
+    this.bookUpdateListeners.add(listener);
+    return () => this.bookUpdateListeners.delete(listener);
   }
 
   getBook(ticker: string): KalshiOrderbook | null {
@@ -182,7 +189,13 @@ export class KalshiOrderbookStream {
       const ticker = String(msg.market_ticker ?? '');
       if (!ticker) return;
       if (type === 'orderbook_snapshot') this.applySnapshot(ticker, sequence, msg);
-      else if (type === 'orderbook_delta') this.applyDelta(ticker, sequence, msg);
+      else if (type === 'orderbook_delta') {
+        this.applyDelta(ticker, sequence, msg);
+        const book = this.getBook(ticker);
+        if (book?.sourceTimestamp != null) {
+          for (const listener of this.bookUpdateListeners) listener(book);
+        }
+      }
       else return;
       this.registry.recordSuccess('kalshi-ws', 0);
     } catch {

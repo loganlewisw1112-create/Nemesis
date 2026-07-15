@@ -3862,6 +3862,16 @@ app.whenReady().then(() => {
   initializeEvidenceCampaign();
   startupTrace('evidence-campaign');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
+  kalshiOrderbookStream.onBookUpdate((book) => {
+    const observedAt = Date.now();
+    if (
+      !campaignStore
+      || book.sourceTimestamp == null
+      || observedAt - book.sourceTimestamp > entryQualificationSettings().maxBookAgeMs
+    ) return;
+    void runThroughputCertification('exchange-book-delta');
+    void evaluateCampaignConfirmations();
+  });
   setupIpc();
   startupTrace('ipc');
   setupBridgeServer();

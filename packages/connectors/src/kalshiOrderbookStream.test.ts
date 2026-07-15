@@ -5,6 +5,8 @@ import { KalshiOrderbookStream } from './kalshiOrderbookStream.js';
 describe('KalshiOrderbookStream', () => {
   it('uses exchange delta timestamp and sequence, never local snapshot time', () => {
     const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null);
+    const observed: Array<{ sequence?: number; sourceTimestamp?: number }> = [];
+    stream.onBookUpdate((book) => observed.push(book));
     stream.ingest(JSON.stringify({
       type: 'orderbook_snapshot',
       seq: 2,
@@ -30,6 +32,8 @@ describe('KalshiOrderbookStream', () => {
     const book = stream.getBook('KXTEST');
     expect(book).toMatchObject({ sequence: 3, sourceTimestamp: 1_669_149_841_000 });
     expect(book?.no).toContainEqual({ price: 0.59, quantity: 5 });
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({ sequence: 3, sourceTimestamp: 1_669_149_841_000 });
   });
 
   it('drops a book on sequence regression', () => {
