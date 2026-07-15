@@ -676,12 +676,20 @@ function sampleRendererMemory(): void {
   marketBroadcastThrottleMs = stable
     ? MARKET_BROADCAST_THROTTLE_MS
     : DEGRADED_MARKET_BROADCAST_THROTTLE_MS;
+  if (!stable) {
+    if (!snapshot.operationalChecks.some((check) => check.name === 'renderer_memory_mitigation_applied')) {
+      campaignStore.record((tracker) => tracker.recordOperationalCheck(
+        'renderer_memory_mitigation_applied',
+        true,
+        `${assessment.detail}; full-state broadcast throttle raised to ${marketBroadcastThrottleMs}ms while stabilization evidence continues`,
+      ));
+    }
+    return;
+  }
   campaignStore.record((tracker) => tracker.recordOperationalCheck(
     'renderer_memory_stable',
-    stable,
-    stable
-      ? assessment.detail
-      : `${assessment.detail}; full-state broadcast throttle raised to ${marketBroadcastThrottleMs}ms`,
+    true,
+    assessment.detail,
   ));
 }
 

@@ -4,7 +4,7 @@ export interface RendererMemorySample {
 }
 
 export interface RendererMemoryAssessment {
-  status: 'warming' | 'stable' | 'monotonic-growth';
+  status: 'warming' | 'stable' | 'unstable-growth';
   sampleCount: number;
   growthRate: number;
   detail: string;
@@ -38,12 +38,14 @@ export class RendererMemoryMonitor {
     const last = window.at(-1)!.workingSetKb;
     const growthRate = (last - first) / first;
     const monotonic = window.slice(1).every((item, index) => item.workingSetKb > window[index]!.workingSetKb);
-    if (monotonic && growthRate > 0.1) {
+    if (growthRate > 0.1) {
       return {
-        status: 'monotonic-growth',
+        status: 'unstable-growth',
         sampleCount: window.length,
         growthRate,
-        detail: `renderer working set grew ${(growthRate * 100).toFixed(1)}% monotonically`,
+        detail: monotonic
+          ? `renderer working set grew ${(growthRate * 100).toFixed(1)}% monotonically`
+          : `renderer working set ended ${(growthRate * 100).toFixed(1)}% above its post-warm-up baseline`,
       };
     }
     return {
