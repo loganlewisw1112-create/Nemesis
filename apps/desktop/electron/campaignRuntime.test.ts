@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CampaignSnapshot } from '@nemesis/execution';
-import type { ThesisCard } from '@nemesis/core';
+import type { KalshiOrderbook, ThesisCard } from '@nemesis/core';
 import {
   CampaignBookTriggerScheduler,
   campaignBookUpdateWork,
+  campaignEnrollmentReadiness,
   campaignPendingCapacity,
   isEvidenceOnlyCampaignExecution,
 } from './campaignRuntime.js';
@@ -53,6 +54,39 @@ describe('campaign runtime isolation', () => {
   it('calculates pending capacity from the campaign namespace, not historical strategy validation', () => {
     const campaign = snapshot('active', [undefined, undefined, 'rejected']);
     expect(campaignPendingCapacity(campaign, 5)).toBe(3);
+  });
+
+  it('enrolls only from fresh exchange deltas with a resolved fee policy', () => {
+    const baseBook: KalshiOrderbook = {
+      ticker: 'KXTEST',
+      yes: [{ price: 0.4, quantity: 10 }],
+      no: [{ price: 0.59, quantity: 10 }],
+      sourceTimestamp: 9_500,
+      sequence: 12,
+      feePolicy: {
+        known: true,
+        role: 'taker',
+        multiplier: 1,
+        accountPrecision: 'non_direct',
+        scheduleVersion: 'test',
+        source: 'test',
+      },
+    };
+
+    expect(campaignEnrollmentReadiness(baseBook, 10_000, 1_000)).toEqual({ ready: true });
+    expect(campaignEnrollmentReadiness({ ...baseBook, sourceTimestamp: undefined }, 10_000, 1_000)).toMatchObject({ ready: false });
+    expect(campaignEnrollmentReadiness({ ...baseBook, sourceTimestamp: 8_999 }, 10_000, 1_000)).toMatchObject({ ready: false });
+    expect(campaignEnrollmentReadiness({
+      ...baseBook,
+      feePolicy: {
+        known: false,
+        role: 'taker',
+        multiplier: 1,
+        accountPrecision: 'unknown',
+        scheduleVersion: 'test',
+        source: 'test',
+      },
+    }, 10_000, 1_000)).toMatchObject({ ready: false });
   });
 
   it('ignores unrelated deltas and does not repeat a persisted economic lifecycle', () => {

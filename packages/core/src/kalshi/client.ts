@@ -1,4 +1,5 @@
 import type {
+  KalshiEvent,
   KalshiMarket,
   KalshiMarketsResponse,
   KalshiOrderbook,
@@ -315,6 +316,20 @@ export async function fetchMarket(
     opts,
   );
   return normalizeKalshiMarket(raw.market);
+}
+
+export async function fetchEvent(
+  eventTicker: string,
+  opts: FetchOptions = {},
+): Promise<KalshiEvent> {
+  const raw = await kalshiFetch<{ event: KalshiEvent }>(
+    `/events/${encodeURIComponent(eventTicker)}`,
+    opts,
+  );
+  if (!raw.event?.event_ticker || !raw.event.series_ticker) {
+    throw new Error('Kalshi event payload missing event or series ticker');
+  }
+  return raw.event;
 }
 
 export async function fetchSeries(

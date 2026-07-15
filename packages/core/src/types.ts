@@ -67,6 +67,12 @@ export interface KalshiSeries {
   last_updated_ts?: string;
 }
 
+export interface KalshiEvent {
+  event_ticker: string;
+  series_ticker: string;
+  last_updated_ts?: string;
+}
+
 export interface KalshiOrderbook {
   ticker: string;
   yes: OrderbookLevel[];

@@ -32,4 +32,27 @@ describe('KalshiFeePolicyResolver', () => {
     );
     expect((await unknownSeries.resolve('KXTEST')).known).toBe(false);
   });
+
+  it('resolves the current API shape through market event and series', async () => {
+    const resolver = new KalshiFeePolicyResolver(
+      () => 'non_direct',
+      async (ticker) => ({
+        ticker,
+        title: 'Test',
+        status: 'open',
+        event_ticker: 'KXEVENT-26JUL15',
+      }),
+      async (ticker) => ({ ticker, fee_type: 'quadratic', fee_multiplier: 1 }),
+      60_000,
+      async (eventTicker) => ({ event_ticker: eventTicker, series_ticker: 'KXSERIES' }),
+    );
+
+    await expect(resolver.resolve('KXTEST', 1_000)).resolves.toMatchObject({
+      known: true,
+      multiplier: 1,
+      accountPrecision: 'non_direct',
+      seriesTicker: 'KXSERIES',
+      source: 'market-and-series-api',
+    });
+  });
 });

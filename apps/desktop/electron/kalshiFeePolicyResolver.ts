@@ -1,9 +1,11 @@
 import {
   UNKNOWN_KALSHI_FEE_POLICY,
   buildKalshiFeePolicy,
+  fetchEvent,
   fetchMarket,
   fetchSeries,
   type KalshiAccountPrecision,
+  type KalshiEvent,
   type KalshiFeePolicy,
   type KalshiMarket,
   type KalshiSeries,
@@ -11,6 +13,7 @@ import {
 
 type MarketFetcher = (ticker: string) => Promise<KalshiMarket>;
 type SeriesFetcher = (seriesTicker: string) => Promise<KalshiSeries>;
+type EventFetcher = (eventTicker: string) => Promise<KalshiEvent>;
 
 interface CacheEntry {
   policy: KalshiFeePolicy;
@@ -25,6 +28,7 @@ export class KalshiFeePolicyResolver {
     private readonly marketFetcher: MarketFetcher = fetchMarket,
     private readonly seriesFetcher: SeriesFetcher = fetchSeries,
     private readonly cacheTtlMs = 5 * 60_000,
+    private readonly eventFetcher: EventFetcher = fetchEvent,
   ) {}
 
   clear(): void {
@@ -36,7 +40,10 @@ export class KalshiFeePolicyResolver {
     if (cached && cached.expiresAt > now) return cached.policy;
     try {
       const market = await this.marketFetcher(ticker);
-      const seriesTicker = market.series_ticker;
+      const event = !market.series_ticker && market.event_ticker
+        ? await this.eventFetcher(market.event_ticker)
+        : null;
+      const seriesTicker = market.series_ticker ?? event?.series_ticker;
       if (!seriesTicker) return this.remember(ticker, UNKNOWN_KALSHI_FEE_POLICY, now);
       const series = await this.seriesFetcher(seriesTicker);
       const feeType = market.fee_type_override ?? market.fee_type ?? series.fee_type;
@@ -63,7 +70,10 @@ export class KalshiFeePolicyResolver {
         source: 'market-and-series-api',
       }), now);
     } catch {
-      return this.remember(ticker, { ...UNKNOWN_KALSHI_FEE_POLICY }, now);
+      return this.remember(ticker, {
+        ...UNKNOWN_KALSHI_FEE_POLICY,
+        source: 'market-event-series-api-error',
+      }, now);
     }
   }
 

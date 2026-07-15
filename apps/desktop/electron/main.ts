@@ -122,6 +122,7 @@ import { SevenHourCampaignStore } from './sevenHourCampaignStore.js';
 import {
   CampaignBookTriggerScheduler,
   campaignBookUpdateWork,
+  campaignEnrollmentReadiness,
   campaignPendingCapacity,
   isEvidenceOnlyCampaignExecution,
 } from './campaignRuntime.js';
@@ -1403,6 +1404,26 @@ async function executeReservedStrictPaperBuyForCard(
       queueState: 'blocked_retryable',
       wouldMutate: false,
     };
+  }
+
+  if (evidenceOnlyCampaign) {
+    const readiness = campaignEnrollmentReadiness(
+      book,
+      Date.now(),
+      entryQualificationSettings().maxBookAgeMs,
+    );
+    if (!readiness.ready) {
+      opportunityQueue.markBlocked(key, readiness.reason, true);
+      return {
+        ok: false,
+        aborted: true,
+        abortReason: readiness.reason,
+        error: readiness.reason,
+        abortCode: 'entry_confirmation_pending',
+        queueState: 'blocked_retryable',
+        wouldMutate: false,
+      };
+    }
   }
 
   const startedAt = Date.now();

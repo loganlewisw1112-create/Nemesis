@@ -1,5 +1,9 @@
 import { candidateEconomicIdentity, type CampaignSnapshot } from '@nemesis/execution';
-import type { ThesisCard } from '@nemesis/core';
+import {
+  isKnownKalshiFeePolicy,
+  type KalshiOrderbook,
+  type ThesisCard,
+} from '@nemesis/core';
 
 export type PaperExecutionSource = 'manual' | 'working-order' | 'throughput';
 
@@ -27,6 +31,36 @@ export interface CampaignBookUpdateWork {
 export interface CampaignBookTriggerBatch {
   throughputTickers: string[];
   confirmationTickers: string[];
+}
+
+export type CampaignEnrollmentReadiness =
+  | { ready: true }
+  | { ready: false; reason: string };
+
+/**
+ * A campaign lifecycle may start only from evidence that can actually qualify.
+ * REST/snapshot books and unresolved fee schedules remain retryable upstream;
+ * they must not consume an economic identity or create a terminal candidate.
+ */
+export function campaignEnrollmentReadiness(
+  book: KalshiOrderbook,
+  observedAt: number,
+  maxBookAgeMs: number,
+): CampaignEnrollmentReadiness {
+  if (book.sourceTimestamp == null || !Number.isFinite(book.sourceTimestamp) || book.sequence == null || !Number.isFinite(book.sequence)) {
+    return { ready: false, reason: 'campaign enrollment awaits an exchange-timestamped order-book delta' };
+  }
+  const bookAgeMs = observedAt - book.sourceTimestamp;
+  if (bookAgeMs > maxBookAgeMs) {
+    return { ready: false, reason: `campaign enrollment awaits a fresh order-book delta; current book is ${Math.round(bookAgeMs)}ms old` };
+  }
+  if (bookAgeMs < -maxBookAgeMs) {
+    return { ready: false, reason: 'campaign enrollment rejected an exchange book timestamp outside the allowed clock window' };
+  }
+  if (!isKnownKalshiFeePolicy(book.feePolicy)) {
+    return { ready: false, reason: 'campaign enrollment awaits a resolved market, series, and account fee policy' };
+  }
+  return { ready: true };
 }
 
 /**
