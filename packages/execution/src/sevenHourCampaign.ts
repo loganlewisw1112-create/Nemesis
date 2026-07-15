@@ -535,6 +535,7 @@ export class SevenHourCampaignTracker {
     const failedOperationalChecks = this.operationalChecks.filter((check) => !check.passed);
     const rendererMemoryCheck = this.operationalChecks.find((check) => check.name === 'renderer_memory_stable' && check.passed);
     const bridgeTrafficCheck = this.operationalChecks.find((check) => check.name === 'bridge_bidirectional_traffic' && check.passed);
+    const exchangeBookTimeCheck = this.operationalChecks.find((check) => check.name === 'exchange_book_time_available' && check.passed);
     const reasons: string[] = [];
 
     if (this.integrityError) reasons.push(this.integrityError);
@@ -542,6 +543,7 @@ export class SevenHourCampaignTracker {
     if (failedOperationalChecks.length > 0) reasons.push(`${failedOperationalChecks.length} operational check(s) failed`);
     if (!rendererMemoryCheck) reasons.push('renderer memory stabilization was not proven');
     if (!bridgeTrafficCheck) reasons.push('recent bidirectional bridge traffic was not proven');
+    if (!exchangeBookTimeCheck) reasons.push('exchange-origin book timestamp and sequence were not proven');
     if (this.manifest.stage === 'instrumentation') {
       if (candidates.length < this.settings.instrumentationMinUniqueCandidates) reasons.push('fewer than 20 unique economically viable candidates');
       if (terminalCoverage < this.settings.instrumentationMinTerminalCoverage) reasons.push('terminal lifecycle coverage below 100%');

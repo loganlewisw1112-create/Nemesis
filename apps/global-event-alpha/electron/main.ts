@@ -68,6 +68,7 @@ import { resolveGeaUserDataPath } from './userDataPath.js';
 import { copyLegacyGeaDatabaseIfMissing, legacyGeaDatabasePath, resolveGeaDatabasePath } from './localDb.js';
 import { TapeStartupCoordinator } from './tapeStartup.js';
 import { buildExitExecutionContext } from './exitExecutionContext.js';
+import { noTradeDecisionSignature } from './noTradeDecision.js';
 
 if (process.env.GEA_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -376,7 +377,7 @@ function publishIntelligencePackets(state: GlobalEventAlphaIntelligenceState) {
   }
 
   if (state.noTrade.blocked) {
-    const signature = `${state.noTrade.ticker}:${state.noTrade.reasons.join('|')}:${state.noTrade.recheck_at}`;
+    const signature = noTradeDecisionSignature(state.noTrade);
     if (signature !== lastNoTradeSignature) {
       lastNoTradeSignature = signature;
       const warning: NoTradeWarning = {
@@ -387,8 +388,20 @@ function publishIntelligencePackets(state: GlobalEventAlphaIntelligenceState) {
         issued_by: role,
         issued_at: issuedAt,
       };
+      try {
+        localStore?.insertNoTradeDecision(warning);
+      } catch (error) {
+        dbStatus = {
+          ...dbStatus,
+          available: false,
+          error: `no-trade decision persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+        broadcast('gea:dbStatus', dbStatus);
+      }
       sendToNemesis({ type: 'brain:no-trade', payload: warning });
     }
+  } else {
+    lastNoTradeSignature = '';
   }
 
   if (state.retention.action !== 'hold') {

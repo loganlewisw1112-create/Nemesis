@@ -65,6 +65,8 @@ describe('Kalshi tape normalization', () => {
       yesAsk: 0.48,
       noAsk: 0.54,
       spread: 0.02,
+      sourceTimestamp: 1_772_000_000_900,
+      sequence: 42,
     };
 
     expect(tradeToTapePrint(trade)).toMatchObject({
@@ -82,6 +84,9 @@ describe('Kalshi tape normalization', () => {
       no_ask: 0.54,
       spread: 0.02,
       timestamp: 1_772_000_001_000,
+      observed_at: 1_772_000_001_000,
+      exchange_timestamp: 1_772_000_000_900,
+      exchange_sequence: 42,
     });
   });
 });

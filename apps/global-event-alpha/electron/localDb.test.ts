@@ -15,6 +15,9 @@ describe('GEA local database schema', () => {
     expect(schema).toContain('kalshi_orderbook_snapshot');
     expect(schema).toContain('yes_levels_json');
     expect(schema).toContain('no_levels_json');
+    expect(schema).toContain('observed_at');
+    expect(schema).toContain('exchange_timestamp');
+    expect(schema).toContain('exchange_sequence');
   });
 
   it('includes public world data source, observation, and release tables', () => {
@@ -42,6 +45,14 @@ describe('GEA local database schema', () => {
     ]) {
       expect(schema).toContain(table);
     }
+  });
+  it('includes durable no-trade decision evidence', () => {
+    const schema = GEA_SCHEMA.join('\n');
+
+    expect(schema).toContain('no_trade_decision');
+    expect(schema).toContain('block_reason');
+    expect(schema).toContain('what_would_need_to_change');
+    expect(schema).toContain('decision_json');
   });
   it('declares better-sqlite3 so GEA persistence is installed with the app workspace', () => {
     const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8')) as {

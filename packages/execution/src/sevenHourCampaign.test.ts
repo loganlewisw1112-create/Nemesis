@@ -171,6 +171,7 @@ describe('SevenHourCampaignTracker', () => {
     const tracker = start();
     tracker.recordOperationalCheck('renderer_memory_stable', true, 'stable', startedAt + 100);
     tracker.recordOperationalCheck('bridge_bidirectional_traffic', true, 'recent traffic', startedAt + 100);
+    tracker.recordOperationalCheck('exchange_book_time_available', true, 'exchange timestamp and sequence observed', startedAt + 100);
     for (let index = 0; index < 30; index += 1) {
       const candidate = card(index);
       const initialFill = fill(candidate.ticker);

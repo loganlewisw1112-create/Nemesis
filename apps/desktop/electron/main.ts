@@ -119,6 +119,7 @@ import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
 import { PaperQualificationStore } from './paperQualificationStore.js';
 import { StrategyValidationStore } from './strategyValidationStore.js';
 import { SevenHourCampaignStore } from './sevenHourCampaignStore.js';
+import { campaignPendingCapacity, isEvidenceOnlyCampaignExecution } from './campaignRuntime.js';
 import { KalshiFeePolicyResolver } from './kalshiFeePolicyResolver.js';
 import { buildStrategyConfigHash, PAPER_STRATEGY_ENGINE_VERSION } from './qualificationConfig.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
@@ -201,6 +202,7 @@ const auditLog = new AuditLog();
 const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
 const opportunityQueue = new OpportunityThroughputQueue(DEFAULT_OPPORTUNITY_THROUGHPUT);
 let entryConfirmationEngine = new EntryConfirmationEngine(DEFAULT_ENTRY_QUALIFICATION);
+let campaignEntryConfirmationEngine = new EntryConfirmationEngine(DEFAULT_ENTRY_QUALIFICATION);
 const lastTickerSideExecutionAt = new Map<string, number>();
 const tickHistory = new Map<string, PriceTick[]>();
 const autoCloseStates = new Map<string, AutoCloseState>();
@@ -577,6 +579,7 @@ function initializeEvidenceCampaign(): void {
   if (!pointer) return;
 
   const config = entryQualificationSettings();
+  campaignEntryConfirmationEngine = new EntryConfirmationEngine(config);
   const isNewLedger = !fs.existsSync(pointer.filePath);
   const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
   if (isNewLedger && !frozenCommit) {
@@ -608,7 +611,7 @@ function initializeEvidenceCampaign(): void {
     campaignStore.record((tracker) => tracker.ensureConfiguration(strategyConfigHash()));
     for (const candidate of campaignStore.snapshot().candidates) {
       if (candidate.terminalState) continue;
-      entryConfirmationEngine.restoreCandidateState({
+      campaignEntryConfirmationEngine.restoreCandidateState({
         candidateId: candidate.candidateId,
         sourceSignalId: candidate.originalCardId,
         ticker: candidate.ticker,
@@ -906,6 +909,15 @@ function loadSettings() {
   const campaignPrecision = process.env.NEMESIS_KALSHI_ACCOUNT_PRECISION;
   if (campaignPrecision === 'direct' || campaignPrecision === 'non_direct') {
     settings = normalizeGuardrailSettings({ ...settings, kalshiAccountPrecision: campaignPrecision });
+  }
+  if (process.env.NEMESIS_EVIDENCE_CAMPAIGN_STAGE) {
+    settings = normalizeGuardrailSettings({
+      ...settings,
+      liveEnabled: false,
+      liveStage: 'paper',
+      autoLiveEnabled: false,
+      dryRun: true,
+    });
   }
 }
 
@@ -1282,17 +1294,19 @@ async function executeReservedStrictPaperBuyForCard(
     });
     return { ok: false, error: reason, abortCode: 'rolling_loss_pause', queueState: 'blocked_final', wouldMutate: false };
   }
-  const validation = strategyValidationSnapshot();
-  if (!validation || validation.integrityError) {
+  const activeCampaign = source === 'throughput' ? campaignSnapshot() : null;
+  const evidenceOnlyCampaign = isEvidenceOnlyCampaignExecution(source, activeCampaign);
+  const validation = evidenceOnlyCampaign ? null : strategyValidationSnapshot();
+  if (!evidenceOnlyCampaign && (!validation || validation.integrityError)) {
     const reason = `strategy validation evidence is unavailable or corrupt: ${validation?.integrityError ?? 'store unavailable'}`;
     return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
   }
-  if (validation.paused) {
+  if (!evidenceOnlyCampaign && validation?.paused) {
     const reason = `strategy validation paused: ${validation.pauseReason ?? 'manual review required'}`;
     opportunityQueue.markBlocked(opportunityKey(card), reason, false);
     return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_paused', queueState: 'blocked_final', wouldMutate: false };
   }
-  const validationStage: StrategyValidationStage = validation.stage;
+  const validationStage: StrategyValidationStage = evidenceOnlyCampaign ? 'shadow' : validation!.stage;
   const eligibilityBlock = entryEligibilityBlockReason(card);
   if (eligibilityBlock) {
     recordPaperBlock({
@@ -1417,13 +1431,21 @@ async function executeReservedStrictPaperBuyForCard(
 
   const observedAt = Date.now();
   const campaignCandidate = enrollCampaignCandidate(card, preview, book, observedAt);
+  if (evidenceOnlyCampaign && !campaignCandidate) {
+    const reason = 'campaign candidate evidence could not be persisted';
+    opportunityQueue.markBlocked(key, reason, false);
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
+  }
   if (campaignCandidate?.terminalState) {
     const reason = `campaign candidate already terminal: ${campaignCandidate.terminalState}`;
     return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_candidate_terminal', queueState: 'blocked_final', wouldMutate: false };
   }
   const priorCampaignSamples = campaignCandidate?.samples.length ?? 0;
   const confirmationCard = campaignCandidate?.card ?? card;
-  const confirmation = entryConfirmationEngine.observe({
+  const confirmationEngine = evidenceOnlyCampaign
+    ? campaignEntryConfirmationEngine
+    : entryConfirmationEngine;
+  const confirmation = confirmationEngine.observe({
     candidateId: campaignCandidate?.candidateId,
     card: confirmationCard,
     fill: preview.fill,
@@ -1432,10 +1454,21 @@ async function executeReservedStrictPaperBuyForCard(
     bookSequence: book.sequence,
     feePolicy: book.feePolicy,
     observedAt,
-    sourceAlreadyUsed: strategyValidationStore?.tracker.hasUsedSource(confirmationCard.id),
+    sourceAlreadyUsed: evidenceOnlyCampaign
+      ? false
+      : strategyValidationStore?.tracker.hasUsedSource(confirmationCard.id),
     lastTickerExecutionAt: lastTickerSideExecutionAt.get(key),
   });
   if (campaignCandidate && campaignStore && confirmation.samples > priorCampaignSamples && book.sequence != null && book.sourceTimestamp != null) {
+    const operationalChecks = campaignStore.snapshot().operationalChecks;
+    if (!operationalChecks.some((check) => check.name === 'exchange_book_time_available' && check.passed)) {
+      campaignStore.record((tracker) => tracker.recordOperationalCheck(
+        'exchange_book_time_available',
+        true,
+        `exchange sequence ${book.sequence} observed ${Math.max(0, observedAt - book.sourceTimestamp!)}ms after matching-engine timestamp`,
+        observedAt,
+      ));
+    }
     campaignStore.record((tracker) => tracker.recordSample(campaignCandidate.candidateId, {
       at: observedAt,
       observedAt,
@@ -1459,7 +1492,7 @@ async function executeReservedStrictPaperBuyForCard(
       observedAt,
     ));
   }
-  const confirmationRecorded = recordStrategyValidation((tracker) => tracker.recordEntryConfirmation({
+  const confirmationRecorded = evidenceOnlyCampaign || recordStrategyValidation((tracker) => tracker.recordEntryConfirmation({
     sourceSignalId: card.id,
     ticker: card.ticker,
     side: card.side,
@@ -2336,10 +2369,13 @@ async function runThroughputCertification(trigger: string) {
     if (duplicateCount > 0) {
       recordQualification((tracker) => tracker.recordFunnel('duplicates_removed', duplicateCount, 'duplicate_execution_key'));
     }
+    const throughputCampaign = campaignSnapshot();
     const validation = strategyValidationSnapshot();
-    const pendingCapacity = validation?.stage === 'shadow'
-      ? Math.max(0, entryQualificationSettings().maxPendingCandidates - validation.shadowPendingCount)
-      : entryQualificationSettings().maxPendingCandidates;
+    const pendingCapacity = throughputCampaign?.manifest.status === 'active'
+      ? campaignPendingCapacity(throughputCampaign, entryQualificationSettings().maxPendingCandidates)
+      : validation?.stage === 'shadow'
+        ? Math.max(0, entryQualificationSettings().maxPendingCandidates - validation.shadowPendingCount)
+        : entryQualificationSettings().maxPendingCandidates;
     const candidates = deduplicatedCandidates
       .slice(0, Math.min(
         rankedCandidates.length,

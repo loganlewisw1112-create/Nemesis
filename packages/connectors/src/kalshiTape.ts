@@ -35,7 +35,12 @@ export interface KalshiOrderbookSnapshotRecord {
   yes_ask: number | null;
   no_ask: number | null;
   spread: number | null;
+  /** Local observation time retained for replay ordering; never qualification evidence. */
   timestamp: number;
+  observed_at: number;
+  /** Matching-engine time and sequence are nullable because REST/snapshot responses may omit them. */
+  exchange_timestamp: number | null;
+  exchange_sequence: number | null;
 }
 
 export interface KalshiTapeSink {
@@ -126,10 +131,10 @@ export function tradeToTapePrint(trade: KalshiTrade): KalshiTradePrintRecord {
 
 export function orderbookToTapeSnapshot(
   book: KalshiOrderbook,
-  timestamp = Date.now(),
+  observedAt = Date.now(),
 ): KalshiOrderbookSnapshotRecord {
   return {
-    id: `book-${book.ticker}-${timestamp}`,
+    id: `book-${book.ticker}-${observedAt}`,
     ticker: book.ticker,
     yes_levels_json: JSON.stringify(normalizeLevels(book.yes)),
     no_levels_json: JSON.stringify(normalizeLevels(book.no)),
@@ -137,7 +142,10 @@ export function orderbookToTapeSnapshot(
     yes_ask: book.yesAsk ?? null,
     no_ask: book.noAsk ?? null,
     spread: book.spread ?? null,
-    timestamp,
+    timestamp: observedAt,
+    observed_at: observedAt,
+    exchange_timestamp: book.sourceTimestamp ?? null,
+    exchange_sequence: book.sequence ?? null,
   };
 }
 
