@@ -211,6 +211,15 @@ try {
       }
       $samples.Add([pscustomobject]$sample)
       ($sample | ConvertTo-Json -Compress) | Add-Content -LiteralPath $samplesPath -Encoding utf8
+      if ($sample.runtimeState -eq 'invalidated') {
+        $runtimeReasons = if ($null -eq $externalStatus.runtime.reasons) {
+          'no reason was exported'
+        } else {
+          @($externalStatus.runtime.reasons) -join '; '
+        }
+        $runtimeFailure = "NEMESIS runtime health invalidated during soak: $runtimeReasons"
+        break
+      }
       if (!$rootProcess.Responding) {
         if ($null -eq $unresponsiveSince) { $unresponsiveSince = $now.AddSeconds(-2) }
         elseif (($now - $unresponsiveSince).TotalSeconds -ge 10) {

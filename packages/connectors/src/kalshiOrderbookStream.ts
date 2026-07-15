@@ -66,6 +66,9 @@ export class KalshiOrderbookStream {
   private readonly quarantined = new Set<string>();
   private readonly books = new Map<string, MutableBook>();
   private readonly sequenceBySubscription = new Map<string, number>();
+  private readonly tickersBySubscription = new Map<string, Set<string>>();
+  private readonly subscriptionIdByKey = new Map<string, number>();
+  private readonly pendingSnapshotRepair = new Map<string, Set<string>>();
   private socket: WebSocket | null = null;
   private started = false;
   private commandId = 1;
@@ -97,6 +100,9 @@ export class KalshiOrderbookStream {
 
   restart(): void {
     this.sequenceBySubscription.clear();
+    this.tickersBySubscription.clear();
+    this.subscriptionIdByKey.clear();
+    this.pendingSnapshotRepair.clear();
     this.closeCurrentSocket();
     if (this.started) this.connect();
   }
@@ -195,6 +201,9 @@ export class KalshiOrderbookStream {
       this.subscribed.clear();
       this.books.clear();
       this.sequenceBySubscription.clear();
+      this.tickersBySubscription.clear();
+      this.subscriptionIdByKey.clear();
+      this.pendingSnapshotRepair.clear();
       this.lastSequencedDeltaAt = null;
       for (const ticker of this.tickers) this.quarantined.add(ticker);
       this.lastMessageAt = Date.now();
@@ -266,22 +275,39 @@ export class KalshiOrderbookStream {
       const type = String(packet.type ?? '');
       const sequence = parseNumber(packet.seq);
       const msg = packet.msg && typeof packet.msg === 'object' ? packet.msg as Record<string, unknown> : null;
-      if (!msg || sequence == null) {
+      if (sequence == null) {
         if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
         return;
       }
-      const ticker = String(msg.market_ticker ?? '');
-      if (!ticker) return;
-      const subscription = String(packet.sid ?? 'default');
+      const numericSubscriptionId = parseNumber(packet.sid);
+      const subscription = numericSubscriptionId == null ? 'default' : String(numericSubscriptionId);
+      if (numericSubscriptionId != null) this.subscriptionIdByKey.set(subscription, numericSubscriptionId);
+      const subscriptionTickers = this.tickersBySubscription.get(subscription) ?? new Set<string>();
+      const ticker = String(msg?.market_ticker ?? '');
+      if (ticker) subscriptionTickers.add(ticker);
+      if (Array.isArray(msg?.market_tickers)) {
+        for (const value of msg.market_tickers) {
+          const controlTicker = String(value ?? '');
+          if (controlTicker) subscriptionTickers.add(controlTicker);
+        }
+      }
+      this.tickersBySubscription.set(subscription, subscriptionTickers);
       const previousSequence = this.sequenceBySubscription.get(subscription);
       if (previousSequence != null && sequence !== previousSequence + 1) {
         if (sequence <= previousSequence) this.sequenceRegressions += 1;
         this.sequenceGaps += 1;
-        this.quarantineAndReconnect(ticker, previousSequence + 1, sequence);
+        this.sequenceBySubscription.set(subscription, Math.max(previousSequence, sequence));
+        this.quarantineSubscriptionAndRequestSnapshot(subscription, ticker || null, previousSequence + 1, sequence);
+        this.recordHealth();
         return;
       }
       this.sequenceBySubscription.set(subscription, sequence);
-      if (type === 'orderbook_snapshot') this.applySnapshot(ticker, sequence, msg);
+      if (!ticker || !msg) {
+        if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
+        this.recordHealth();
+        return;
+      }
+      if (type === 'orderbook_snapshot') this.applySnapshot(subscription, ticker, sequence, msg);
       else if (type === 'orderbook_delta') {
         this.applyDelta(ticker, sequence, msg);
         const book = this.getBook(ticker);
@@ -296,13 +322,16 @@ export class KalshiOrderbookStream {
     }
   }
 
-  private applySnapshot(ticker: string, sequence: number, msg: Record<string, unknown>): void {
+  private applySnapshot(subscription: string, ticker: string, sequence: number, msg: Record<string, unknown>): void {
     const yes = parseLevels(msg.yes_dollars_fp ?? msg.yes_dollars ?? msg.yes);
     const no = parseLevels(msg.no_dollars_fp ?? msg.no_dollars ?? msg.no);
     this.books.set(ticker, { ticker, yes, no, sequence, receivedAt: Date.now() });
     // A snapshot repairs structure, but qualification stays quarantined until a
     // later sequenced exchange delta proves the stream is advancing.
     this.quarantined.add(ticker);
+    const pending = this.pendingSnapshotRepair.get(subscription);
+    pending?.delete(ticker);
+    if (pending?.size === 0) this.pendingSnapshotRepair.delete(subscription);
   }
 
   private applyDelta(ticker: string, sequence: number, msg: Record<string, unknown>): void {
@@ -311,7 +340,7 @@ export class KalshiOrderbookStream {
     if (sequence <= book.sequence) {
       this.sequenceRegressions += 1;
       this.sequenceGaps += 1;
-      this.quarantineAndReconnect(ticker, book.sequence + 1, sequence);
+      this.quarantineSubscriptionAndRequestSnapshot('default', ticker, book.sequence + 1, sequence);
       return;
     }
     const side = msg.side === 'yes' || msg.side === 'no' ? msg.side : null;
@@ -332,11 +361,35 @@ export class KalshiOrderbookStream {
     this.quarantined.delete(ticker);
   }
 
-  private quarantineAndReconnect(ticker: string, expected: number, received: number): void {
-    this.books.delete(ticker);
-    this.quarantined.add(ticker);
-    this.registry.recordWarn('kalshi-orderbook-ws', `order-book sequence gap for ${ticker}: expected ${expected}, received ${received}`);
-    this.restart();
+  private quarantineSubscriptionAndRequestSnapshot(
+    subscription: string,
+    ticker: string | null,
+    expected: number,
+    received: number,
+  ): void {
+    const affected = new Set(this.tickersBySubscription.get(subscription));
+    if (ticker) affected.add(ticker);
+    for (const affectedTicker of affected) {
+      this.books.delete(affectedTicker);
+      this.quarantined.add(affectedTicker);
+    }
+    this.registry.recordWarn(
+      'kalshi-orderbook-ws',
+      `order-book sequence gap for sid ${subscription}: expected ${expected}, received ${received}; quarantined ${affected.size} ticker(s)`,
+    );
+    if (affected.size === 0 || this.pendingSnapshotRepair.has(subscription)) return;
+    this.pendingSnapshotRepair.set(subscription, new Set(affected));
+    const sid = this.subscriptionIdByKey.get(subscription);
+    if (sid == null || this.socket?.readyState !== WebSocket.OPEN) return;
+    this.socket.send(JSON.stringify({
+      id: this.commandId++,
+      cmd: 'update_subscription',
+      params: {
+        sids: [sid],
+        market_tickers: [...affected].sort(),
+        action: 'get_snapshot',
+      },
+    }));
   }
 
   private startHeartbeat(socket: WebSocket, generation: number): void {

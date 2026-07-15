@@ -81,6 +81,7 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('externalStatusCoverage -ge 0.95');
     expect(script).toContain("latestExternalStatus.rendererStatus -eq 'stable'");
     expect(script).toContain("latestExternalStatus.runtimeState -eq 'healthy'");
+    expect(script).toContain("$sample.runtimeState -eq 'invalidated'");
     expect(script).toContain('remained unresponsive for at least ten seconds');
   });
 });

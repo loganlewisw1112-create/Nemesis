@@ -68,15 +68,15 @@ describe('KalshiOrderbookStream', () => {
     expect(stream.getBook('KXTEST')).toBeNull();
 
     stream.ingest(JSON.stringify({
-      type: 'orderbook_snapshot', seq: 20,
+      type: 'orderbook_snapshot', seq: 13,
       msg: { market_ticker: 'KXTEST', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
     }));
     expect(stream.getBook('KXTEST')).toBeNull();
     stream.ingest(JSON.stringify({
-      type: 'orderbook_delta', seq: 21,
+      type: 'orderbook_delta', seq: 14,
       msg: { market_ticker: 'KXTEST', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: 1_669_149_842_000 },
     }));
-    expect(stream.getBook('KXTEST')).toMatchObject({ sequence: 21, sourceTimestamp: 1_669_149_842_000 });
+    expect(stream.getBook('KXTEST')).toMatchObject({ sequence: 14, sourceTimestamp: 1_669_149_842_000 });
   });
 
   it('tracks sequence continuity per subscription, not per ticker', () => {
@@ -193,50 +193,135 @@ describe('KalshiOrderbookStream', () => {
     });
   });
 
-  it('keeps a quarantined ticker fail-closed without poisoning another healthy ticker', () => {
+  it('repairs only the gapped subscription while another subscription remains qualified', () => {
     vi.useFakeTimers();
     const recoveredAt = 1_700_000_300_000;
     vi.setSystemTime(recoveredAt);
     const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
-    const staleSocket = { readyState: WebSocket.OPEN, close: vi.fn() };
+    const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() };
     Object.assign(stream as unknown as Record<string, unknown>, {
-      socket: staleSocket,
+      socket,
       authenticated: true,
       generation: 1,
     });
 
     stream.ingest(JSON.stringify({
       type: 'orderbook_snapshot', sid: 8, seq: 1,
-      msg: { market_ticker: 'KXQUARANTINED', yes_dollars_fp: [['0.3000', '5.00']], no_dollars_fp: [] },
+      msg: { market_ticker: 'KXA', yes_dollars_fp: [['0.3000', '5.00']], no_dollars_fp: [] },
     }), 1);
     stream.ingest(JSON.stringify({
-      type: 'orderbook_delta', sid: 8, seq: 3,
-      msg: { market_ticker: 'KXQUARANTINED', price_dollars: '0.3100', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+      type: 'orderbook_delta', sid: 8, seq: 2,
+      msg: { market_ticker: 'KXA', price_dollars: '0.3100', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
     }), 1);
-    expect(staleSocket.close).toHaveBeenCalledTimes(1);
-
-    Object.assign(stream as unknown as Record<string, unknown>, {
-      socket: { readyState: WebSocket.OPEN },
-      authenticated: true,
-      generation: 2,
-    });
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', sid: 8, seq: 3,
+      msg: { market_ticker: 'KXB', yes_dollars_fp: [['0.3500', '8.00']], no_dollars_fp: [] },
+    }), 1);
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', sid: 8, seq: 4,
+      msg: { market_ticker: 'KXB', price_dollars: '0.3600', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+    }), 1);
     stream.ingest(JSON.stringify({
       type: 'orderbook_snapshot', sid: 9, seq: 1,
       msg: { market_ticker: 'KXHEALTHY', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
-    }), 2);
+    }), 1);
     stream.ingest(JSON.stringify({
       type: 'orderbook_delta', sid: 9, seq: 2,
       msg: { market_ticker: 'KXHEALTHY', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
-    }), 2);
+    }), 1);
 
-    expect(stream.getBook('KXQUARANTINED')).toBeNull();
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', sid: 8, seq: 6,
+      msg: { market_ticker: 'KXA', price_dollars: '0.3200', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+    }), 1);
+    expect(socket.send).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(socket.send.mock.calls[0]![0]))).toEqual({
+      id: 1,
+      cmd: 'update_subscription',
+      params: {
+        sids: [8],
+        market_tickers: ['KXA', 'KXB'],
+        action: 'get_snapshot',
+      },
+    });
+    expect(socket.close).not.toHaveBeenCalled();
+    expect(stream.getBook('KXA')).toBeNull();
+    expect(stream.getBook('KXB')).toBeNull();
     expect(stream.getBook('KXHEALTHY')).toMatchObject({ sequence: 2, sourceTimestamp: recoveredAt });
     expect(stream.telemetry(recoveredAt)).toMatchObject({
       connected: true,
       authenticated: true,
-      quarantinedTickers: 1,
+      quarantinedTickers: 2,
       qualifiedTickers: 1,
       qualificationReady: true,
+    });
+
+    // The official sequenced OK response advances continuity without mutating
+    // books or causing a false second repair request.
+    stream.ingest(JSON.stringify({
+      type: 'ok', sid: 8, seq: 7,
+      msg: { market_tickers: ['KXA', 'KXB'] },
+    }), 1);
+    expect(stream.getBook('KXA')).toBeNull();
+    expect(stream.getBook('KXB')).toBeNull();
+    expect(socket.send).toHaveBeenCalledTimes(1);
+
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', sid: 8, seq: 8,
+      msg: { market_ticker: 'KXA', yes_dollars_fp: [['0.3000', '5.00']], no_dollars_fp: [] },
+    }), 1);
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', sid: 8, seq: 9,
+      msg: { market_ticker: 'KXB', yes_dollars_fp: [['0.3500', '8.00']], no_dollars_fp: [] },
+    }), 1);
+    expect(stream.getBook('KXA')).toBeNull();
+    expect(stream.getBook('KXB')).toBeNull();
+
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', sid: 8, seq: 10,
+      msg: { market_ticker: 'KXA', price_dollars: '0.3100', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+    }), 1);
+    expect(stream.getBook('KXA')).toMatchObject({ sequence: 10 });
+    expect(stream.getBook('KXB')).toBeNull();
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', sid: 8, seq: 11,
+      msg: { market_ticker: 'KXB', price_dollars: '0.3600', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+    }), 1);
+    expect(stream.getBook('KXB')).toMatchObject({ sequence: 11 });
+  });
+
+  it('uses known sid tickers when a sequenced control packet reveals the gap', () => {
+    vi.useFakeTimers();
+    const at = 1_700_000_400_000;
+    vi.setSystemTime(at);
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() };
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket,
+      authenticated: true,
+      generation: 1,
+    });
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', sid: 12, seq: 1,
+      msg: { market_ticker: 'KXCONTROL', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+    }), 1);
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', sid: 12, seq: 2,
+      msg: { market_ticker: 'KXCONTROL', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: at },
+    }), 1);
+    expect(stream.getBook('KXCONTROL')).not.toBeNull();
+
+    stream.ingest(JSON.stringify({
+      type: 'ok', sid: 12, seq: 4,
+      msg: { market_tickers: ['KXCONTROL'] },
+    }), 1);
+
+    expect(stream.getBook('KXCONTROL')).toBeNull();
+    expect(socket.close).not.toHaveBeenCalled();
+    expect(socket.send).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(socket.send.mock.calls[0]![0]))).toMatchObject({
+      cmd: 'update_subscription',
+      params: { sids: [12], market_tickers: ['KXCONTROL'], action: 'get_snapshot' },
     });
   });
 });
