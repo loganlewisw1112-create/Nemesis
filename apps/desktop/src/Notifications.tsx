@@ -3,6 +3,25 @@ import { AnimatePresence, motion } from 'framer-motion';
 import type { AutoCloseDecision, ThesisCard } from '@nemesis/core';
 
 let _audioCtx: AudioContext | null = null;
+export const NOTIFICATION_ID_TTL_MS = 24 * 60 * 60_000;
+export const MAX_RETAINED_NOTIFICATION_IDS = 2_000;
+
+export function pruneFiredNotificationIds(
+  fired: Map<string, number>,
+  now: number,
+  ttlMs = NOTIFICATION_ID_TTL_MS,
+  maxEntries = MAX_RETAINED_NOTIFICATION_IDS,
+): void {
+  for (const [id, firedAt] of fired) {
+    if (now - firedAt >= ttlMs) fired.delete(id);
+  }
+  while (fired.size > maxEntries) {
+    const oldest = fired.keys().next().value as string | undefined;
+    if (oldest == null) break;
+    fired.delete(oldest);
+  }
+}
+
 function getAudioCtx(): AudioContext {
   if (!_audioCtx || _audioCtx.state === 'closed') _audioCtx = new AudioContext();
   return _audioCtx;
@@ -65,16 +84,20 @@ function pnlPct(pos: PaperPos, mark: number): number {
 
 export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null) {
   const [notes, setNotes] = useState<NemesisNotification[]>([]);
-  const fired = useRef(new Set<string>());
+  const fired = useRef(new Map<string, number>());
   const prevPaper = useRef<PaperSlice | null>(null);
   const prevIds = useRef(new Set<string>());
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   function push(n: Omit<NemesisNotification, 'ts'>) {
+    const now = Date.now();
+    pruneFiredNotificationIds(fired.current, now);
     if (fired.current.has(n.id)) return;
-    fired.current.add(n.id);
-    const full = { ...n, ts: Date.now() };
+    fired.current.set(n.id, now);
+    pruneFiredNotificationIds(fired.current, now);
+    const full = { ...n, ts: now };
     setNotes((p) => [full, ...p].slice(0, 5));
+    clearTimeout(timers.current.get(n.id));
     timers.current.set(n.id, setTimeout(() => dismiss(n.id), 10_000));
     playDing(n.severity);
   }
@@ -84,6 +107,11 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
     clearTimeout(timers.current.get(id));
     timers.current.delete(id);
   }
+
+  useEffect(() => () => {
+    for (const timer of timers.current.values()) clearTimeout(timer);
+    timers.current.clear();
+  }, []);
 
   // Position & portfolio checks (runs whenever paper or theses update)
   useEffect(() => {

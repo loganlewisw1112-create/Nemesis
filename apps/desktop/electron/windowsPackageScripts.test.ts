@@ -41,13 +41,39 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('-ArgumentList @($MainEntryArg)');
   });
 
-  it('launches evidence campaigns from a frozen production build with DevTools disabled', () => {
+  it('launches evidence campaigns only from the exact passing soaked production artifact', () => {
     const script = fs.readFileSync(path.join(repoRoot, 'scripts', 'start-evidence-campaign.ps1'), 'utf8');
 
-    expect(script).toContain('npm run build');
+    expect(script).not.toContain('npm run build');
     expect(script).toContain("$env:NEMESIS_DEVTOOLS = 'false'");
     expect(script).toContain('dist-electron\\main.js');
-    expect(script).toContain('& $electronExe $mainEntry');
+    expect(script).toContain('Assert-PassingSoak');
+    expect(script).toContain('productionArtifactHash');
+    expect(script).toContain('Current production artifact differs from the exact artifact that passed the soak');
+    expect(script).toContain('Assert-CleanR10Unlock');
+    expect(script).toContain('restartOrdinal -ne 0');
+    expect(script).toContain("-notmatch '(^|[-_.])r10($|[-_.])'");
+    expect(script).toContain('NEMESIS_EVIDENCE_PREFLIGHT');
+    expect(script).toContain('preflight-ready');
+    expect(script).toContain('start-campaign');
+    expect(script).toContain('closeout-ready');
+    expect(script).toContain('Start-Process -FilePath $electronExe');
+    expect(script).toContain('Stop-CapturedProcessTree');
+    expect(script).toContain('Update-ProcessCapture');
+    expect(script).toContain('Mark-UncleanShutdown');
+    expect(script).toContain("$result.passed -ne $true");
     expect(script).not.toContain('npm run dev');
+  });
+
+  it('makes the production soak attest its artifact and calculate renderer slope from renderer timestamps', () => {
+    const script = fs.readFileSync(path.join(repoRoot, 'scripts', 'run-production-soak.ps1'), 'utf8');
+
+    expect(script).toContain("$env:NEMESIS_DEVTOOLS = 'false'");
+    expect(script).toContain("$env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'");
+    expect(script).toContain('productionArtifactHash');
+    expect(script).toContain('productionEntryHash');
+    expect(script).toContain('$rendererObservations[-1].at - $rendererObservations[0].at');
+    expect(script).toContain('rendererSampleCoverage -ge 0.95');
+    expect(script).toContain('geaSampleCoverage -ge 0.95');
   });
 });

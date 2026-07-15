@@ -12,9 +12,10 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
 import { app, BrowserWindow, ipcMain, globalShortcut, safeStorage } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { WebSocketServer, WebSocket as WsSocket, type RawData } from 'ws';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { validateBridgeMessage, type BridgeStatus, type ExitRecommendation, type NemesisBridgeMessage, type NemesisStateMirror, type RecommendationPacket } from '@nemesis/bridge-contracts';
+import { validateBridgeMessage, type BridgeProcessTelemetry, type BridgeStatus, type ExitRecommendation, type NemesisBridgeMessage, type NemesisStateMirror, type RecommendationPacket } from '@nemesis/bridge-contracts';
 import {
   DEFAULT_GUARDRAILS,
   DEFAULT_AUTO_CLOSE_SETTINGS,
@@ -57,6 +58,7 @@ import {
   type ThesisCard,
   type KalshiMarket,
   type KalshiOrderbook,
+  type KalshiFeePolicy,
   type OpportunityRadarRow,
   type PriceTick,
   type PaperPortfolio,
@@ -104,9 +106,15 @@ import {
   type PaperQualificationSnapshot,
   EntryConfirmationEngine,
   authHeaders,
-  calculateEntryEconomics,
   candidateEconomicIdentity,
+  qualifyCampaignEnrollment,
+  calculateEntryEconomics,
   type CampaignCandidateRecord,
+  type CampaignScreenedOut,
+  type CampaignScreeningReasonCode,
+  type CampaignScreeningDecisionV2,
+  type DryRunOrder,
+  type DiagnosticAttemptOutcome,
   type StrategyValidationEvent,
   type StrategyValidationSnapshot,
 } from '@nemesis/execution';
@@ -135,6 +143,11 @@ import { startupTrace } from './startupTrace.js';
 import { createBridgeAuth, isBridgeRequestAuthenticated, resolveBridgeHost } from './bridgeSecurity.js';
 import { resolveNemesisUserDataPath } from './userDataPath.js';
 import { RendererMemoryMonitor } from './rendererMemoryMonitor.js';
+import type { RendererMemoryAssessment } from './rendererMemoryMonitor.js';
+import { RuntimeHealthController, type RuntimeComponentHealth, type RuntimeHealthDecision } from './runtimeHealthController.js';
+import { RuntimeEvidenceSidecar } from './runtimeEvidenceSidecar.js';
+import { EvidenceRunSupervisor } from './evidenceRunSupervisor.js';
+import { VersionedStateStream } from './stateStreamCoalescer.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -171,6 +184,10 @@ const PAPER_BROADCAST_THROTTLE_MS = 1_000;
 const CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS = 500;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
+const BRIDGE_HEARTBEAT_MS = 5_000;
+const BRIDGE_TRAFFIC_TTL_MS = 15_000;
+const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
+const RENDERER_MEMORY_SAMPLE_INTERVAL_MS = 30_000;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
@@ -182,7 +199,12 @@ const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
 const feedHub = new FeedHub(registry);
 const activeTradeMarketResolver = new ActiveTradeMarketResolver();
-const kalshiStream = new KalshiStream(registry);
+const kalshiStream = new KalshiStream(registry, () => {
+  const credentials = getLiveCreds();
+  return credentials
+    ? authHeaders(credentials.apiKeyId, credentials.privateKeyPem, 'GET', '/trade-api/ws/v2')
+    : null;
+});
 const hotOpportunityIndex = new HotOpportunityIndex({ maxRows: 25, targetDecisionMs: 3 });
 const journal = new JournalStore();
 const quarantine = new StrategyQuarantine();
@@ -247,6 +269,25 @@ let qualificationFollowUpRunning = false;
 let strategyValidationFollowUpRunning = false;
 let campaignConfirmationWorkerRunning = false;
 let campaignDiagnosticWorkerRunning = false;
+const pendingCampaignConfirmationTickers = new Set<string>();
+const pendingCampaignThroughputTickers = new Set<string>();
+const pendingCampaignDiagnosticTickers = new Set<string>();
+interface CampaignBookObservation {
+  ticker: string;
+  sequence: number;
+  observedAt: number;
+  completedAt: number;
+  book: KalshiOrderbook;
+  feeResult:
+    | { status: 'resolved'; policy: KalshiFeePolicy }
+    | {
+        status: 'failed';
+        outcome: 'book_fetch_failed' | 'missing_provenance' | 'stale_book' | 'fee_unknown';
+        detail: string;
+      };
+}
+const latestCampaignObservationSequence = new Map<string, number>();
+const pendingCampaignDiagnosticObservations = new Map<string, CampaignBookObservation>();
 let shutdownEvidenceRecorded = false;
 let lastQualificationEquity: number | null = null;
 let sessionStatsData: SessionStats = {
@@ -265,17 +306,74 @@ let marketBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 let paperBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 let marketBroadcastThrottleMs = MARKET_BROADCAST_THROTTLE_MS;
 const rendererMemoryMonitor = new RendererMemoryMonitor();
+let latestRendererMemoryAssessment: RendererMemoryAssessment = rendererMemoryMonitor.snapshot();
+let runtimeHealthController = new RuntimeHealthController();
+let latestRuntimeDecision: RuntimeHealthDecision | null = null;
+let rendererLastHeartbeatAt = 0;
+let rendererMonitoringStartedAt = 0;
+let rendererUnresponsiveAt: number | null = null;
+let rendererHasPainted = false;
+let campaignEvidencePaused = true;
+let pendingCampaignPointer: ActiveCampaignPointer | null = null;
+let evidenceRunSupervisor: EvidenceRunSupervisor | null = null;
+let runtimeEvidenceSidecar: RuntimeEvidenceSidecar | null = null;
+let runtimeStatusState = 'idle';
+let lastRuntimeStatusWriteAt = 0;
+let lastRuntimeTransitionAction: RuntimeHealthDecision['action'] | null = null;
+let runtimeObservedSamples = 0;
+let runtimeHealthySamples = 0;
+let preflightRestSuccessAt = 0;
+let preflightTradeSuccessAt = 0;
+let preflightRestCycles = 0;
+let preflightTradeCycles = 0;
+let lastRendererMemorySampleAt = 0;
+let lastRuntimeSampleAt = 0;
+let closeoutPrepared = false;
+let campaignFinalizationState: 'idle' | 'waiting-gea' | 'running' | 'done' = 'idle';
+let campaignFinalizationTimer: ReturnType<typeof setTimeout> | null = null;
+let evidenceInvalidationInProgress = false;
+let lastDiscoveryRevision = '';
+let lastWorldRevision = '';
 const campaignBookTriggerScheduler = new CampaignBookTriggerScheduler(
   CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS,
-  ({ throughputTickers, confirmationTickers }) => {
+  ({ throughputTickers, confirmationTickers, diagnosticTickers }) => {
     if (throughputTickers.length > 0) {
       void runThroughputCertification('exchange-book-delta', new Set(throughputTickers));
     }
     if (confirmationTickers.length > 0) {
       void evaluateCampaignConfirmations(new Set(confirmationTickers));
     }
+    if (diagnosticTickers.length > 0) {
+      void evaluateCampaignDiagnostics(new Set(diagnosticTickers), true);
+    }
   },
 );
+
+type MarketStateStreamItem =
+  | { key: string; kind: 'market'; value: KalshiMarket }
+  | { key: string; kind: 'thesis'; value: ThesisCard };
+type EquityHistoryPoint = { t: number; equity: number; deployed: number; cash: number };
+const marketStreamItemCache = new Map<string, { fingerprint: string; item: MarketStateStreamItem }>();
+const marketStateStream = new VersionedStateStream<MarketStateStreamItem>(
+  'markets',
+  (item) => item.key,
+  (envelope) => broadcast('markets:state-v2', envelope),
+  1_000,
+);
+const equityHistoryStream = new VersionedStateStream<EquityHistoryPoint>(
+  'equity-history',
+  (point) => String(point.t),
+  (envelope) => broadcast('equity-history:state-v2', envelope),
+);
+
+function marketStreamItem(key: string, kind: MarketStateStreamItem['kind'], value: KalshiMarket | ThesisCard): MarketStateStreamItem {
+  const fingerprint = JSON.stringify(value);
+  const cached = marketStreamItemCache.get(key);
+  if (cached?.fingerprint === fingerprint) return cached.item;
+  const item = { key, kind, value } as MarketStateStreamItem;
+  marketStreamItemCache.set(key, { fingerprint, item });
+  return item;
+}
 
 interface StoredKalshiCredentials {
   storage: 'electron-safeStorage-v1';
@@ -296,6 +394,7 @@ interface KalshiCredentialStatus {
 const bridgeClients = new Set<WsSocket>();
 let bridgeSeq = 0;
 let geaProcess: ChildProcess | null = null;
+let geaExitedDuringEvidence = false;
 const bridgeAuth = createBridgeAuth(process.env);
 const bridgeStatus: BridgeStatus = {
   connected: false,
@@ -316,12 +415,47 @@ let bridgeConnectionCount = 0;
 
 function refreshBridgeConnectivity(now = Date.now()): void {
   const stream = kalshiOrderbookStream.telemetry();
-  bridgeStatus.tapeFreshnessMs = stream.lastExchangeTimestamp == null
+  const tradeFeed = feedHub.getTradeFeedState();
+  bridgeStatus.tradeTapeFreshnessMs = tradeFeed.tapeAgeMs;
+  bridgeStatus.orderbookObservationFreshnessMs = stream.lastMessageAt == null
+    ? null
+    : Math.max(0, now - stream.lastMessageAt);
+  bridgeStatus.exchangeDeltaFreshnessMs = stream.lastExchangeTimestamp == null
     ? null
     : Math.max(0, now - stream.lastExchangeTimestamp);
-  const inboundRecent = bridgeStatus.lastInboundAt != null && now - bridgeStatus.lastInboundAt <= 15_000;
-  const outboundRecent = bridgeStatus.lastOutboundAt != null && now - bridgeStatus.lastOutboundAt <= 15_000;
-  bridgeStatus.connected = bridgeStatus.clientCount > 0 && inboundRecent && outboundRecent;
+  bridgeStatus.tapeFreshnessMs = bridgeStatus.tradeTapeFreshnessMs;
+  const inboundRecent = bridgeStatus.lastInboundAt != null && now - bridgeStatus.lastInboundAt <= BRIDGE_TRAFFIC_TTL_MS;
+  const outboundRecent = bridgeStatus.lastOutboundAt != null && now - bridgeStatus.lastOutboundAt <= BRIDGE_TRAFFIC_TTL_MS;
+  bridgeStatus.socketConnected = bridgeStatus.clientCount > 0;
+  bridgeStatus.connected = bridgeStatus.socketConnected && inboundRecent && outboundRecent;
+  bridgeStatus.qualificationReady = bridgeStatus.connected && bridgeStatus.lastPongAt != null
+    && now - bridgeStatus.lastPongAt <= BRIDGE_TRAFFIC_TTL_MS;
+  bridgeStatus.trafficFreshnessMs = bridgeStatus.lastInboundAt == null || bridgeStatus.lastOutboundAt == null
+    ? null
+    : Math.max(now - bridgeStatus.lastInboundAt, now - bridgeStatus.lastOutboundAt);
+}
+
+function currentProcessTelemetry(now = Date.now()): Record<string, unknown> {
+  const mainWorkingSetMb = Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3));
+  bridgeStatus.mainPid = process.pid;
+  bridgeStatus.mainWorkingSetMb = mainWorkingSetMb;
+  bridgeStatus.mainProcessSampledAt = now;
+  const geaSampledAt = bridgeStatus.geaProcessSampledAt ?? null;
+  return {
+    main: {
+      pid: process.pid,
+      workingSetMb: mainWorkingSetMb,
+      sampledAt: now,
+    },
+    gea: bridgeStatus.geaPid != null && bridgeStatus.geaWorkingSetMb != null && geaSampledAt != null
+      ? {
+          pid: bridgeStatus.geaPid,
+          workingSetMb: bridgeStatus.geaWorkingSetMb,
+          sampledAt: geaSampledAt,
+          sampleAgeMs: Math.max(0, now - geaSampledAt),
+        }
+      : null,
+  };
 }
 
 function persistBridgeTelemetry(event: string, detail: Record<string, unknown> = {}): void {
@@ -547,18 +681,27 @@ function initializeStrategyValidation(): void {
 }
 
 interface ActiveCampaignPointer {
+  schemaVersion: 2;
   evidenceNamespace: string;
   stage: 'instrumentation' | 'seven-hour';
   filePath: string;
+  parentRunId: string | null;
+  restartOrdinal: number;
+  healthPolicyHash: string;
+  runtimeSidecarPath: string;
+  runtimeLedgerPath: string;
+  controlPath: string;
+  status: 'preflight' | 'active' | 'closeout';
 }
 
 function readActiveCampaignPointer(): ActiveCampaignPointer | null {
   if (!fs.existsSync(ACTIVE_CAMPAIGN_PATH)) return null;
   try {
     const pointer = JSON.parse(fs.readFileSync(ACTIVE_CAMPAIGN_PATH, 'utf8')) as ActiveCampaignPointer;
-    if (!pointer.evidenceNamespace || !['instrumentation', 'seven-hour'].includes(pointer.stage)) return null;
+    if (pointer.schemaVersion !== 2 || !pointer.evidenceNamespace || !['instrumentation', 'seven-hour'].includes(pointer.stage)) return null;
     const expected = path.resolve(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.jsonl`);
     if (path.resolve(pointer.filePath) !== expected) return null;
+    if (!pointer.runtimeSidecarPath || !pointer.runtimeLedgerPath || !pointer.controlPath) return null;
     return pointer;
   } catch {
     return null;
@@ -567,13 +710,122 @@ function readActiveCampaignPointer(): ActiveCampaignPointer | null {
 
 function writeActiveCampaignPointer(pointer: ActiveCampaignPointer): void {
   fs.mkdirSync(CAMPAIGN_DIR, { recursive: true });
-  fs.writeFileSync(ACTIVE_CAMPAIGN_PATH, JSON.stringify(pointer, null, 2), 'utf8');
+  writeAtomicJson(ACTIVE_CAMPAIGN_PATH, pointer);
+}
+
+function writeAtomicJson(filePath: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { encoding: 'utf8', flag: 'wx' });
+  fs.renameSync(temporary, filePath);
+}
+
+function configuredCampaignPointer(stage: ActiveCampaignPointer['stage'], evidenceNamespace: string): ActiveCampaignPointer {
+  const namespace = campaignNamespace(evidenceNamespace);
+  return {
+    schemaVersion: 2,
+    evidenceNamespace: namespace,
+    stage,
+    filePath: path.join(CAMPAIGN_DIR, `${namespace}.jsonl`),
+    parentRunId: process.env.NEMESIS_EVIDENCE_PARENT_RUN_ID?.trim() || null,
+    restartOrdinal: Number.parseInt(process.env.NEMESIS_EVIDENCE_RESTART_ORDINAL ?? '0', 10) || 0,
+    healthPolicyHash: process.env.NEMESIS_HEALTH_POLICY_HASH?.trim()
+      || createHash('sha256').update('runtime-health-v2').digest('hex'),
+    runtimeSidecarPath: process.env.NEMESIS_EVIDENCE_RUNTIME_SIDECAR?.trim()
+      || path.join(CAMPAIGN_DIR, `${namespace}.runtime.json`),
+    runtimeLedgerPath: process.env.NEMESIS_EVIDENCE_RUNTIME_LEDGER?.trim()
+      || path.join(CAMPAIGN_DIR, `${namespace}.runtime.jsonl`),
+    controlPath: process.env.NEMESIS_EVIDENCE_CONTROL?.trim()
+      || path.join(CAMPAIGN_DIR, `${namespace}.control.json`),
+    status: process.env.NEMESIS_EVIDENCE_PREFLIGHT === 'true' ? 'preflight' : 'active',
+  };
+}
+
+function runtimeStatusPayload(state: string, detail: Record<string, unknown> = {}): Record<string, unknown> {
+  const pointer = pendingCampaignPointer ?? readActiveCampaignPointer();
+  const now = Date.now();
+  const processes = currentProcessTelemetry(now);
+  return {
+    schemaVersion: 2,
+    runId: pointer?.evidenceNamespace ?? null,
+    state,
+    restartable: state === 'invalidated' && (pointer?.restartOrdinal ?? 2) < 2,
+    updatedAt: now,
+    campaign: campaignStore?.snapshot() ?? null,
+    runtime: latestRuntimeDecision,
+    renderer: latestRendererMemoryAssessment,
+    bridge: { ...bridgeStatus },
+    processes,
+    feeds: feedHub.getFeedHealthSnapshot(),
+    ...detail,
+  };
+}
+
+function writeRuntimeStatus(state: string, detail: Record<string, unknown> = {}, force = false): void {
+  const pointer = pendingCampaignPointer ?? readActiveCampaignPointer();
+  if (!pointer?.runtimeSidecarPath) return;
+  const now = Date.now();
+  if (!force && state === runtimeStatusState && now - lastRuntimeStatusWriteAt < RUNTIME_SAMPLE_INTERVAL_MS) return;
+  writeAtomicJson(pointer.runtimeSidecarPath, runtimeStatusPayload(state, detail));
+  runtimeStatusState = state;
+  lastRuntimeStatusWriteAt = now;
 }
 
 function campaignNamespace(input: string): string {
   const normalized = input.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   if (!normalized) throw new Error('campaign evidence namespace is empty after normalization');
   return normalized;
+}
+
+function startEvidenceCampaign(pointer: ActiveCampaignPointer, startedAt: number): boolean {
+  const config = entryQualificationSettings();
+  campaignEntryConfirmationEngine = new EntryConfirmationEngine(config);
+  const isNewLedger = !fs.existsSync(pointer.filePath);
+  const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
+  if (!isNewLedger) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign restart refused: attempts require an isolated namespace and fresh clock');
+    return false;
+  }
+  if (!frozenCommit) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: NEMESIS_GIT_COMMIT is required');
+    return false;
+  }
+  if ((settings.kalshiAccountPrecision ?? 'unknown') === 'unknown') {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: account balance precision must be explicit');
+    return false;
+  }
+  if (paperDesk.snapshot().positions.length > 0) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: close all paper positions first');
+    return false;
+  }
+  campaignStore = SevenHourCampaignStore.open(pointer.filePath, {
+    runId: pointer.evidenceNamespace,
+    evidenceNamespace: pointer.evidenceNamespace,
+    configurationHash: strategyConfigHash(),
+    gitCommit: frozenCommit,
+    stage: pointer.stage,
+    startedAt,
+    settings: config,
+    parentRunId: pointer.parentRunId ?? undefined,
+    restartOrdinal: pointer.restartOrdinal,
+    healthPolicyHash: pointer.healthPolicyHash,
+    runtimeSidecarPath: pointer.runtimeLedgerPath,
+  }, config);
+  pointer.status = 'active';
+  pendingCampaignPointer = pointer;
+  writeActiveCampaignPointer(pointer);
+  const snapshot = campaignStore.snapshot();
+  if (snapshot.integrityError || snapshot.manifest.schemaVersion !== 2) {
+    reviewOnly = true;
+    campaignStore = null;
+    return false;
+  }
+  campaignEvidencePaused = latestRuntimeDecision?.state !== 'healthy';
+  return true;
 }
 
 function initializeEvidenceCampaign(): void {
@@ -583,61 +835,57 @@ function initializeEvidenceCampaign(): void {
     : undefined;
   const requestedNamespace = process.env.NEMESIS_EVIDENCE_NAMESPACE;
   let pointer: ActiveCampaignPointer | null = requestedNamespace && stage
-    ? {
-        evidenceNamespace: campaignNamespace(requestedNamespace),
-        stage,
-        filePath: path.join(CAMPAIGN_DIR, `${campaignNamespace(requestedNamespace)}.jsonl`),
-      }
+    ? configuredCampaignPointer(stage, requestedNamespace)
     : readActiveCampaignPointer();
   if (!pointer && stage) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const evidenceNamespace = campaignNamespace(`${stage}-${stamp}`);
-    pointer = { evidenceNamespace, stage, filePath: path.join(CAMPAIGN_DIR, `${evidenceNamespace}.jsonl`) };
+    pointer = configuredCampaignPointer(stage, `${stage}-${stamp}`);
   }
   if (!pointer) return;
-
-  const config = entryQualificationSettings();
-  campaignEntryConfirmationEngine = new EntryConfirmationEngine(config);
-  const isNewLedger = !fs.existsSync(pointer.filePath);
   const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
-  if (isNewLedger && !frozenCommit) {
+  if (!frozenCommit) {
     reviewOnly = true;
     console.error('[nemesis] evidence campaign not started: NEMESIS_GIT_COMMIT is required');
     return;
   }
-  if (isNewLedger && (settings.kalshiAccountPrecision ?? 'unknown') === 'unknown') {
-    reviewOnly = true;
-    console.error('[nemesis] evidence campaign not started: account balance precision must be explicit');
-    return;
-  }
-  if (isNewLedger && paperDesk.snapshot().positions.length > 0) {
-    reviewOnly = true;
-    console.error('[nemesis] evidence campaign not started: close all paper positions first');
-    return;
-  }
-  campaignStore = SevenHourCampaignStore.open(pointer.filePath, {
-    runId: pointer.evidenceNamespace,
-    evidenceNamespace: pointer.evidenceNamespace,
-    configurationHash: strategyConfigHash(),
-    gitCommit: frozenCommit ?? 'resume-from-ledger',
-    stage: pointer.stage,
-    settings: config,
-  }, config);
+  pendingCampaignPointer = pointer;
   writeActiveCampaignPointer(pointer);
-  const snapshot = campaignStore.snapshot();
-  if (!snapshot.integrityError) {
-    campaignStore.record((tracker) => tracker.ensureConfiguration(strategyConfigHash()));
-    for (const candidate of campaignStore.snapshot().candidates) {
-      if (candidate.terminalState) continue;
-      campaignEntryConfirmationEngine.restoreCandidateState({
-        candidateId: candidate.candidateId,
-        sourceSignalId: candidate.originalCardId,
-        ticker: candidate.ticker,
-        side: candidate.side,
-        samples: candidate.samples,
-      });
+  if (pointer.status === 'preflight') {
+    if (fs.existsSync(pointer.filePath) || fs.existsSync(pointer.runtimeLedgerPath)) {
+      reviewOnly = true;
+      invalidateEvidenceAttempt(['preflight namespace is not clean'], Date.now(), false);
+      return;
     }
+    try {
+      runtimeEvidenceSidecar = RuntimeEvidenceSidecar.create(pointer.runtimeLedgerPath, {
+        runId: pointer.evidenceNamespace,
+        gitCommit: frozenCommit,
+        configurationHash: strategyConfigHash(),
+        healthPolicyHash: pointer.healthPolicyHash,
+      });
+      evidenceRunSupervisor = new EvidenceRunSupervisor({
+        at: Date.now(),
+        runId: pointer.evidenceNamespace,
+        parentRunId: pointer.parentRunId,
+        restartOrdinal: pointer.restartOrdinal,
+        evidenceNamespace: pointer.evidenceNamespace,
+        gitCommit: frozenCommit,
+        configurationHash: strategyConfigHash(),
+        healthPolicyHash: pointer.healthPolicyHash,
+        stage: pointer.stage,
+        runtimeSidecarPath: pointer.runtimeLedgerPath,
+      });
+      campaignEvidencePaused = true;
+      writeRuntimeStatus('preflight', {}, true);
+    } catch (error) {
+      reviewOnly = true;
+      invalidateEvidenceAttempt([
+        `runtime evidence startup failed: ${error instanceof Error ? error.message : String(error)}`,
+      ], Date.now(), false);
+    }
+    return;
   }
+  startEvidenceCampaign(pointer, Date.now());
 }
 
 function campaignSnapshot() {
@@ -652,71 +900,560 @@ function campaignSnapshot() {
   }
 }
 
+function campaignMutationLockReason(): string | null {
+  if (!pendingCampaignPointer) return null;
+  return `paper/live mutation locked during supervised evidence state ${pendingCampaignPointer.status}`;
+}
+
 function sampleRendererMemory(): void {
-  if (!mainWindow || mainWindow.isDestroyed() || !campaignStore) return;
-  const snapshot = campaignSnapshot();
-  if (!snapshot || snapshot.manifest.status !== 'active') return;
-  if (snapshot.operationalChecks.some((check) => check.name === 'renderer_memory_stable')) return;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
   const devToolsClosed = !mainWindow.webContents.isDevToolsOpened();
   if (!devToolsClosed) {
-    campaignStore.record((tracker) => tracker.recordOperationalCheck(
-      'renderer_memory_stable',
-      false,
-      'DevTools must remain closed during production memory evidence',
-    ));
+    latestRendererMemoryAssessment = {
+      ...rendererMemoryMonitor.snapshot(),
+      status: 'unstable-growth',
+      blocked: true,
+      reasons: ['DevTools must remain closed during production memory evidence'],
+      detail: 'DevTools must remain closed during production memory evidence',
+    };
     return;
   }
   const rendererPid = mainWindow.webContents.getOSProcessId();
   const metric = app.getAppMetrics().find((item) => item.pid === rendererPid);
   const workingSetKb = metric?.memory.workingSetSize;
   if (!workingSetKb) return;
-  const assessment = rendererMemoryMonitor.add({ at: Date.now(), workingSetKb });
-  if (assessment.status === 'warming') return;
-  const stable = assessment.status === 'stable';
+  const now = Date.now();
+  lastRendererMemorySampleAt = now;
+  latestRendererMemoryAssessment = rendererMemoryMonitor.add({
+    at: now,
+    workingSetKb,
+    rendererPid,
+    heartbeatAgeMs: rendererLastHeartbeatAt > 0
+      ? now - rendererLastHeartbeatAt
+      : Math.max(0, now - rendererMonitoringStartedAt),
+    unresponsiveForMs: rendererUnresponsiveAt == null ? 0 : now - rendererUnresponsiveAt,
+    painted: rendererHasPainted,
+  });
+  const stable = latestRendererMemoryAssessment.status === 'stable' && !latestRendererMemoryAssessment.blocked;
   marketBroadcastThrottleMs = stable
     ? MARKET_BROADCAST_THROTTLE_MS
     : DEGRADED_MARKET_BROADCAST_THROTTLE_MS;
-  if (!stable) {
-    if (!snapshot.operationalChecks.some((check) => check.name === 'renderer_memory_mitigation_applied')) {
-      campaignStore.record((tracker) => tracker.recordOperationalCheck(
-        'renderer_memory_mitigation_applied',
-        true,
-        `${assessment.detail}; full-state broadcast throttle raised to ${marketBroadcastThrottleMs}ms while stabilization evidence continues`,
-      ));
+}
+
+function runtimeComponents(now: number): RuntimeComponentHealth[] {
+  refreshBridgeConnectivity(now);
+  const feeds = feedHub.getFeedHealthSnapshot(now);
+  const ticker = kalshiStream.telemetry(now);
+  const orderbook = kalshiOrderbookStream.telemetry(now);
+  const component = (
+    name: RuntimeComponentHealth['name'],
+    health: ReturnType<typeof registry.get>,
+  ): RuntimeComponentHealth => ({
+    name,
+    connected: health?.transportConnected === true || health?.status === 'ok',
+    qualificationReady: health?.qualificationReady === true,
+    lastSuccessAt: health?.lastMessageAt ?? health?.lastSuccess ?? null,
+    lastPongAt: health?.lastPongAt ?? null,
+    retryAt: health?.nextRetryAt ?? null,
+    failureClass: health?.failureClass ?? null,
+    failures: health?.errorCount1h ?? 0,
+    maxAgeMs: name === 'rest-markets' || name === 'trade-tape' ? 30_000 : undefined,
+  });
+  return [
+    component('rest-markets', feeds.restMarkets ?? undefined),
+    component('trade-tape', feeds.tradeTape ?? undefined),
+    {
+      name: 'ticker-websocket',
+      connected: ticker.connected,
+      qualificationReady: ticker.qualificationReady,
+      lastSuccessAt: ticker.lastMessageAt,
+      lastPongAt: ticker.lastPongAt,
+      failures: ticker.sequenceGaps,
+      maxAgeMs: 25_000,
+    },
+    {
+      name: 'orderbook-websocket',
+      connected: orderbook.connected,
+      qualificationReady: orderbook.qualificationReady && orderbook.booksWithExchangeTime > 0,
+      lastSuccessAt: orderbook.lastMessageAt,
+      lastPongAt: orderbook.lastPongAt,
+      failures: orderbook.sequenceGaps + orderbook.sequenceRegressions,
+      maxAgeMs: 25_000,
+    },
+    {
+      name: 'bridge',
+      connected: bridgeStatus.connected,
+      qualificationReady: bridgeStatus.qualificationReady === true,
+      lastSuccessAt: bridgeStatus.lastPongAt ?? bridgeStatus.lastInboundAt,
+      lastPingAt: bridgeStatus.lastPingAt ?? null,
+      lastPongAt: bridgeStatus.lastPongAt,
+      failures: bridgeStatus.sequenceGaps ?? 0,
+      maxAgeMs: BRIDGE_TRAFFIC_TTL_MS,
+    },
+    {
+      name: 'gea',
+      connected: Boolean(geaProcess && !geaProcess.killed),
+      qualificationReady: Boolean(geaProcess && !geaProcess.killed && bridgeStatus.connected),
+      lastSuccessAt: bridgeStatus.lastInboundAt,
+      failures: bridgeStatus.disconnects,
+      maxAgeMs: BRIDGE_TRAFFIC_TTL_MS,
+    },
+  ];
+}
+
+function updatePreflightCycleCounts(): void {
+  const feeds = feedHub.getFeedHealthSnapshot();
+  const restAt = feeds.restMarkets?.lastSuccess ?? 0;
+  const tradeAt = feeds.tradeTape?.lastSuccess ?? 0;
+  if (restAt > preflightRestSuccessAt) {
+    preflightRestSuccessAt = restAt;
+    preflightRestCycles += 1;
+  }
+  if (tradeAt > preflightTradeSuccessAt) {
+    preflightTradeSuccessAt = tradeAt;
+    preflightTradeCycles += 1;
+  }
+}
+
+function preflightHealthy(): boolean {
+  const ticker = kalshiStream.telemetry();
+  const orderbook = kalshiOrderbookStream.telemetry();
+  return settings.liveEnabled !== true
+    && settings.autoLiveEnabled !== true
+    && settings.dryRun === true
+    && paperDesk.snapshot().positions.length === 0
+    && paperDesk.snapshot().trades.length === 0
+    && paperOrderBook.working().length === 0
+    && latestRendererMemoryAssessment.status === 'stable'
+    && !latestRendererMemoryAssessment.blocked
+    && preflightRestCycles >= 3
+    && preflightTradeCycles >= 3
+    && ticker.authenticated
+    && ticker.qualificationReady
+    && orderbook.authenticated
+    && orderbook.qualificationReady
+    && orderbook.booksWithExchangeTime > 0
+    && (bridgeStatus.pongCount ?? 0) >= 3
+    && bridgeStatus.qualificationReady === true
+    && Boolean(geaProcess && !geaProcess.killed)
+    && latestRuntimeDecision?.state === 'healthy'
+    && Boolean(pendingCampaignPointer && !fs.existsSync(pendingCampaignPointer.filePath));
+}
+
+function readEvidenceControl(): { command?: string; runId?: string } | null {
+  const pointer = pendingCampaignPointer;
+  if (!pointer || !fs.existsSync(pointer.controlPath)) return null;
+  try {
+    const control = JSON.parse(fs.readFileSync(pointer.controlPath, 'utf8')) as { command?: string; runId?: string };
+    fs.rmSync(pointer.controlPath, { force: true });
+    return control.runId === pointer.evidenceNamespace ? control : null;
+  } catch {
+    return null;
+  }
+}
+
+function stopCampaignInputs(): void {
+  campaignEvidencePaused = true;
+  pendingCampaignConfirmationTickers.clear();
+  pendingCampaignThroughputTickers.clear();
+  pendingCampaignDiagnosticTickers.clear();
+  pendingCampaignDiagnosticObservations.clear();
+  latestCampaignObservationSequence.clear();
+  campaignBookTriggerScheduler.stop();
+  marketStateStream.stop();
+  equityHistoryStream.stop();
+  kalshiStream.stop();
+  kalshiOrderbookStream.stop();
+  feedHub.stopBackgroundPolling();
+}
+
+function writeCampaignResult(result: ReturnType<SevenHourCampaignStore['snapshot']>, extra: Record<string, unknown> = {}): void {
+  const pointer = pendingCampaignPointer;
+  if (!pointer) return;
+  const resultPath = path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.result.json`);
+  const summaryPath = path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.summary.md`);
+  const payload = {
+    schemaVersion: 2,
+    generatedAt: Date.now(),
+    runId: pointer.evidenceNamespace,
+    passed: result.passed,
+    reasons: result.reasons,
+    manifest: result.manifest,
+    metrics: {
+      candidates: result.candidates.length,
+      screenedOut: result.screenedOut?.length ?? 0,
+      validDiagnosticOutcomes: result.validDiagnosticOutcomes,
+      readyCandidates: result.readyCandidates,
+      terminalCoverage: result.terminalCoverage,
+      diagnosticSchedulingCoverage: result.diagnosticSchedulingCoverage,
+      validDiagnosticCoverage: result.validDiagnosticCoverage,
+      freshConfirmationRate: result.freshConfirmationRate,
+      runtimeObservedSamples,
+      runtimeHealthySamples,
+    },
+    ...extra,
+  };
+  writeAtomicJson(resultPath, payload);
+  fs.writeFileSync(summaryPath, [
+    `# NEMESIS ${pointer.evidenceNamespace}`,
+    '',
+    `Result: **${result.passed ? 'PASS' : 'FAIL'}**`,
+    '',
+    ...result.reasons.map((reason) => `- ${reason}`),
+    '',
+    `Candidates: ${result.candidates.length}`,
+    `Valid diagnostics: ${result.validDiagnosticOutcomes}`,
+    `Ready candidates: ${result.readyCandidates}`,
+    `Runtime health samples: ${runtimeHealthySamples}/${runtimeObservedSamples}`,
+    '',
+  ].join('\n'), 'utf8');
+}
+
+function writePreflightFailureResult(reason: string, now: number, restartable: boolean): void {
+  const pointer = pendingCampaignPointer;
+  if (!pointer) return;
+  writeAtomicJson(path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.result.json`), {
+    schemaVersion: 2,
+    generatedAt: now,
+    runId: pointer.evidenceNamespace,
+    passed: false,
+    reasons: [reason],
+    manifest: {
+      schemaVersion: 2,
+      runId: pointer.evidenceNamespace,
+      evidenceNamespace: pointer.evidenceNamespace,
+      parentRunId: pointer.parentRunId,
+      restartOrdinal: pointer.restartOrdinal,
+      healthPolicyHash: pointer.healthPolicyHash,
+      stage: pointer.stage,
+      status: 'invalidated',
+      invalidationReason: reason,
+    },
+    metrics: {
+      candidates: 0,
+      screenedOut: 0,
+      validDiagnosticOutcomes: 0,
+      readyCandidates: 0,
+      runtimeObservedSamples,
+      runtimeHealthySamples,
+    },
+    invalidated: true,
+    restartable,
+  });
+}
+
+function prepareCampaignCloseout(now: number): void {
+  if (closeoutPrepared || !campaignStore || !pendingCampaignPointer) return;
+  closeoutPrepared = true;
+  const finalOrderbookTelemetry = kalshiOrderbookStream.telemetry(now);
+  stopCampaignInputs();
+  const snapshot = campaignStore.snapshot();
+  const startedAt = snapshot.manifest.startedAt;
+  const expectedSamples = Math.max(1, Math.floor((now - startedAt) / RUNTIME_SAMPLE_INTERVAL_MS) + 1);
+  const sampleCoverage = runtimeObservedSamples / expectedSamples;
+  const healthyCoverage = runtimeHealthySamples / expectedSamples;
+  const rendererHealthy = latestRendererMemoryAssessment.status === 'stable'
+    && !latestRendererMemoryAssessment.blocked
+    && (latestRendererMemoryAssessment.p95WorkingSetKb ?? Number.POSITIVE_INFINITY) <= 384 * 1024
+    && latestRendererMemoryAssessment.slopePerHour <= 0.02
+    && now - lastRendererMemorySampleAt <= 60_000;
+  const bridgeHealthy = bridgeStatus.qualificationReady === true && now - lastRuntimeSampleAt <= 60_000;
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'renderer_memory_stable',
+    rendererHealthy,
+    latestRendererMemoryAssessment.detail,
+    now,
+  ));
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'bridge_bidirectional_traffic',
+    bridgeHealthy,
+    `bridge coverage current=${bridgeStatus.qualificationReady === true} roundTripMs=${bridgeStatus.roundTripMs ?? 'unknown'}`,
+    now,
+  ));
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'runtime_health_coverage',
+    sampleCoverage >= 0.95 && healthyCoverage >= 0.995,
+    `sample coverage ${(sampleCoverage * 100).toFixed(3)}%; healthy coverage ${(healthyCoverage * 100).toFixed(3)}%`,
+    now,
+  ));
+  const finalExchangeAgeMs = finalOrderbookTelemetry.lastExchangeTimestamp == null
+    ? Number.POSITIVE_INFINITY
+    : now - finalOrderbookTelemetry.lastExchangeTimestamp;
+  const finalExchangeEvidenceReady = finalOrderbookTelemetry.qualificationReady
+    && finalExchangeAgeMs >= 0
+    && finalExchangeAgeMs <= 25_000;
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'exchange_book_time_available',
+    finalExchangeEvidenceReady,
+    `final sequenced delta received at ${finalOrderbookTelemetry.lastSequencedDeltaAt ?? 'unknown'}; exchange age ${Number.isFinite(finalExchangeAgeMs) ? `${finalExchangeAgeMs}ms` : 'unknown'}`,
+    now,
+  ));
+  const restartOrdinal = snapshot.manifest.schemaVersion === 2 ? snapshot.manifest.restartOrdinal : -1;
+  const noRuntimeMitigation = restartOrdinal === 0
+    && (latestRuntimeDecision?.recoveryCount ?? 0) === 0;
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'no_runtime_restart_or_emergency_mitigation',
+    noRuntimeMitigation,
+    `restart ordinal ${restartOrdinal}; runtime recoveries ${latestRuntimeDecision?.recoveryCount ?? 0}`,
+    now,
+  ));
+  campaignStore.record((tracker) => tracker.prepareCloseout(now));
+  pendingCampaignPointer.status = 'closeout';
+  writeActiveCampaignPointer(pendingCampaignPointer);
+  runtimeEvidenceSidecar?.appendTransition({ action: 'closeout', sampleCoverage, healthyCoverage }, now);
+  writeRuntimeStatus('closeout-ready', { sampleCoverage, healthyCoverage }, true);
+}
+
+function finishOfflineCampaignFinalization(now: number): void {
+  if (campaignFinalizationState === 'running' || campaignFinalizationState === 'done') return;
+  if (!campaignStore || !pendingCampaignPointer || !runtimeEvidenceSidecar) return;
+  campaignFinalizationState = 'running';
+  if (campaignFinalizationTimer) {
+    clearTimeout(campaignFinalizationTimer);
+    campaignFinalizationTimer = null;
+  }
+  try {
+    const pointer = pendingCampaignPointer;
+    const liveSnapshot = campaignStore.snapshot();
+    if (liveSnapshot.integrityError || liveSnapshot.manifest.schemaVersion !== 2 || liveSnapshot.manifest.status !== 'closeout') {
+      throw new Error(liveSnapshot.integrityError ?? `offline replay requires schema-v2 closeout, got ${liveSnapshot.manifest.status}`);
+    }
+    // Inputs and GEA are closed before this single replay becomes the authoritative finalizer.
+    const replayedStore = SevenHourCampaignStore.open(pointer.filePath, {
+      runId: pointer.evidenceNamespace,
+      evidenceNamespace: pointer.evidenceNamespace,
+      configurationHash: liveSnapshot.manifest.configurationHash,
+      gitCommit: liveSnapshot.manifest.gitCommit,
+      stage: pointer.stage,
+      startedAt: liveSnapshot.manifest.startedAt,
+      settings: entryQualificationSettings(),
+      parentRunId: pointer.parentRunId ?? undefined,
+      restartOrdinal: pointer.restartOrdinal,
+      healthPolicyHash: pointer.healthPolicyHash,
+      runtimeSidecarPath: pointer.runtimeLedgerPath,
+    }, entryQualificationSettings());
+    const replayed = replayedStore.snapshot();
+    if (replayed.integrityError || replayed.manifest.status !== 'closeout') {
+      throw new Error(replayed.integrityError ?? `offline replay produced unexpected status ${replayed.manifest.status}`);
+    }
+    const runtimeHash = runtimeEvidenceSidecar.finalize({ cleanShutdownRequested: true }, now);
+    replayedStore.record((tracker) => tracker.finalize(now, runtimeHash));
+    evidenceRunSupervisor?.finalize(runtimeHash);
+    campaignStore = replayedStore;
+    const result = replayedStore.snapshot();
+    writeCampaignResult(result, { finalRuntimeSidecarHash: runtimeHash, offlineReplayCount: 1 });
+    writeRuntimeStatus('finalized', {
+      passed: result.passed,
+      finalRuntimeSidecarHash: runtimeHash,
+      offlineReplayCount: 1,
+      restartable: false,
+    }, true);
+    // The active pointer is cleared only after both durable result and status writes succeed.
+    fs.rmSync(ACTIVE_CAMPAIGN_PATH, { force: true });
+    campaignFinalizationState = 'done';
+    setTimeout(() => app.quit(), 250);
+  } catch (error) {
+    campaignFinalizationState = 'done';
+    invalidateEvidenceAttempt([
+      `offline campaign finalization failed: ${error instanceof Error ? error.message : String(error)}`,
+    ], Date.now(), false);
+  }
+}
+
+function finalizeCampaign(now: number): void {
+  if (!campaignStore || !pendingCampaignPointer || !runtimeEvidenceSidecar) return;
+  if (campaignFinalizationState !== 'idle') return;
+  stopCampaignInputs();
+  if (!geaProcess || geaProcess.killed) {
+    finishOfflineCampaignFinalization(now);
+    return;
+  }
+  campaignFinalizationState = 'waiting-gea';
+  const closingGea = geaProcess;
+  closingGea.once('exit', () => finishOfflineCampaignFinalization(Date.now()));
+  if (!closingGea.kill()) {
+    campaignFinalizationState = 'done';
+    invalidateEvidenceAttempt(['GEA did not accept the clean closeout signal'], now, false);
+    return;
+  }
+  campaignFinalizationTimer = setTimeout(() => {
+    campaignFinalizationTimer = null;
+    campaignFinalizationState = 'done';
+    invalidateEvidenceAttempt(['unclean shutdown: GEA did not exit within 30 seconds'], Date.now(), false);
+  }, 30_000);
+}
+
+function invalidateEvidenceAttempt(reasons: readonly string[], now: number, restartable = true): void {
+  if (evidenceInvalidationInProgress) return;
+  evidenceInvalidationInProgress = true;
+  const reason = [...new Set(reasons)].join('; ') || 'runtime invalidated';
+  campaignEvidencePaused = true;
+  evidenceRunSupervisor?.invalidate(reason);
+  let runtimeHash: string | null = null;
+  if (campaignStore && ['active', 'closeout'].includes(campaignStore.snapshot().manifest.status)) {
+    campaignStore.record((tracker) => tracker.invalidate(reason, now));
+  }
+  try {
+    runtimeEvidenceSidecar?.appendTransition({ action: 'invalidate', reason }, now);
+    runtimeHash = runtimeEvidenceSidecar?.finalize({ invalidated: true, reason }, now) ?? null;
+  } catch {
+    restartable = false;
+  }
+  stopCampaignInputs();
+  try {
+    if (campaignStore) {
+      writeCampaignResult(campaignStore.snapshot(), {
+        invalidated: true,
+        restartable,
+        finalRuntimeSidecarHash: runtimeHash,
+      });
+    } else {
+      writePreflightFailureResult(reason, now, restartable);
+    }
+    writeRuntimeStatus('invalidated', { reason, restartable }, true);
+    // Preserve the pointer whenever either durable invalidation artifact fails.
+    fs.rmSync(ACTIVE_CAMPAIGN_PATH, { force: true });
+  } catch (error) {
+    restartable = false;
+    console.error('[nemesis] invalidation artifact persistence failed; active pointer preserved', error);
+  }
+  if (geaProcess && !geaProcess.killed) geaProcess.kill();
+  setTimeout(() => app.quit(), 250);
+}
+
+function processEvidenceSupervisor(now: number): void {
+  if (!pendingCampaignPointer || !evidenceRunSupervisor) return;
+  const control = readEvidenceControl();
+  const state = evidenceRunSupervisor.snapshot().status;
+  if (control?.command === 'unclean-shutdown') {
+    invalidateEvidenceAttempt(['unclean shutdown requested by external supervisor'], now, false);
+    return;
+  }
+  if (state === 'preflight') {
+    updatePreflightCycleCounts();
+    const decision = evidenceRunSupervisor.observePreflight(now, preflightHealthy());
+    if (decision.state === 'invalidated') {
+      invalidateEvidenceAttempt([decision.reason], now);
+      return;
+    }
+    if (decision.state === 'preflight-ready') writeRuntimeStatus('preflight-ready', {}, true);
+    else writeRuntimeStatus('preflight');
+    if (control?.command === 'start-campaign' && decision.state === 'preflight-ready') {
+      const start = evidenceRunSupervisor.start(now);
+      if (!startEvidenceCampaign(pendingCampaignPointer, now)) {
+        invalidateEvidenceAttempt(['campaign ledger could not be started after preflight'], now, false);
+        return;
+      }
+      runtimeObservedSamples = 0;
+      runtimeHealthySamples = 0;
+      runtimeHealthController = new RuntimeHealthController();
+      latestRuntimeDecision = null;
+      campaignEvidencePaused = false;
+      runtimeEvidenceSidecar?.appendTransition({ action: 'start-campaign' }, now);
+      writeRuntimeStatus('active', { cutoffAt: start.manifest.cutoffAt }, true);
     }
     return;
   }
-  campaignStore.record((tracker) => tracker.recordOperationalCheck(
-    'renderer_memory_stable',
-    true,
-    assessment.detail,
-  ));
+  if (state === 'preflight-ready') {
+    writeRuntimeStatus('preflight-ready');
+    if (control?.command === 'start-campaign') {
+      const start = evidenceRunSupervisor.start(now);
+      if (!startEvidenceCampaign(pendingCampaignPointer, now)) {
+        invalidateEvidenceAttempt(['campaign ledger could not be started after preflight'], now, false);
+        return;
+      }
+      runtimeObservedSamples = 0;
+      runtimeHealthySamples = 0;
+      runtimeHealthController = new RuntimeHealthController();
+      latestRuntimeDecision = null;
+      campaignEvidencePaused = false;
+      runtimeEvidenceSidecar?.appendTransition({ action: 'start-campaign' }, now);
+      writeRuntimeStatus('active', { cutoffAt: start.manifest.cutoffAt }, true);
+    }
+    return;
+  }
+  if (state === 'active') {
+    const transition = evidenceRunSupervisor.tick(now);
+    if (transition.state === 'closeout') prepareCampaignCloseout(now);
+    else writeRuntimeStatus('active');
+    return;
+  }
+  if (state === 'closeout' && control?.command === 'finalize') finalizeCampaign(now);
 }
 
 function recordCampaignOperationalTelemetry(): void {
-  if (!campaignStore) return;
-  const snapshot = campaignSnapshot();
-  if (!snapshot || snapshot.manifest.status !== 'active') return;
-  refreshBridgeConnectivity();
-  if (
-    bridgeStatus.connected
-    && !snapshot.operationalChecks.some((check) => check.name === 'bridge_bidirectional_traffic')
-  ) {
-    campaignStore.record((tracker) => tracker.recordOperationalCheck(
-      'bridge_bidirectional_traffic',
-      true,
-      `recent inbound seq ${bridgeStatus.lastSequenceIn} and outbound seq ${bridgeStatus.lastSequenceOut}`,
-    ));
+  const now = Date.now();
+  const activeSnapshot = campaignSnapshot();
+  if (activeSnapshot?.integrityError) {
+    invalidateEvidenceAttempt([activeSnapshot.integrityError], now, false);
+    return;
   }
+  if (activeSnapshot?.manifest.status === 'invalidated') {
+    invalidateEvidenceAttempt([activeSnapshot.manifest.invalidationReason ?? 'campaign configuration invalidated'], now, false);
+    return;
+  }
+  if (pendingCampaignPointer && !getLiveCreds()) {
+    invalidateEvidenceAttempt(['protected Kalshi credentials became unavailable'], now, false);
+    return;
+  }
+  if (pendingCampaignPointer && geaExitedDuringEvidence) {
+    invalidateEvidenceAttempt(['GEA process exited during supervised evidence'], now);
+    return;
+  }
+  const components = runtimeComponents(now);
+  const supervisorState = evidenceRunSupervisor?.snapshot().status;
+  if (supervisorState === 'preflight') runtimeHealthController = new RuntimeHealthController();
+  latestRuntimeDecision = runtimeHealthController.observe({
+    at: now,
+    components,
+    renderer: latestRendererMemoryAssessment,
+    process: {
+      geaRunning: process.env.NEMESIS_AUTO_SPAWN_GEA === 'false' || Boolean(geaProcess && !geaProcess.killed),
+      nemesisResponsive: rendererUnresponsiveAt == null,
+    },
+  });
+  lastRuntimeSampleAt = now;
+  if (campaignStore?.snapshot().manifest.status === 'active') {
+    runtimeObservedSamples += 1;
+    if (latestRuntimeDecision.lease.status === 'healthy') runtimeHealthySamples += 1;
+  }
+  try {
+    const processes = currentProcessTelemetry(now);
+    runtimeEvidenceSidecar?.appendSample({
+      state: latestRuntimeDecision.state,
+      lease: latestRuntimeDecision.lease,
+      components,
+      renderer: latestRendererMemoryAssessment,
+      bridge: { ...bridgeStatus },
+      processes,
+    }, now);
+  } catch (error) {
+    invalidateEvidenceAttempt([`runtime evidence persistence failed: ${error instanceof Error ? error.message : String(error)}`], now, false);
+    return;
+  }
+  if (latestRuntimeDecision.action !== lastRuntimeTransitionAction) {
+    runtimeEvidenceSidecar?.appendTransition({
+      action: latestRuntimeDecision.action,
+      reasons: latestRuntimeDecision.reasons,
+    }, now);
+    lastRuntimeTransitionAction = latestRuntimeDecision.action;
+  }
+  if (latestRuntimeDecision.invalidated && supervisorState !== 'preflight') {
+    invalidateEvidenceAttempt(latestRuntimeDecision.reasons, now);
+    return;
+  }
+  if (latestRuntimeDecision.pauseEvidence) campaignEvidencePaused = true;
+  else if (latestRuntimeDecision.action === 'resume' || latestRuntimeDecision.state === 'healthy') campaignEvidencePaused = false;
+  const snapshot = campaignSnapshot();
   const orderbookTelemetry = kalshiOrderbookStream.telemetry();
-  if (
-    orderbookTelemetry.sequenceRegressions > 0
-    && !snapshot.safetyFailures.some((failure) => failure.includes('order-book sequence regression'))
-  ) {
-    campaignStore.record((tracker) => tracker.recordSafetyFailure(
+  if (snapshot?.manifest.status === 'active'
+    && orderbookTelemetry.sequenceRegressions > 0
+    && !snapshot.safetyFailures.some((failure) => failure.includes('order-book sequence regression'))) {
+    campaignStore?.record((tracker) => tracker.recordSafetyFailure(
       `${orderbookTelemetry.sequenceRegressions} order-book sequence regression(s) detected`,
     ));
   }
+  processEvidenceSupervisor(now);
 }
 
 function entryQualificationSettings() {
@@ -966,6 +1703,10 @@ function loadDiscoverySettings() {
       /* keep defaults */
     }
   }
+  const supervisedMaxTickers = Number.parseInt(process.env.NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS ?? '', 10);
+  if (Number.isFinite(supervisedMaxTickers) && supervisedMaxTickers > 0) {
+    discovery.loadSettings({ ...discovery.settings, maxTrackedTickers: Math.min(500, supervisedMaxTickers) });
+  }
 }
 
 function saveDiscoverySettings() {
@@ -974,7 +1715,11 @@ function saveDiscoverySettings() {
 }
 
 function broadcastDiscovery() {
-  broadcast('discovery:update', discovery.getState());
+  const state = discovery.getState();
+  const revision = createHash('sha256').update(JSON.stringify(state)).digest('hex');
+  if (revision === lastDiscoveryRevision) return;
+  lastDiscoveryRevision = revision;
+  broadcast('discovery:update', state);
 }
 
 function buildWorldEventsPayload(): WorldEventsPayload {
@@ -1011,7 +1756,11 @@ function buildWorldEventsPayload(): WorldEventsPayload {
 }
 
 function broadcastWorldEvents() {
-  broadcast('worldevents:update', buildWorldEventsPayload());
+  const payload = buildWorldEventsPayload();
+  const revision = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  if (revision === lastWorldRevision) return;
+  lastWorldRevision = revision;
+  broadcast('worldevents:update', payload);
 }
 
 function loadJournal() {
@@ -1244,31 +1993,121 @@ function findCampaignCandidate(card: ThesisCard): CampaignCandidateRecord | null
   return snapshot.candidates.find((candidate) => candidate.economicIdentity === identity) ?? null;
 }
 
-function enrollCampaignCandidate(card: ThesisCard, preview: PaperBuyResult, book: KalshiOrderbook, at: number): CampaignCandidateRecord | null {
-  if (!campaignStore || !preview.fill || !preview.profitCertificate) return null;
-  const existing = findCampaignCandidate(card);
-  if (existing) return existing;
+interface CampaignEnrollmentResult {
+  candidate: CampaignCandidateRecord | null;
+  decision: CampaignScreeningDecisionV2 | null;
+}
+
+interface CampaignScreeningEvidenceContext {
+  fill?: DryRunOrder;
+  feePolicy?: KalshiFeePolicy;
+  entryRiskUsd?: number;
+  maxSafeContracts?: number;
+}
+
+function finiteCampaignNumber(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) ? value! : fallback;
+}
+
+/** Records every pre-enrollment campaign rejection without creating lifecycle or diagnostic state. */
+function recordPreEnrollmentScreeningFailure(
+  card: ThesisCard,
+  reasonCode: CampaignScreeningReasonCode,
+  reason: string,
+  completedAt = Date.now(),
+  context: CampaignScreeningEvidenceContext = {},
+): void {
+  const snapshot = campaignSnapshot();
+  if (!campaignStore || snapshot?.manifest.status !== 'active' || findCampaignCandidate(card)) return;
+  const fallbackPrice = Math.max(0.0001, Math.min(0.9999, finiteCampaignNumber(card.marketPrice, 0.5)));
+  const fill: DryRunOrder = context.fill ?? {
+    ticker: card.ticker,
+    side: card.side,
+    contracts: 1,
+    expectedPrice: fallbackPrice,
+    fillPrice: fallbackPrice,
+    filled: 1,
+    fillLevels: [{ price: fallbackPrice, quantity: 1, cost: fallbackPrice }],
+    slippage: 0,
+    fees: 0,
+    feePolicyKnown: false,
+    netEdge: finiteCampaignNumber(card.netEdge, 0),
+    aborted: true,
+    abortReason: reason,
+  };
+  const contracts = Math.max(0.01, finiteCampaignNumber(fill.filled || fill.contracts, 1));
+  const entryPrice = Math.max(0.0001, Math.min(0.9999, finiteCampaignNumber(fill.fillPrice, fallbackPrice)));
+  const feePolicy = isKnownKalshiFeePolicy(context.feePolicy) ? context.feePolicy : undefined;
   const economics = calculateEntryEconomics({
-    entryPrice: preview.fill.fillPrice,
-    entryFeesUsd: preview.fill.fees,
-    contracts: preview.fill.filled,
-    sideFairPrice: card.impliedPrice,
-    marketPrice: card.marketPrice,
-    grossEdge: card.grossEdge,
-    screeningNetEdge: card.netEdge,
-    executableEntryNetEdge: preview.fill.netEdge,
-    spread: card.spread,
-    fillSlippage: preview.fill.slippage,
-    feePolicy: book.feePolicy,
+    entryPrice,
+    entryFeesUsd: Math.max(0, finiteCampaignNumber(fill.fees, 0)),
+    contracts,
+    sideFairPrice: Math.max(0.0001, Math.min(0.9999, finiteCampaignNumber(card.impliedPrice, entryPrice))),
+    marketPrice: finiteCampaignNumber(card.marketPrice, entryPrice),
+    grossEdge: finiteCampaignNumber(card.grossEdge, 0),
+    screeningNetEdge: finiteCampaignNumber(card.netEdge, 0),
+    executableEntryNetEdge: finiteCampaignNumber(fill.netEdge, 0),
+    spread: Math.max(0, finiteCampaignNumber(card.spread, 0)),
+    fillSlippage: Math.max(0, finiteCampaignNumber(fill.slippage, 0)),
+    feePolicy,
   });
-  campaignStore.record((tracker) => tracker.enroll({
-    card,
-    initialFill: preview.fill!,
+  const decision: CampaignScreenedOut = {
+    schemaVersion: 2,
+    economicIdentity: candidateEconomicIdentity(card),
+    originalCardId: card.id,
+    ticker: card.ticker,
+    side: card.side,
+    completedAt,
     economics,
-    enrolledAt: at,
-    diagnosticDueAt: at + entryQualificationSettings().shadowFollowUpMs,
+    entryRiskUsd: finiteCampaignNumber(context.entryRiskUsd, economics.entryCostUsd),
+    maxSafeContracts: context.maxSafeContracts,
+    status: 'screened_out',
+    reasonCode,
+    reason,
+  };
+  campaignStore.record((tracker) => tracker.recordScreenedOut({ card, decision, completedAt }));
+}
+
+function screeningReasonForPreview(preview: PaperBuyResult): CampaignScreeningReasonCode {
+  const detail = `${preview.abortCode ?? ''} ${preview.abortReason ?? ''} ${preview.error ?? ''}`.toLowerCase();
+  if (/reward.?risk|2:1/.test(detail)) return 'reward_risk_below_minimum';
+  if (/stress/.test(detail)) return 'stress_profit_below_minimum';
+  if (/risk|\$10/.test(detail)) return 'entry_risk_above_limit';
+  if (/fair price/.test(detail)) return 'fair_price_not_above_entry';
+  if (/edge/.test(detail)) return 'non_positive_executable_edge';
+  if (/reward|profit|strict_profit/.test(detail)) return 'target_reward_below_minimum';
+  return 'incomplete_fill';
+}
+
+function enrollCampaignCandidate(card: ThesisCard, preview: PaperBuyResult, book: KalshiOrderbook, at: number): CampaignEnrollmentResult {
+  if (!campaignStore || !preview.fill || !preview.profitCertificate) return { candidate: null, decision: null };
+  const fill = preview.fill;
+  const existing = findCampaignCandidate(card);
+  if (existing) return { candidate: existing, decision: null };
+  const decision = qualifyCampaignEnrollment({
+    card,
+    fill,
+    bookTimestamp: book.sourceTimestamp ?? Number.NaN,
+    bookSequence: book.sequence,
+    feePolicy: book.feePolicy,
+    observedAt: at,
+    sourceAlreadyUsed: campaignEntryConfirmationEngine.hasUsedSource(card.id),
+    lastTickerExecutionAt: lastTickerSideExecutionAt.get(opportunityKey(card)),
+    maxSafeContracts: preview.capitalDecision?.maxSafeContracts,
+    entryRiskUsd: preview.capitalDecision?.riskUsd,
+    settings: entryQualificationSettings(),
+  });
+  if (decision.status === 'screened_out') {
+    campaignStore.record((tracker) => tracker.recordScreenedOut({ card, decision, completedAt: at }));
+    return { candidate: null, decision };
+  }
+  campaignStore.record((tracker) => tracker.enrollQualified({
+    card,
+    initialFill: fill,
+    screening: decision,
+    completedAt: at,
   }));
-  return findCampaignCandidate(card);
+  return { candidate: findCampaignCandidate(card), decision };
 }
 
 function retryableFromResult(result: PaperBuyResult): boolean {
@@ -1311,8 +2150,16 @@ async function executeReservedStrictPaperBuyForCard(
   contracts: number | undefined,
   source: 'manual' | 'working-order' | 'throughput',
 ): Promise<PaperBuyResult> {
+  const mutationLock = campaignMutationLockReason();
+  if (mutationLock && source !== 'throughput') {
+    return { ok: false, aborted: true, abortReason: mutationLock, error: mutationLock, abortCode: 'campaign_mutation_lock', queueState: 'blocked_final', wouldMutate: false };
+  }
   const activeCampaign = source === 'throughput' ? campaignSnapshot() : null;
   const evidenceOnlyCampaign = isEvidenceOnlyCampaignExecution(source, activeCampaign);
+  if (evidenceOnlyCampaign && campaignEvidencePaused) {
+    const reason = `campaign evidence paused while runtime is ${latestRuntimeDecision?.state ?? 'not ready'}`;
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_runtime_paused', queueState: 'blocked_retryable', wouldMutate: false };
+  }
   if (source !== 'manual' && qualificationSnapshot()?.rollingLossPaused) {
     const reason = 'automatic entries paused by the rolling 20-position loss rule';
     recordPaperBlock({
@@ -1339,6 +2186,13 @@ async function executeReservedStrictPaperBuyForCard(
   const validationStage: StrategyValidationStage = evidenceOnlyCampaign ? 'shadow' : validation!.stage;
   const eligibilityBlock = entryEligibilityBlockReason(card);
   if (eligibilityBlock) {
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(
+        card,
+        /net edge/i.test(eligibilityBlock) ? 'non_positive_executable_edge' : 'automatic_source_required',
+        eligibilityBlock,
+      );
+    }
     recordPaperBlock({
       thesisId: card.id,
       ticker: card.ticker,
@@ -1363,6 +2217,9 @@ async function executeReservedStrictPaperBuyForCard(
   const key = opportunityKey(card);
   const risk = checkPaperRisk(card, paperDesk.snapshot(), settings, getDailyPnl());
   if (!risk.ok) {
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(card, 'entry_risk_above_limit', risk.error ?? 'risk gate blocked');
+    }
     recordPaperBlock({
       thesisId,
       ticker: card.ticker,
@@ -1385,6 +2242,9 @@ async function executeReservedStrictPaperBuyForCard(
     }
   } catch (error) {
     const reason = describeBookFetchError(error);
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(card, 'missing_exchange_provenance', `book unavailable: ${reason}`);
+    }
     const backoffActive = isBookFetchBackoffError(error);
     opportunityQueue.markBlocked(key, `book unavailable: ${reason}`, true);
     if (source === 'throughput' && !evidenceOnlyCampaign) {
@@ -1421,6 +2281,14 @@ async function executeReservedStrictPaperBuyForCard(
       entryQualificationSettings().maxBookAgeMs,
     );
     if (!readiness.ready) {
+      const reasonCode: CampaignScreeningReasonCode = /fee/i.test(readiness.reason)
+        ? 'fee_policy_unknown'
+        : /stale|age/i.test(readiness.reason)
+          ? 'book_stale'
+          : 'missing_exchange_provenance';
+      recordPreEnrollmentScreeningFailure(card, reasonCode, readiness.reason, Date.now(), {
+        feePolicy: book.feePolicy,
+      });
       opportunityQueue.markBlocked(key, readiness.reason, true);
       return {
         ok: false,
@@ -1461,6 +2329,11 @@ async function executeReservedStrictPaperBuyForCard(
   if (validationStage === 'shadow' || validationStage === 'pilot') {
     const rawAsk = card.side === 'yes' ? book.yesAsk : book.noAsk;
     if (!isExecutablePrice(rawAsk)) {
+      if (evidenceOnlyCampaign) {
+        recordPreEnrollmentScreeningFailure(card, 'incomplete_fill', 'entry ask is not executable', Date.now(), {
+          feePolicy: book.feePolicy,
+        });
+      }
       return { ok: false, aborted: true, abortReason: 'pilot entry ask is not executable', error: 'pilot entry ask is not executable', abortCode: 'invalid_price', queueState: 'blocked_final', wouldMutate: false };
     }
     const maxPilotContracts = Math.max(1, Math.floor(entryConfig.pilotMaxEntryRiskUsd / (rawAsk + kalshiFeeForOrder(rawAsk, 1))));
@@ -1472,6 +2345,14 @@ async function executeReservedStrictPaperBuyForCard(
   const preview = previewPaperBuy(paperDesk.snapshot(), card, book, settings, effectiveContracts);
   if (!preview.ok || !preview.fill || !preview.profitCertificate) {
     const blockReason = preview.abortReason ?? preview.error ?? preview.abortCode ?? 'paper buy preview blocked';
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(card, screeningReasonForPreview(preview), blockReason, Date.now(), {
+        fill: preview.fill,
+        feePolicy: book.feePolicy,
+        entryRiskUsd: preview.capitalDecision?.riskUsd,
+        maxSafeContracts: preview.capitalDecision?.maxSafeContracts,
+      });
+    }
     opportunityQueue.markBlocked(key, blockReason, retryableFromResult(preview));
     recordPaperBlock({
       thesisId,
@@ -1488,7 +2369,20 @@ async function executeReservedStrictPaperBuyForCard(
   }
 
   const observedAt = Date.now();
-  const campaignCandidate = enrollCampaignCandidate(card, preview, book, observedAt);
+  const enrollment = enrollCampaignCandidate(card, preview, book, observedAt);
+  const campaignCandidate = enrollment.candidate;
+  if (evidenceOnlyCampaign && enrollment.decision?.status === 'screened_out') {
+    opportunityQueue.markBlocked(key, enrollment.decision.reason, false);
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: enrollment.decision.reason,
+      error: enrollment.decision.reason,
+      abortCode: `campaign_screened_out:${enrollment.decision.reasonCode}`,
+      queueState: 'blocked_final',
+      wouldMutate: false,
+    };
+  }
   if (evidenceOnlyCampaign && !campaignCandidate) {
     const reason = 'campaign candidate evidence could not be persisted';
     opportunityQueue.markBlocked(key, reason, false);
@@ -2373,6 +3267,7 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
 }
 
 function processWorkingOrders() {
+  if (campaignMutationLockReason()) return;
   const working = paperOrderBook.working();
   if (working.length === 0) return;
   for (const order of working) {
@@ -2397,9 +3292,15 @@ function processWorkingOrders() {
 
 async function runThroughputCertification(trigger: string, tickerFilter?: ReadonlySet<string>) {
   const throughput = { ...DEFAULT_OPPORTUNITY_THROUGHPUT, ...(settings.opportunityThroughput ?? {}) };
+  const activeCampaign = campaignSnapshot()?.manifest.status === 'active';
+  if (throughputRunning && activeCampaign && tickerFilter) {
+    for (const ticker of tickerFilter) pendingCampaignThroughputTickers.add(ticker);
+    return;
+  }
   if (
     !throughput.enabled
     || throughputRunning
+    || (activeCampaign && campaignEvidencePaused)
     || settings.killSwitchActive
     || qualificationSnapshot()?.rollingLossPaused
   ) return;
@@ -2472,109 +3373,202 @@ async function runThroughputCertification(trigger: string, tickerFilter?: Readon
     }
   } finally {
     throughputRunning = false;
+    if (pendingCampaignThroughputTickers.size > 0 && !campaignEvidencePaused) {
+      const queued = new Set(pendingCampaignThroughputTickers);
+      pendingCampaignThroughputTickers.clear();
+      queueMicrotask(() => { void runThroughputCertification('coalesced-exchange-book-delta', queued); });
+    }
   }
 }
 
 async function evaluateCampaignConfirmations(tickerFilter?: ReadonlySet<string>): Promise<void> {
-  if (campaignConfirmationWorkerRunning || !campaignStore) return;
-  const snapshot = campaignSnapshot();
-  if (!snapshot || snapshot.manifest.status !== 'active') return;
-  const now = Date.now();
-  if (now >= snapshot.manifest.cutoffAt) {
-    campaignStore.record((tracker) => tracker.finalize(now));
-    return;
-  }
-  const pending = snapshot.candidates.filter((candidate) =>
-    !candidate.terminalState && (!tickerFilter || tickerFilter.has(candidate.ticker))).slice(0, 4);
-  if (pending.length === 0) return;
+  const initial = campaignSnapshot();
+  if (!campaignStore || !initial || initial.manifest.status !== 'active' || campaignEvidencePaused) return;
+  if (tickerFilter) for (const ticker of tickerFilter) pendingCampaignConfirmationTickers.add(ticker);
+  else for (const candidate of initial.candidates) if (!candidate.terminalState) pendingCampaignConfirmationTickers.add(candidate.ticker);
+  if (campaignConfirmationWorkerRunning) return;
   campaignConfirmationWorkerRunning = true;
   try {
-    await Promise.all(pending.map(async (candidate) => {
-      const result = await executeStrictPaperBuyForCard(
-        candidate.card,
-        candidate.initialFill.contracts,
-        'throughput',
-      );
-      if (
-        campaignStore
-        && !['book_unavailable', 'entry_confirmation_pending', 'execution_in_flight'].includes(result.abortCode ?? '')
-        && !['campaign_candidate_ready', 'campaign_candidate_terminal'].includes(result.abortCode ?? '')
-      ) {
-        campaignStore.record((tracker) => tracker.terminalize(
-          candidate.candidateId,
-          'rejected',
-          result.abortReason ?? result.error ?? 'campaign confirmation failed closed',
-        ));
-      }
-    }));
+    while (pendingCampaignConfirmationTickers.size > 0 && !campaignEvidencePaused) {
+      const tickers = new Set([...pendingCampaignConfirmationTickers].slice(0, 4));
+      for (const ticker of tickers) pendingCampaignConfirmationTickers.delete(ticker);
+      const snapshot = campaignSnapshot();
+      if (!snapshot || snapshot.manifest.status !== 'active' || Date.now() >= snapshot.manifest.cutoffAt) break;
+      const candidates = snapshot.candidates.filter((candidate) => !candidate.terminalState && tickers.has(candidate.ticker));
+      await Promise.all(candidates.map(async (candidate) => {
+        const result = await executeStrictPaperBuyForCard(
+          candidate.card,
+          candidate.initialFill.contracts,
+          'throughput',
+        );
+        if (
+          campaignStore
+          && !['book_unavailable', 'entry_confirmation_pending', 'execution_in_flight', 'campaign_runtime_paused'].includes(result.abortCode ?? '')
+          && !['campaign_candidate_ready', 'campaign_candidate_terminal'].includes(result.abortCode ?? '')
+        ) {
+          campaignStore.record((tracker) => tracker.terminalize(
+            candidate.candidateId,
+            'rejected',
+            result.abortReason ?? result.error ?? 'campaign confirmation failed closed',
+            Date.now(),
+          ));
+        }
+      }));
+    }
   } finally {
     campaignConfirmationWorkerRunning = false;
+    if (pendingCampaignConfirmationTickers.size > 0 && !campaignEvidencePaused) {
+      queueMicrotask(() => { void evaluateCampaignConfirmations(new Set()); });
+    }
   }
 }
 
-async function evaluateCampaignDiagnostics(): Promise<void> {
-  if (campaignDiagnosticWorkerRunning || !campaignStore) return;
-  const snapshot = campaignSnapshot();
-  if (!snapshot || snapshot.manifest.status !== 'active') return;
-  const now = Date.now();
-  if (now >= snapshot.manifest.cutoffAt) {
-    campaignStore.record((tracker) => tracker.finalize(now));
+type DiagnosticFailureOutcome = Exclude<DiagnosticAttemptOutcome, 'valid_observation'>;
+
+function recordDiagnosticFailure(
+  diagnosticId: string,
+  outcome: DiagnosticFailureOutcome,
+  detail: string,
+  completedAt: number,
+  book?: KalshiOrderbook,
+): void {
+  campaignStore?.record((tracker) => tracker.recordDiagnosticAttempt({
+    diagnosticId,
+    outcome,
+    detail,
+    completedAt,
+    exchangeTimestamp: book?.sourceTimestamp,
+    exchangeSequence: book?.sequence,
+  }));
+}
+
+function evaluateDiagnosticBook(
+  diagnostic: ReturnType<SevenHourCampaignStore['snapshot']>['diagnostics'][number],
+  candidate: CampaignCandidateRecord,
+  book: KalshiOrderbook,
+): void {
+  const completedAt = Date.now();
+  if (book.sourceTimestamp == null || book.sequence == null) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'missing_provenance', 'matching order-book delta lacked exchange timestamp or sequence', completedAt, book);
     return;
   }
-  const due = snapshot.diagnostics.filter((diagnostic) =>
-    diagnostic.status === 'scheduled'
-    && diagnostic.dueAt <= now
-    && (diagnostic.lastAttemptAt == null || now - diagnostic.lastAttemptAt >= 30_000)).slice(0, 4);
-  if (due.length === 0) return;
+  const bookAgeMs = completedAt - book.sourceTimestamp;
+  if (bookAgeMs < 0 || bookAgeMs > entryQualificationSettings().maxBookAgeMs) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'stale_book', `matching order-book delta age was ${bookAgeMs}ms at completion`, completedAt, book);
+    return;
+  }
+  if (!isKnownKalshiFeePolicy(book.feePolicy)) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'fee_unknown', 'market, series, or account fee policy was unresolved', completedAt, book);
+    return;
+  }
+  const fill = dryRunCloseFill(
+    book,
+    candidate.side,
+    candidate.initialFill.filled,
+    candidate.initialFill.fillPrice,
+    settings.maxSlippagePp,
+  );
+  if (fill.filled <= 0) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'insufficient_depth', fill.abortReason ?? 'no executable close-side depth', completedAt, book);
+    return;
+  }
+  if (fill.filled !== candidate.initialFill.filled) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'partial_fill', fill.abortReason ?? 'follow-up fill was partial', completedAt, book);
+    return;
+  }
+  if (fill.slippage > settings.maxSlippagePp || /slippage/i.test(fill.abortReason ?? '')) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'slippage_exceeded', fill.abortReason ?? 'follow-up slippage exceeded the limit', completedAt, book);
+    return;
+  }
+  if (!fill.feePolicyKnown) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'fee_unknown', 'reconstructed follow-up fees were not exact', completedAt, book);
+    return;
+  }
+  if (fill.aborted) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'insufficient_depth', fill.abortReason ?? 'follow-up fill aborted', completedAt, book);
+    return;
+  }
+  const entryCost = candidate.initialFill.fillPrice * candidate.initialFill.filled + candidate.initialFill.fees;
+  const netPnl = fill.fillPrice * fill.filled - fill.fees - entryCost;
+  campaignStore?.record((tracker) => tracker.completeDiagnostic({
+    diagnosticId: diagnostic.diagnosticId,
+    validExecutableObservation: true,
+    exchangeTimestamp: book.sourceTimestamp,
+    exchangeSequence: book.sequence,
+    executableFollowUpMark: fill.fillPrice,
+    reconstructedExitFill: fill,
+    executableNetPnlUsd: Number(netPnl.toFixed(6)),
+    targetAt: netPnl >= candidate.economics.targetRewardUsd ? completedAt : undefined,
+    lossAt: netPnl <= -candidate.economics.plannedLossUsd ? completedAt : undefined,
+    edgeGoneAt: netPnl <= 0 ? completedAt : undefined,
+    reason: 'valid executable follow-up reconstructed directly from a matching exchange delta and resolved fees',
+    completedAt,
+  }));
+}
+
+async function evaluateCampaignDiagnostics(tickerFilter?: ReadonlySet<string>, _fromExchangeDelta = false): Promise<void> {
+  const initial = campaignSnapshot();
+  if (!campaignStore || !initial || initial.manifest.status !== 'active' || campaignEvidencePaused) return;
+  if (tickerFilter) {
+    for (const ticker of tickerFilter) {
+      pendingCampaignDiagnosticTickers.add(ticker);
+    }
+  }
+  else {
+    const now = Date.now();
+    const dueIds = new Set(campaignStore.tracker.dueDiagnostics(now).map((diagnostic) => diagnostic.candidateId));
+    for (const candidate of initial.candidates) if (dueIds.has(candidate.candidateId)) pendingCampaignDiagnosticTickers.add(candidate.ticker);
+  }
+  if (campaignDiagnosticWorkerRunning) return;
   campaignDiagnosticWorkerRunning = true;
   try {
-    await Promise.all(due.map(async (diagnostic) => {
-      const candidate = snapshot.candidates.find((item) => item.candidateId === diagnostic.candidateId);
-      if (!candidate || !campaignStore) return;
-      campaignStore.record((tracker) => tracker.recordDiagnosticAttempt(
-        diagnostic.diagnosticId,
-        'executable 15-minute follow-up requested',
-        now,
-      ));
-      try {
-        const book = await fetchBookForCard(candidate.card);
-        const fill = dryRunCloseFill(
-          book,
-          candidate.side,
-          candidate.initialFill.filled,
-          candidate.initialFill.fillPrice,
-          settings.maxSlippagePp,
-        );
-        const fresh = book.sourceTimestamp != null
-          && book.sequence != null
-          && now - book.sourceTimestamp <= entryQualificationSettings().maxBookAgeMs;
-        const valid = !fill.aborted
-          && fill.filled === candidate.initialFill.filled
-          && fill.feePolicyKnown
-          && fresh;
-        if (!valid) return;
-        const entryCost = candidate.initialFill.fillPrice * candidate.initialFill.filled + candidate.initialFill.fees;
-        const netPnl = fill.fillPrice * fill.filled - fill.fees - entryCost;
-        campaignStore.record((tracker) => tracker.completeDiagnostic({
-          diagnosticId: diagnostic.diagnosticId,
-          validExecutableObservation: true,
-          exchangeTimestamp: book.sourceTimestamp,
-          exchangeSequence: book.sequence,
-          executableFollowUpMark: fill.fillPrice,
-          reconstructedExitFill: fill,
-          executableNetPnlUsd: Number(netPnl.toFixed(6)),
-          targetAt: netPnl >= candidate.economics.targetRewardUsd ? now : undefined,
-          lossAt: netPnl <= -candidate.economics.plannedLossUsd ? now : undefined,
-          edgeGoneAt: netPnl <= 0 ? now : undefined,
-          reason: 'valid executable follow-up reconstructed from exchange-sequenced depth and resolved fees',
-          completedAt: now,
-        }));
-      } catch {
-        // The scheduled diagnostic remains retryable until the fixed campaign cutoff.
+    while (pendingCampaignDiagnosticTickers.size > 0 && !campaignEvidencePaused) {
+      const tickers = new Set([...pendingCampaignDiagnosticTickers].slice(0, 4));
+      for (const ticker of tickers) pendingCampaignDiagnosticTickers.delete(ticker);
+      const observations = new Map<string, CampaignBookObservation>();
+      for (const ticker of tickers) {
+        const observation = pendingCampaignDiagnosticObservations.get(ticker);
+        if (!observation) continue;
+        observations.set(ticker, observation);
+        if (pendingCampaignDiagnosticObservations.get(ticker) === observation) {
+          pendingCampaignDiagnosticObservations.delete(ticker);
+        }
       }
-    }));
+      const snapshot = campaignSnapshot();
+      if (!snapshot || snapshot.manifest.status !== 'active') break;
+      const now = Date.now();
+      const candidates = new Map(snapshot.candidates.map((candidate) => [candidate.candidateId, candidate]));
+      const diagnostics = snapshot.diagnostics.filter((diagnostic) => {
+        const candidate = candidates.get(diagnostic.candidateId);
+        return candidate && tickers.has(candidate.ticker) && diagnostic.status === 'scheduled' && diagnostic.dueAt <= now;
+      });
+      for (const diagnostic of diagnostics) {
+        const candidate = candidates.get(diagnostic.candidateId)!;
+        const observation = observations.get(candidate.ticker);
+        if (observation?.feeResult.status === 'resolved') {
+          evaluateDiagnosticBook(diagnostic, candidate, observation.book);
+          continue;
+        }
+        if (observation?.feeResult.status === 'failed') {
+          recordDiagnosticFailure(
+            diagnostic.diagnosticId,
+            observation.feeResult.outcome,
+            observation.feeResult.detail,
+            observation.completedAt,
+            observation.book,
+          );
+          continue;
+        }
+        const dueNow = campaignStore.tracker.dueDiagnostics(now).some((item) => item.diagnosticId === diagnostic.diagnosticId);
+        if (!dueNow) continue;
+        recordDiagnosticFailure(diagnostic.diagnosticId, 'no_delta', 'no matching fresh order-book delta arrived at the paced evaluation time', now);
+      }
+    }
   } finally {
     campaignDiagnosticWorkerRunning = false;
+    if (pendingCampaignDiagnosticTickers.size > 0 && !campaignEvidencePaused) {
+      queueMicrotask(() => { void evaluateCampaignDiagnostics(new Set()); });
+    }
   }
 }
 
@@ -2585,12 +3579,12 @@ function broadcastPaperUpdate(forceSnapshot = false) {
   const marksObj: Record<string, number> = {};
   for (const [k, v] of marks) marksObj[k] = v;
   snapshotEquity(forceSnapshot);
+  equityHistoryStream.replace(equityHistory);
   broadcast('paper:update', {
     portfolio,
     marks: marksObj,
     equity: mtm.equity,
     unrealized: mtm.unrealized,
-    equityHistory,
     workingOrders: paperOrderBook.working(),
     dailyPnl: sessionStatsData.dailyPnl,
     activeRegimes,
@@ -2649,9 +3643,15 @@ function replaceGeaTheses(base: ThesisCard[]): ThesisCard[] {
 }
 
 function publishMarketState(extra: Record<string, unknown> = {}) {
+  const currentTheses = thesesForUi();
+  const items: MarketStateStreamItem[] = [
+    ...marketsCache.map((market) => marketStreamItem(`market:${market.ticker}`, 'market', market)),
+    ...currentTheses.map((thesis) => marketStreamItem(`thesis:${thesis.id}`, 'thesis', thesis)),
+  ];
+  marketStateStream.replace(items);
+  const activeKeys = new Set(items.map((item) => item.key));
+  for (const key of marketStreamItemCache.keys()) if (!activeKeys.has(key)) marketStreamItemCache.delete(key);
   broadcast('markets:update', {
-    markets: marketsCache,
-    theses: thesesForUi(),
     connectors: registry.getAll(),
     tradeFeed: feedHub.getTradeFeedState(),
     discovery: discovery.getState(),
@@ -3045,8 +4045,13 @@ function broadcastToGea(msg: Omit<NemesisBridgeMessage, 'seq'>) {
     }
   }
   if (sent) {
-    bridgeStatus.lastOutboundAt = Date.now();
+    const sentAt = Date.now();
+    bridgeStatus.lastOutboundAt = sentAt;
     bridgeStatus.lastSequenceOut = full.seq;
+    if (full.type === 'bridge:ping') {
+      bridgeStatus.lastPingAt = sentAt;
+      bridgeStatus.pingCount = (bridgeStatus.pingCount ?? 0) + 1;
+    }
     refreshBridgeConnectivity();
     persistBridgeTelemetry('outbound', { messageType: full.type });
   }
@@ -3114,6 +4119,9 @@ function setupBridgeServer() {
     bridgeConnectionCount += 1;
     if (bridgeConnectionCount > 1) bridgeStatus.reconnects += 1;
     bridgeStatus.clientCount = bridgeClients.size;
+    bridgeStatus.lastSequenceIn = null;
+    bridgeStatus.lastPingAt = null;
+    bridgeStatus.lastPongAt = null;
     refreshBridgeConnectivity();
     persistBridgeTelemetry('client_connected');
     broadcastBridgeStatus();
@@ -3144,9 +4152,34 @@ function setupBridgeServer() {
 
         const valid = validation.value;
         const receivedAt = Date.now();
+        const previousSequence = bridgeStatus.lastSequenceIn;
+        if (previousSequence != null && valid.seq !== previousSequence + 1) {
+          bridgeStatus.sequenceGaps = (bridgeStatus.sequenceGaps ?? 0) + 1;
+          bridgeStatus.qualificationReady = false;
+          persistBridgeTelemetry('sequence_gap', { expected: previousSequence + 1, received: valid.seq });
+          ws.close(1008, 'bridge sequence gap');
+          return;
+        }
         bridgeStatus.lastSeenAt = receivedAt;
         bridgeStatus.lastInboundAt = receivedAt;
         bridgeStatus.lastSequenceIn = valid.seq;
+        if (valid.type === 'bridge:hello') {
+          bridgeStatus.peerRole = (valid.payload as { role?: 'nemesis' | 'gea' }).role ?? null;
+        }
+        if (valid.type === 'bridge:pong') {
+          bridgeStatus.lastPongAt = receivedAt;
+          bridgeStatus.pongCount = (bridgeStatus.pongCount ?? 0) + 1;
+          bridgeStatus.roundTripMs = bridgeStatus.lastPingAt == null ? null : Math.max(0, receivedAt - bridgeStatus.lastPingAt);
+          const telemetry = valid.payload as Partial<BridgeProcessTelemetry>;
+          if (Number.isInteger(telemetry.pid) && telemetry.pid! > 0
+            && Number.isFinite(telemetry.workingSetMb) && telemetry.workingSetMb! >= 0
+            && Number.isFinite(telemetry.sampledAt) && telemetry.sampledAt! > 0
+            && telemetry.sampledAt! <= receivedAt + 5_000) {
+            bridgeStatus.geaPid = telemetry.pid!;
+            bridgeStatus.geaWorkingSetMb = telemetry.workingSetMb!;
+            bridgeStatus.geaProcessSampledAt = telemetry.sampledAt!;
+          }
+        }
         refreshBridgeConnectivity(receivedAt);
         persistBridgeTelemetry('inbound', { messageType: valid.type });
         if (valid.type === 'brain:recommendation') {
@@ -3162,10 +4195,17 @@ function setupBridgeServer() {
         } else if (valid.type === 'brain:no-trade') {
           broadcast('bridge:recommendation', valid.payload);
         } else if (valid.type === 'bridge:ping') {
-          const pong: NemesisBridgeMessage = { type: 'bridge:pong', payload: {}, seq: ++bridgeSeq };
+          const pong: NemesisBridgeMessage = {
+            type: 'bridge:pong',
+            payload: {
+              pid: process.pid,
+              workingSetMb: Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3)),
+              sampledAt: Date.now(),
+            },
+            seq: ++bridgeSeq,
+          };
           ws.send(JSON.stringify(pong));
           bridgeStatus.lastOutboundAt = Date.now();
-          bridgeStatus.lastPongAt = bridgeStatus.lastOutboundAt;
           bridgeStatus.lastSequenceOut = pong.seq;
           refreshBridgeConnectivity();
           persistBridgeTelemetry('outbound', { messageType: pong.type });
@@ -3235,18 +4275,21 @@ function spawnGlobalEventAlpha() {
     env: childEnv,
     windowsHide: plan.windowsHide,
   });
+  geaExitedDuringEvidence = false;
   geaProcess.stderr?.on('data', (d: Buffer) => {
     process.stderr.write(`[gea] ${d.toString()}`);
   });
   geaProcess.once('error', (err) => {
     console.warn(`[gea] spawn failed: ${err.message}`);
     geaProcess = null;
-    setTimeout(spawnGlobalEventAlpha, 3_000);
+    if (pendingCampaignPointer) geaExitedDuringEvidence = true;
+    if (!pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);
   });
   geaProcess.once('exit', (code) => {
     console.log(`[gea] exited (code=${code ?? 'null'})`);
     geaProcess = null;
-    if (code !== 0) setTimeout(spawnGlobalEventAlpha, 3_000); // auto-retry once on crash
+    if (pendingCampaignPointer && !closeoutPrepared) geaExitedDuringEvidence = true;
+    if (code !== 0 && !pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);
   });
 }
 
@@ -3303,6 +4346,10 @@ function invalidateLiveCertificate(reason: string) {
   auditLog.append({ action: 'gate_block', detail: `live certificate invalidated: ${reason}`, ok: false });
 }
 function setupIpc() {
+  ipcMain.on('renderer:heartbeat', (_event, payload: { painted?: boolean } | undefined) => {
+    rendererLastHeartbeatAt = Date.now();
+    rendererHasPainted ||= payload?.painted === true;
+  });
   ipcMain.handle('nemesis:getState', () => {
     const targetStage = settings.liveStage === 'manual-live' ? 'auto-live' : 'manual-live';
     const confirmText = targetStage === 'auto-live' ? 'ENABLE LIVE AUTO' : 'ENABLE LIVE MANUAL';
@@ -3335,6 +4382,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:getMarkets', () => marketsCache);
 
   ipcMain.handle('nemesis:updateSettings', (_e, partial: Partial<GuardrailSettings>) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; configuration is frozen` };
     if (partial.liveEnabled) {
       return { ok: false, error: 'Use the staged live unlock wizard; credentials alone cannot enable live trading' };
     }
@@ -3371,6 +4420,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:getKalshiCredentialStatus', () => kalshiCredentialStatus());
 
   ipcMain.handle('nemesis:saveKalshiCredentials', (_e, input: { kalshiApiKeyId?: string; privateKeyPem?: string }) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; credentials are frozen` };
     const result = persistKalshiCredentials(input ?? {});
     if (result.ok && (settings.liveStage ?? 'paper') !== 'paper') {
       invalidateLiveCertificate('credential change');
@@ -3382,6 +4433,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:clearKalshiCredentials', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; credentials are frozen`, status: kalshiCredentialStatus() };
     if ((settings.liveStage ?? 'paper') !== 'paper') {
       invalidateLiveCertificate('credential change');
     }
@@ -3449,6 +4502,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:killSwitch', () => activateKillSwitch('ipc'));
 
   ipcMain.handle('nemesis:unlockLive', (_e, confirmText: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     const targetStage = confirmText === 'ENABLE LIVE AUTO' ? 'auto-live' : 'manual-live';
     const evaluation = buildLiveUnlockReadiness(targetStage, confirmText);
     if (!evaluation.passed || !evaluation.certificate) {
@@ -3505,6 +4560,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:refresh', () => runMarketRefresh());
 
   ipcMain.handle('nemesis:liveBuy', async (_e, thesisId: string, contracts?: number, limitPrice?: number) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     if (!settings.liveEnabled) return { ok: false, error: 'live trading not enabled' };
     if (settings.killSwitchActive) return { ok: false, error: 'kill switch active' };
     const creds = getLiveCreds();
@@ -3573,6 +4630,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:paperClose', async (_e, positionId: string, contracts?: number) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock, abortCode: 'campaign_mutation_lock', wouldMutate: false };
     const pos = paperDesk.snapshot().positions.find((p) => p.id === positionId);
     if (!pos) return { ok: false, error: 'position not found' };
     const card = cardForPosition(pos);
@@ -3642,6 +4701,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:paperPlaceLimit', (_e, thesisId: string, contracts: number, limitPrice: number) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     const card = theses.find((t) => t.id === thesisId);
     if (!card) return { ok: false, error: 'thesis not found' };
     const eligibilityBlock = entryEligibilityBlockReason(card);
@@ -3664,6 +4725,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:paperCancelOrder', (_e, orderId: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     const ok = paperOrderBook.cancel(orderId);
     if (ok) {
       savePaperOrders();
@@ -3720,6 +4783,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:resetPaper', (_e, confirmation: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     try {
       const result = archiveAndResetPaper({
         dataDir: DATA_DIR,
@@ -3864,6 +4929,7 @@ function setupIpc() {
 
 function createWindow() {
   startupTrace('window-before-create');
+  rendererMonitoringStartedAt = Date.now();
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -3894,6 +4960,7 @@ function createWindow() {
   });
   mainWindow.webContents.on('did-finish-load', () => {
     startupTrace('renderer-did-finish-load');
+    rendererLastHeartbeatAt = Date.now();
     forceInitialPaint();
     setTimeout(forceInitialPaint, 250);
     setTimeout(forceInitialPaint, 1_000);
@@ -3903,6 +4970,7 @@ function createWindow() {
   });
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error('[nemesis] render-process-gone', details.reason, details.exitCode);
+    rendererUnresponsiveAt ??= Date.now() - 11_000;
   });
   mainWindow.webContents.on('console-message', (event) => {
     if (event.level === 'warning' || event.level === 'error') {
@@ -3914,8 +4982,14 @@ function createWindow() {
       });
     }
   });
-  mainWindow.on('unresponsive', () => console.error('[nemesis] main window became unresponsive'));
-  mainWindow.on('responsive', () => console.warn('[nemesis] main window became responsive again'));
+  mainWindow.on('unresponsive', () => {
+    rendererUnresponsiveAt ??= Date.now();
+    console.error('[nemesis] main window became unresponsive');
+  });
+  mainWindow.on('responsive', () => {
+    rendererUnresponsiveAt = null;
+    console.warn('[nemesis] main window became responsive again');
+  });
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
@@ -3968,21 +5042,96 @@ app.whenReady().then(() => {
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
   kalshiOrderbookStream.onBookUpdate((book) => {
     const observedAt = Date.now();
-    if (
-      !campaignStore
-      || book.sourceTimestamp == null
-      || observedAt - book.sourceTimestamp > entryQualificationSettings().maxBookAgeMs
-    ) return;
-    const campaign = campaignSnapshot();
-    const eligibleCards = theses.filter((card) =>
-      card.ticker === book.ticker
-      && isEntryEligible(card)
-      && hasRealExecutableDepth(card));
-    campaignBookTriggerScheduler.request(
-      book.ticker,
-      campaignBookUpdateWork(book.ticker, eligibleCards, campaign),
-      observedAt,
-    );
+    if (!campaignStore || campaignEvidencePaused) return;
+    if (!Number.isInteger(book.sequence)) {
+      const completedAt = Date.now();
+      const work = campaignBookUpdateWork(book.ticker, [], campaignSnapshot(), completedAt);
+      if (work.diagnostic) {
+        pendingCampaignDiagnosticObservations.set(book.ticker, {
+          ticker: book.ticker,
+          sequence: -1,
+          observedAt,
+          completedAt,
+          book,
+          feeResult: {
+            status: 'failed',
+            outcome: 'missing_provenance',
+            detail: 'order-book delta is missing an exchange sequence',
+          },
+        });
+        campaignBookTriggerScheduler.request(book.ticker, { throughput: false, confirmation: false, diagnostic: true }, completedAt);
+      }
+      return;
+    }
+    const sequence = book.sequence!;
+    const latestSequence = latestCampaignObservationSequence.get(book.ticker);
+    if (latestSequence != null && sequence <= latestSequence) return;
+    // Claim the sequence before resolving fees so an older async completion can never overwrite it.
+    latestCampaignObservationSequence.set(book.ticker, sequence);
+    void kalshiFeePolicyResolver.resolve(book.ticker).then((feePolicy) => {
+      const completedAt = Date.now();
+      if (latestCampaignObservationSequence.get(book.ticker) !== sequence) return;
+      const enriched = sanitizeExecutableBook({ ...book, feePolicy });
+      const readiness = campaignEnrollmentReadiness(
+        enriched,
+        completedAt,
+        entryQualificationSettings().maxBookAgeMs,
+      );
+      const campaign = campaignSnapshot();
+      const work = campaignBookUpdateWork(book.ticker, theses.filter((card) =>
+        card.ticker === book.ticker
+        && isEntryEligible(card)
+        && hasRealExecutableDepth(card)), campaign, completedAt);
+      if (!readiness.ready) {
+        if (work.diagnostic) {
+          const outcome: 'missing_provenance' | 'stale_book' | 'fee_unknown' = /fee/i.test(readiness.reason)
+            ? 'fee_unknown'
+            : /stale|age/i.test(readiness.reason)
+              ? 'stale_book'
+              : 'missing_provenance';
+          pendingCampaignDiagnosticObservations.set(book.ticker, {
+            ticker: book.ticker,
+            sequence,
+            observedAt,
+            completedAt,
+            book: enriched,
+            feeResult: { status: 'failed', outcome, detail: readiness.reason },
+          });
+          campaignBookTriggerScheduler.request(book.ticker, { throughput: false, confirmation: false, diagnostic: true }, completedAt);
+        }
+        return;
+      }
+      if (work.diagnostic) {
+        pendingCampaignDiagnosticObservations.set(book.ticker, {
+          ticker: book.ticker,
+          sequence,
+          observedAt,
+          completedAt,
+          book: enriched,
+          feeResult: { status: 'resolved', policy: feePolicy },
+        });
+      }
+      campaignBookTriggerScheduler.request(book.ticker, work, completedAt);
+    }).catch((error) => {
+      const completedAt = Date.now();
+      if (latestCampaignObservationSequence.get(book.ticker) !== sequence) return;
+      const work = campaignBookUpdateWork(book.ticker, [], campaignSnapshot(), completedAt);
+      if (work.diagnostic) {
+        pendingCampaignDiagnosticObservations.set(book.ticker, {
+          ticker: book.ticker,
+          sequence,
+          observedAt,
+          completedAt,
+          book,
+          feeResult: {
+            status: 'failed',
+            outcome: 'fee_unknown',
+            detail: `fee policy resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        });
+        campaignBookTriggerScheduler.request(book.ticker, { throughput: false, confirmation: false, diagnostic: true }, completedAt);
+      }
+    });
   });
   setupIpc();
   startupTrace('ipc');
@@ -4000,12 +5149,14 @@ app.whenReady().then(() => {
     void runThroughputCertification('entry-confirmation-tick');
     void evaluateCampaignConfirmations();
     void evaluateCampaignDiagnostics();
+    broadcastToGea({ type: 'bridge:ping', payload: {} });
     recordCampaignOperationalTelemetry();
     broadcast('connectors:update', registry.getAll());
-    if (paperDesk.snapshot().positions.length > 0) {
-      broadcastPaperUpdate();
-    }
-  }, 5_000);
+    if (paperDesk.snapshot().positions.length === 0) broadcastPaperUpdate();
+  }, BRIDGE_HEARTBEAT_MS);
+  setInterval(() => {
+    if (paperDesk.snapshot().positions.length > 0) broadcastPaperUpdate();
+  }, PAPER_BROADCAST_THROTTLE_MS);
 
   createWindow();
   startupTrace('window-created');
@@ -4057,7 +5208,8 @@ app.whenReady().then(() => {
     }
   })();
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
-  setInterval(() => sampleRendererMemory(), 30_000);
+  setTimeout(() => sampleRendererMemory(), 1_000);
+  setInterval(() => sampleRendererMemory(), RENDERER_MEMORY_SAMPLE_INTERVAL_MS);
   setTimeout(() => { void sweepSettledPositions(); }, 20_000);
   setInterval(() => { void sweepSettledPositions(); }, SETTLEMENT_SWEEP_MS);
 
@@ -4073,6 +5225,8 @@ app.whenReady().then(() => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   campaignBookTriggerScheduler.stop();
+  marketStateStream.stop();
+  equityHistoryStream.stop();
   kalshiStream.stop();
   kalshiOrderbookStream.stop();
   if (geaProcess && !geaProcess.killed) geaProcess.kill();

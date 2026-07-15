@@ -6,20 +6,54 @@ import type {
   KalshiSeries,
   KalshiTrade,
   KalshiTradesResponse,
+  KalshiEndpointClass,
+  KalshiEndpointPolicy,
+  KalshiEnvironment,
+  KalshiFailureClass,
   OrderbookLevel,
 } from '../types.js';
 import { resilientFetch, sleep } from '../http/resilientFetch.js';
 
-export const KALSHI_API_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
+export const KALSHI_ENDPOINT_POLICIES: Readonly<Record<KalshiEnvironment, KalshiEndpointPolicy>> = {
+  production: {
+    environment: 'production',
+    restBaseUrls: [
+      'https://external-api.kalshi.com/trade-api/v2',
+      'https://api.elections.kalshi.com/trade-api/v2',
+    ],
+    websocketUrls: [
+      'wss://external-api-ws.kalshi.com/trade-api/ws/v2',
+      'wss://api.elections.kalshi.com/trade-api/ws/v2',
+    ],
+  },
+  demo: {
+    environment: 'demo',
+    restBaseUrls: [
+      'https://external-api.demo.kalshi.co/trade-api/v2',
+      'https://demo-api.kalshi.co/trade-api/v2',
+    ],
+    websocketUrls: [
+      'wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2',
+      'wss://demo-api.kalshi.co/trade-api/ws/v2',
+    ],
+  },
+};
 
-export const KALSHI_API_BASES = [
-  KALSHI_API_BASE,
-  'https://trading-api.kalshi.com/trade-api/v2',
-  'https://demo-api.kalshi.co/trade-api/v2',
-];
+export const KALSHI_API_BASE = KALSHI_ENDPOINT_POLICIES.production.restBaseUrls[0];
+export const KALSHI_API_BASES = KALSHI_ENDPOINT_POLICIES.production.restBaseUrls;
+
+export function getKalshiEndpointPolicy(environment: KalshiEnvironment = 'production'): KalshiEndpointPolicy {
+  return KALSHI_ENDPOINT_POLICIES[environment];
+}
+
+export function getKalshiWebSocketUrl(environment: KalshiEnvironment = 'production'): string {
+  return getKalshiEndpointPolicy(environment).websocketUrls[0];
+}
 
 export interface FetchOptions {
   baseUrl?: string;
+  environment?: KalshiEnvironment;
+  endpointClass?: KalshiEndpointClass;
   fetchFn?: typeof fetch;
   limit?: number;
   status?: string;
@@ -208,27 +242,167 @@ export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
   };
 }
 
-let _workingBase: string | null = null;
+const workingBases = new Map<string, string>();
+export interface KalshiHostHealth {
+  environment: KalshiEnvironment;
+  endpointClass: KalshiEndpointClass;
+  baseUrl: string;
+  lastSuccessAt: number | null;
+  lastFailureAt: number | null;
+  failureCount: number;
+  failureClass: KalshiFailureClass | null;
+}
+const hostHealth = new Map<string, Map<string, KalshiHostHealth>>();
 
-class KalshiHttpError extends Error {
-  constructor(readonly status: number, path: string) {
-    super(`Kalshi API ${status}: ${path}`);
-    this.name = 'KalshiHttpError';
+/** Clears learned host affinity; primarily useful for deterministic process restart and tests. */
+export function resetKalshiHostCache(): void {
+  workingBases.clear();
+  hostHealth.clear();
+}
+
+export function getKalshiHostHealth(): KalshiHostHealth[] {
+  return [...hostHealth.values()].flatMap((byHost) => [...byHost.values()].map((health) => ({ ...health })));
+}
+
+function recordHostResult(
+  environment: KalshiEnvironment,
+  endpointClass: KalshiEndpointClass,
+  baseUrl: string,
+  failureClass: KalshiFailureClass | null,
+): void {
+  const key = cacheKey(environment, endpointClass);
+  let byHost = hostHealth.get(key);
+  if (!byHost) {
+    byHost = new Map();
+    hostHealth.set(key, byHost);
   }
+  const previous = byHost.get(baseUrl);
+  byHost.set(baseUrl, {
+    environment,
+    endpointClass,
+    baseUrl,
+    lastSuccessAt: failureClass === null ? Date.now() : previous?.lastSuccessAt ?? null,
+    lastFailureAt: failureClass === null ? previous?.lastFailureAt ?? null : Date.now(),
+    failureCount: failureClass === null ? 0 : (previous?.failureCount ?? 0) + 1,
+    failureClass,
+  });
+}
+
+function endpointClassFor(path: string, explicit?: KalshiEndpointClass): KalshiEndpointClass {
+  if (explicit) return explicit;
+  if (path.startsWith('/portfolio/orders')) return 'orders';
+  if (path.startsWith('/portfolio/')) return 'portfolio';
+  return 'market-data';
+}
+
+function cacheKey(environment: KalshiEnvironment, endpointClass: KalshiEndpointClass): string {
+  return `${environment}:${endpointClass}`;
+}
+
+function validatedBases(opts: FetchOptions): readonly string[] {
+  const environment = opts.environment ?? 'production';
+  const policy = getKalshiEndpointPolicy(environment);
+  if (!opts.baseUrl) return policy.restBaseUrls;
+  if (!policy.restBaseUrls.includes(opts.baseUrl)) {
+    throw new KalshiRequestFailure('Kalshi base URL is outside the selected environment policy', {
+      classification: 'authorization',
+      environment,
+      endpointClass: opts.endpointClass ?? 'market-data',
+      path: '(endpoint-policy)',
+      baseUrl: opts.baseUrl,
+    });
+  }
+  return [opts.baseUrl];
+}
+
+function retryAfterMs(response: Response, now = Date.now()): number | null {
+  const value = response.headers.get('retry-after');
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - now) : null;
+}
+
+function httpFailureClass(status: number): KalshiFailureClass {
+  if (status === 401) return 'authentication';
+  if (status === 403) return 'authorization';
+  if (status === 404) return 'not_found';
+  if (status === 429) return 'rate_limit';
+  if (status >= 500) return 'server';
+  return 'invalid_response';
+}
+
+export class KalshiRequestFailure extends Error {
+  readonly status: number | null;
+  readonly classification: KalshiFailureClass;
+  readonly environment: KalshiEnvironment;
+  readonly endpointClass: KalshiEndpointClass;
+  readonly path: string;
+  readonly baseUrl: string | null;
+  readonly retryAfterMs: number | null;
+
+  constructor(message: string, details: {
+    status?: number | null;
+    classification: KalshiFailureClass;
+    environment: KalshiEnvironment;
+    endpointClass: KalshiEndpointClass;
+    path: string;
+    baseUrl?: string | null;
+    retryAfterMs?: number | null;
+    cause?: unknown;
+  }) {
+    super(message, details.cause === undefined ? undefined : { cause: details.cause });
+    this.name = 'KalshiRequestFailure';
+    this.status = details.status ?? null;
+    this.classification = details.classification;
+    this.environment = details.environment;
+    this.endpointClass = details.endpointClass;
+    this.path = details.path;
+    this.baseUrl = details.baseUrl ?? null;
+    this.retryAfterMs = details.retryAfterMs ?? null;
+  }
+}
+
+function normalizeFailure(
+  error: unknown,
+  context: {
+    environment: KalshiEnvironment;
+    endpointClass: KalshiEndpointClass;
+    path: string;
+    baseUrl: string;
+  },
+): KalshiRequestFailure {
+  if (error instanceof KalshiRequestFailure) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  const name = error instanceof Error ? error.name : '';
+  const classification: KalshiFailureClass = name === 'AbortError'
+    ? 'aborted'
+    : name === 'SyntaxError'
+      ? 'invalid_response'
+      : /timeout|timed out/i.test(message)
+        ? 'timeout'
+        : /fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|network|SSL/i.test(message)
+          ? 'network'
+          : 'unknown';
+  return new KalshiRequestFailure(message, { ...context, classification, cause: error });
 }
 
 async function kalshiFetch<T>(
   path: string,
   opts: FetchOptions = {},
 ): Promise<T> {
-  // Build base list: cached working base first, then full list (deduped)
-  const defaultBases = opts.baseUrl ? [opts.baseUrl] : KALSHI_API_BASES;
-  const bases = _workingBase && !opts.baseUrl
-    ? [_workingBase, ...defaultBases.filter((b) => b !== _workingBase)]
+  const environment = opts.environment ?? 'production';
+  const endpointClass = endpointClassFor(path, opts.endpointClass);
+  const key = cacheKey(environment, endpointClass);
+  const defaultBases = validatedBases({ ...opts, endpointClass });
+  const workingBase = workingBases.get(key);
+  const bases = workingBase && !opts.baseUrl
+    ? [workingBase, ...defaultBases.filter((base) => base !== workingBase)]
     : defaultBases;
 
   const fetchFn = opts.fetchFn ?? fetch;
-  let lastError: Error | null = null;
+  let lastError: KalshiRequestFailure | null = null;
 
   for (const base of bases) {
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -251,7 +425,17 @@ async function kalshiFetch<T>(
           // retries:1).  App-level timeouts in main.ts cap real blocking to ≤20 s.
           : await resilientFetch(url, { headers, signal: opts.signal, label: `Kalshi ${path}`, retries: 0, timeoutMs: 10_000 });
         if (!res.ok) {
-          lastError = new KalshiHttpError(res.status, path);
+          if (workingBases.get(key) === base) workingBases.delete(key);
+          recordHostResult(environment, endpointClass, base, httpFailureClass(res.status));
+          lastError = new KalshiRequestFailure(`Kalshi API ${res.status}: ${path}`, {
+            status: res.status,
+            classification: httpFailureClass(res.status),
+            environment,
+            endpointClass,
+            path,
+            baseUrl: base,
+            retryAfterMs: retryAfterMs(res),
+          });
           // A 4xx applies to the request, not to one hostname. In particular,
           // rotating a 429 through all fallback bases multiplies the rate-limit
           // storm and defeats FeedHub backoff.
@@ -262,26 +446,36 @@ async function kalshiFetch<T>(
           }
           break;
         }
-        _workingBase = base;
-        return res.json() as Promise<T>;
+        const payload = await res.json() as T;
+        workingBases.set(key, base);
+        recordHostResult(environment, endpointClass, base, null);
+        return payload;
       } catch (e) {
-        lastError = e instanceof Error ? e : new Error(String(e));
+        lastError = normalizeFailure(e, { environment, endpointClass, path, baseUrl: base });
+        if (!(e instanceof KalshiRequestFailure)) {
+          recordHostResult(environment, endpointClass, base, lastError.classification);
+        }
         if (opts.signal?.aborted) throw lastError;
-        // Don't retry SSL/connection errors — move to next base immediately
-        if (lastError instanceof KalshiHttpError && lastError.status >= 400 && lastError.status < 500) {
+        if (lastError.status !== null && lastError.status >= 400 && lastError.status < 500) {
           throw lastError;
         }
-        const msg = lastError.message ?? '';
-        const isFatal = msg.includes('SSL') || msg.includes('ECONNRESET') || msg.includes('fetch failed');
-        if (!isFatal && attempt < 2) await sleep(300 * (attempt + 1));
-        if (isFatal) break;
+        const moveToAlias = lastError.classification === 'network'
+          || lastError.classification === 'timeout'
+          || lastError.classification === 'aborted'
+          || lastError.classification === 'invalid_response';
+        if (!moveToAlias && attempt < 2) await sleep(300 * (attempt + 1));
+        if (moveToAlias) break;
       }
     }
-    // If the cached base just failed, clear it so we re-discover on next call
-    if (base === _workingBase) _workingBase = null;
+    if (workingBases.get(key) === base) workingBases.delete(key);
   }
 
-  throw lastError ?? new Error(`Kalshi API failed: ${path}`);
+  throw lastError ?? new KalshiRequestFailure(`Kalshi API failed: ${path}`, {
+    classification: 'unknown',
+    environment,
+    endpointClass,
+    path,
+  });
 }
 
 export async function fetchMarkets(opts: FetchOptions = {}): Promise<KalshiMarketsResponse> {

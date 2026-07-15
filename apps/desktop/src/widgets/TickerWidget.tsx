@@ -10,7 +10,7 @@ export function TickerWidget() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    window.nemesis.onTicksUpdate((d) => {
+    return window.nemesis.onTicksUpdate((d) => {
       const data = d as { ticker: string; ticks: PriceTick[] };
       if (data.ticker === activeTicker) setTicks(data.ticks);
     });

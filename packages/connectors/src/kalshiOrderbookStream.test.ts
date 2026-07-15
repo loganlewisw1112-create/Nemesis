@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WebSocket } from 'ws';
 import { ConnectorRegistry } from './registry.js';
 import { KalshiOrderbookStream } from './kalshiOrderbookStream.js';
 
 describe('KalshiOrderbookStream', () => {
+  afterEach(() => vi.useRealTimers());
+
   it('uses exchange delta timestamp and sequence, never local snapshot time', () => {
     const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null);
     const observed: Array<{ sequence?: number; sourceTimestamp?: number }> = [];
@@ -16,7 +19,8 @@ describe('KalshiOrderbookStream', () => {
         no_dollars_fp: [['0.5800', '20.00']],
       },
     }));
-    expect(stream.getBook('KXTEST')).toMatchObject({ sequence: 2, sourceTimestamp: undefined });
+    // A snapshot repairs structure but cannot qualify until a later exchange delta.
+    expect(stream.getBook('KXTEST')).toBeNull();
 
     stream.ingest(JSON.stringify({
       type: 'orderbook_delta',
@@ -48,5 +52,144 @@ describe('KalshiOrderbookStream', () => {
     }));
     expect(stream.getBook('KXTEST')).toBeNull();
     expect(stream.telemetry().sequenceRegressions).toBe(1);
+    expect(stream.telemetry()).toMatchObject({ sequenceGaps: 1, quarantinedTickers: 1 });
+  });
+
+  it('requires a fresh snapshot and later delta after a sequence gap', () => {
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null);
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', seq: 10,
+      msg: { market_ticker: 'KXTEST', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+    }));
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', seq: 12,
+      msg: { market_ticker: 'KXTEST', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: 1_669_149_841_000 },
+    }));
+    expect(stream.getBook('KXTEST')).toBeNull();
+
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', seq: 20,
+      msg: { market_ticker: 'KXTEST', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+    }));
+    expect(stream.getBook('KXTEST')).toBeNull();
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', seq: 21,
+      msg: { market_ticker: 'KXTEST', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: 1_669_149_842_000 },
+    }));
+    expect(stream.getBook('KXTEST')).toMatchObject({ sequence: 21, sourceTimestamp: 1_669_149_842_000 });
+  });
+
+  it('tracks sequence continuity per subscription, not per ticker', () => {
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null);
+    stream.ingest(JSON.stringify({ type: 'orderbook_snapshot', sid: 7, seq: 1, msg: {
+      market_ticker: 'KXA', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [],
+    } }));
+    stream.ingest(JSON.stringify({ type: 'orderbook_snapshot', sid: 7, seq: 2, msg: {
+      market_ticker: 'KXB', yes_dollars_fp: [['0.4500', '10.00']], no_dollars_fp: [],
+    } }));
+    stream.ingest(JSON.stringify({ type: 'orderbook_delta', sid: 7, seq: 3, msg: {
+      market_ticker: 'KXA', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: 1_669_149_842_000,
+    } }));
+    expect(stream.telemetry().sequenceGaps).toBe(0);
+    expect(stream.getBook('KXA')).toMatchObject({ sequence: 3 });
+  });
+
+  it('stops qualification after 25 seconds without a sequenced exchange delta even while pongs remain live', () => {
+    vi.useFakeTimers();
+    const deltaAt = 1_700_000_000_000;
+    vi.setSystemTime(deltaAt);
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null);
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket: { readyState: WebSocket.OPEN },
+      authenticated: true,
+      lastPongAt: deltaAt,
+      generation: 1,
+    });
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_snapshot', seq: 1,
+      msg: { market_ticker: 'KXTEST', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+    }), 1);
+    stream.ingest(JSON.stringify({
+      type: 'orderbook_delta', seq: 2,
+      msg: { market_ticker: 'KXTEST', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: deltaAt },
+    }), 1);
+
+    expect(stream.telemetry(deltaAt + 25_000).qualificationReady).toBe(true);
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      lastPongAt: deltaAt + 25_001,
+      lastMessageAt: deltaAt + 25_001,
+    });
+    expect(stream.telemetry(deltaAt + 25_001)).toMatchObject({
+      connected: true,
+      qualificationReady: false,
+      lastPongAt: deltaAt + 25_001,
+      lastSequencedDeltaAt: deltaAt,
+      lastExchangeTimestamp: deltaAt,
+    });
+  });
+
+  it('terminates an authenticated half-open socket after ping-pong traffic expires', async () => {
+    vi.useFakeTimers();
+    const startedAt = 1_700_000_100_000;
+    vi.setSystemTime(startedAt);
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const socket = {
+      readyState: WebSocket.OPEN,
+      ping: vi.fn(),
+      terminate: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket,
+      authenticated: true,
+      generation: 4,
+      lastMessageAt: startedAt,
+      lastPongAt: startedAt,
+      lastSequencedDeltaAt: startedAt,
+    });
+    (stream as unknown as { startHeartbeat(socket: WebSocket, generation: number): void })
+      .startHeartbeat(socket, 4);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(socket.ping).toHaveBeenCalledTimes(2);
+    expect(socket.terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(socket.terminate).toHaveBeenCalledTimes(1);
+    expect(stream.telemetry(startedAt + 30_000).qualificationReady).toBe(false);
+    stream.stop();
+  });
+
+  it('allows only the current authenticated generation to repair qualification', () => {
+    vi.useFakeTimers();
+    const recoveredAt = 1_700_000_200_000;
+    vi.setSystemTime(recoveredAt);
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket: { readyState: WebSocket.OPEN },
+      authenticated: true,
+      generation: 2,
+    });
+    const snapshot = JSON.stringify({
+      type: 'orderbook_snapshot', seq: 1,
+      msg: { market_ticker: 'KXRECOVER', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+    });
+    const delta = JSON.stringify({
+      type: 'orderbook_delta', seq: 2,
+      msg: { market_ticker: 'KXRECOVER', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: recoveredAt },
+    });
+
+    stream.ingest(snapshot, 1);
+    stream.ingest(delta, 1);
+    expect(stream.getBook('KXRECOVER')).toBeNull();
+    expect(stream.telemetry(recoveredAt).qualificationReady).toBe(false);
+
+    stream.ingest(snapshot, 2);
+    stream.ingest(delta, 2);
+    expect(stream.getBook('KXRECOVER')).toMatchObject({ sequence: 2, sourceTimestamp: recoveredAt });
+    expect(stream.telemetry(recoveredAt)).toMatchObject({
+      authenticated: true,
+      generation: 2,
+      qualificationReady: true,
+    });
   });
 });

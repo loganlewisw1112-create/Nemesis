@@ -1,6 +1,10 @@
 import { WebSocket } from 'ws';
-import { KALSHI_WS_URL, type KalshiOrderbook, type OrderbookLevel } from '@nemesis/core';
+import { getKalshiWebSocketUrl, type KalshiEnvironment, type KalshiOrderbook, type OrderbookLevel } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
+import type { KalshiWebSocketHeaderProvider } from './kalshiStream.js';
+
+const PING_INTERVAL_MS = 10_000;
+const DEAD_CONNECTION_MS = 25_000;
 
 export interface KalshiOrderbookStreamTelemetry {
   connected: boolean;
@@ -8,7 +12,14 @@ export interface KalshiOrderbookStreamTelemetry {
   booksWithExchangeTime: number;
   reconnects: number;
   sequenceRegressions: number;
+  sequenceGaps: number;
+  quarantinedTickers: number;
+  authenticated: boolean;
+  qualificationReady: boolean;
+  generation: number;
+  lastPongAt: number | null;
   lastMessageAt: number | null;
+  lastSequencedDeltaAt: number | null;
   lastExchangeTimestamp: number | null;
 }
 
@@ -21,7 +32,6 @@ interface MutableBook {
   receivedAt: number;
 }
 
-type HeaderProvider = () => Record<string, string> | null;
 type BookUpdateListener = (book: KalshiOrderbook) => void;
 
 function parseNumber(value: unknown): number | undefined {
@@ -51,20 +61,30 @@ function sortedLevels(levels: Map<number, number>): OrderbookLevel[] {
 export class KalshiOrderbookStream {
   private readonly tickers = new Set<string>();
   private readonly subscribed = new Set<string>();
+  private readonly quarantined = new Set<string>();
   private readonly books = new Map<string, MutableBook>();
+  private readonly sequenceBySubscription = new Map<string, number>();
   private socket: WebSocket | null = null;
   private started = false;
   private commandId = 1;
   private reconnectDelayMs = 1_000;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private generation = 0;
   private reconnects = 0;
   private sequenceRegressions = 0;
+  private sequenceGaps = 0;
+  private authenticated = false;
   private lastMessageAt: number | null = null;
+  private lastPongAt: number | null = null;
+  private lastSequencedDeltaAt: number | null = null;
   private lastExchangeTimestamp: number | null = null;
   private readonly bookUpdateListeners = new Set<BookUpdateListener>();
 
   constructor(
     private readonly registry: ConnectorRegistry,
-    private readonly headers: HeaderProvider,
+    private readonly headers: KalshiWebSocketHeaderProvider,
+    private readonly environment: KalshiEnvironment = 'production',
   ) {}
 
   start(): void {
@@ -74,16 +94,16 @@ export class KalshiOrderbookStream {
   }
 
   restart(): void {
-    this.socket?.close();
-    this.socket = null;
-    this.subscribed.clear();
+    this.sequenceBySubscription.clear();
+    this.closeCurrentSocket();
     if (this.started) this.connect();
   }
 
   stop(): void {
     this.started = false;
-    this.socket?.close();
-    this.socket = null;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.closeCurrentSocket();
   }
 
   track(tickers: string[]): void {
@@ -97,6 +117,7 @@ export class KalshiOrderbookStream {
   }
 
   getBook(ticker: string): KalshiOrderbook | null {
+    if (this.quarantined.has(ticker)) return null;
     const book = this.books.get(ticker);
     if (!book) return null;
     const yes = sortedLevels(book.yes);
@@ -118,14 +139,31 @@ export class KalshiOrderbookStream {
     };
   }
 
-  telemetry(): KalshiOrderbookStreamTelemetry {
+  telemetry(now = Date.now()): KalshiOrderbookStreamTelemetry {
+    const connected = this.socket?.readyState === WebSocket.OPEN;
+    const exchangeDeltaAgeMs = this.lastSequencedDeltaAt == null
+      ? null
+      : now - this.lastSequencedDeltaAt;
+    const qualificationReady = connected
+      && this.authenticated
+      && this.quarantined.size === 0
+      && exchangeDeltaAgeMs != null
+      && exchangeDeltaAgeMs >= 0
+      && exchangeDeltaAgeMs <= DEAD_CONNECTION_MS;
     return {
-      connected: this.socket?.readyState === WebSocket.OPEN,
+      connected,
       trackedTickers: this.tickers.size,
       booksWithExchangeTime: [...this.books.values()].filter((book) => book.sourceTimestamp != null).length,
       reconnects: this.reconnects,
       sequenceRegressions: this.sequenceRegressions,
+      sequenceGaps: this.sequenceGaps,
+      quarantinedTickers: this.quarantined.size,
+      authenticated: this.authenticated,
+      qualificationReady,
+      generation: this.generation,
+      lastPongAt: this.lastPongAt,
       lastMessageAt: this.lastMessageAt,
+      lastSequencedDeltaAt: this.lastSequencedDeltaAt,
       lastExchangeTimestamp: this.lastExchangeTimestamp,
     };
   }
@@ -134,28 +172,71 @@ export class KalshiOrderbookStream {
     if (!this.started || this.socket?.readyState === WebSocket.CONNECTING || this.socket?.readyState === WebSocket.OPEN) return;
     const headers = this.headers();
     if (!headers) {
-      this.registry.recordWarn('kalshi-ws', 'credentials required for exchange-timestamped order books');
+      this.authenticated = false;
+      this.registry.recordTelemetry('kalshi-orderbook-ws', {
+        status: 'warn',
+        lastError: 'credentials required for exchange-timestamped order books',
+        authenticated: false,
+        transportConnected: false,
+        qualificationReady: false,
+        environment: this.environment,
+      });
       return;
     }
-    const socket = new WebSocket(KALSHI_WS_URL, { headers });
+    const generation = ++this.generation;
+    const socket = new WebSocket(getKalshiWebSocketUrl(this.environment), { headers });
     this.socket = socket;
     socket.on('open', () => {
+      if (!this.isCurrent(socket, generation)) return;
+      this.authenticated = true;
       this.reconnectDelayMs = 1_000;
       this.subscribed.clear();
-      this.registry.recordSuccess('kalshi-ws', 0);
+      this.books.clear();
+      this.sequenceBySubscription.clear();
+      this.lastSequencedDeltaAt = null;
+      for (const ticker of this.tickers) this.quarantined.add(ticker);
+      this.lastMessageAt = Date.now();
+      this.lastPongAt = Date.now();
+      this.startHeartbeat(socket, generation);
+      this.recordHealth();
       this.subscribeMissing();
     });
-    socket.on('message', (raw) => this.ingest(String(raw)));
+    socket.on('message', (raw) => {
+      if (this.isCurrent(socket, generation)) this.ingest(String(raw), generation);
+    });
+    socket.on('ping', () => {
+      if (!this.isCurrent(socket, generation)) return;
+      this.lastMessageAt = Date.now();
+      this.recordHealth();
+    });
+    socket.on('pong', () => {
+      if (!this.isCurrent(socket, generation)) return;
+      this.lastPongAt = Date.now();
+      this.recordHealth();
+    });
     socket.on('error', () => socket.close());
     socket.on('close', () => {
-      if (this.socket === socket) this.socket = null;
+      if (!this.isCurrent(socket, generation)) return;
+      this.socket = null;
+      this.authenticated = false;
+      this.clearHeartbeatTimer();
       this.subscribed.clear();
       if (!this.started) return;
       this.reconnects += 1;
-      this.registry.recordWarn('kalshi-ws', 'order-book stream disconnected; reconnect scheduled');
+      this.registry.recordTelemetry('kalshi-orderbook-ws', {
+        status: 'warn',
+        lastError: 'order-book stream disconnected; reconnect scheduled',
+        reconnects: this.reconnects,
+        transportConnected: false,
+        authenticated: false,
+        qualificationReady: false,
+      });
       const waitMs = this.reconnectDelayMs;
       this.reconnectDelayMs = Math.min(30_000, this.reconnectDelayMs * 2);
-      setTimeout(() => this.connect(), waitMs);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.connect();
+      }, waitMs);
     });
   }
 
@@ -175,7 +256,8 @@ export class KalshiOrderbookStream {
   }
 
   /** Ingests one official WebSocket packet; public to support deterministic replay tests. */
-  ingest(raw: string): void {
+  ingest(raw: string, generation = this.generation): void {
+    if (generation !== this.generation) return;
     this.lastMessageAt = Date.now();
     try {
       const packet = JSON.parse(raw) as Record<string, unknown>;
@@ -188,6 +270,15 @@ export class KalshiOrderbookStream {
       }
       const ticker = String(msg.market_ticker ?? '');
       if (!ticker) return;
+      const subscription = String(packet.sid ?? 'default');
+      const previousSequence = this.sequenceBySubscription.get(subscription);
+      if (previousSequence != null && sequence !== previousSequence + 1) {
+        if (sequence <= previousSequence) this.sequenceRegressions += 1;
+        this.sequenceGaps += 1;
+        this.quarantineAndReconnect(ticker, previousSequence + 1, sequence);
+        return;
+      }
+      this.sequenceBySubscription.set(subscription, sequence);
       if (type === 'orderbook_snapshot') this.applySnapshot(ticker, sequence, msg);
       else if (type === 'orderbook_delta') {
         this.applyDelta(ticker, sequence, msg);
@@ -197,7 +288,7 @@ export class KalshiOrderbookStream {
         }
       }
       else return;
-      this.registry.recordSuccess('kalshi-ws', 0);
+      this.recordHealth();
     } catch {
       this.registry.recordWarn('kalshi-ws', 'malformed order-book stream message');
     }
@@ -207,6 +298,9 @@ export class KalshiOrderbookStream {
     const yes = parseLevels(msg.yes_dollars_fp ?? msg.yes_dollars ?? msg.yes);
     const no = parseLevels(msg.no_dollars_fp ?? msg.no_dollars ?? msg.no);
     this.books.set(ticker, { ticker, yes, no, sequence, receivedAt: Date.now() });
+    // A snapshot repairs structure, but qualification stays quarantined until a
+    // later sequenced exchange delta proves the stream is advancing.
+    this.quarantined.add(ticker);
   }
 
   private applyDelta(ticker: string, sequence: number, msg: Record<string, unknown>): void {
@@ -214,7 +308,8 @@ export class KalshiOrderbookStream {
     if (!book) return;
     if (sequence <= book.sequence) {
       this.sequenceRegressions += 1;
-      this.books.delete(ticker);
+      this.sequenceGaps += 1;
+      this.quarantineAndReconnect(ticker, book.sequence + 1, sequence);
       return;
     }
     const side = msg.side === 'yes' || msg.side === 'no' ? msg.side : null;
@@ -229,6 +324,77 @@ export class KalshiOrderbookStream {
     book.sequence = sequence;
     book.sourceTimestamp = timestamp;
     book.receivedAt = Date.now();
+    this.lastSequencedDeltaAt = book.receivedAt;
     this.lastExchangeTimestamp = timestamp;
+    this.quarantined.delete(ticker);
+  }
+
+  private quarantineAndReconnect(ticker: string, expected: number, received: number): void {
+    this.books.delete(ticker);
+    this.quarantined.add(ticker);
+    this.registry.recordWarn('kalshi-orderbook-ws', `order-book sequence gap for ${ticker}: expected ${expected}, received ${received}`);
+    this.restart();
+  }
+
+  private startHeartbeat(socket: WebSocket, generation: number): void {
+    this.clearHeartbeatTimer();
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.isCurrent(socket, generation) || socket.readyState !== WebSocket.OPEN) return;
+      const now = Date.now();
+      const freshestTrafficAt = Math.max(this.lastMessageAt ?? 0, this.lastPongAt ?? 0);
+      if (freshestTrafficAt === 0 || now - freshestTrafficAt > DEAD_CONNECTION_MS) {
+        this.registry.recordWarn('kalshi-orderbook-ws', 'order-book websocket liveness expired');
+        socket.terminate();
+        return;
+      }
+      socket.ping();
+    }, PING_INTERVAL_MS);
+  }
+
+  private recordHealth(): void {
+    const telemetry = this.telemetry();
+    this.registry.recordTelemetry('kalshi-orderbook-ws', {
+      status: telemetry.qualificationReady ? 'ok' : 'warn',
+      lastSuccess: telemetry.qualificationReady ? Date.now() : this.registry.get('kalshi-orderbook-ws')?.lastSuccess ?? null,
+      lastError: telemetry.qualificationReady ? null : 'order-book websocket awaiting repaired sequenced delta',
+      lastMessageAt: telemetry.lastMessageAt,
+      lastPongAt: telemetry.lastPongAt,
+      reconnects: telemetry.reconnects,
+      sequenceGaps: telemetry.sequenceGaps,
+      transportConnected: telemetry.connected,
+      authenticated: telemetry.authenticated,
+      qualificationReady: telemetry.qualificationReady,
+      environment: this.environment,
+      endpointClass: 'market-data',
+    });
+    const tickerReady = this.registry.get('kalshi-ticker-ws')?.qualificationReady === true;
+    this.registry.recordTelemetry('kalshi-ws', {
+      status: tickerReady && telemetry.qualificationReady ? 'ok' : 'warn',
+      lastMessageAt: telemetry.lastMessageAt,
+      lastPongAt: telemetry.lastPongAt,
+      transportConnected: telemetry.connected,
+      authenticated: telemetry.authenticated,
+      qualificationReady: tickerReady && telemetry.qualificationReady,
+      reconnects: telemetry.reconnects,
+      sequenceGaps: telemetry.sequenceGaps,
+    });
+  }
+
+  private closeCurrentSocket(): void {
+    this.clearHeartbeatTimer();
+    const socket = this.socket;
+    this.socket = null;
+    this.authenticated = false;
+    this.subscribed.clear();
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close();
+  }
+
+  private clearHeartbeatTimer(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  private isCurrent(socket: WebSocket, generation: number): boolean {
+    return this.socket === socket && this.generation === generation;
   }
 }

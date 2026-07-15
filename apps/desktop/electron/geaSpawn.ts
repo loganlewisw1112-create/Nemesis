@@ -38,6 +38,17 @@ export function createGeaChildEnv(
     GEA_COORDINATE_TAPE_WITH_NEMESIS: 'true',
   };
   delete childEnv.VITE_DEV_SERVER_URL;
+  // GEA consumes only the public, unsigned trade tape. Portfolio and exchange
+  // websocket credentials stay inside NEMESIS and must never cross the child
+  // process boundary.
+  for (const key of [
+    'NEMESIS_KALSHI_PRIVATE_KEY',
+    'NEMESIS_KALSHI_API_KEY',
+    'NEMESIS_KALSHI_API_KEY_ID',
+    'KALSHI_PRIVATE_KEY',
+    'KALSHI_API_KEY',
+    'KALSHI_API_KEY_ID',
+  ]) delete childEnv[key];
   return childEnv;
 }
 

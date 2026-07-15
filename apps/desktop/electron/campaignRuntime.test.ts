@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CampaignSnapshot } from '@nemesis/execution';
+import { candidateEconomicIdentity, type CampaignSnapshot } from '@nemesis/execution';
 import type { KalshiOrderbook, ThesisCard } from '@nemesis/core';
 import {
   CampaignBookTriggerScheduler,
@@ -25,6 +25,7 @@ function snapshot(status: CampaignSnapshot['manifest']['status'], terminalStates
     },
     candidates: terminalStates.map((terminalState, index) => ({ candidateId: `candidate-${index}`, terminalState })) as CampaignSnapshot['candidates'],
     diagnostics: [],
+    screenedOut: [],
     safetyFailures: [],
     operationalChecks: [],
     eventCount: 1,
@@ -38,6 +39,7 @@ function snapshot(status: CampaignSnapshot['manifest']['status'], terminalStates
     diagnosticSchedulingCoverage: 0,
     validDiagnosticCoverage: 0,
     freshConfirmationRate: 0,
+    readOnly: false,
   };
 }
 
@@ -95,14 +97,14 @@ describe('campaign runtime isolation', () => {
       signalReason: 'Whale yes 20 @ 0.40',
     } as ThesisCard;
     const active = snapshot('active');
-    expect(campaignBookUpdateWork('OTHER', [card], active)).toEqual({ throughput: false, confirmation: false });
-    expect(campaignBookUpdateWork('KXTEST', [card], active)).toEqual({ throughput: true, confirmation: false });
+    expect(campaignBookUpdateWork('OTHER', [card], active)).toEqual({ throughput: false, confirmation: false, diagnostic: false });
+    expect(campaignBookUpdateWork('KXTEST', [card], active)).toEqual({ throughput: true, confirmation: false, diagnostic: false });
 
     active.candidates = [{
       candidateId: 'candidate-1', ticker: card.ticker, terminalState: 'rejected',
-      economicIdentity: 'KXTEST|yes|flow-hunter|flow-driven|whale yes 20 @ 0.40',
+      economicIdentity: candidateEconomicIdentity(card),
     }] as CampaignSnapshot['candidates'];
-    expect(campaignBookUpdateWork('KXTEST', [card], active)).toEqual({ throughput: false, confirmation: false });
+    expect(campaignBookUpdateWork('KXTEST', [card], active)).toEqual({ throughput: false, confirmation: false, diagnostic: false });
   });
 
   it('routes a matching pending candidate only to confirmation work', () => {
@@ -110,27 +112,45 @@ describe('campaign runtime isolation', () => {
     active.candidates = [{
       candidateId: 'candidate-1', ticker: 'KXTEST', economicIdentity: 'identity',
     }] as CampaignSnapshot['candidates'];
-    expect(campaignBookUpdateWork('KXTEST', [], active)).toEqual({ throughput: false, confirmation: true });
+    expect(campaignBookUpdateWork('KXTEST', [], active)).toEqual({ throughput: false, confirmation: true, diagnostic: false });
+  });
+
+  it('routes a due diagnostic from the exact matching exchange delta', () => {
+    const active = snapshot('active');
+    active.candidates = [{
+      candidateId: 'candidate-1', ticker: 'KXTEST', economicIdentity: 'identity', terminalState: 'rejected',
+    }] as CampaignSnapshot['candidates'];
+    active.diagnostics = [{
+      diagnosticId: 'diagnostic-1', candidateId: 'candidate-1', dueAt: 9_000, attempts: 0,
+      status: 'scheduled', qualificationEligible: false,
+    }] as CampaignSnapshot['diagnostics'];
+
+    expect(campaignBookUpdateWork('KXTEST', [], active, 10_000)).toEqual({
+      throughput: false,
+      confirmation: false,
+      diagnostic: true,
+    });
+    expect(campaignBookUpdateWork('OTHER', [], active, 10_000).diagnostic).toBe(false);
   });
 
   it('coalesces a burst into one immediate and one delayed batch', () => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);
-    const batches: Array<{ throughputTickers: string[]; confirmationTickers: string[] }> = [];
+    const batches: Array<{ throughputTickers: string[]; confirmationTickers: string[]; diagnosticTickers: string[] }> = [];
     const scheduler = new CampaignBookTriggerScheduler(500, (batch) => batches.push(batch));
 
-    scheduler.request('KX-A', { throughput: true, confirmation: false });
+    scheduler.request('KX-A', { throughput: true, confirmation: false, diagnostic: false });
     for (let index = 0; index < 100; index += 1) {
-      scheduler.request('KX-A', { throughput: true, confirmation: true });
+      scheduler.request('KX-A', { throughput: true, confirmation: true, diagnostic: true });
     }
-    expect(batches).toEqual([{ throughputTickers: ['KX-A'], confirmationTickers: [] }]);
+    expect(batches).toEqual([{ throughputTickers: ['KX-A'], confirmationTickers: [], diagnosticTickers: [] }]);
 
     vi.advanceTimersByTime(499);
     expect(batches).toHaveLength(1);
     vi.advanceTimersByTime(1);
     expect(batches).toEqual([
-      { throughputTickers: ['KX-A'], confirmationTickers: [] },
-      { throughputTickers: ['KX-A'], confirmationTickers: ['KX-A'] },
+      { throughputTickers: ['KX-A'], confirmationTickers: [], diagnosticTickers: [] },
+      { throughputTickers: ['KX-A'], confirmationTickers: ['KX-A'], diagnosticTickers: ['KX-A'] },
     ]);
     scheduler.stop();
   });

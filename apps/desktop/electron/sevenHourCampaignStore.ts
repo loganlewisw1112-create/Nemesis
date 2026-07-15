@@ -58,7 +58,13 @@ export class SevenHourCampaignStore {
     const created = this.tracker.allEvents().slice(before);
     if (created.length > 0) {
       try {
-        fs.appendFileSync(this.filePath, `${created.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8');
+        const fd = fs.openSync(this.filePath, 'a');
+        try {
+          fs.writeSync(fd, `${created.map((event) => JSON.stringify(event)).join('\n')}\n`, undefined, 'utf8');
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
       } catch (error) {
         this.persistenceError = `campaign append failed: ${error instanceof Error ? error.message : String(error)}`;
         throw new Error(this.persistenceError);

@@ -69,7 +69,7 @@ describe('FeedHub trade tape degradation', () => {
 
     await refreshTrades(hub);
 
-    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(hub.getTradeFeedState()).toMatchObject({
       status: 'degraded',
       failureCount: 1,
@@ -85,11 +85,11 @@ describe('FeedHub trade tape degradation', () => {
 
     await refreshTrades(hub);
 
-    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps cached trade-derived theses usable after a later trade fetch failure', async () => {
+  it('keeps stale cached trades displayable but excludes them from qualification', async () => {
     const whaleTrade: KalshiTrade = {
       trade_id: 'tr-1',
       ticker: 'KXDEMO',
@@ -129,11 +129,14 @@ describe('FeedHub trade tape degradation', () => {
     vi.setSystemTime(new Date('2026-06-27T12:01:00.000Z'));
     await refreshTrades(hub);
 
-    expect(hub.getTradesForTicker('KXDEMO')).toEqual([whaleTrade]);
+    expect(hub.getTradesForTicker('KXDEMO')).toEqual([]);
+    expect(hub.getCachedTradeTapeForDisplay()).toEqual([whaleTrade]);
     expect(hub.getTradeFeedState()).toMatchObject({
       status: 'degraded',
       cachedTradeCount: 1,
       lastError: 'fetch failed: trade endpoint timeout',
+      displayOnly: true,
+      qualificationReady: false,
     });
   });
 

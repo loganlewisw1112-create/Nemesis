@@ -37,6 +37,12 @@ export interface BridgeHello {
   timestamp: number;
 }
 
+export interface BridgeProcessTelemetry {
+  pid: number;
+  workingSetMb: number;
+  sampledAt: number;
+}
+
 export type BridgePayload =
   | NemesisStateMirror
   | RecommendationPacket
@@ -44,6 +50,7 @@ export type BridgePayload =
   | ExitRecommendation
   | NemesisCloseResult
   | BridgeHello
+  | BridgeProcessTelemetry
   | Record<string, never>;
 
 export interface NemesisBridgeMessage {
@@ -66,4 +73,23 @@ export interface BridgeStatus {
   disconnects: number;
   failovers: number;
   tapeFreshnessMs: number | null;
+  /** True transport state; `connected` additionally requires recent bidirectional traffic. */
+  socketConnected?: boolean;
+  qualificationReady?: boolean;
+  peerRole?: BridgeHello['role'] | null;
+  lastPingAt?: number | null;
+  roundTripMs?: number | null;
+  trafficFreshnessMs?: number | null;
+  sequenceGaps?: number;
+  pingCount?: number;
+  pongCount?: number;
+  tradeTapeFreshnessMs?: number | null;
+  orderbookObservationFreshnessMs?: number | null;
+  exchangeDeltaFreshnessMs?: number | null;
+  geaPid?: number | null;
+  geaWorkingSetMb?: number | null;
+  geaProcessSampledAt?: number | null;
+  mainPid?: number | null;
+  mainWorkingSetMb?: number | null;
+  mainProcessSampledAt?: number | null;
 }

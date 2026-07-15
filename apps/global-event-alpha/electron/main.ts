@@ -69,6 +69,12 @@ import { copyLegacyGeaDatabaseIfMissing, legacyGeaDatabasePath, resolveGeaDataba
 import { TapeStartupCoordinator } from './tapeStartup.js';
 import { buildExitExecutionContext } from './exitExecutionContext.js';
 import { noTradeDecisionSignature } from './noTradeDecision.js';
+import {
+  BRIDGE_HEARTBEAT_MS,
+  recordBridgeInbound,
+  recordBridgeOutbound,
+  refreshBridgeTrafficStatus,
+} from './bridgeTelemetry.js';
 
 if (process.env.GEA_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -87,8 +93,10 @@ let bridgeWs: WebSocket | null = null;
 let bridgeSeq = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectDelay = RECONNECT_INITIAL_MS;
+let bridgeHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let bridgeConnectionCount = 0;
 
-const bridgeStatus: BridgeStatus = {
+let bridgeStatus: BridgeStatus = {
   connected: false,
   brainRole: null,
   lastSeenAt: null,
@@ -102,6 +110,18 @@ const bridgeStatus: BridgeStatus = {
   disconnects: 0,
   failovers: 0,
   tapeFreshnessMs: null,
+  socketConnected: false,
+  qualificationReady: false,
+  peerRole: null,
+  lastPingAt: null,
+  roundTripMs: null,
+  trafficFreshnessMs: null,
+  sequenceGaps: 0,
+  pingCount: 0,
+  pongCount: 0,
+  tradeTapeFreshnessMs: null,
+  orderbookObservationFreshnessMs: null,
+  exchangeDeltaFreshnessMs: null,
 };
 
 export interface GlobalEventAlphaIntelligenceState {
@@ -172,7 +192,14 @@ function emptyTapeState(): KalshiTapeState {
     latestSnapshots: [],
     latestTrades: [],
     latestOrderbooks: [],
-    freshness: { kalshiTapeAgeMs: null, stale: true },
+    freshness: {
+      marketSnapshotAgeMs: null,
+      tradeTapeAgeMs: null,
+      orderbookObservationAgeMs: null,
+      exchangeDeltaAgeMs: null,
+      kalshiTapeAgeMs: null,
+      stale: true,
+    },
   };
 }
 
@@ -321,6 +348,7 @@ function broadcast(channel: string, data: unknown) {
 }
 
 function pushBridgeStatus() {
+  bridgeStatus = refreshBridgeTrafficStatus(bridgeStatus, bridgeWs?.readyState === WebSocket.OPEN);
   broadcast('gea:bridgeStatus', { ...bridgeStatus });
 }
 
@@ -439,6 +467,11 @@ function pushIntelligenceState() {
 
 function pushTapeState(state = tapeEngine?.getState() ?? tapeState) {
   tapeState = state;
+  bridgeStatus.tapeFreshnessMs = tapeState.freshness.kalshiTapeAgeMs;
+  bridgeStatus.tradeTapeFreshnessMs = tapeState.freshness.tradeTapeAgeMs;
+  bridgeStatus.orderbookObservationFreshnessMs = tapeState.freshness.orderbookObservationAgeMs;
+  bridgeStatus.exchangeDeltaFreshnessMs = tapeState.freshness.exchangeDeltaAgeMs;
+  pushBridgeStatus();
   broadcast('gea:tapeUpdate', tapeState);
   pushIntelligenceState();
 }
@@ -673,6 +706,7 @@ function sendToNemesis(msg: Omit<NemesisBridgeMessage, 'seq'>) {
   if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) return;
   const full: NemesisBridgeMessage = { ...msg, seq: ++bridgeSeq };
   bridgeWs.send(JSON.stringify(full));
+  bridgeStatus = recordBridgeOutbound(bridgeStatus, full);
 }
 
 function connectBridge() {
@@ -686,8 +720,15 @@ function connectBridge() {
 
   ws.on('open', () => {
     reconnectDelay = RECONNECT_INITIAL_MS;
-    bridgeStatus.connected = true;
-    bridgeStatus.lastSeenAt = Date.now();
+    bridgeConnectionCount += 1;
+    if (bridgeConnectionCount > 1) bridgeStatus.reconnects += 1;
+    bridgeStatus.clientCount = 1;
+    bridgeStatus.lastInboundAt = null;
+    bridgeStatus.lastOutboundAt = null;
+    bridgeStatus.lastPongAt = null;
+    bridgeStatus.lastPingAt = null;
+    bridgeStatus.lastSequenceIn = null;
+    bridgeStatus = refreshBridgeTrafficStatus(bridgeStatus, true);
     pushBridgeStatus();
 
     sendToNemesis({
@@ -700,7 +741,12 @@ function connectBridge() {
   ws.on('message', (raw: RawData) => {
     try {
       const msg = JSON.parse(raw.toString()) as NemesisBridgeMessage;
-      bridgeStatus.lastSeenAt = Date.now();
+      const inbound = recordBridgeInbound(bridgeStatus, msg);
+      bridgeStatus = inbound.status;
+      if (!inbound.accepted) {
+        pushBridgeStatus();
+        return;
+      }
 
       if (msg.type === 'nemesis:state') {
         latestNemesisState = msg.payload as NemesisStateMirror;
@@ -713,14 +759,27 @@ function connectBridge() {
         broadcast('gea:closeResult', msg.payload);
       } else if (msg.type === 'bridge:pong') {
         // heartbeat ack
+      } else if (msg.type === 'bridge:ping') {
+        sendToNemesis({
+          type: 'bridge:pong',
+          payload: {
+            pid: process.pid,
+            workingSetMb: Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3)),
+            sampledAt: Date.now(),
+          },
+        });
       }
+      pushBridgeStatus();
     } catch {
       // malformed packet — drop
     }
   });
 
   ws.on('close', () => {
-    bridgeStatus.connected = false;
+    if (bridgeWs === ws) bridgeWs = null;
+    bridgeStatus.clientCount = 0;
+    bridgeStatus.disconnects += 1;
+    bridgeStatus = refreshBridgeTrafficStatus(bridgeStatus, false);
     pushBridgeStatus();
     scheduleReconnect();
   });
@@ -782,9 +841,11 @@ app.whenReady().then(async () => {
   connectBridge();
   tapeStartup.begin();
 
-  setInterval(() => {
+  bridgeHeartbeatTimer = setInterval(() => {
     sendToNemesis({ type: 'bridge:ping', payload: {} });
-  }, 30_000);
+    pushBridgeStatus();
+  }, BRIDGE_HEARTBEAT_MS);
+  sendToNemesis({ type: 'bridge:ping', payload: {} });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -798,6 +859,7 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (bridgeHeartbeatTimer) clearInterval(bridgeHeartbeatTimer);
   if (brainHealthTimer) clearInterval(brainHealthTimer);
   if (tapeRefreshTimer) clearInterval(tapeRefreshTimer);
   if (publicDataRefreshTimer) clearInterval(publicDataRefreshTimer);

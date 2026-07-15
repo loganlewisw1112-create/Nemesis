@@ -1,10 +1,12 @@
-import type { ConnectorHealth } from '@nemesis/core';
+import type { ConnectorHealth, KalshiFailureClass } from '@nemesis/core';
 import { fetchMarkets } from '@nemesis/core';
 
 export type ConnectorId =
   | 'kalshi-rest'
   | 'kalshi-trades'
   | 'kalshi-ws'
+  | 'kalshi-ticker-ws'
+  | 'kalshi-orderbook-ws'
   | 'kalshi-portfolio'
   | 'nws'
   | 'open-meteo'
@@ -29,6 +31,8 @@ export const CONNECTORS: ConnectorDef[] = [
   { id: 'kalshi-rest', name: 'Kalshi REST', pollMs: 30_000 },
   { id: 'kalshi-trades', name: 'Kalshi Trade Tape', pollMs: 15_000 },
   { id: 'kalshi-ws', name: 'Kalshi WebSocket', pollMs: 5_000 },
+  { id: 'kalshi-ticker-ws', name: 'Kalshi Ticker WebSocket', pollMs: 5_000 },
+  { id: 'kalshi-orderbook-ws', name: 'Kalshi Orderbook WebSocket', pollMs: 5_000 },
   { id: 'kalshi-portfolio', name: 'Kalshi Portfolio' },
   { id: 'nws', name: 'NWS', pollMs: 300_000 },
   { id: 'open-meteo', name: 'Open-Meteo', pollMs: 300_000 },
@@ -62,36 +66,52 @@ export class ConnectorRegistry {
   }
 
   getAll(): ConnectorHealth[] {
-    return [...this.health.values()];
+    return [...this.health.values()].map((health) => ({ ...health }));
   }
 
   get(id: ConnectorId): ConnectorHealth | undefined {
-    return this.health.get(id);
+    const health = this.health.get(id);
+    return health ? { ...health } : undefined;
+  }
+
+  recordAttempt(id: ConnectorId, now = Date.now()) {
+    const h = this.health.get(id);
+    if (!h) return;
+    h.lastAttempt = now;
   }
 
   recordSuccess(id: ConnectorId, latencyMs: number) {
     const h = this.health.get(id);
     if (!h) return;
+    const now = Date.now();
     h.status = 'ok';
-    h.lastSuccess = Date.now();
+    h.lastSuccess = now;
+    h.lastMessageAt = now;
     h.latencyMs = latencyMs;
     h.lastError = null;
+    h.lastAttempt = now;
+    h.failureClass = null;
+    h.transportConnected = true;
+    h.qualificationReady = true;
   }
 
-  recordError(id: ConnectorId, error: string) {
+  recordError(id: ConnectorId, error: string, failureClass: KalshiFailureClass = 'unknown') {
     const h = this.health.get(id);
     if (!h) return;
     h.status = 'error';
     h.errorCount1h += 1;
     h.lastError = error;
+    h.lastAttempt = Date.now();
+    h.failureClass = failureClass;
+    h.qualificationReady = false;
   }
 
   recordWarn(id: ConnectorId, detail: string) {
     const h = this.health.get(id);
     if (!h) return;
-    if (h.status === 'ok') return;
     h.status = 'warn';
     h.lastError = detail;
+    h.qualificationReady = false;
   }
 
   recordDegraded(id: ConnectorId, detail: string) {
@@ -99,6 +119,25 @@ export class ConnectorRegistry {
     if (!h) return;
     h.status = 'warn';
     h.lastError = detail;
+    h.qualificationReady = false;
+  }
+
+  recordTelemetry(id: ConnectorId, telemetry: Partial<Omit<ConnectorHealth, 'id' | 'name'>>) {
+    const h = this.health.get(id);
+    if (!h) return;
+    Object.assign(h, telemetry);
+  }
+
+  refreshFreshness(id: ConnectorId, staleAfterMs: number, now = Date.now()): ConnectorHealth | undefined {
+    const h = this.health.get(id);
+    if (!h) return undefined;
+    const sourceAt = h.lastMessageAt ?? h.lastSuccess;
+    h.freshnessMs = sourceAt === null || sourceAt === undefined ? null : Math.max(0, now - sourceAt);
+    if (h.freshnessMs === null || h.freshnessMs > staleAfterMs) {
+      h.qualificationReady = false;
+      if (h.status === 'ok') h.status = 'warn';
+    }
+    return { ...h };
   }
 
   isHealthy(id: ConnectorId): boolean {

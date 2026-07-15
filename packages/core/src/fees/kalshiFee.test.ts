@@ -12,6 +12,11 @@ import {
   isExecutablePrice,
   fetchMarkets,
   fetchTrades,
+  fetchBalance,
+  getKalshiHostHealth,
+  getKalshiEndpointPolicy,
+  KalshiRequestFailure,
+  resetKalshiHostCache,
   normalizeExecutablePrice,
   parseOrderbook,
   normalizeMarketPrice,
@@ -69,6 +74,93 @@ describe('kalshiFee', () => {
 });
 
 describe('kalshi client', () => {
+  it('keeps production and demo endpoint policies isolated and excludes retired hosts', () => {
+    const production = getKalshiEndpointPolicy('production');
+    const demo = getKalshiEndpointPolicy('demo');
+    expect(production.restBaseUrls[0]).toBe('https://external-api.kalshi.com/trade-api/v2');
+    expect(production.websocketUrls[0]).toBe('wss://external-api-ws.kalshi.com/trade-api/ws/v2');
+    expect(production.restBaseUrls.join(' ')).not.toContain('trading-api.kalshi.com');
+    expect(production.restBaseUrls.some((url) => demo.restBaseUrls.includes(url))).toBe(false);
+  });
+
+  it('fails closed before contacting a retired production host', async () => {
+    resetKalshiHostCache();
+    const fetchFn = vi.fn<typeof fetch>();
+    const failure = await fetchMarkets({
+      baseUrl: 'https://trading-api.kalshi.com/trade-api/v2',
+      fetchFn,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(KalshiRequestFailure);
+    expect(failure).toMatchObject({ classification: 'authorization', path: '(endpoint-policy)' });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('classifies a timeout, evicts that host, and prefers the healthy alias next time', async () => {
+    resetKalshiHostCache();
+    const firstUrls: string[] = [];
+    await fetchMarkets({
+      limit: 1,
+      fetchFn: vi.fn<typeof fetch>(async (input) => {
+        const url = String(input);
+        firstUrls.push(url);
+        if (url.startsWith('https://external-api.kalshi.com')) throw new Error('request timed out');
+        return new Response(JSON.stringify({ markets: [] }), { status: 200 });
+      }),
+    });
+    expect(firstUrls).toHaveLength(2);
+    expect(getKalshiHostHealth()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        baseUrl: 'https://external-api.kalshi.com/trade-api/v2',
+        failureClass: 'timeout',
+        failureCount: 1,
+      }),
+    ]));
+
+    const nextUrls: string[] = [];
+    await fetchMarkets({
+      limit: 1,
+      fetchFn: vi.fn<typeof fetch>(async (input) => {
+        nextUrls.push(String(input));
+        return new Response(JSON.stringify({ markets: [] }), { status: 200 });
+      }),
+    });
+    expect(nextUrls[0]).toMatch(/^https:\/\/api\.elections\.kalshi\.com/);
+  });
+
+  it('learns working hosts per endpoint class instead of poisoning all requests', async () => {
+    resetKalshiHostCache();
+    const marketUrls: string[] = [];
+    const marketFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      marketUrls.push(url);
+      if (url.startsWith('https://external-api.kalshi.com')) throw new Error('fetch failed');
+      return new Response(JSON.stringify({ markets: [] }), { status: 200 });
+    });
+    await fetchMarkets({ fetchFn: marketFetch, limit: 1 });
+
+    const portfolioUrls: string[] = [];
+    await fetchBalance({
+      fetchFn: vi.fn<typeof fetch>(async (input) => {
+        portfolioUrls.push(String(input));
+        return new Response(JSON.stringify({ balance: 100, payout: 0 }), { status: 200 });
+      }),
+    });
+    expect(marketUrls[1]).toMatch(/^https:\/\/api\.elections\.kalshi\.com/);
+    expect(portfolioUrls[0]).toMatch(/^https:\/\/external-api\.kalshi\.com/);
+  });
+
+  it('classifies and exposes server-directed 429 backoff without host rotation', async () => {
+    resetKalshiHostCache();
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}', {
+      status: 429,
+      headers: { 'Retry-After': '12' },
+    }));
+    const failure = await fetchTrades({ fetchFn }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(KalshiRequestFailure);
+    expect(failure).toMatchObject({ classification: 'rate_limit', status: 429, retryAfterMs: 12_000 });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
   it('parses bid-only orderbook with derived asks', () => {
     const ob = parseOrderbook('TEST', {
       orderbook: { yes: [[54, 100]], no: [[40, 50]] },

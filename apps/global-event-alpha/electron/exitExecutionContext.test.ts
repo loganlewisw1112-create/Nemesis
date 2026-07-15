@@ -20,7 +20,14 @@ function tape(): KalshiTapeState {
       best_yes_bid: 0.44, yes_ask: 0.46, no_ask: 0.56, spread: 0.02, timestamp: 1_000,
       observed_at: 1_000, exchange_timestamp: 950, exchange_sequence: 12,
     }],
-    freshness: { kalshiTapeAgeMs: 0, stale: false },
+    freshness: {
+      marketSnapshotAgeMs: 0,
+      tradeTapeAgeMs: null,
+      orderbookObservationAgeMs: 100,
+      exchangeDeltaAgeMs: 150,
+      kalshiTapeAgeMs: 0,
+      stale: false,
+    },
   };
 }
 

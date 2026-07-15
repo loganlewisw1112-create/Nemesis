@@ -1,6 +1,29 @@
 import { DEFAULT_AUTO_CLOSE_SETTINGS, type AutoCloseSettings, type ProfitCertificate } from './paper/types.js';
 
-export const KALSHI_WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
+/** Kalshi's recommended production websocket endpoint. */
+export const KALSHI_WS_URL = 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
+
+export type KalshiEnvironment = 'production' | 'demo';
+
+export type KalshiEndpointClass = 'market-data' | 'portfolio' | 'orders';
+
+export interface KalshiEndpointPolicy {
+  environment: KalshiEnvironment;
+  restBaseUrls: readonly string[];
+  websocketUrls: readonly string[];
+}
+
+export type KalshiFailureClass =
+  | 'aborted'
+  | 'authentication'
+  | 'authorization'
+  | 'rate_limit'
+  | 'not_found'
+  | 'server'
+  | 'timeout'
+  | 'network'
+  | 'invalid_response'
+  | 'unknown';
 
 export interface KalshiMarket {
   ticker: string;
@@ -395,6 +418,20 @@ export interface ConnectorHealth {
   latencyMs: number | null;
   errorCount1h: number;
   lastError: string | null;
+  lastAttempt?: number | null;
+  lastMessageAt?: number | null;
+  lastPongAt?: number | null;
+  nextRetryAt?: number | null;
+  failureClass?: KalshiFailureClass | null;
+  reconnects?: number;
+  disconnects?: number;
+  sequenceGaps?: number;
+  freshnessMs?: number | null;
+  transportConnected?: boolean;
+  authenticated?: boolean;
+  qualificationReady?: boolean;
+  environment?: KalshiEnvironment;
+  endpointClass?: KalshiEndpointClass;
 }
 
 export interface GateStatus {

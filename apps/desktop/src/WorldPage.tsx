@@ -104,7 +104,7 @@ export function WorldPage() {
   useEffect(() => {
     if (!window.nemesis) return;
     window.nemesis.getWorldEvents().then(handleData);
-    window.nemesis.onWorldEventsUpdate(handleData);
+    return window.nemesis.onWorldEventsUpdate(handleData);
   }, [handleData]);
 
   const filteredNews = selectedCountry

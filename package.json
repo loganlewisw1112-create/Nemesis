@@ -21,6 +21,7 @@
     "paper:archive-reset": "node scripts/archive-and-reset-paper.cjs",
     "paper:rescore": "node scripts/rescore-strategy-validation.cjs",
     "campaign:start": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/start-evidence-campaign.ps1",
+    "soak:production": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-production-soak.ps1",
     "campaign:invalidate": "node scripts/invalidate-evidence-campaign.cjs",
     "report:seven-hour": "node scripts/regenerate-seven-hour-report.cjs",
     "ci:build": "npm run build",

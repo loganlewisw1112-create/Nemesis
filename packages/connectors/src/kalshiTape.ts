@@ -58,6 +58,10 @@ export interface KalshiTapeState {
   latestTrades: KalshiTradePrintRecord[];
   latestOrderbooks: KalshiOrderbookSnapshotRecord[];
   freshness: {
+    marketSnapshotAgeMs: number | null;
+    tradeTapeAgeMs: number | null;
+    orderbookObservationAgeMs: number | null;
+    exchangeDeltaAgeMs: number | null;
     kalshiTapeAgeMs: number | null;
     stale: boolean;
   };
@@ -219,8 +223,22 @@ export class KalshiTapeEngine {
   }
 
   getState(now = Date.now()): KalshiTapeState {
-    const lastAt = this.latestSnapshots[0]?.timestamp ?? this.latestOrderbooks[0]?.timestamp ?? null;
-    const kalshiTapeAgeMs = lastAt === null ? null : Math.max(0, now - lastAt);
+    const marketSnapshotAt = this.latestSnapshots[0]?.timestamp ?? null;
+    const tradeTapeAt = this.latestTrades
+      .map((trade) => Date.parse(trade.created_time))
+      .filter(Number.isFinite)
+      .reduce<number | null>((latest, timestamp) => latest === null ? timestamp : Math.max(latest, timestamp), null);
+    const orderbookObservedAt = this.latestOrderbooks[0]?.observed_at ?? null;
+    const exchangeDeltaAt = this.latestOrderbooks
+      .map((book) => book.exchange_timestamp)
+      .filter((timestamp): timestamp is number => timestamp !== null)
+      .reduce<number | null>((latest, timestamp) => latest === null ? timestamp : Math.max(latest, timestamp), null);
+    const age = (timestamp: number | null) => timestamp === null ? null : Math.max(0, now - timestamp);
+    const marketSnapshotAgeMs = age(marketSnapshotAt);
+    const tradeTapeAgeMs = age(tradeTapeAt);
+    const orderbookObservationAgeMs = age(orderbookObservedAt);
+    const exchangeDeltaAgeMs = age(exchangeDeltaAt);
+    const kalshiTapeAgeMs = marketSnapshotAgeMs ?? orderbookObservationAgeMs;
     return {
       snapshotCount: this.latestSnapshots.length,
       tradeCount: this.latestTrades.length,
@@ -230,6 +248,10 @@ export class KalshiTapeEngine {
       latestTrades: [...this.latestTrades],
       latestOrderbooks: [...this.latestOrderbooks],
       freshness: {
+        marketSnapshotAgeMs,
+        tradeTapeAgeMs,
+        orderbookObservationAgeMs,
+        exchangeDeltaAgeMs,
         kalshiTapeAgeMs,
         stale: kalshiTapeAgeMs === null || kalshiTapeAgeMs > this.staleAfterMs,
       },

@@ -1,5 +1,25 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
+function subscribe(channel: string, cb: (payload: unknown) => void): () => void {
+  const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => cb(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
+let rendererPainted = false;
+const reportRendererHeartbeat = () => ipcRenderer.send('renderer:heartbeat', {
+  painted: rendererPainted,
+  at: Date.now(),
+});
+const rendererHeartbeatTimer = setInterval(reportRendererHeartbeat, 5_000);
+window.addEventListener('DOMContentLoaded', () => {
+  requestAnimationFrame(() => {
+    rendererPainted = true;
+    reportRendererHeartbeat();
+  });
+}, { once: true });
+window.addEventListener('beforeunload', () => clearInterval(rendererHeartbeatTimer), { once: true });
+
 contextBridge.exposeInMainWorld('nemesis', {
   getState: () => ipcRenderer.invoke('nemesis:getState'),
   getMarkets: () => ipcRenderer.invoke('nemesis:getMarkets'),
@@ -39,43 +59,40 @@ contextBridge.exposeInMainWorld('nemesis', {
   forceUniverseRefresh: () => ipcRenderer.invoke('nemesis:forceUniverseRefresh'),
   forceDepthPass: () => ipcRenderer.invoke('nemesis:forceDepthPass'),
   onSettingsUpdate: (cb: (s: unknown) => void) => {
-    ipcRenderer.removeAllListeners('settings:update');
-    ipcRenderer.on('settings:update', (_e, s) => cb(s));
+    return subscribe('settings:update', cb);
   },
   onMarketsUpdate: (cb: (d: unknown) => void) => {
-    ipcRenderer.removeAllListeners('markets:update');
-    ipcRenderer.on('markets:update', (_e, d) => cb(d));
+    return subscribe('markets:update', cb);
+  },
+  onMarketsStateV2: (cb: (d: unknown) => void) => {
+    return subscribe('markets:state-v2', cb);
   },
   onPaperUpdate: (cb: (d: unknown) => void) => {
-    ipcRenderer.removeAllListeners('paper:update');
-    ipcRenderer.on('paper:update', (_e, d) => cb(d));
+    return subscribe('paper:update', cb);
+  },
+  onEquityHistoryStateV2: (cb: (d: unknown) => void) => {
+    return subscribe('equity-history:state-v2', cb);
   },
   onTicksUpdate: (cb: (d: unknown) => void) => {
-    ipcRenderer.removeAllListeners('ticks:update');
-    ipcRenderer.on('ticks:update', (_e, d) => cb(d));
+    return subscribe('ticks:update', cb);
   },
   onDiscoveryUpdate: (cb: (d: unknown) => void) => {
-    ipcRenderer.removeAllListeners('discovery:update');
-    ipcRenderer.on('discovery:update', (_e, d) => cb(d));
+    return subscribe('discovery:update', cb);
   },
   openWidget: (type: string) => ipcRenderer.invoke('nemesis:openWidget', type),
   closeThisWidget: () => ipcRenderer.invoke('nemesis:closeThisWidget'),
   getWorldEvents: () => ipcRenderer.invoke('nemesis:getWorldEvents'),
   onWorldEventsUpdate: (cb: (d: unknown) => void) => {
-    ipcRenderer.removeAllListeners('worldevents:update');
-    ipcRenderer.on('worldevents:update', (_e, d) => cb(d));
+    return subscribe('worldevents:update', cb);
   },
   getBridgeStatus: () => ipcRenderer.invoke('nemesis:getBridgeStatus'),
   onBridgeStatus: (cb: (s: unknown) => void) => {
-    ipcRenderer.removeAllListeners('bridge:status');
-    ipcRenderer.on('bridge:status', (_e, s) => cb(s));
+    return subscribe('bridge:status', cb);
   },
   onBridgeRecommendation: (cb: (p: unknown) => void) => {
-    ipcRenderer.removeAllListeners('bridge:recommendation');
-    ipcRenderer.on('bridge:recommendation', (_e, p) => cb(p));
+    return subscribe('bridge:recommendation', cb);
   },
   onConnectorsUpdate: (cb: (d: unknown) => void) => {
-    ipcRenderer.removeAllListeners('connectors:update');
-    ipcRenderer.on('connectors:update', (_e, d) => cb(d));
+    return subscribe('connectors:update', cb);
   },
 });

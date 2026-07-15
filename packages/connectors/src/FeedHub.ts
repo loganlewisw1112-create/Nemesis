@@ -1,4 +1,4 @@
-import { fetchTrades, type KalshiMarket, type KalshiTrade, type GeoNewsItem } from '@nemesis/core';
+import { KalshiRequestFailure, fetchTrades, type ConnectorHealth, type KalshiFailureClass, type KalshiMarket, type KalshiTrade, type GeoNewsItem } from '@nemesis/core';
 import { BinanceStream, type BinanceQuote } from './binanceStream.js';
 import type { ConnectorRegistry } from './registry.js';
 import type { InfraAlert, NewsItem } from './feeds.js';
@@ -69,6 +69,19 @@ export interface FeedHubTradeFeedState {
   cachedTradeCount: number;
   backoffMs: number;
   lastWarningAt: number | null;
+  tapeAgeMs: number | null;
+  displayOnly: boolean;
+  qualificationReady: boolean;
+  failureClass: KalshiFailureClass | null;
+}
+
+export interface FeedHealthSnapshot {
+  generatedAt: number;
+  restMarkets: ConnectorHealth | null;
+  tradeTape: ConnectorHealth | null;
+  tickerWebSocket: ConnectorHealth | null;
+  orderbookWebSocket: ConnectorHealth | null;
+  qualificationReady: boolean;
 }
 
 function tradeBackoffMs(failureCount: number): number {
@@ -97,6 +110,10 @@ export class FeedHub {
     cachedTradeCount: 0,
     backoffMs: 0,
     lastWarningAt: null,
+    tapeAgeMs: null,
+    displayOnly: true,
+    qualificationReady: false,
+    failureClass: null,
   };
   private worldNews: GeoNewsItem[] = [];
   private worldNewsAt = 0;
@@ -189,21 +206,50 @@ export class FeedHub {
   }
 
   getTradesForTicker(ticker: string): KalshiTrade[] {
-    return this.trades.filter((t) => t.ticker === ticker);
+    return this.getTradeTape().filter((t) => t.ticker === ticker);
   }
 
   getTradeTape(): KalshiTrade[] {
+    return this.tradeTapeQualificationReady() ? [...this.trades] : [];
+  }
+
+  /** Cached records are for operator display/replay only and never qualification. */
+  getCachedTradeTapeForDisplay(): KalshiTrade[] {
     return [...this.trades];
   }
 
   getTradeFeedState(): FeedHubTradeFeedState {
-    return { ...this.tradeFeedState, cachedTradeCount: this.trades.length };
+    const tapeAgeMs = this.tradesFetchedAt > 0 ? Math.max(0, Date.now() - this.tradesFetchedAt) : null;
+    const qualificationReady = this.tradeTapeQualificationReady();
+    return {
+      ...this.tradeFeedState,
+      cachedTradeCount: this.trades.length,
+      tapeAgeMs,
+      displayOnly: !qualificationReady,
+      qualificationReady,
+    };
+  }
+
+  getFeedHealthSnapshot(now = Date.now()): FeedHealthSnapshot {
+    const restMarkets = this.registry.refreshFreshness('kalshi-rest', 30_000, now) ?? null;
+    const tradeTape = this.registry.refreshFreshness('kalshi-trades', STALE_MS.trades, now) ?? null;
+    const tickerWebSocket = this.registry.refreshFreshness('kalshi-ticker-ws', 25_000, now) ?? null;
+    const orderbookWebSocket = this.registry.refreshFreshness('kalshi-orderbook-ws', 25_000, now) ?? null;
+    return {
+      generatedAt: now,
+      restMarkets,
+      tradeTape,
+      tickerWebSocket,
+      orderbookWebSocket,
+      qualificationReady: [restMarkets, tradeTape, tickerWebSocket, orderbookWebSocket]
+        .every((component) => component?.qualificationReady === true),
+    };
   }
 
   /** Return the short-TTL cached tape, refreshing through one paced request when eligible. */
   async refreshTradeTape(): Promise<KalshiTrade[]> {
     if (this.shouldRefreshTrades()) await this.refreshTradesCoalesced();
-    return [...this.trades];
+    return this.getTradeTape();
   }
 
   refreshForMarkets(markets: KalshiMarket[]): Promise<void> {
@@ -348,6 +394,12 @@ export class FeedHub {
     return this.tradeFeedState.status === 'degraded' || this.isStale(this.tradesFetchedAt, STALE_MS.trades);
   }
 
+  private tradeTapeQualificationReady(now = Date.now()): boolean {
+    return this.tradeFeedState.status === 'ok'
+      && this.tradesFetchedAt > 0
+      && now - this.tradesFetchedAt <= STALE_MS.trades;
+  }
+
   private refreshTradesCoalesced(): Promise<void> {
     if (this.tradeRefreshInFlight) return this.tradeRefreshInFlight;
     this.tradeRefreshInFlight = this.refreshTrades().finally(() => {
@@ -468,13 +520,28 @@ export class FeedHub {
         cachedTradeCount: this.trades.length,
         backoffMs: 0,
         lastWarningAt: this.tradeWarningAt || null,
+        tapeAgeMs: 0,
+        displayOnly: false,
+        qualificationReady: true,
+        failureClass: null,
       };
       this.registry.recordSuccess('kalshi-trades', fetchedAt - attemptStartedAt);
+      this.registry.recordTelemetry('kalshi-trades', {
+        lastAttempt: attemptStartedAt,
+        lastMessageAt: fetchedAt,
+        freshnessMs: 0,
+        transportConnected: true,
+        qualificationReady: true,
+        environment: 'production',
+        endpointClass: 'market-data',
+      });
     } catch (e) {
       const failedAt = Date.now();
       const message = e instanceof Error ? e.message : String(e);
+      const failureClass = e instanceof KalshiRequestFailure ? e.classification : 'unknown';
       const failureCount = this.tradeFeedState.failureCount + 1;
-      const backoffMs = tradeBackoffMs(failureCount);
+      const serverRetryAfterMs = e instanceof KalshiRequestFailure ? e.retryAfterMs ?? 0 : 0;
+      const backoffMs = Math.max(tradeBackoffMs(failureCount), serverRetryAfterMs);
       const nextRetryAt = failedAt + backoffMs;
       const shouldWarn = this.tradeWarningAt === 0
         || failureCount === 1
@@ -496,11 +563,25 @@ export class FeedHub {
         cachedTradeCount: this.trades.length,
         backoffMs,
         lastWarningAt: this.tradeWarningAt || null,
+        tapeAgeMs: this.tradesFetchedAt > 0 ? Math.max(0, failedAt - this.tradesFetchedAt) : null,
+        displayOnly: true,
+        qualificationReady: false,
+        failureClass,
       };
       this.registry.recordDegraded(
         'kalshi-trades',
         `Trade tape degraded (${failureCount} failure${failureCount === 1 ? '' : 's'}): ${message}; retry in ${Math.round(backoffMs / 1000)}s`,
       );
+      this.registry.recordTelemetry('kalshi-trades', {
+        lastAttempt: attemptStartedAt,
+        nextRetryAt,
+        failureClass,
+        freshnessMs: this.tradesFetchedAt > 0 ? Math.max(0, failedAt - this.tradesFetchedAt) : null,
+        transportConnected: false,
+        qualificationReady: false,
+        environment: 'production',
+        endpointClass: 'market-data',
+      });
       /* trades are optional - keep cached trade tape and leave Kalshi REST errors to required callers */
     }
   }

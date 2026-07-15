@@ -7,7 +7,7 @@ export function ScoutWidget() {
 
   useEffect(() => {
     window.nemesis.getDiscoveryState().then((d) => setState(d as DiscoveryState));
-    window.nemesis.onDiscoveryUpdate((d) => setState(d as DiscoveryState));
+    return window.nemesis.onDiscoveryUpdate((d) => setState(d as DiscoveryState));
   }, []);
 
   const m = state?.metrics;

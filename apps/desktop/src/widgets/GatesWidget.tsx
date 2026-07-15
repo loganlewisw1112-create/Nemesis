@@ -10,7 +10,7 @@ export function GatesWidget() {
 
   useEffect(() => {
     window.nemesis.getState().then((s) => setGates((s as AppState).gates ?? []));
-    window.nemesis.onMarketsUpdate((d) => {
+    return window.nemesis.onMarketsUpdate((d) => {
       const data = d as { gates?: GateStatus[] };
       if (data.gates) setGates(data.gates);
     });

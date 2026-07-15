@@ -26,11 +26,13 @@ export function campaignPendingCapacity(
 export interface CampaignBookUpdateWork {
   throughput: boolean;
   confirmation: boolean;
+  diagnostic: boolean;
 }
 
 export interface CampaignBookTriggerBatch {
   throughputTickers: string[];
   confirmationTickers: string[];
+  diagnosticTickers: string[];
 }
 
 export type CampaignEnrollmentReadiness =
@@ -73,16 +75,26 @@ export function campaignBookUpdateWork(
   ticker: string,
   eligibleCards: readonly ThesisCard[],
   campaign: CampaignSnapshot | null,
+  now = Date.now(),
 ): CampaignBookUpdateWork {
   if (!campaign || campaign.manifest.status !== 'active') {
-    return { throughput: false, confirmation: false };
+    return { throughput: false, confirmation: false, diagnostic: false };
   }
   const existingIdentities = new Set(campaign.candidates.map((candidate) => candidate.economicIdentity));
+  const candidateIdsForTicker = new Set(
+    campaign.candidates
+      .filter((candidate) => candidate.ticker === ticker)
+      .map((candidate) => candidate.candidateId),
+  );
   return {
     throughput: eligibleCards.some((card) =>
       card.ticker === ticker && !existingIdentities.has(candidateEconomicIdentity(card))),
     confirmation: campaign.candidates.some((candidate) =>
       candidate.ticker === ticker && !candidate.terminalState),
+    diagnostic: campaign.diagnostics.some((diagnostic) =>
+      candidateIdsForTicker.has(diagnostic.candidateId)
+      && diagnostic.status === 'scheduled'
+      && diagnostic.dueAt <= now),
   };
 }
 
@@ -90,6 +102,7 @@ export function campaignBookUpdateWork(
 export class CampaignBookTriggerScheduler {
   private readonly throughputTickers = new Set<string>();
   private readonly confirmationTickers = new Set<string>();
+  private readonly diagnosticTickers = new Set<string>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFlushAt = Number.NEGATIVE_INFINITY;
 
@@ -101,7 +114,8 @@ export class CampaignBookTriggerScheduler {
   request(ticker: string, work: CampaignBookUpdateWork, now = Date.now()): void {
     if (work.throughput) this.throughputTickers.add(ticker);
     if (work.confirmation) this.confirmationTickers.add(ticker);
-    if ((!work.throughput && !work.confirmation) || this.timer) return;
+    if (work.diagnostic) this.diagnosticTickers.add(ticker);
+    if ((!work.throughput && !work.confirmation && !work.diagnostic) || this.timer) return;
     const elapsed = now - this.lastFlushAt;
     const delay = Number.isFinite(elapsed) ? Math.max(0, this.intervalMs - elapsed) : 0;
     if (delay === 0) {
@@ -119,16 +133,23 @@ export class CampaignBookTriggerScheduler {
     this.timer = null;
     this.throughputTickers.clear();
     this.confirmationTickers.clear();
+    this.diagnosticTickers.clear();
   }
 
   private flush(now: number): void {
-    if (this.throughputTickers.size === 0 && this.confirmationTickers.size === 0) return;
+    if (
+      this.throughputTickers.size === 0
+      && this.confirmationTickers.size === 0
+      && this.diagnosticTickers.size === 0
+    ) return;
     const batch = {
       throughputTickers: [...this.throughputTickers],
       confirmationTickers: [...this.confirmationTickers],
+      diagnosticTickers: [...this.diagnosticTickers],
     };
     this.throughputTickers.clear();
     this.confirmationTickers.clear();
+    this.diagnosticTickers.clear();
     this.lastFlushAt = now;
     this.onFlush(batch);
   }

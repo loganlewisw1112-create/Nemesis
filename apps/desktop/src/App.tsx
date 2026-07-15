@@ -93,6 +93,22 @@ interface PaperState {
   pilotValidation?: PilotValidationSnapshot | null;
 }
 
+interface StateEnvelopeV2<T> {
+  schemaVersion: 2;
+  stream: string;
+  revision: number;
+  generatedAt: number;
+  full?: T[];
+  upserts?: T[];
+  removals?: string[];
+}
+
+type MarketStateStreamItem =
+  | { key: string; kind: 'market'; value: KalshiMarket }
+  | { key: string; kind: 'thesis'; value: ThesisCard };
+type EquityHistoryPoint = PaperState['equityHistory'][number];
+type PaperUpdate = Omit<PaperState, 'equityHistory'> & { equityHistory?: EquityHistoryPoint[] };
+
 interface KalshiCredentialStatus {
   apiKeyId: string | null;
   hasPrivateKey: boolean;
@@ -149,19 +165,21 @@ declare global {
       resumeDiscovery: () => Promise<DiscoveryState>;
       forceUniverseRefresh: () => Promise<DiscoveryState>;
       forceDepthPass: () => Promise<DiscoveryState>;
-      onSettingsUpdate: (cb: (s: GuardrailSettings) => void) => void;
-      onMarketsUpdate: (cb: (d: { theses: ThesisCard[]; markets: KalshiMarket[]; offline?: boolean; connectors?: ConnectorHealth[]; tradeFeed?: FeedHubTradeFeedState; discovery?: DiscoveryState; gates?: GateStatus[] }) => void) => void;
-      onPaperUpdate: (cb: (d: PaperState) => void) => void;
-      onTicksUpdate: (cb: (d: { ticker: string; ticks: PriceTick[] }) => void) => void;
-      onDiscoveryUpdate: (cb: (d: DiscoveryState) => void) => void;
+      onSettingsUpdate: (cb: (s: GuardrailSettings) => void) => () => void;
+      onMarketsUpdate: (cb: (d: { theses?: ThesisCard[]; markets?: KalshiMarket[]; offline?: boolean; connectors?: ConnectorHealth[]; tradeFeed?: FeedHubTradeFeedState; discovery?: DiscoveryState; gates?: GateStatus[] }) => void) => () => void;
+      onMarketsStateV2: (cb: (d: StateEnvelopeV2<MarketStateStreamItem>) => void) => () => void;
+      onPaperUpdate: (cb: (d: PaperUpdate) => void) => () => void;
+      onEquityHistoryStateV2: (cb: (d: StateEnvelopeV2<EquityHistoryPoint>) => void) => () => void;
+      onTicksUpdate: (cb: (d: { ticker: string; ticks: PriceTick[] }) => void) => () => void;
+      onDiscoveryUpdate: (cb: (d: DiscoveryState) => void) => () => void;
       openWidget: (type: 'pnl' | 'risk' | 'ticker' | 'gates' | 'scout' | 'world') => Promise<{ ok: boolean }>;
       closeThisWidget: () => Promise<void>;
       getWorldEvents: () => Promise<unknown>;
-      onWorldEventsUpdate: (cb: (d: unknown) => void) => void;
+      onWorldEventsUpdate: (cb: (d: unknown) => void) => () => void;
       getBridgeStatus: () => Promise<{ connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }>;
-      onBridgeStatus: (cb: (s: { connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }) => void) => void;
-      onBridgeRecommendation: (cb: (p: unknown) => void) => void;
-      onConnectorsUpdate: (cb: (d: ConnectorHealth[]) => void) => void;
+      onBridgeStatus: (cb: (s: { connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }) => void) => () => void;
+      onBridgeRecommendation: (cb: (p: unknown) => void) => () => void;
+      onConnectorsUpdate: (cb: (d: ConnectorHealth[]) => void) => () => void;
     };
   }
 }
@@ -223,50 +241,72 @@ export default function App() {
     }
     load();
     window.nemesis.getBridgeStatus().then((s) => setBridgeConnected(s.connected)).catch(() => {});
-    window.nemesis.onBridgeStatus((s) => setBridgeConnected(s.connected));
+    const unsubscribeBridge = window.nemesis.onBridgeStatus((s) => setBridgeConnected(s.connected));
     const bridgePoll = setInterval(() => {
       window.nemesis.getBridgeStatus().then((s) => setBridgeConnected(s.connected)).catch(() => {});
     }, 1_000);
-    return () => clearInterval(bridgePoll);
+    return () => {
+      clearInterval(bridgePoll);
+      unsubscribeBridge();
+    };
   }, [load]);
 
-  // IPC subscriptions — re-registers when selected ticker changes so the
-  // onTicksUpdate closure captures the latest ticker value. Safe because
-  // preload uses removeAllListeners before each on(), so no accumulation.
+  // IPC subscriptions own and release their exact listener.
   useEffect(() => {
     if (!window.nemesis) return;
-    window.nemesis.onMarketsUpdate((d) => {
+    const unsubscribers = [window.nemesis.onMarketsUpdate((d) => {
       setState((prev) => (prev ? {
         ...prev,
-        theses: d.theses,
+        theses: d.theses ?? prev.theses,
         connectors: d.connectors ?? prev.connectors,
         tradeFeed: d.tradeFeed ?? prev.tradeFeed,
         gates: d.gates ?? prev.gates,
       } : prev));
-      setMarkets(d.markets);
+      if (d.markets) setMarkets(d.markets);
       if (d.discovery) setDiscovery(d.discovery);
-    });
-    window.nemesis.onConnectorsUpdate((connectors) => {
+    }), window.nemesis.onMarketsStateV2((envelope) => {
+      const changes = envelope.full ?? envelope.upserts ?? [];
+      setMarkets((previous) => {
+        const next = new Map((envelope.full ? [] : previous).map((market) => [market.ticker, market]));
+        for (const key of envelope.removals ?? []) if (key.startsWith('market:')) next.delete(key.slice(7));
+        for (const item of changes) if (item.kind === 'market') next.set(item.value.ticker, item.value);
+        return [...next.values()];
+      });
+      setState((previous) => {
+        if (!previous) return previous;
+        const next = new Map((envelope.full ? [] : previous.theses).map((thesis) => [thesis.id, thesis]));
+        for (const key of envelope.removals ?? []) if (key.startsWith('thesis:')) next.delete(key.slice(7));
+        for (const item of changes) if (item.kind === 'thesis') next.set(item.value.id, item.value);
+        return { ...previous, theses: [...next.values()] };
+      });
+    }), window.nemesis.onConnectorsUpdate((connectors) => {
       setState((prev) => prev ? { ...prev, connectors } : prev);
-    });
-    window.nemesis.onDiscoveryUpdate((d) => setDiscovery(d as DiscoveryState));
+    }), window.nemesis.onDiscoveryUpdate((d) => setDiscovery(d as DiscoveryState)),
     window.nemesis.onSettingsUpdate((s) => {
       setState((prev) => prev ? { ...prev, settings: s } : prev);
-    });
-    window.nemesis.onPaperUpdate((d) => {
-      setPaper(d as PaperState);
+    }), window.nemesis.onPaperUpdate((d) => {
+      setPaper((previous) => ({ ...d, equityHistory: d.equityHistory ?? previous?.equityHistory ?? [] }));
       setState((prev) => prev ? {
         ...prev,
-        activeRegimes: (d as PaperState).activeRegimes,
-        dailyPnl: (d as PaperState).dailyPnl,
-        paperQualification: (d as PaperState).paperQualification,
-        strategyValidation: (d as PaperState).strategyValidation,
-        pilotValidation: (d as PaperState).pilotValidation,
+        activeRegimes: d.activeRegimes,
+        dailyPnl: d.dailyPnl,
+        paperQualification: d.paperQualification,
+        strategyValidation: d.strategyValidation,
+        pilotValidation: d.pilotValidation,
       } : prev);
-    });
-    window.nemesis.onTicksUpdate((d) => {
+    }), window.nemesis.onEquityHistoryStateV2((envelope) => {
+      setPaper((previous) => {
+        if (!previous) return previous;
+        const changes = envelope.full ?? envelope.upserts ?? [];
+        const next = new Map((envelope.full ? [] : previous.equityHistory).map((point) => [String(point.t), point]));
+        for (const key of envelope.removals ?? []) next.delete(key);
+        for (const point of changes) next.set(String(point.t), point);
+        return { ...previous, equityHistory: [...next.values()].sort((left, right) => left.t - right.t) };
+      });
+    }), window.nemesis.onTicksUpdate((d) => {
       if (selected?.ticker === d.ticker) setTicks(d.ticks);
-    });
+    })];
+    return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
   }, [selected?.ticker]);
 
   useEffect(() => {
