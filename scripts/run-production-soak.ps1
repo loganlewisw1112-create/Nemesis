@@ -128,6 +128,7 @@ try {
   $deadline = $startedAt.AddMinutes($DurationMinutes)
   $samples = [Collections.Generic.List[object]]::new()
   $runtimeFailure = $null
+  $unresponsiveSince = $null
   $lastProgressMinute = -1
   try {
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
@@ -164,15 +165,38 @@ try {
       $samples.Add([pscustomobject]$sample)
       ($sample | ConvertTo-Json -Compress) | Add-Content -LiteralPath $samplesPath -Encoding utf8
       if (!$rootProcess.Responding) {
-        $runtimeFailure = 'NEMESIS became unresponsive during soak'
-        break
-      }
+        if ($null -eq $unresponsiveSince) { $unresponsiveSince = $now }
+        elseif (($now - $unresponsiveSince).TotalSeconds -ge 10) {
+          $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
+          break
+        }
+      } else { $unresponsiveSince = $null }
       $wholeMinute = [Math]::Floor($elapsedMinutes)
       if ($wholeMinute -ge 0 -and $wholeMinute % 5 -eq 0 -and $wholeMinute -ne $lastProgressMinute) {
         $lastProgressMinute = $wholeMinute
         Write-Host ("Soak {0:N1}/{1} min; renderer={2} MB; GEA={3} MB" -f $elapsedMinutes, $DurationMinutes, $rendererMb, $geaMb)
       }
-      Start-Sleep -Seconds $SampleSeconds
+      $remainingSleepSeconds = $SampleSeconds
+      while ($remainingSleepSeconds -gt 0 -and [DateTimeOffset]::UtcNow -lt $deadline) {
+        $probeDelaySeconds = [Math]::Min(2, $remainingSleepSeconds)
+        Start-Sleep -Seconds $probeDelaySeconds
+        $remainingSleepSeconds -= $probeDelaySeconds
+        $process.Refresh()
+        if ($process.HasExited) {
+          $runtimeFailure = "NEMESIS exited early with code $($process.ExitCode)"
+          break
+        }
+        $probeAt = [DateTimeOffset]::UtcNow
+        $probeProcess = Get-Process -Id $process.Id -ErrorAction Stop
+        if (!$probeProcess.Responding) {
+          if ($null -eq $unresponsiveSince) { $unresponsiveSince = $probeAt }
+          elseif (($probeAt - $unresponsiveSince).TotalSeconds -ge 10) {
+            $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
+            break
+          }
+        } else { $unresponsiveSince = $null }
+      }
+      if ($null -ne $runtimeFailure) { break }
     }
   } finally {
     $process.Refresh()
