@@ -1,6 +1,7 @@
 import {
   fetchMarkets,
   fetchOrderbook,
+  KalshiRequestFailure,
   normalizeMarketPrice,
   getTierThresholds,
   verifySideDepth,
@@ -163,7 +164,12 @@ export class DiscoveryOrchestrator {
       this.universePages = pages;
       this.liveUniverseLoaded = true;
     } catch (e) {
-      this.registry.recordError('kalshi-rest', e instanceof Error ? e.message : String(e));
+      this.registry.recordError(
+        'kalshi-rest',
+        e instanceof Error ? e.message : String(e),
+        e instanceof KalshiRequestFailure ? e.classification : undefined,
+        e instanceof KalshiRequestFailure ? e.retryAfterMs : undefined,
+      );
       if (!this.liveUniverseLoaded || Date.now() - this.universeUpdatedAt > UNIVERSE_STALE_MS) {
         throw e;
       }

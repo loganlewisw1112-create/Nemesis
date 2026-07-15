@@ -1,5 +1,17 @@
 import type { ConnectorHealth, KalshiFailureClass } from '@nemesis/core';
-import { fetchMarkets } from '@nemesis/core';
+import { fetchMarkets, KalshiRequestFailure } from '@nemesis/core';
+
+const REQUIRED_REST_FRESHNESS_MS = 30_000;
+const DEFAULT_RATE_LIMIT_BACKOFF_MS = 1_000;
+
+function inferFailureClass(error: string): KalshiFailureClass {
+  if (/\b429\b|rate.?limit|too many requests/i.test(error)) return 'rate_limit';
+  if (/\b401\b|authentication/i.test(error)) return 'authentication';
+  if (/\b403\b|authorization/i.test(error)) return 'authorization';
+  if (/timeout|timed out/i.test(error)) return 'timeout';
+  if (/fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|network|SSL/i.test(error)) return 'network';
+  return 'unknown';
+}
 
 export type ConnectorId =
   | 'kalshi-rest'
@@ -50,6 +62,7 @@ export const CONNECTORS: ConnectorDef[] = [
 
 export class ConnectorRegistry {
   private health = new Map<ConnectorId, ConnectorHealth>();
+  private lastRecordedError = new Map<ConnectorId, { error: string; failureClass: KalshiFailureClass; at: number }>();
 
   constructor() {
     for (const c of CONNECTORS) {
@@ -93,16 +106,40 @@ export class ConnectorRegistry {
     h.failureClass = null;
     h.transportConnected = true;
     h.qualificationReady = true;
+    h.nextRetryAt = null;
+    this.lastRecordedError.delete(id);
   }
 
-  recordError(id: ConnectorId, error: string, failureClass: KalshiFailureClass = 'unknown') {
+  recordError(
+    id: ConnectorId,
+    error: string,
+    failureClass?: KalshiFailureClass,
+    retryAfterMs?: number | null,
+  ) {
     const h = this.health.get(id);
     if (!h) return;
-    h.status = 'error';
-    h.errorCount1h += 1;
+    const now = Date.now();
+    const resolvedFailureClass = failureClass ?? inferFailureClass(error);
+    const previousError = this.lastRecordedError.get(id);
+    const duplicate = previousError?.failureClass === resolvedFailureClass
+      && previousError.error === error
+      && now - previousError.at < 1_000;
+    if (!duplicate) h.errorCount1h += 1;
+    this.lastRecordedError.set(id, { error, failureClass: resolvedFailureClass, at: now });
     h.lastError = error;
-    h.lastAttempt = Date.now();
-    h.failureClass = failureClass;
+    h.lastAttempt = now;
+    h.failureClass = resolvedFailureClass;
+    if (resolvedFailureClass === 'rate_limit') {
+      const backoffMs = Math.max(DEFAULT_RATE_LIMIT_BACKOFF_MS, retryAfterMs ?? 0);
+      h.nextRetryAt = Math.max(h.nextRetryAt ?? 0, now + backoffMs);
+      const lastSuccessAgeMs = h.lastSuccess == null ? Number.POSITIVE_INFINITY : now - h.lastSuccess;
+      const leaseFresh = lastSuccessAgeMs <= REQUIRED_REST_FRESHNESS_MS;
+      h.status = leaseFresh ? 'warn' : 'error';
+      h.qualificationReady = leaseFresh;
+      h.transportConnected = true;
+      return;
+    }
+    h.status = 'error';
     h.qualificationReady = false;
   }
 
@@ -147,11 +184,19 @@ export class ConnectorRegistry {
 
   async pingKalshiRest(fetchFn?: typeof fetch): Promise<void> {
     const start = Date.now();
+    const health = this.health.get('kalshi-rest');
+    if (health?.nextRetryAt != null && start < health.nextRetryAt) return;
+    this.recordAttempt('kalshi-rest', start);
     try {
       await fetchMarkets({ limit: 1, fetchFn });
       this.recordSuccess('kalshi-rest', Date.now() - start);
     } catch (e) {
-      this.recordError('kalshi-rest', e instanceof Error ? e.message : String(e));
+      this.recordError(
+        'kalshi-rest',
+        e instanceof Error ? e.message : String(e),
+        e instanceof KalshiRequestFailure ? e.classification : undefined,
+        e instanceof KalshiRequestFailure ? e.retryAfterMs : undefined,
+      );
       throw e;
     }
   }

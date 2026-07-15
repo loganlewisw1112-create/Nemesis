@@ -29,7 +29,7 @@ export interface RuntimeProcessHealth {
   geaRunning: boolean;
 }
 
-export type RuntimeControlState = 'healthy' | 'recovering' | 'invalidated';
+export type RuntimeControlState = 'warming' | 'healthy' | 'recovering' | 'invalidated';
 
 export interface RuntimeHealthDecision {
   state: RuntimeControlState;
@@ -62,7 +62,7 @@ const DEFAULT_POLICY: Readonly<RuntimeHealthPolicy> = Object.freeze({
 export class RuntimeHealthController {
   private readonly policy: RuntimeHealthPolicy;
   private readonly leases: OperationalLeaseTracker;
-  private state: RuntimeControlState = 'healthy';
+  private state: RuntimeControlState = 'warming';
   private recoveringAt: number | null = null;
   private healthyStreak = 0;
   private recoveryStarts: number[] = [];
@@ -98,6 +98,16 @@ export class RuntimeHealthController {
       return this.invalidate(at, blockingReasons);
     }
     if (this.state === 'invalidated') return this.decision(at, 'invalidate', this.invalidationReasons);
+
+    // Startup is not a recovery. Qualification remains paused until every
+    // required component has established one complete healthy snapshot.
+    if (this.state === 'warming') {
+      if (recoverableReasons.length > 0) {
+        return this.decision(at, 'pause', recoverableReasons);
+      }
+      this.state = 'healthy';
+      return this.decision(at, 'resume', []);
+    }
 
     if (recoverableReasons.length > 0) {
       this.healthyStreak = 0;
@@ -137,7 +147,11 @@ export class RuntimeHealthController {
   }
 
   private decision(at: number, action: RuntimeHealthDecision['action'], reasons: string[]): RuntimeHealthDecision {
-    const status = this.state === 'invalidated' ? 'failed' : this.state === 'recovering' ? 'degraded' : 'healthy';
+    const status = this.state === 'invalidated'
+      ? 'failed'
+      : this.state === 'recovering' || this.state === 'warming'
+        ? 'degraded'
+        : 'healthy';
     const lease = this.leases.issue({
       status,
       observedAt: at,

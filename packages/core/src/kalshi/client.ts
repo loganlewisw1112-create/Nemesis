@@ -243,6 +243,89 @@ export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
 }
 
 const workingBases = new Map<string, string>();
+const KALSHI_READ_REQUEST_INTERVAL_MS = 125;
+const KALSHI_DEFAULT_RATE_LIMIT_BACKOFF_MS = 1_000;
+const KALSHI_MAX_RATE_LIMIT_BACKOFF_MS = 30_000;
+
+interface KalshiReadThrottleState {
+  nextRequestAt: number;
+  blockedUntil: number;
+  consecutiveRateLimits: number;
+  tail: Promise<void>;
+}
+
+const readThrottleByEnvironment = new Map<KalshiEnvironment, KalshiReadThrottleState>();
+
+function readThrottle(environment: KalshiEnvironment): KalshiReadThrottleState {
+  let state = readThrottleByEnvironment.get(environment);
+  if (!state) {
+    state = {
+      nextRequestAt: 0,
+      blockedUntil: 0,
+      consecutiveRateLimits: 0,
+      tail: Promise.resolve(),
+    };
+    readThrottleByEnvironment.set(environment, state);
+  }
+  return state;
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('Kalshi request aborted');
+}
+
+async function awaitAbortable(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return promise;
+  if (signal.aborted) throw abortReason(signal);
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+async function acquireReadRequestSlot(environment: KalshiEnvironment, signal?: AbortSignal): Promise<void> {
+  const state = readThrottle(environment);
+  let release!: () => void;
+  const turn = new Promise<void>((resolve) => { release = resolve; });
+  const previous = state.tail;
+  state.tail = previous.then(() => turn);
+  try {
+    await awaitAbortable(previous, signal);
+  } catch (error) {
+    release();
+    throw error;
+  }
+  try {
+    if (signal?.aborted) throw abortReason(signal);
+    const waitMs = Math.max(0, state.nextRequestAt - Date.now(), state.blockedUntil - Date.now());
+    if (waitMs > 0) await awaitAbortable(sleep(waitMs), signal);
+    if (signal?.aborted) throw abortReason(signal);
+    state.nextRequestAt = Date.now() + KALSHI_READ_REQUEST_INTERVAL_MS;
+  } finally {
+    release();
+  }
+}
+
+function applyReadRateLimit(environment: KalshiEnvironment, serverRetryAfterMs: number | null, now = Date.now()): number {
+  const state = readThrottle(environment);
+  state.consecutiveRateLimits += 1;
+  const exponentialBackoffMs = Math.min(
+    KALSHI_MAX_RATE_LIMIT_BACKOFF_MS,
+    KALSHI_DEFAULT_RATE_LIMIT_BACKOFF_MS * (2 ** Math.max(0, state.consecutiveRateLimits - 1)),
+  );
+  const backoffMs = Math.max(exponentialBackoffMs, serverRetryAfterMs ?? 0);
+  state.blockedUntil = Math.max(state.blockedUntil, now + backoffMs);
+  return Math.max(0, state.blockedUntil - now);
+}
+
+function recordReadSuccess(environment: KalshiEnvironment): void {
+  const state = readThrottle(environment);
+  if (Date.now() < state.blockedUntil) return;
+  state.consecutiveRateLimits = 0;
+  state.blockedUntil = 0;
+}
+
 export interface KalshiHostHealth {
   environment: KalshiEnvironment;
   endpointClass: KalshiEndpointClass;
@@ -258,6 +341,7 @@ const hostHealth = new Map<string, Map<string, KalshiHostHealth>>();
 export function resetKalshiHostCache(): void {
   workingBases.clear();
   hostHealth.clear();
+  readThrottleByEnvironment.clear();
 }
 
 export function getKalshiHostHealth(): KalshiHostHealth[] {
@@ -418,6 +502,7 @@ async function kalshiFetch<T>(
           'User-Agent': 'NEMESIS/1.0',
           ...opts.authHeaders,
         };
+        await acquireReadRequestSlot(environment, opts.signal);
         const res = opts.fetchFn
           ? await fetchFn(url, { headers, signal: opts.signal })
           // retries:0 → one attempt per outer loop iteration, 10 s abort.
@@ -427,6 +512,10 @@ async function kalshiFetch<T>(
         if (!res.ok) {
           if (workingBases.get(key) === base) workingBases.delete(key);
           recordHostResult(environment, endpointClass, base, httpFailureClass(res.status));
+          const serverRetryAfterMs = retryAfterMs(res);
+          const appliedRetryAfterMs = res.status === 429
+            ? applyReadRateLimit(environment, serverRetryAfterMs)
+            : serverRetryAfterMs;
           lastError = new KalshiRequestFailure(`Kalshi API ${res.status}: ${path}`, {
             status: res.status,
             classification: httpFailureClass(res.status),
@@ -434,7 +523,7 @@ async function kalshiFetch<T>(
             endpointClass,
             path,
             baseUrl: base,
-            retryAfterMs: retryAfterMs(res),
+            retryAfterMs: appliedRetryAfterMs,
           });
           // A 4xx applies to the request, not to one hostname. In particular,
           // rotating a 429 through all fallback bases multiplies the rate-limit
@@ -447,6 +536,7 @@ async function kalshiFetch<T>(
           break;
         }
         const payload = await res.json() as T;
+        recordReadSuccess(environment);
         workingBases.set(key, base);
         recordHostResult(environment, endpointClass, base, null);
         return payload;

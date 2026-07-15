@@ -28,6 +28,7 @@ import {
   isExecutablePrice,
   normalizeMarketPrice,
   sanitizeExecutableBook,
+  KalshiRequestFailure,
   evaluateGates,
   rankTheses,
   detectNoTradeRegimes,
@@ -188,6 +189,7 @@ const CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS = 500;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
 const REST_HEALTH_POLL_MS = 20_000;
+const UNIVERSE_REFRESH_MS = 5 * 60_000;
 const BRIDGE_HEARTBEAT_MS = 5_000;
 const BRIDGE_TRAFFIC_TTL_MS = 15_000;
 const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
@@ -3838,6 +3840,15 @@ const runUniverseDiscovery = createSingleFlight(() => withAbortTimeout(
 ));
 const runRestHealthProbe = createSingleFlight(() => registry.pingKalshiRest());
 
+function recordKalshiRestFailure(error: unknown): void {
+  registry.recordError(
+    'kalshi-rest',
+    error instanceof Error ? error.message : String(error),
+    error instanceof KalshiRequestFailure ? error.classification : undefined,
+    error instanceof KalshiRequestFailure ? error.retryAfterMs : undefined,
+  );
+}
+
 async function refreshMarkets(options: RefreshMarketsOptions = {}) {
   try {
     // Fixture data keeps the UI usable, but it must never suppress live retries.
@@ -3859,7 +3870,7 @@ async function refreshMarkets(options: RefreshMarketsOptions = {}) {
     // Depth pass runs in background after tickets are shown; next refresh() uses results
     void discovery.runDepthPass();
   } catch (e) {
-    registry.recordError('kalshi-rest', e instanceof Error ? e.message : String(e));
+    recordKalshiRestFailure(e);
     if (marketsCache.length === 0) {
       marketsCache = FIXTURE_MARKETS;
       discovery.seedFixtureDepth(FIXTURE_MARKETS);
@@ -5231,7 +5242,7 @@ app.whenReady().then(() => {
       broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
       void evaluateAutoClosePositions('startup-fixtures');
     })
-    .catch((err) => registry.recordError('kalshi-rest', err instanceof Error ? err.message : String(err)));
+    .catch((err) => recordKalshiRestFailure(err));
 
   // GEA opens immediately, but its tape waits on marketFeedReady. The initial
   // NEMESIS discovery is truly aborted at the timeout so the two processes never
@@ -5244,10 +5255,7 @@ app.whenReady().then(() => {
     } catch (startupErr) {
       const cr = registry.get('kalshi-rest');
       if (cr && cr.lastSuccess === null && cr.lastError === null) {
-        registry.recordError(
-          'kalshi-rest',
-          startupErr instanceof Error ? startupErr.message : 'startup timeout',
-        );
+        recordKalshiRestFailure(startupErr);
       }
     }
     broadcast('connectors:update', registry.getAll());
@@ -5258,7 +5266,7 @@ app.whenReady().then(() => {
       broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
       startupTrace('market-feed-ready');
       setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
-      setInterval(() => { void runUniverseRefresh(); }, 60_000);
+      setInterval(() => { void runUniverseRefresh(); }, UNIVERSE_REFRESH_MS);
     }
   })();
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);

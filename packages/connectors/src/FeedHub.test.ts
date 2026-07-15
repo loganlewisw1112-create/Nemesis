@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { KalshiTrade } from '@nemesis/core';
+import { resetKalshiHostCache, type KalshiTrade } from '@nemesis/core';
 import { tradeToThesis } from '@nemesis/pods';
 import { FeedHub } from './FeedHub.js';
 import { ConnectorRegistry } from './registry.js';
@@ -28,6 +28,7 @@ describe('FeedHub trade tape degradation', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-06-27T12:00:00.000Z'));
+    resetKalshiHostCache();
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
 
@@ -67,7 +68,9 @@ describe('FeedHub trade tape degradation', () => {
     const fetchFn = vi.fn<typeof fetch>().mockRejectedValue(new Error('fetch failed: /markets/trades'));
     const { hub, registry } = makeHub(fetchFn);
 
-    await refreshTrades(hub);
+    const firstRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await firstRefresh;
 
     expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(hub.getTradeFeedState()).toMatchObject({
@@ -83,7 +86,9 @@ describe('FeedHub trade tape degradation', () => {
     });
     expect(warnSpy).toHaveBeenCalledTimes(1);
 
-    await refreshTrades(hub);
+    const failedRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await failedRefresh;
 
     expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(warnSpy).toHaveBeenCalledTimes(1);
@@ -127,7 +132,9 @@ describe('FeedHub trade tape degradation', () => {
     });
 
     vi.setSystemTime(new Date('2026-06-27T12:01:00.000Z'));
-    await refreshTrades(hub);
+    const staleRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await staleRefresh;
 
     expect(hub.getTradesForTicker('KXDEMO')).toEqual([]);
     expect(hub.getCachedTradeTapeForDisplay()).toEqual([whaleTrade]);
@@ -187,7 +194,7 @@ describe('FeedHub trade tape degradation', () => {
     const first = hub.refreshForMarkets(markets);
     const second = hub.refreshTradeTape();
 
-    await Promise.resolve();
+    await vi.runAllTimersAsync();
     expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
 
     releaseTradeFetch?.();

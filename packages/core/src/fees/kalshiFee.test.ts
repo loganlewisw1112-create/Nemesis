@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   kalshiFeeForOrder,
   kalshiFeeForFills,
@@ -74,6 +74,10 @@ describe('kalshiFee', () => {
 });
 
 describe('kalshi client', () => {
+  beforeEach(() => {
+    resetKalshiHostCache();
+  });
+
   it('keeps production and demo endpoint policies isolated and excludes retired hosts', () => {
     const production = getKalshiEndpointPolicy('production');
     const demo = getKalshiEndpointPolicy('demo');
