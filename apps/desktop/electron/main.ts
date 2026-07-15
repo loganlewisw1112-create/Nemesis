@@ -133,6 +133,7 @@ import {
   campaignEnrollmentReadiness,
   campaignPendingCapacity,
   isEvidenceOnlyCampaignExecution,
+  shouldInvalidateSupervisedEvidence,
 } from './campaignRuntime.js';
 import { KalshiFeePolicyResolver } from './kalshiFeePolicyResolver.js';
 import { buildStrategyConfigHash, PAPER_STRATEGY_ENGINE_VERSION } from './qualificationConfig.js';
@@ -1438,12 +1439,14 @@ function recordCampaignOperationalTelemetry(): void {
     }, now);
     lastRuntimeTransitionAction = latestRuntimeDecision.action;
   }
-  if (latestRuntimeDecision.invalidated && supervisorState !== 'preflight') {
+  if (shouldInvalidateSupervisedEvidence(Boolean(pendingCampaignPointer), supervisorState, latestRuntimeDecision.invalidated)) {
     invalidateEvidenceAttempt(latestRuntimeDecision.reasons, now);
     return;
   }
-  if (latestRuntimeDecision.pauseEvidence) campaignEvidencePaused = true;
-  else if (latestRuntimeDecision.action === 'resume' || latestRuntimeDecision.state === 'healthy') campaignEvidencePaused = false;
+  if (pendingCampaignPointer) {
+    if (latestRuntimeDecision.pauseEvidence) campaignEvidencePaused = true;
+    else if (latestRuntimeDecision.action === 'resume' || latestRuntimeDecision.state === 'healthy') campaignEvidencePaused = false;
+  }
   const snapshot = campaignSnapshot();
   const orderbookTelemetry = kalshiOrderbookStream.telemetry();
   if (snapshot?.manifest.status === 'active'

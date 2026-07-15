@@ -39,6 +39,15 @@ export type CampaignEnrollmentReadiness =
   | { ready: true }
   | { ready: false; reason: string };
 
+/** Runtime faults may invalidate only a real supervised evidence attempt, never an ordinary app/soak session. */
+export function shouldInvalidateSupervisedEvidence(
+  hasCampaignPointer: boolean,
+  supervisorState: string | undefined,
+  runtimeInvalidated: boolean,
+): boolean {
+  return hasCampaignPointer && supervisorState !== 'preflight' && runtimeInvalidated;
+}
+
 /**
  * A campaign lifecycle may start only from evidence that can actually qualify.
  * REST/snapshot books and unresolved fee schedules remain retryable upstream;

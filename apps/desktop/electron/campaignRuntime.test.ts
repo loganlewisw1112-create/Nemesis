@@ -7,6 +7,7 @@ import {
   campaignEnrollmentReadiness,
   campaignPendingCapacity,
   isEvidenceOnlyCampaignExecution,
+  shouldInvalidateSupervisedEvidence,
 } from './campaignRuntime.js';
 
 function snapshot(status: CampaignSnapshot['manifest']['status'], terminalStates: Array<'ready' | 'rejected' | 'expired' | undefined> = []): CampaignSnapshot {
@@ -45,6 +46,12 @@ function snapshot(status: CampaignSnapshot['manifest']['status'], terminalStates
 
 describe('campaign runtime isolation', () => {
   afterEach(() => vi.useRealTimers());
+
+  it('never lets an unsupervised soak fault invalidate and quit the application', () => {
+    expect(shouldInvalidateSupervisedEvidence(false, undefined, true)).toBe(false);
+    expect(shouldInvalidateSupervisedEvidence(true, 'preflight', true)).toBe(false);
+    expect(shouldInvalidateSupervisedEvidence(true, 'active', true)).toBe(true);
+  });
 
   it('uses evidence-only evaluation only for active throughput campaigns', () => {
     expect(isEvidenceOnlyCampaignExecution('throughput', snapshot('active'))).toBe(true);
