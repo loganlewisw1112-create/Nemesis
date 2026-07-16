@@ -319,6 +319,8 @@ try {
         rendererSlopeWindowComplete = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.slopeWindowComplete }
         rendererSlopeWindowMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.slopeWindowMs }
         rendererHeartbeatAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.heartbeatAgeMs }
+        rendererProbeAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.probeAgeMs }
+        rendererProbeResponseReceived = if ($null -eq $externalStatus) { $null } else { [bool]$externalStatus.renderer.probeResponseReceived }
         rendererUnresponsiveForMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.unresponsiveForMs }
         feedQualificationReady = $feedReady
         bridgeQualificationReady = $bridgeReady
@@ -493,6 +495,10 @@ try {
   $runtimeStatusCoverage = [Math]::Min(1.0, [double]$runtimeStatusSamples.Count / [double]$expectedScoredSampleCount)
   $feedReadyCount = @($scoredSamples | Where-Object { $_.feedQualificationReady -eq $true }).Count
   $bridgeReadyCount = @($scoredSamples | Where-Object { $_.bridgeQualificationReady -eq $true }).Count
+  $rendererProbeSamples = @($scoredSamples | Where-Object {
+    $_.rendererProbeResponseReceived -eq $true -and $null -ne $_.rendererProbeAgeMs -and [double]$_.rendererProbeAgeMs -le 15000
+  })
+  $rendererProbeCoverage = [Math]::Min(1.0, [double]$rendererProbeSamples.Count / [double]$expectedScoredSampleCount)
   $feedReadinessCoverage = [Math]::Min(1.0, [double]$feedReadyCount / [double]$expectedScoredSampleCount)
   $bridgeReadinessCoverage = [Math]::Min(1.0, [double]$bridgeReadyCount / [double]$expectedScoredSampleCount)
   $rendererBlockedSamples = @($runtimeStatusSamples | Where-Object { $_.rendererBlocked -eq $true }).Count
@@ -506,6 +512,8 @@ try {
   $finalRendererStatus = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.status } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererStatus } else { $null }
   $finalRendererBlocked = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.blocked } elseif ($null -ne $latestRuntimeStatusSample) { [bool]$latestRuntimeStatusSample.rendererBlocked } else { $true }
   $finalRendererHeartbeatAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.heartbeatAgeMs } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererHeartbeatAgeMs } else { $null }
+  $finalRendererProbeAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.probeAgeMs } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererProbeAgeMs } else { $null }
+  $finalRendererProbeResponseReceived = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.probeResponseReceived } elseif ($null -ne $latestRuntimeStatusSample) { [bool]$latestRuntimeStatusSample.rendererProbeResponseReceived } else { $false }
   $finalRuntimeStatusAgeMs = if ($null -ne $cutoffExternalStatus -and $null -ne $cutoffExternalStatus.updatedAt) {
     [Math]::Max(0, $cutoffCapturedAt.ToUnixTimeMilliseconds() - [double]$cutoffExternalStatus.updatedAt)
   } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.externalStatusAgeMs } else { $null }
@@ -549,6 +557,7 @@ try {
   if ($null -eq $maxMb -or $maxMb -gt 512) { $acceptanceFailures.Add('renderer maximum exceeds 512MB or is unavailable') }
   if ($null -eq $maxTenMinuteGrowth -or $maxTenMinuteGrowth -gt 0.10) { $acceptanceFailures.Add('renderer ten-minute growth exceeds 10% or is unavailable') }
   if ($rendererSampleCoverage -lt 0.99) { $acceptanceFailures.Add('renderer evidence coverage is below 99%') }
+  if ($rendererProbeCoverage -lt 0.99) { $acceptanceFailures.Add('renderer probe evidence coverage is below 99%') }
   if ($geaSampleCoverage -lt 0.99) { $acceptanceFailures.Add('GEA evidence coverage is below 99%') }
   if ($runtimeStatusCoverage -lt 0.99) { $acceptanceFailures.Add('runtime-status evidence coverage is below 99%') }
   if ($feedReadinessCoverage -lt 0.995) { $acceptanceFailures.Add('feed readiness coverage is below 99.5%') }
@@ -561,6 +570,7 @@ try {
   if ($finalRuntimeState -ne 'healthy') { $acceptanceFailures.Add('runtime was not healthy at cutoff') }
   if ($null -eq $finalRuntimeStatusAgeMs -or $finalRuntimeStatusAgeMs -gt 60000) { $acceptanceFailures.Add('final runtime status was stale') }
   if ($null -eq $finalRendererHeartbeatAgeMs -or [double]$finalRendererHeartbeatAgeMs -gt 15000) { $acceptanceFailures.Add('final renderer heartbeat was stale') }
+  if (!$finalRendererProbeResponseReceived -or $null -eq $finalRendererProbeAgeMs -or [double]$finalRendererProbeAgeMs -gt 15000) { $acceptanceFailures.Add('final renderer probe was stale or missing') }
   if (!$finalFeedReady) { $acceptanceFailures.Add('feeds were not qualification-ready at cutoff') }
   if (!$finalBridgeReady) { $acceptanceFailures.Add('authenticated bridge was not qualification-ready at cutoff') }
   if (!$devToolsDisabled) { $acceptanceFailures.Add('DevTools were not disabled') }
@@ -618,6 +628,7 @@ try {
     runnerSlopeWindowMs = $slopeEvidence.slopeWindowMs
     runtimeSlopeWindowMs = $runtimeSlopeWindowMs
     rendererSampleCoverage = $rendererSampleCoverage
+    rendererProbeCoverage = $rendererProbeCoverage
     geaSampleCoverage = $geaSampleCoverage
     runtimeStatusCoverage = $runtimeStatusCoverage
     externalStatusCoverage = $runtimeStatusCoverage
@@ -637,6 +648,8 @@ try {
     finalRuntimeState = $finalRuntimeState
     finalRendererStatus = $finalRendererStatus
     finalRendererHeartbeatAgeMs = $finalRendererHeartbeatAgeMs
+    finalRendererProbeAgeMs = $finalRendererProbeAgeMs
+    finalRendererProbeResponseReceived = $finalRendererProbeResponseReceived
     finalRuntimeStatusAgeMs = $finalRuntimeStatusAgeMs
     finalFeedQualificationReady = $finalFeedReady
     finalBridgeQualificationReady = $finalBridgeReady
