@@ -97,7 +97,8 @@ export class RendererHeartbeatMonitor {
     sequence?: number;
   } = {}): void {
     const receivedAt = input.receivedAt ?? Date.now();
-    if (this.lastHeartbeatAt != null && receivedAt - this.lastHeartbeatAt > this.policy.heartbeatMaxAgeMs) {
+    const monitoring = this.loadFinishedAt != null;
+    if (monitoring && this.lastHeartbeatAt != null && receivedAt - this.lastHeartbeatAt > this.policy.heartbeatMaxAgeMs) {
       this.stickyReasons.add('renderer heartbeat gap exceeded 15 seconds');
     }
     if (Number.isInteger(input.sequence) && input.sequence! > 0) {
@@ -111,13 +112,13 @@ export class RendererHeartbeatMonitor {
       ? input.reportedAt!
       : null;
     if (reportedAt != null) {
-      if (receivedAt - reportedAt > this.policy.heartbeatMaxAgeMs) {
+      if (monitoring && receivedAt - reportedAt > this.policy.heartbeatMaxAgeMs) {
         this.stickyReasons.add('renderer heartbeat IPC delivery exceeded 15 seconds');
       }
       if (this.lastRendererReportedAt != null
         && reportedAt > this.lastRendererReportedAt
         && reportedAt - this.lastRendererReportedAt > this.policy.heartbeatMaxAgeMs) {
-        this.stickyReasons.add('renderer-reported heartbeat gap exceeded 15 seconds');
+        if (monitoring) this.stickyReasons.add('renderer-reported heartbeat gap exceeded 15 seconds');
       }
       if (this.lastRendererReportedAt == null || reportedAt > this.lastRendererReportedAt) {
         this.lastRendererReportedAt = reportedAt;

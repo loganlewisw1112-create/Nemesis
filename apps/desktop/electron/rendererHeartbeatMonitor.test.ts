@@ -22,6 +22,15 @@ describe('RendererHeartbeatMonitor', () => {
     expect(monitor.snapshot(50_001).reasons).toContain('renderer heartbeat was absent after the startup loading grace');
   });
 
+  it('does not latch pre-load heartbeat delivery delay', () => {
+    const monitor = new RendererHeartbeatMonitor(1_000);
+    monitor.recordHeartbeat({ receivedAt: 20_000, reportedAt: 1_000, sequence: 1 });
+    expect(monitor.snapshot(20_001).blocked).toBe(false);
+    monitor.markLoadFinished(20_000);
+    monitor.recordHeartbeat({ receivedAt: 20_100, reportedAt: 1_000, sequence: 2 });
+    expect(monitor.snapshot(20_101).reasons).toContain('renderer heartbeat IPC delivery exceeded 15 seconds');
+  });
+
   it('records the first heartbeat and first painted heartbeat with ordered sequences', () => {
     const monitor = new RendererHeartbeatMonitor(0);
     monitor.markLoadFinished(100);
@@ -102,6 +111,7 @@ describe('RendererHeartbeatMonitor', () => {
 
   it('latches an inter-heartbeat gap even after a fresh heartbeat arrives', () => {
     const monitor = new RendererHeartbeatMonitor(0);
+    monitor.markLoadFinished(1_000);
     monitor.recordHeartbeat({ receivedAt: 1_000, reportedAt: 1_000 });
     monitor.recordHeartbeat({ receivedAt: 17_000, reportedAt: 17_000, painted: true });
     const snapshot = monitor.snapshot(17_001);
