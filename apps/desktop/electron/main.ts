@@ -186,6 +186,7 @@ const BOOK_CACHE_TTL_MS = 600;
 const MARKET_BROADCAST_THROTTLE_MS = 750;
 const DEGRADED_MARKET_BROADCAST_THROTTLE_MS = 3_000;
 const PAPER_BROADCAST_THROTTLE_MS = 1_000;
+const PAPER_SUMMARY_BROADCAST_THROTTLE_MS = 5_000;
 const CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS = 500;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
 const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
@@ -3737,10 +3738,13 @@ function scheduleMarketStatePublish() {
 
 function schedulePaperUpdate() {
   if (paperBroadcastTimer) return;
+  const throttleMs = paperDesk.snapshot().positions.length > 0
+    ? PAPER_BROADCAST_THROTTLE_MS
+    : PAPER_SUMMARY_BROADCAST_THROTTLE_MS;
   paperBroadcastTimer = setTimeout(() => {
     paperBroadcastTimer = null;
     broadcastPaperUpdate();
-  }, PAPER_BROADCAST_THROTTLE_MS);
+  }, throttleMs);
 }
 
 function campaignCriticalOrderbookTickers(now = Date.now()): string[] {

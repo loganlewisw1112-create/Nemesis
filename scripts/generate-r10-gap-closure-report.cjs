@@ -6,7 +6,9 @@ const repoRoot = path.resolve(__dirname, '..');
 const workspaceRoot = path.resolve(repoRoot, '..', '..');
 const outputDir = path.join(workspaceRoot, 'output', 'reports', 'nemesis-gap-closure-r10-2026-07-15');
 const soakDir = path.join(outputDir, 'soak');
+const soakAttemptsDir = path.join(outputDir, 'soak-attempts');
 const soakResultPath = path.join(soakDir, 'production-soak-result.json');
+const soakSamplesPath = path.join(soakDir, 'production-soak-samples.jsonl');
 const campaignDir = path.join(process.env.APPDATA ?? '', '@nemesis', 'desktop', 'nemesis-data', 'evidence-campaigns');
 const r9Path = path.join(campaignDir, 'nemesis-instrumentation-2026-07-15-r9.jsonl');
 const r10RunId = 'nemesis-instrumentation-2026-07-15-r10';
@@ -24,11 +26,15 @@ function sha256File(filePath) {
 }
 
 function percent(value) {
-  return Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(2)}%` : 'not available';
+  return value != null && value !== '' && Number.isFinite(Number(value))
+    ? `${(Number(value) * 100).toFixed(2)}%`
+    : 'not available';
 }
 
 function number(value, digits = 3) {
-  return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : 'not available';
+  return value != null && value !== '' && Number.isFinite(Number(value))
+    ? Number(value).toFixed(digits)
+    : 'not available';
 }
 
 function passLabel(value) {
@@ -47,6 +53,9 @@ if (actualR9Hash !== expectedR9Hash) {
 }
 
 const soak = readJson(soakResultPath);
+const soakSamples = fs.existsSync(soakSamplesPath)
+  ? fs.readFileSync(soakSamplesPath, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+  : [];
 const r10 = readJson(r10ResultPath);
 const verification = readJson(path.join(outputDir, 'verification-summary.json'));
 const soakPassed = soak?.passed === true;
@@ -60,12 +69,34 @@ const reportState = !soakPassed
       ? 'soak_and_r10_passed'
       : 'soak_passed_r10_failed';
 
-const coverageRows = soak ? [
-  { metric: 'Renderer', coverage: Number(soak.rendererSampleCoverage), threshold: 0.99, result: Number(soak.rendererSampleCoverage) >= 0.99 ? 'pass' : 'fail' },
-  { metric: 'GEA', coverage: Number(soak.geaSampleCoverage), threshold: 0.99, result: Number(soak.geaSampleCoverage) >= 0.99 ? 'pass' : 'fail' },
-  { metric: 'Runtime status', coverage: Number(soak.runtimeStatusCoverage), threshold: 0.99, result: Number(soak.runtimeStatusCoverage) >= 0.99 ? 'pass' : 'fail' },
-  { metric: 'Feeds', coverage: Number(soak.feedReadinessCoverage), threshold: 0.995, result: Number(soak.feedReadinessCoverage) >= 0.995 ? 'pass' : 'fail' },
-  { metric: 'Authenticated bridge', coverage: Number(soak.bridgeReadinessCoverage), threshold: 0.995, result: Number(soak.bridgeReadinessCoverage) >= 0.995 ? 'pass' : 'fail' },
+const scoredSoakSamples = soakSamples.filter((sample) => sample.phase === 'scored');
+const soakAttempts = fs.existsSync(soakAttemptsDir)
+  ? fs.readdirSync(soakAttemptsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const resultPath = path.join(soakAttemptsDir, entry.name, 'production-soak-result.json');
+      const result = readJson(resultPath);
+      return result ? { namespace: entry.name, ...result } : null;
+    })
+    .filter(Boolean)
+  : [];
+const attemptSummary = soakAttempts.length > 0
+  ? `Archived attempts: ${soakAttempts.map((attempt) => `${attempt.attemptId ?? attempt.namespace}=${passLabel(attempt.passed)}`).join(', ')}.`
+  : 'No additional archived soak attempt result was present.';
+const expectedScoredSamples = soak ? Math.floor((Number(soak.scoredDurationMinutes) * 60) / Number(soak.sampleIntervalSeconds)) + 1 : 0;
+const derivedCoverage = expectedScoredSamples > 0 ? {
+  renderer: Math.min(1, scoredSoakSamples.filter((sample) => sample.rendererWorkingSetMb != null).length / expectedScoredSamples),
+  gea: Math.min(1, scoredSoakSamples.filter((sample) => Number(sample.geaCount) > 0).length / expectedScoredSamples),
+  runtime: Math.min(1, scoredSoakSamples.filter((sample) => sample.externalStatusAgeMs != null && Number(sample.externalStatusAgeMs) <= 60_000).length / expectedScoredSamples),
+  feeds: Math.min(1, scoredSoakSamples.filter((sample) => sample.feedQualificationReady === true).length / expectedScoredSamples),
+  bridge: Math.min(1, scoredSoakSamples.filter((sample) => sample.bridgeQualificationReady === true).length / expectedScoredSamples),
+} : null;
+const coverageRows = soak && derivedCoverage ? [
+  { metric: 'Renderer', coverage: derivedCoverage.renderer, threshold: 0.99, result: derivedCoverage.renderer >= 0.99 ? 'pass' : 'fail' },
+  { metric: 'GEA', coverage: derivedCoverage.gea, threshold: 0.99, result: derivedCoverage.gea >= 0.99 ? 'pass' : 'fail' },
+  { metric: 'Runtime status', coverage: derivedCoverage.runtime, threshold: 0.99, result: derivedCoverage.runtime >= 0.99 ? 'pass' : 'fail' },
+  { metric: 'Feeds', coverage: derivedCoverage.feeds, threshold: 0.995, result: derivedCoverage.feeds >= 0.995 ? 'pass' : 'fail' },
+  { metric: 'Authenticated bridge', coverage: derivedCoverage.bridge, threshold: 0.995, result: derivedCoverage.bridge >= 0.995 ? 'pass' : 'fail' },
 ] : [];
 
 const r10Metrics = r10?.metrics ?? null;
@@ -90,7 +121,7 @@ const decisionBody = sevenHourUnlocked
       ? 'The production soak passed, but r10 has not produced a finalized result.'
       : `R10 failed: ${Array.isArray(r10.reasons) && r10.reasons.length > 0 ? r10.reasons.join('; ') : 'one or more required gates did not pass'}.`} Preserve the evidence and repair the named failure without extending, splicing, or lowering thresholds.`;
 
-const soakBody = soak ? `## 30-minute production soak\n\nResult: **${passLabel(soak.passed)}**. The process ran for ${number(soak.actualWarmupMinutes, 2)} warm-up minutes plus ${number(soak.actualScoredDurationMinutes, 2)} scored minutes. The 30-minute slope window was ${soak.slopeWindowComplete ? 'complete' : 'incomplete'} (${number(Number(soak.slopeWindowMs) / 60000, 2)} minutes).\n\n- Renderer p95: **${number(soak.rendererP95Mb, 2)} MB**; limit 384 MB.\n- Renderer maximum: **${number(soak.rendererMaxMb, 2)} MB**; limit 512 MB.\n- Maximum rolling ten-minute growth: **${percent(soak.rendererTenMinuteGrowthMax)}**; limit 10%.\n- Runner slope: **${percent(soak.rendererSlopePerHour)} per hour**; limit 2%.\n- Runtime slope: **${percent(soak.runtimeRendererSlopePerHour)} per hour**; limit 2%.\n- Restarts / emergency mitigations / invalidations: **${soak.processRestartCount ?? 'n/a'} / ${soak.emergencyMitigationCount ?? 'n/a'} / ${soak.runtimeInvalidatedSampleCount ?? 'n/a'}**.\n- Frozen artifact remained identical: **${soak.matchingArtifactHashes === true ? 'yes' : 'no'}**. Clean shutdown: **${soak.cleanShutdown === true ? 'yes' : 'no'}**.\n\n${Array.isArray(soak.acceptanceFailures) && soak.acceptanceFailures.length > 0 ? `Failure reasons: ${soak.acceptanceFailures.join('; ')}.` : 'No soak acceptance failures were recorded.'}`
+const soakBody = soak ? `## 30-minute production soak\n\nResult: **${passLabel(soak.passed)}**. The process ran for ${number(soak.actualWarmupMinutes, 2)} warm-up minutes plus ${number(soak.actualScoredDurationMinutes, 2)} scored minutes. The 30-minute slope window was ${soak.slopeWindowComplete ? 'complete' : 'incomplete'} (${number(Number(soak.slopeWindowMs) / 60000, 2)} minutes).\n\n${attemptSummary}\n\n- Renderer p95: **${number(soak.rendererP95Mb, 2)} MB**; limit 384 MB.\n- Renderer maximum: **${number(soak.rendererMaxMb, 2)} MB**; limit 512 MB.\n- Maximum rolling ten-minute growth: **${percent(soak.rendererTenMinuteGrowthMax)}**; limit 10%.\n- Runner slope: **${soak.slopeWindowComplete ? `${percent(soak.rendererSlopePerHour)} per hour` : 'not evaluated'}**; limit 2%.\n- Runtime slope: **${soak.slopeWindowComplete ? `${percent(soak.runtimeRendererSlopePerHour)} per hour` : 'not evaluated'}**; limit 2%.\n- Restarts / emergency mitigations / invalidations: **${soak.processRestartCount ?? 'n/a'} / ${soak.emergencyMitigationCount ?? 'n/a'} / ${soak.runtimeInvalidatedSampleCount ?? 'n/a'}**.\n- Frozen artifact remained identical: **${soak.matchingArtifactHashes === true ? 'yes' : 'no'}**. Clean shutdown: **${soak.cleanShutdown === true ? 'yes' : 'no'}**.\n\n${Array.isArray(soak.acceptanceFailures) && soak.acceptanceFailures.length > 0 ? `Failure reasons: ${soak.acceptanceFailures.join('; ')}.` : 'No soak acceptance failures were recorded.'}`
   : '## 30-minute production soak\n\nNo finalized official soak result was found. R10 remains locked.';
 
 const r10Body = r10 ? `## R10 two-hour instrumentation result\n\nResult: **${passLabel(r10.passed)}**.\n\n- Economically viable candidates: **${r10Metrics?.candidates ?? 'n/a'}**; required at least 20.\n- Terminal lifecycle coverage: **${percent(r10Metrics?.terminalCoverage)}**; required 100%.\n- Diagnostic scheduling coverage: **${percent(r10Metrics?.diagnosticSchedulingCoverage)}**; required at least 95%.\n- Valid diagnostic coverage: **${percent(r10Metrics?.validDiagnosticCoverage)}**; required at least 90%.\n- Valid diagnostic outcomes: **${r10Metrics?.validDiagnosticOutcomes ?? 'n/a'}**.\n- True exchange-book freshness: **${percent(r10Metrics?.freshConfirmationRate)}**; required at least 95%.\n- Ready candidates: **${r10Metrics?.readyCandidates ?? 'n/a'}**.\n- Healthy runtime samples: **${r10Metrics?.runtimeHealthySamples ?? 'n/a'} / ${r10Metrics?.runtimeObservedSamples ?? 'n/a'}**.\n\n${Array.isArray(r10.reasons) && r10.reasons.length > 0 ? `Failure reasons: ${r10.reasons.join('; ')}.` : 'No r10 gate failures were recorded.'}`
@@ -179,6 +210,7 @@ const sources = [
   source('r9_ledger', 'Preserved r9 schema-v1 campaign ledger and verified SHA-256', 'nemesis-instrumentation-2026-07-15-r9.jsonl'),
   ...(soak ? [source('soak_result', 'Official schema-v2 production soak result', 'soak/production-soak-result.json')] : []),
   ...(r10 ? [source('r10_result', 'Official schema-v2 r10 result', `${r10RunId}.result.json`)] : []),
+  ...(soakAttempts.length > 0 ? [source('soak_attempts', 'Archived schema-v2 soak attempts', 'soak-attempts/')] : []),
   ...(verification ? [source('verification', 'Build, test, type-check, diff, and hash verification summary', 'verification-summary.json')] : []),
   source('notes', 'Evidence inventory and report-generation notes', 'source-notes.md'),
 ];
@@ -213,11 +245,12 @@ const inventory = {
   reportState,
   r9: { path: r9Path, sha256: actualR9Hash, verified: true },
   soak: { path: soakResultPath, present: Boolean(soak), passed: soak?.passed ?? null, sha256: fs.existsSync(soakResultPath) ? sha256File(soakResultPath) : null },
+  soakAttempts: soakAttempts.map((attempt) => ({ namespace: attempt.namespace, attemptId: attempt.attemptId ?? null, passed: attempt.passed ?? null })),
   r10: { runId: r10RunId, path: r10ResultPath, present: Boolean(r10), passed: r10?.passed ?? null, sha256: fs.existsSync(r10ResultPath) ? sha256File(r10ResultPath) : null },
   sevenHourUnlocked,
 };
 
-const notes = `# NEMESIS r9 gap closure and r10 report notes\n\nGenerated: ${generatedAt}\n\n- The r9 ledger was read only and verified at SHA-256 ${actualR9Hash}.\n- The interrupted 28.56-minute attempt remains incomplete evidence and is excluded from qualification.\n- Soak state: ${soak ? passLabel(soak.passed) : 'not finalized'}.\n- R10 state: ${r10 ? passLabel(r10.passed) : 'not run or not finalized'}.\n- Seven-hour unlock: ${sevenHourUnlocked ? 'yes' : 'no'}.\n- The report generator recommends the seven-hour campaign only when both the official soak and r10 have passed.\n- Existing reports and historical evidence are not overwritten.\n`;
+const notes = `# NEMESIS r9 gap closure and r10 report notes\n\nGenerated: ${generatedAt}\n\n- The r9 ledger was read only and verified at SHA-256 ${actualR9Hash}.\n- The interrupted 28.56-minute attempt remains incomplete evidence and is excluded from qualification.\n- Soak state: ${soak ? passLabel(soak.passed) : 'not finalized'}.\n- Archived soak attempts: ${soakAttempts.length}.\n- R10 state: ${r10 ? passLabel(r10.passed) : 'not run or not finalized'}.\n- Seven-hour unlock: ${sevenHourUnlocked ? 'yes' : 'no'}.\n- The report generator recommends the seven-hour campaign only when both the official soak and r10 have passed.\n- Existing reports and historical evidence are not overwritten.\n`;
 
 fs.writeFileSync(path.join(outputDir, 'artifact.json'), `${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
 fs.writeFileSync(path.join(outputDir, 'evidence-inventory.json'), `${JSON.stringify(inventory, null, 2)}\n`, 'utf8');

@@ -89,6 +89,7 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain("$_.phase -eq 'scored'");
     expect(script).toContain('scoredElapsedMinutes -le 5');
     expect(script).toContain('expectedScoredSampleCount');
+    expect(script).toContain('[double]$rendererObservations.Count / [double]$expectedScoredSampleCount');
     expect(script).toContain('rendererSampleCoverage -lt 0.99');
     expect(script).toContain('geaSampleCoverage -lt 0.99');
     expect(script).toContain('NEMESIS_RUNTIME_STATUS_PATH');
@@ -123,5 +124,14 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('evidence-inventory.json');
     expect(script).toContain('source-notes.md');
     expect(script).toContain('expectedR9Hash');
+    expect(script).toContain("sample.phase === 'scored'");
+    expect(script).toContain("'not evaluated'");
+  });
+
+  it('keeps empty-paper renderer updates at the five-second summary cadence', () => {
+    const main = fs.readFileSync(path.join(repoRoot, 'apps', 'desktop', 'electron', 'main.ts'), 'utf8');
+    expect(main).toContain('PAPER_SUMMARY_BROADCAST_THROTTLE_MS = 5_000');
+    expect(main).toContain('paperDesk.snapshot().positions.length > 0');
+    expect(main).toContain('const throttleMs = paperDesk.snapshot().positions.length > 0');
   });
 });

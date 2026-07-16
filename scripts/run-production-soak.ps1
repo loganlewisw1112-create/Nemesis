@@ -483,15 +483,15 @@ try {
   $scoredSampleCount = $scoredSamples.Count
   $expectedWarmupSampleCount = [Math]::Ceiling(($WarmupMinutes * 60) / $SampleSeconds)
   $expectedScoredSampleCount = [Math]::Floor(($DurationMinutes * 60) / $SampleSeconds) + 1
-  $rendererSampleCoverage = [Math]::Min(1, $rendererObservations.Count / $expectedScoredSampleCount)
+  $rendererSampleCoverage = [Math]::Min(1.0, [double]$rendererObservations.Count / [double]$expectedScoredSampleCount)
   $geaSampleCount = @($scoredSamples | Where-Object { $_.geaCount -gt 0 }).Count
-  $geaSampleCoverage = [Math]::Min(1, $geaSampleCount / $expectedScoredSampleCount)
+  $geaSampleCoverage = [Math]::Min(1.0, [double]$geaSampleCount / [double]$expectedScoredSampleCount)
   $runtimeStatusSamples = @($scoredSamples | Where-Object { $null -ne $_.externalStatusAgeMs -and [double]$_.externalStatusAgeMs -le 60000 })
-  $runtimeStatusCoverage = [Math]::Min(1, $runtimeStatusSamples.Count / $expectedScoredSampleCount)
+  $runtimeStatusCoverage = [Math]::Min(1.0, [double]$runtimeStatusSamples.Count / [double]$expectedScoredSampleCount)
   $feedReadyCount = @($scoredSamples | Where-Object { $_.feedQualificationReady -eq $true }).Count
   $bridgeReadyCount = @($scoredSamples | Where-Object { $_.bridgeQualificationReady -eq $true }).Count
-  $feedReadinessCoverage = [Math]::Min(1, $feedReadyCount / $expectedScoredSampleCount)
-  $bridgeReadinessCoverage = [Math]::Min(1, $bridgeReadyCount / $expectedScoredSampleCount)
+  $feedReadinessCoverage = [Math]::Min(1.0, [double]$feedReadyCount / [double]$expectedScoredSampleCount)
+  $bridgeReadinessCoverage = [Math]::Min(1.0, [double]$bridgeReadyCount / [double]$expectedScoredSampleCount)
   $rendererBlockedSamples = @($runtimeStatusSamples | Where-Object { $_.rendererBlocked -eq $true }).Count
   $runtimeInvalidatedSamples = @($runtimeStatusSamples | Where-Object { $_.runtimeState -eq 'invalidated' }).Count
   $emergencyMitigationCount = @($runtimeStatusSamples | Where-Object { $_.runtimeAction -in @('stop', 'invalidate') }).Count
@@ -594,8 +594,8 @@ try {
     sampleIntervalSeconds = $SampleSeconds
     sampleCount = $samples.Count
     phaseCoverage = [ordered]@{
-      warmup = [ordered]@{ requiredMinutes = $WarmupMinutes; observedMinutes = [Math]::Round($actualWarmupMinutes, 4); expectedSampleCount = $expectedWarmupSampleCount; sampleCount = $warmupSamples.Count; evidenceCoverage = [Math]::Min(1, $warmupSamples.Count / $expectedWarmupSampleCount); complete = $warmupDurationComplete }
-      scored = [ordered]@{ requiredMinutes = $DurationMinutes; observedMinutes = [Math]::Round($actualScoredMinutes, 4); expectedSampleCount = $expectedScoredSampleCount; sampleCount = $scoredSampleCount; evidenceCoverage = [Math]::Min(1, $scoredSampleCount / $expectedScoredSampleCount); complete = $scoredDurationComplete }
+      warmup = [ordered]@{ requiredMinutes = $WarmupMinutes; observedMinutes = [Math]::Round($actualWarmupMinutes, 4); expectedSampleCount = $expectedWarmupSampleCount; sampleCount = $warmupSamples.Count; evidenceCoverage = [Math]::Min(1.0, [double]$warmupSamples.Count / [double]$expectedWarmupSampleCount); complete = $warmupDurationComplete }
+      scored = [ordered]@{ requiredMinutes = $DurationMinutes; observedMinutes = [Math]::Round($actualScoredMinutes, 4); expectedSampleCount = $expectedScoredSampleCount; sampleCount = $scoredSampleCount; evidenceCoverage = [Math]::Min(1.0, [double]$scoredSampleCount / [double]$expectedScoredSampleCount); complete = $scoredDurationComplete }
     }
     retryIdentity = [ordered]@{ attemptId = $AttemptId; retryOrdinal = $RetryOrdinal; maximumRetryOrdinal = 2; retryEligible = $retryEligible }
     baselineSampleCount = $baselineSamples.Count
