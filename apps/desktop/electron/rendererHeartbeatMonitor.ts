@@ -153,7 +153,9 @@ export class RendererHeartbeatMonitor {
   }
 
   markResponsive(at = Date.now()): void {
-    if (this.unresponsiveAt != null && at - this.unresponsiveAt > this.policy.unresponsiveMaxMs) {
+    if (this.loadFinishedAt != null
+      && this.unresponsiveAt != null
+      && at - this.unresponsiveAt > this.policy.unresponsiveMaxMs) {
       this.stickyReasons.add('renderer was unresponsive for more than 10 seconds');
     }
     this.unresponsiveAt = null;
@@ -186,7 +188,7 @@ export class RendererHeartbeatMonitor {
     if (this.lastProbeSentAt != null && probeAgeMs > this.policy.probeMaxAgeMs) {
       this.stickyReasons.add('renderer probe response was absent or stale');
     }
-    if (unresponsiveForMs > this.policy.unresponsiveMaxMs) {
+    if (this.loadFinishedAt != null && unresponsiveForMs > this.policy.unresponsiveMaxMs) {
       this.stickyReasons.add('renderer was unresponsive for more than 10 seconds');
     }
     return {

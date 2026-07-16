@@ -211,6 +211,7 @@ try {
   $cutoffExternalStatus = $null
   $cutoffCapturedAt = $null
   $unresponsiveSince = $null
+  $rendererLivenessActive = $false
   $lastProgressMinute = -1
   $cleanShutdown = $false
 
@@ -278,6 +279,12 @@ try {
       } else {
         [Math]::Max(0, $now.ToUnixTimeMilliseconds() - [double]$externalStatus.updatedAt)
       }
+      # Electron can report the main process as non-responsive while the
+      # packaged page is still loading. Apply the ten-second process liveness
+      # limit only after did-finish-load has established the renderer.
+      $rendererLivenessActive = $null -ne $externalStatus `
+        -and $null -ne $externalStatus.renderer `
+        -and $null -ne $externalStatus.renderer.rendererLoadFinishedAt
       $bridgeReady = $null -ne $externalStatus `
         -and $null -ne $externalStatusAgeMs `
         -and [double]$externalStatusAgeMs -le 15000 `
@@ -336,7 +343,7 @@ try {
         $runtimeFailure = "NEMESIS runtime health invalidated during soak: $runtimeReasons"
         break
       }
-      if (!$rootProcess.Responding) {
+      if ($rendererLivenessActive -and !$rootProcess.Responding) {
         if ($null -eq $unresponsiveSince) { $unresponsiveSince = $now.AddSeconds(-2) }
         elseif (($now - $unresponsiveSince).TotalSeconds -ge 10) {
           $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
@@ -383,7 +390,7 @@ try {
           }
           throw
         }
-        if (!$probeProcess.Responding) {
+        if ($rendererLivenessActive -and !$probeProcess.Responding) {
           if ($null -eq $unresponsiveSince) { $unresponsiveSince = $probeAt.AddSeconds(-2) }
           elseif (($probeAt - $unresponsiveSince).TotalSeconds -ge 10) {
             $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
@@ -425,7 +432,10 @@ try {
           break
         }
         $graceProcess = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
-        if ($null -eq $graceProcess -or !$graceProcess.Responding) {
+        $graceRendererActive = $null -ne $graceStatus `
+          -and $null -ne $graceStatus.renderer `
+          -and $null -ne $graceStatus.renderer.rendererLoadFinishedAt
+        if ($graceRendererActive -and ($null -eq $graceProcess -or !$graceProcess.Responding)) {
           $runtimeFailure = 'NEMESIS became unresponsive during unscored closeout'
           break
         }

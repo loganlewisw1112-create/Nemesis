@@ -5266,16 +5266,18 @@ function createWindow(rendererRetryOrdinal = 0) {
     if (packagedLoadRetryCount < 1 && mainWindow && !mainWindow.isDestroyed()) {
       packagedLoadRetryCount += 1;
       packagedLoadRetryInFlight = true;
+      // Set this before scheduling the replacement. Electron can emit
+      // window-all-closed/before-quit while the failed WebContents is being
+      // torn down; the retry must own that interval.
+      rendererRetryInProgress = true;
       rendererHeartbeatMonitor.reset(Date.now());
       startupTrace(`renderer-load-retry:${packagedLoadRetryCount}`);
       setTimeout(() => {
         packagedLoadRetryInFlight = false;
-        if (!mainWindow || mainWindow.isDestroyed()) return;
         // ERR_FAILED can leave the original WebContents unusable. Recreate
         // the window once so the retry gets a fresh renderer process.
         const failedWindow = mainWindow;
-        rendererRetryInProgress = true;
-        failedWindow.destroy();
+        if (failedWindow && !failedWindow.isDestroyed()) failedWindow.destroy();
         createWindow(packagedLoadRetryCount);
       }, 250);
       return;
@@ -5602,7 +5604,14 @@ app.on('will-quit', () => {
   kalshiOrderbookStream.stop();
   if (geaProcess && !geaProcess.killed) geaProcess.kill();
 });
-app.on('before-quit', () => startupTrace('app-before-quit'));
+app.on('before-quit', (event) => {
+  if (rendererRetryInProgress) {
+    event.preventDefault();
+    startupTrace('app-before-quit-suppressed-during-renderer-retry');
+    return;
+  }
+  startupTrace('app-before-quit');
+});
 app.on('window-all-closed', () => {
   startupTrace('app-window-all-closed');
   if (rendererRetryInProgress) {

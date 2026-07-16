@@ -102,6 +102,7 @@ describe('RendererHeartbeatMonitor', () => {
   it('latches a completed unresponsive incident longer than ten seconds', () => {
     const monitor = new RendererHeartbeatMonitor(0);
     monitor.recordHeartbeat({ receivedAt: 1_000 });
+    monitor.markLoadFinished(1_000);
     monitor.markUnresponsive(2_000);
     monitor.markResponsive(12_001);
     expect(monitor.snapshot(12_002).reasons).toContain('renderer was unresponsive for more than 10 seconds');
@@ -110,6 +111,7 @@ describe('RendererHeartbeatMonitor', () => {
   it('does not block on a short completed unresponsive incident', () => {
     const monitor = new RendererHeartbeatMonitor(0);
     monitor.recordHeartbeat({ receivedAt: 1_000 });
+    monitor.markLoadFinished(1_000);
     monitor.markUnresponsive(2_000);
     monitor.markResponsive(11_999);
     expect(monitor.snapshot(12_000).blocked).toBe(false);
