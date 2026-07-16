@@ -44,6 +44,36 @@ describe('RendererMemoryMonitor', () => {
     expect(result.detail).toContain('rolling ten-minute window');
   });
 
+  it('does not turn a one-sample garbage-collection trough into rolling growth', () => {
+    const monitor = new RendererMemoryMonitor(0, 1);
+    let result = monitor.add({ at: 0, workingSetKb: 90 * MB, painted: true });
+    for (let index = 1; index <= 20; index += 1) {
+      result = monitor.add({
+        at: index * 30_000,
+        workingSetKb: (100 + (index % 3)) * MB,
+        painted: true,
+      });
+    }
+
+    expect(result.status).toBe('stable');
+    expect(result.growthRate).toBeLessThan(0.10);
+  });
+
+  it('still blocks sustained rolling growth when the window has many samples', () => {
+    const monitor = new RendererMemoryMonitor(0, 1);
+    let result = monitor.add({ at: 0, workingSetKb: 100 * MB, painted: true });
+    for (let index = 1; index <= 20; index += 1) {
+      result = monitor.add({
+        at: index * 30_000,
+        workingSetKb: (100 + (11 * index / 20)) * MB,
+        painted: true,
+      });
+    }
+
+    expect(result.blocked).toBe(true);
+    expect(result.growthRate).toBeGreaterThan(0.10);
+  });
+
   it('excludes the five-minute warm-up from the rolling ten-minute growth gate', () => {
     const monitor = new RendererMemoryMonitor(5 * 60_000, 1);
     monitor.add({ at: 0, workingSetKb: 80 * MB, painted: true });

@@ -63,10 +63,34 @@ function percentile95(values: readonly number[]): number | null {
   return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)]!;
 }
 
-function endpointGrowth(samples: readonly RendererMemorySample[]): number {
+function rollingWindowGrowth(samples: readonly RendererMemorySample[]): number {
   if (samples.length < 2) return 0;
-  const first = samples[0]!.workingSetKb;
-  return first > 0 ? (samples.at(-1)!.workingSetKb - first) / first : 0;
+  const first = samples[0]!;
+  const last = samples.at(-1)!;
+  if (samples.length < 6) {
+    return first.workingSetKb > 0
+      ? (last.workingSetKb - first.workingSetKb) / first.workingSetKb
+      : 0;
+  }
+
+  // A renderer working-set sample can briefly fall during garbage collection.
+  // Comparing one endpoint to another turns that harmless trough into a sticky
+  // failure ten minutes later. Split-half medians retain the ten-minute growth
+  // meaning while making the gate resistant to one-sample GC noise.
+  const midpointAt = first.at + ((last.at - first.at) / 2);
+  const early = samples.filter((sample) => sample.at <= midpointAt);
+  const late = samples.filter((sample) => sample.at > midpointAt);
+  if (early.length === 0 || late.length === 0) return 0;
+
+  const earlyWorkingSet = median(early.map((sample) => sample.workingSetKb));
+  const lateWorkingSet = median(late.map((sample) => sample.workingSetKb));
+  const earlyAt = median(early.map((sample) => sample.at));
+  const lateAt = median(late.map((sample) => sample.at));
+  const centerSpanMs = lateAt - earlyAt;
+  const fullSpanMs = last.at - first.at;
+  if (earlyWorkingSet <= 0 || centerSpanMs <= 0 || fullSpanMs <= 0) return 0;
+
+  return ((lateWorkingSet - earlyWorkingSet) / earlyWorkingSet) * (fullSpanMs / centerSpanMs);
 }
 
 /** Returns the least-squares working-set slope, normalized to baseline per hour. */
@@ -156,7 +180,7 @@ export class RendererMemoryMonitor {
     // becomes eligible only after a full post-warm-up trend window exists.
     const trend = this.samples.filter((item) => item.at >= Math.max(trendStart, warmupCutoffAt));
     const trendSpan = trend.length > 1 ? trend.at(-1)!.at - trend[0]!.at : 0;
-    const growthRate = trendSpan >= this.policy.trendWindowMs * 0.9 ? endpointGrowth(trend) : 0;
+    const growthRate = trendSpan >= this.policy.trendWindowMs * 0.9 ? rollingWindowGrowth(trend) : 0;
     if (growthRate > this.policy.trendGrowthLimit) {
       reasons.push(`renderer working set grew ${(growthRate * 100).toFixed(1)}% over the rolling ten-minute window`);
     }
