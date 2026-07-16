@@ -133,5 +133,6 @@ describe('Windows package staging scripts', () => {
     expect(main).toContain('PAPER_SUMMARY_BROADCAST_THROTTLE_MS = 5_000');
     expect(main).toContain('paperDesk.snapshot().positions.length > 0');
     expect(main).toContain('const throttleMs = paperDesk.snapshot().positions.length > 0');
+    expect(main).toContain('new RuntimeStatusExporter(runtimeStatusPathFromEnvironment(), 5_000)');
   });
 });

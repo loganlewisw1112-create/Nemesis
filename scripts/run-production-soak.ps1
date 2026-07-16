@@ -523,6 +523,11 @@ try {
   $runtimeSlopeWindowComplete = $null -ne $cutoffExternalStatus -and $cutoffExternalStatus.renderer.slopeWindowComplete -eq $true
   $runtimeSlopeWindowMs = if ($null -eq $cutoffExternalStatus) { 0 } else { [double]$cutoffExternalStatus.renderer.slopeWindowMs }
   $runtimeSlopePerHour = if ($null -eq $cutoffExternalStatus) { $null } else { $cutoffExternalStatus.renderer.slopePerHour }
+  $orderbookCloseCode = if ($null -eq $cutoffExternalStatus) { $null } else { $cutoffExternalStatus.feeds.orderbookWebSocket.lastCloseCode }
+  $orderbookReconnects = if ($null -eq $cutoffExternalStatus) { 0 } else { [int]$cutoffExternalStatus.feeds.orderbookWebSocket.reconnects }
+  $bridgeReconnects = if ($null -eq $cutoffExternalStatus) { 0 } else { [int]$cutoffExternalStatus.bridge.reconnects }
+  $temporaryExternalFailure = ($orderbookCloseCode -in @(1006, 1001, 1011, 429, 502, 503, 504)) -or
+    ($bridgeReconnects -gt 0 -and !$finalBridgeReady)
   $slopeWindowComplete = $slopeEvidence.slopeWindowComplete -eq $true -and $runtimeSlopeWindowComplete
   $slopeWindowMs = [Math]::Min([double]$slopeEvidence.slopeWindowMs, $runtimeSlopeWindowMs)
 
@@ -566,7 +571,7 @@ try {
   $nonRetryablePattern = 'integrity|credential|authenticat|memory|renderer|configuration|code|disk|hash|artifact|restart|DevTools'
   $externalPattern = 'Kalshi|feed|bridge|websocket|orderbook|trade tape|rate limit|429|timeout|remote close|traffic'
   $rootFailureText = if ($null -ne $runtimeFailure) { $runtimeFailure } else { $failureText }
-  $retryEligible = !$passed -and $RetryOrdinal -lt 2 -and $rootFailureText -match $externalPattern -and $failureText -notmatch $nonRetryablePattern
+  $retryEligible = !$passed -and $RetryOrdinal -lt 2 -and $temporaryExternalFailure -and $failureText -notmatch $nonRetryablePattern
 
   $evidenceArtifactHashes = [ordered]@{
     samplesSha256 = Get-FileSha256OrNull $samplesPath
@@ -619,6 +624,10 @@ try {
     runtimeInvalidatedSampleCount = $runtimeInvalidatedSamples
     processRestartCount = $processRestartCount
     emergencyMitigationCount = $emergencyMitigationCount
+    temporaryExternalFailure = $temporaryExternalFailure
+    orderbookCloseCode = $orderbookCloseCode
+    orderbookReconnects = $orderbookReconnects
+    bridgeReconnects = $bridgeReconnects
     cutoffRuntimeStatusPath = $cutoffStatusPath
     cutoffCapturedAt = if ($null -eq $cutoffCapturedAt) { $null } else { $cutoffCapturedAt.ToUnixTimeMilliseconds() }
     closeoutGraceMs = if ($null -eq $scoredClosedAt -or $null -eq $cutoffCapturedAt) { 0 } else { [Math]::Max(0, $cutoffCapturedAt.ToUnixTimeMilliseconds() - $scoredClosedAt.ToUnixTimeMilliseconds()) }

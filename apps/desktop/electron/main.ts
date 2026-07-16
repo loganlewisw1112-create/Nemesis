@@ -343,7 +343,9 @@ let closeoutPrepared = false;
 let campaignFinalizationState: 'idle' | 'waiting-gea' | 'running' | 'done' = 'idle';
 let campaignFinalizationTimer: ReturnType<typeof setTimeout> | null = null;
 let evidenceInvalidationInProgress = false;
-const unsupervisedRuntimeStatusExporter = new RuntimeStatusExporter(runtimeStatusPathFromEnvironment());
+// Export the expiring lease more often than the soak sampler so a boundary
+// sample cannot reuse a stale feed/bridge state.
+const unsupervisedRuntimeStatusExporter = new RuntimeStatusExporter(runtimeStatusPathFromEnvironment(), 5_000);
 let lastDiscoveryRevision = '';
 let lastWorldRevision = '';
 let orderbookTrackedTickers: string[] = [];
