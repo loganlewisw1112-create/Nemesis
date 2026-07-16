@@ -24,6 +24,7 @@
     "soak:production": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-production-soak.ps1",
     "campaign:invalidate": "node scripts/invalidate-evidence-campaign.cjs",
     "report:seven-hour": "node scripts/regenerate-seven-hour-report.cjs",
+    "report:r10": "node scripts/generate-r10-gap-closure-report.cjs",
     "ci:build": "npm run build",
     "ci:typecheck": "npm run typecheck",
     "ci:unit": "npm test -- --run",

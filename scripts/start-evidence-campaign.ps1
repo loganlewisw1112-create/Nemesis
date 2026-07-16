@@ -94,13 +94,44 @@ function Get-ProductionArtifactFingerprint {
 
 function Assert-PassingSoak([string]$Path, [string]$Commit, [hashtable]$Artifact) {
   $soak = Read-JsonHashtable $Path
-  if ($null -eq $soak) { throw "A readable passing 45-minute production soak result is required: $Path" }
+  if ($null -eq $soak) { throw "A readable passing five-minute warm-up plus 30-minute scored production soak result is required: $Path" }
   if ($soak.schemaVersion -ne 2 -or $soak.runType -ne 'production-stress-soak' -or $soak.passed -ne $true) {
     throw "Production soak result is not a passing schema-v2 stress soak: $Path"
   }
   if ([string]$soak.gitCommit -ne $Commit) { throw 'Production soak commit does not match frozen HEAD.' }
-  if ([double]$soak.requestedDurationMinutes -lt 45 -or [double]$soak.actualDurationMinutes -lt 44.5) {
-    throw 'Production soak did not complete the required 45-minute duration.'
+  if ([double]$soak.warmupMinutes -ne 5 -or [double]$soak.scoredDurationMinutes -ne 30 -or
+    [double]$soak.actualWarmupMinutes -lt 5 -or [double]$soak.actualScoredDurationMinutes -lt 30 -or
+    $soak.phaseCoverage.warmup.complete -ne $true -or $soak.phaseCoverage.scored.complete -ne $true) {
+    throw 'Production soak did not complete the required five-minute warm-up and 30 scored minutes.'
+  }
+  if ($soak.slopeWindowComplete -ne $true -or [double]$soak.slopeWindowMs -lt 1800000 -or
+    $null -eq $soak.rendererSlopePerHour -or [double]$soak.rendererSlopePerHour -gt 0.02 -or
+    $null -eq $soak.runtimeRendererSlopePerHour -or [double]$soak.runtimeRendererSlopePerHour -gt 0.02) {
+    throw 'Production soak did not prove a complete passing 30-minute renderer slope window.'
+  }
+  if ([double]$soak.rendererSampleCoverage -lt 0.99 -or [double]$soak.geaSampleCoverage -lt 0.99 -or
+    [double]$soak.runtimeStatusCoverage -lt 0.99 -or [double]$soak.feedReadinessCoverage -lt 0.995 -or
+    [double]$soak.bridgeReadinessCoverage -lt 0.995) {
+    throw 'Production soak evidence coverage is below the required 99% runtime or 99.5% feed/bridge gate.'
+  }
+  if ($null -eq $soak.rendererP95Mb -or [double]$soak.rendererP95Mb -gt 384 -or
+    $null -eq $soak.rendererMaxMb -or [double]$soak.rendererMaxMb -gt 512 -or
+    $null -eq $soak.rendererTenMinuteGrowthMax -or [double]$soak.rendererTenMinuteGrowthMax -gt 0.10) {
+    throw 'Production soak did not pass the renderer p95, maximum, and ten-minute growth limits.'
+  }
+  if ($soak.finalFeedQualificationReady -ne $true -or $soak.finalBridgeQualificationReady -ne $true -or
+    [int]$soak.processRestartCount -ne 0 -or [int]$soak.emergencyMitigationCount -ne 0 -or
+    [int]$soak.runtimeInvalidatedSampleCount -ne 0 -or [int]$soak.rendererBlockedSampleCount -ne 0 -or
+    $soak.cleanShutdown -ne $true -or $soak.matchingArtifactHashes -ne $true -or @($soak.acceptanceFailures).Count -ne 0) {
+    throw 'Production soak did not finish cleanly with all runtime and artifact-integrity gates intact.'
+  }
+  if ($soak.finalRuntimeState -ne 'healthy' -or $soak.finalRendererStatus -ne 'stable' -or
+    $null -eq $soak.finalRuntimeStatusAgeMs -or [double]$soak.finalRuntimeStatusAgeMs -gt 60000 -or
+    $null -eq $soak.finalRendererHeartbeatAgeMs -or [double]$soak.finalRendererHeartbeatAgeMs -gt 15000 -or
+    [string]::IsNullOrWhiteSpace([string]$soak.configurationHash) -or
+    [string]::IsNullOrWhiteSpace([string]$soak.retryIdentity.attemptId) -or
+    [int]$soak.retryIdentity.retryOrdinal -lt 0 -or [int]$soak.retryIdentity.retryOrdinal -gt 2) {
+    throw 'Production soak cutoff, configuration, or retry identity evidence is incomplete.'
   }
   if ($soak.devToolsDisabled -ne $true -or [int]$soak.configuredTrackedTickers -ne 500) {
     throw 'Production soak did not prove DevTools-disabled, 500-ticker configuration.'

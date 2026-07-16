@@ -1201,6 +1201,8 @@ function prepareCampaignCloseout(now: number): void {
   const rendererHealthy = latestRendererMemoryAssessment.status === 'stable'
     && !latestRendererMemoryAssessment.blocked
     && (latestRendererMemoryAssessment.p95WorkingSetKb ?? Number.POSITIVE_INFINITY) <= 384 * 1024
+    && latestRendererMemoryAssessment.slopeWindowComplete
+    && latestRendererMemoryAssessment.slopeWindowMs >= 30 * 60_000
     && latestRendererMemoryAssessment.slopePerHour <= 0.02
     && now - lastRendererMemorySampleAt <= 60_000;
   const bridgeHealthy = bridgeStatus.qualificationReady === true && now - lastRuntimeSampleAt <= 60_000;

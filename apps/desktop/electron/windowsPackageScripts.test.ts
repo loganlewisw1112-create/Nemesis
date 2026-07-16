@@ -48,6 +48,12 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain("$env:NEMESIS_DEVTOOLS = 'false'");
     expect(script).toContain('dist-electron\\main.js');
     expect(script).toContain('Assert-PassingSoak');
+    expect(script).toContain('warmupMinutes -ne 5');
+    expect(script).toContain('scoredDurationMinutes -ne 30');
+    expect(script).toContain('slopeWindowComplete -ne $true');
+    expect(script).toContain('rendererSampleCoverage -lt 0.99');
+    expect(script).toContain('feedReadinessCoverage -lt 0.995');
+    expect(script).toContain('bridgeReadinessCoverage -lt 0.995');
     expect(script).toContain('productionArtifactHash');
     expect(script).toContain('Current production artifact differs from the exact artifact that passed the soak');
     expect(script).toContain('Assert-CleanR10Unlock');
@@ -65,25 +71,57 @@ describe('Windows package staging scripts', () => {
     expect(script).not.toContain('npm run dev');
   });
 
-  it('makes the production soak attest its artifact and calculate renderer slope from renderer timestamps', () => {
+  it('makes the production soak attest a five-minute warm-up and exact thirty scored minutes', () => {
     const script = fs.readFileSync(path.join(repoRoot, 'scripts', 'run-production-soak.ps1'), 'utf8');
 
+    expect(script).toContain('[int]$DurationMinutes = 30');
+    expect(script).toContain('[int]$WarmupMinutes = 5');
     expect(script).toContain("$env:NEMESIS_DEVTOOLS = 'false'");
     expect(script).toContain("$env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'");
     expect(script).toContain('productionArtifactHash');
     expect(script).toContain('productionEntryHash');
-    expect(script).toContain('Get-NormalizedSlopePerHour');
-    expect(script).toContain('$latestAt - 1800000');
-    expect(script).toContain("$null -ne $slopePerHour");
-    expect(script).toContain('rendererSampleCoverage -ge 0.95');
-    expect(script).toContain('geaSampleCoverage -ge 0.95');
+    expect(script).toContain('matchingArtifactHashes');
+    expect(script).toContain('Get-NormalizedSlopeEvidence');
+    expect(script).toContain('$spanMs -lt $requiredWindowMs');
+    expect(script).not.toContain('1620000');
+    expect(script).toContain('slopeWindowComplete');
+    expect(script).toContain('slopeWindowMs');
+    expect(script).toContain("$_.phase -eq 'scored'");
+    expect(script).toContain('scoredElapsedMinutes -le 5');
+    expect(script).toContain('expectedScoredSampleCount');
+    expect(script).toContain('rendererSampleCoverage -lt 0.99');
+    expect(script).toContain('geaSampleCoverage -lt 0.99');
     expect(script).toContain('NEMESIS_RUNTIME_STATUS_PATH');
-    expect(script).toContain('externalStatusCoverage -ge 0.95');
+    expect(script).toContain('runtimeStatusCoverage -lt 0.99');
+    expect(script).toContain('feedReadinessCoverage -lt 0.995');
+    expect(script).toContain('bridgeReadinessCoverage -lt 0.995');
+    expect(script).toContain("peerRole -eq 'gea'");
+    expect(script).toContain('warmupMinutes = $WarmupMinutes');
+    expect(script).toContain('scoredDurationMinutes = $DurationMinutes');
+    expect(script).toContain('totalRuntimeMinutes');
+    expect(script).toContain('phaseCoverage');
+    expect(script).toContain('retryIdentity');
+    expect(script).toContain('configurationHash');
+    expect(script).toContain('processRestartCount');
+    expect(script).toContain('emergencyMitigationCount');
     expect(script).toContain('production-soak-runtime-status-at-cutoff.json');
     expect(script).toContain("cutoffExternalStatus.runtime.state -eq 'invalidated'");
-    expect(script).toContain("finalRendererStatus -eq 'stable'");
-    expect(script).toContain("finalRuntimeState -eq 'healthy'");
+    expect(script).toContain("finalRendererStatus -ne 'stable'");
+    expect(script).toContain("finalRuntimeState -ne 'healthy'");
     expect(script).toContain("$sample.runtimeState -eq 'invalidated'");
     expect(script).toContain('remained unresponsive for at least ten seconds');
+  });
+
+  it('generates the r10 report from evidence and unlocks seven hours only after both passes', () => {
+    const script = fs.readFileSync(path.join(repoRoot, 'scripts', 'generate-r10-gap-closure-report.cjs'), 'utf8');
+
+    expect(script).toContain("const sevenHourUnlocked = soakPassed && r10Passed");
+    expect(script).toContain("'soak_failed_r10_not_run'");
+    expect(script).toContain("'soak_passed_r10_failed'");
+    expect(script).toContain("'soak_and_r10_passed'");
+    expect(script).toContain('artifact.json');
+    expect(script).toContain('evidence-inventory.json');
+    expect(script).toContain('source-notes.md');
+    expect(script).toContain('expectedR9Hash');
   });
 });

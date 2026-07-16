@@ -5,7 +5,7 @@ import { RuntimeHealthController, type RuntimeComponentHealth } from './runtimeH
 const renderer: RendererMemoryAssessment = {
   status: 'stable', sampleCount: 10, growthRate: 0, detail: 'stable', blocked: false,
   reasons: [], baselineKb: 100, workingSetKb: 100, p95WorkingSetKb: 100,
-  slopePerHour: 0, rendererPid: 1,
+  slopePerHour: 0, slopeWindowComplete: false, slopeWindowMs: 0, rendererPid: 1,
 };
 
 function components(at: number): RuntimeComponentHealth[] {

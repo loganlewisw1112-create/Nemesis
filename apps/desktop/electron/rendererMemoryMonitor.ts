@@ -32,6 +32,8 @@ export interface RendererMemoryAssessment {
   workingSetKb: number | null;
   p95WorkingSetKb: number | null;
   slopePerHour: number;
+  slopeWindowComplete: boolean;
+  slopeWindowMs: number;
   rendererPid: number | null;
 }
 
@@ -120,6 +122,8 @@ export class RendererMemoryMonitor {
   private baselineKb: number | null = null;
   private rendererPid: number | null = null;
   private stickyReasons = new Set<string>();
+  private latestSlopePerHour = 0;
+  private latestSlopeWindowMs = 0;
 
   constructor(
     private readonly warmupMs = 5 * 60_000,
@@ -191,8 +195,16 @@ export class RendererMemoryMonitor {
       // allocation must not enter this regression, and the gate is not eligible
       // until a complete thirty-minute observation window exists.
       const slopeStart = Math.max(sample.at - this.policy.slopeWindowMs, warmupCutoffAt);
-      const slopeWindow = this.samples.filter((item) => item.at >= slopeStart);
+      const postWarmupSamples = this.samples.filter((item) => item.at >= warmupCutoffAt);
+      const firstInsideIndex = postWarmupSamples.findIndex((item) => item.at >= slopeStart);
+      // Scheduler jitter can put the first boundary sample milliseconds before
+      // the nominal cutoff. Retain that one predecessor so a genuinely complete
+      // window cannot flap back to incomplete at the next sample.
+      const slopeWindow = firstInsideIndex <= 0
+        ? postWarmupSamples
+        : postWarmupSamples.slice(firstInsideIndex - 1);
       const slopeSpan = slopeWindow.length > 1 ? slopeWindow.at(-1)!.at - slopeWindow[0]!.at : 0;
+      this.latestSlopeWindowMs = slopeSpan;
       if (slopeSpan >= this.policy.slopeWindowMs) {
         slopePerHour = normalizedSlopePerHour(slopeWindow, this.baselineKb);
         if (slopePerHour > this.policy.slopeLimitPerHour) {
@@ -200,6 +212,7 @@ export class RendererMemoryMonitor {
         }
       }
     }
+    this.latestSlopePerHour = slopePerHour;
 
     for (const reason of reasons) this.stickyReasons.add(reason);
     if (this.stickyReasons.size > 0) {
@@ -217,9 +230,13 @@ export class RendererMemoryMonitor {
   }
 
   snapshot(): RendererMemoryAssessment {
-    if (this.stickyReasons.size > 0) return this.assessment('unstable-growth', [...this.stickyReasons]);
-    if (this.baselineKb == null) return this.assessment('warming', ['renderer baseline is not established']);
-    return this.assessment('stable', []);
+    if (this.stickyReasons.size > 0) {
+      return this.assessment('unstable-growth', [...this.stickyReasons], 0, this.latestSlopePerHour);
+    }
+    if (this.baselineKb == null) {
+      return this.assessment('warming', ['renderer baseline is not established'], 0, this.latestSlopePerHour);
+    }
+    return this.assessment('stable', [], 0, this.latestSlopePerHour);
   }
 
   private assessment(
@@ -243,6 +260,8 @@ export class RendererMemoryMonitor {
       workingSetKb,
       p95WorkingSetKb: percentile95(this.samples.map((item) => item.workingSetKb)),
       slopePerHour,
+      slopeWindowComplete: this.latestSlopeWindowMs >= this.policy.slopeWindowMs,
+      slopeWindowMs: this.latestSlopeWindowMs,
       rendererPid: this.rendererPid,
     };
   }

@@ -104,10 +104,38 @@ describe('RendererMemoryMonitor', () => {
     const early = monitor.add({ at: 32 * 60_000, workingSetKb: 101 * MB, painted: true });
     expect(early.status).toBe('stable');
     expect(early.slopePerHour).toBe(0);
+    expect(early.slopeWindowComplete).toBe(false);
+    expect(early.slopeWindowMs).toBe(27 * 60_000);
 
     const complete = monitor.add({ at: 35 * 60_000, workingSetKb: 100 * MB, painted: true });
     expect(complete.status).toBe('stable');
     expect(complete.slopePerHour).toBeLessThanOrEqual(0.02);
+    expect(complete.slopeWindowComplete).toBe(true);
+    expect(complete.slopeWindowMs).toBe(30 * 60_000);
+    expect(monitor.snapshot()).toMatchObject({
+      slopeWindowComplete: true,
+      slopeWindowMs: 30 * 60_000,
+      slopePerHour: complete.slopePerHour,
+    });
+  });
+
+  it('keeps a complete slope window when sampling jitter crosses the boundary', () => {
+    const monitor = new RendererMemoryMonitor(5 * 60_000, 1);
+    monitor.add({ at: 0, workingSetKb: 80 * MB, painted: true });
+    let result = monitor.add({ at: 5 * 60_000 + 10, workingSetKb: 100 * MB, painted: true });
+    for (let index = 1; index <= 60; index += 1) {
+      result = monitor.add({
+        at: 5 * 60_000 + 10 + (index * 30_001),
+        workingSetKb: 100 * MB,
+        painted: true,
+      });
+    }
+
+    expect(result.slopeWindowComplete).toBe(true);
+    expect(result.slopeWindowMs).toBeGreaterThanOrEqual(30 * 60_000);
+    const next = monitor.add({ at: 35 * 60_000 + 30_071, workingSetKb: 100 * MB, painted: true });
+    expect(next.slopeWindowComplete).toBe(true);
+    expect(next.slopeWindowMs).toBeGreaterThanOrEqual(30 * 60_000);
   });
 
   it('blocks a post-paint sample more than fifty percent above baseline', () => {
