@@ -98,10 +98,11 @@ describe('KalshiOrderbookStream', () => {
     vi.useFakeTimers();
     const deltaAt = 1_700_000_000_000;
     vi.setSystemTime(deltaAt);
-    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null);
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null, 'production', 1);
     Object.assign(stream as unknown as Record<string, unknown>, {
       socket: { readyState: WebSocket.OPEN },
       authenticated: true,
+      tickers: new Set(Array.from({ length: 25 }, (_, index) => `KX-LIVE-${index}`)),
       lastPongAt: deltaAt,
       generation: 1,
     });
@@ -215,6 +216,32 @@ describe('KalshiOrderbookStream', () => {
     stream.stop();
   });
 
+  it('does not qualify a short tracking set and becomes ready at exactly 25 unique tickers', () => {
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() };
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket,
+      authenticated: true,
+      generation: 1,
+      started: true,
+    });
+    const firstTwentyFour = Array.from({ length: 24 }, (_, index) => `KX-LIVE-${index}`);
+    stream.track(firstTwentyFour);
+    expect(stream.telemetry()).toMatchObject({
+      trackedTickers: 24,
+      trackingReady: false,
+      qualificationReady: false,
+    });
+
+    stream.track([...firstTwentyFour, 'KX-LIVE-24', 'KX-LIVE-24']);
+    expect(stream.telemetry()).toMatchObject({
+      trackedTickers: 25,
+      trackingReady: true,
+      qualificationReady: false,
+    });
+    stream.stop();
+  });
+
   it('allows only the current authenticated generation to repair qualification', () => {
     vi.useFakeTimers();
     const recoveredAt = 1_700_000_200_000;
@@ -223,6 +250,7 @@ describe('KalshiOrderbookStream', () => {
     Object.assign(stream as unknown as Record<string, unknown>, {
       socket: { readyState: WebSocket.OPEN },
       authenticated: true,
+      tickers: new Set(Array.from({ length: 25 }, (_, index) => `KX-LIVE-${index}`)),
       generation: 2,
     });
     const snapshot = JSON.stringify({
@@ -258,6 +286,7 @@ describe('KalshiOrderbookStream', () => {
     Object.assign(stream as unknown as Record<string, unknown>, {
       socket,
       authenticated: true,
+      tickers: new Set(Array.from({ length: 25 }, (_, index) => `KX-LIVE-${index}`)),
       generation: 1,
     });
 

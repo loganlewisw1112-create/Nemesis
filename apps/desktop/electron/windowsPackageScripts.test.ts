@@ -135,4 +135,26 @@ describe('Windows package staging scripts', () => {
     expect(main).toContain('const throttleMs = paperDesk.snapshot().positions.length > 0');
     expect(main).toContain('new RuntimeStatusExporter(runtimeStatusPathFromEnvironment(), 5_000)');
   });
+
+  it('keeps renderer liveness independent from page load and cleans up on unload', () => {
+    const preload = fs.readFileSync(path.join(repoRoot, 'apps', 'desktop', 'electron', 'preload.ts'), 'utf8');
+    expect(preload).toContain("ipcRenderer.send('renderer:heartbeat'");
+    expect(preload).toContain('sequence: ++rendererHeartbeatSequence');
+    expect(preload).toContain('setInterval(reportRendererHeartbeat, 5_000)');
+    expect(preload).toContain('requestAnimationFrame');
+    expect(preload).toContain("ipcRenderer.on('renderer:probe'");
+    expect(preload).toContain("ipcRenderer.send('renderer:probe-response'");
+    expect(preload).toContain("ipcRenderer.send('renderer:heartbeat-send-failed')");
+    expect(preload).toContain("ipcRenderer.removeListener('renderer:probe', onRendererProbe)");
+  });
+
+  it('starts renderer probes only after page load and exports probe evidence', () => {
+    const main = fs.readFileSync(path.join(repoRoot, 'apps', 'desktop', 'electron', 'main.ts'), 'utf8');
+    expect(main).toContain('rendererHeartbeatMonitor.markLoadFinished(Date.now())');
+    expect(main).toContain('startRendererProbe()');
+    expect(main).toContain("ipcMain.on('renderer:probe-response'");
+    expect(main).toContain('rendererProbeResponseReceived');
+    expect(main).toContain('renderer-first-heartbeat');
+    expect(main).toContain('renderer-first-painted-heartbeat');
+  });
 });

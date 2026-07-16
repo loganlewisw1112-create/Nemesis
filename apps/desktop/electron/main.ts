@@ -324,6 +324,8 @@ let latestRendererMemoryAssessment: RendererMemoryAssessment = rendererMemoryMon
 let runtimeHealthController = new RuntimeHealthController();
 let latestRuntimeDecision: RuntimeHealthDecision | null = null;
 const rendererHeartbeatMonitor = new RendererHeartbeatMonitor();
+let rendererProbeTimer: ReturnType<typeof setInterval> | null = null;
+let rendererProbeSequence = 0;
 let campaignEvidencePaused = true;
 let pendingCampaignPointer: ActiveCampaignPointer | null = null;
 let evidenceRunSupervisor: EvidenceRunSupervisor | null = null;
@@ -497,7 +499,45 @@ function currentRendererRuntimeAssessment(now = Date.now()): RendererMemoryAsses
     heartbeatLoadingGraceUntil: heartbeat.loadingGraceUntil,
     heartbeatLastReceivedAt: heartbeat.lastHeartbeatAt,
     heartbeatLastRendererReportedAt: heartbeat.lastRendererReportedAt,
+    rendererLoadStartedAt: heartbeat.loadStartedAt,
+    rendererLoadFinishedAt: heartbeat.loadFinishedAt,
+    rendererMonitoringStartedAt: heartbeat.monitoringStartedAt,
+    rendererFirstHeartbeatAt: heartbeat.firstHeartbeatAt,
+    rendererFirstPaintedAt: heartbeat.firstPaintedAt,
+    rendererLastHeartbeatSequence: heartbeat.lastHeartbeatSequence,
+    rendererHeartbeatSendFailures: heartbeat.heartbeatSendFailures,
+    rendererProbeSentAt: heartbeat.lastProbeSentAt,
+    rendererProbeResponseAt: heartbeat.lastProbeResponseAt,
+    rendererProbeSequence: heartbeat.lastProbeSequence,
+    rendererProbeAgeMs: heartbeat.probeAgeMs,
+    rendererProbeResponseReceived: heartbeat.probeResponseReceived,
   };
+}
+
+function stopRendererProbe(): void {
+  if (rendererProbeTimer) clearInterval(rendererProbeTimer);
+  rendererProbeTimer = null;
+}
+
+function sendRendererProbe(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const sentAt = Date.now();
+  const sequence = ++rendererProbeSequence;
+  rendererHeartbeatMonitor.recordProbeSent(sentAt, sequence);
+  try {
+    mainWindow.webContents.send('renderer:probe', { sentAt, sequence });
+    startupTrace(`renderer-probe-sent:${sequence}`);
+  } catch (error) {
+    rendererHeartbeatMonitor.recordHeartbeatSendFailure();
+    startupTrace(`renderer-probe-send-failed:${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function startRendererProbe(): void {
+  stopRendererProbe();
+  rendererProbeSequence = 0;
+  sendRendererProbe();
+  rendererProbeTimer = setInterval(sendRendererProbe, 5_000);
 }
 
 function persistBridgeTelemetry(event: string, detail: Record<string, unknown> = {}): void {
@@ -1020,7 +1060,10 @@ function runtimeComponents(now: number): RuntimeComponentHealth[] {
     {
       name: 'orderbook-websocket',
       connected: orderbook.connected,
-      qualificationReady: orderbook.qualificationReady && orderbook.booksWithExchangeTime > 0,
+      trackingReady: orderbook.trackingReady,
+      qualificationReady: orderbook.qualificationReady
+        && orderbook.trackingReady
+        && orderbook.booksWithExchangeTime > 0,
       lastSuccessAt: orderbook.lastMessageAt,
       lastPongAt: orderbook.lastPongAt,
       failures: orderbook.sequenceGaps + orderbook.sequenceRegressions,
@@ -1073,20 +1116,42 @@ function preflightHealthyForStability(): boolean {
     && paperOrderBook.working().length === 0
     && !latestRendererMemoryAssessment.blocked
     && !heartbeat.blocked
+    && heartbeat.loadFinishedAt != null
     && heartbeat.lastHeartbeatAt != null
     && heartbeat.painted
+    && heartbeat.heartbeatAgeMs <= 15_000
+    && heartbeat.probeResponseReceived
+    && heartbeat.probeAgeMs <= 15_000
     && preflightRestCycles >= 3
     && preflightTradeCycles >= 3
     && ticker.authenticated
     && ticker.qualificationReady
     && orderbook.authenticated
     && orderbook.qualificationReady
+    && orderbook.trackedTickers === ORDERBOOK_TRACKING_LIMIT
+    && orderbook.trackingReady
     && orderbook.booksWithExchangeTime > 0
     && (bridgeStatus.pongCount ?? 0) >= 3
     && bridgeStatus.qualificationReady === true
     && Boolean(geaProcess && !geaProcess.killed)
     && latestRuntimeDecision?.state === 'healthy'
     && Boolean(pendingCampaignPointer && !fs.existsSync(pendingCampaignPointer.filePath));
+}
+
+function preflightReadinessDetail(): Record<string, unknown> {
+  const orderbook = kalshiOrderbookStream.telemetry();
+  return {
+    preflightFailureReason: orderbook.trackedTickers < ORDERBOOK_TRACKING_LIMIT
+      ? 'orderbook_tracking_set_below_25'
+      : null,
+    orderbookTracking: {
+      trackedTickers: orderbook.trackedTickers,
+      requiredTickers: ORDERBOOK_TRACKING_LIMIT,
+      trackingReady: orderbook.trackingReady,
+      authenticated: orderbook.authenticated,
+      connected: orderbook.connected,
+    },
+  };
 }
 
 function readEvidenceControl(): { command?: string; runId?: string } | null {
@@ -1389,8 +1454,8 @@ function processEvidenceSupervisor(now: number): void {
       invalidateEvidenceAttempt([decision.reason], now);
       return;
     }
-    if (decision.state === 'preflight-ready') writeRuntimeStatus('preflight-ready', {}, true);
-    else writeRuntimeStatus('preflight');
+    if (decision.state === 'preflight-ready') writeRuntimeStatus('preflight-ready', preflightReadinessDetail(), true);
+    else writeRuntimeStatus('preflight', preflightReadinessDetail());
     if (control?.command === 'start-campaign' && decision.state === 'preflight-ready') {
       const start = evidenceRunSupervisor.start(now);
       if (!startEvidenceCampaign(pendingCampaignPointer, now)) {
@@ -1408,7 +1473,7 @@ function processEvidenceSupervisor(now: number): void {
     return;
   }
   if (state === 'preflight-ready') {
-    writeRuntimeStatus('preflight-ready');
+    writeRuntimeStatus('preflight-ready', preflightReadinessDetail());
     if (control?.command === 'start-campaign') {
       const start = evidenceRunSupervisor.start(now);
       if (!startEvidenceCampaign(pendingCampaignPointer, now)) {
@@ -1749,6 +1814,9 @@ function loadSettings() {
       liveEnabled: false,
       liveStage: 'paper',
       autoLiveEnabled: false,
+      // Supervised evidence always uses the production market-data feeds in
+      // dry-run mode; demo fixtures must never satisfy feed readiness.
+      demoMode: false,
       dryRun: true,
     });
   }
@@ -3766,14 +3834,29 @@ function campaignCriticalOrderbookTickers(now = Date.now()): string[] {
       add(candidates.get(diagnostic.candidateId)?.ticker);
     }
   }
-  return ordered.slice(0, ORDERBOOK_TRACKING_LIMIT);
+  // Apply the 25-ticker bound only after production/live filtering. Slicing
+  // before filtering could let stale or demo candidates crowd out live ones.
+  return ordered;
+}
+
+/** Only production, currently live markets can enter the authenticated book set. */
+function isProductionLiveTicker(ticker: string | undefined, market?: KalshiMarket): boolean {
+  if (!ticker || /^DEMO(?:[-_]|$)/i.test(ticker)) return false;
+  if (!market) return false;
+  const status = market.status.toLowerCase();
+  return status === 'active' || status === 'open';
 }
 
 function desiredOrderbookTickers(now = Date.now()): string[] {
-  const ordered = campaignCriticalOrderbookTickers(now);
+  const marketByTicker = new Map<string, KalshiMarket>();
+  for (const market of discovery.getUniverse()) marketByTicker.set(market.ticker, market);
+  for (const market of marketsCache) if (!marketByTicker.has(market.ticker)) marketByTicker.set(market.ticker, market);
+  const ordered = campaignCriticalOrderbookTickers(now)
+    .filter((ticker) => isProductionLiveTicker(ticker, marketByTicker.get(ticker)));
   const seen = new Set(ordered);
   const add = (ticker: string | undefined) => {
-    if (!ticker || seen.has(ticker)) return;
+    if (!ticker || !isProductionLiveTicker(ticker, marketByTicker.get(ticker))) return;
+    if (seen.has(ticker)) return;
     seen.add(ticker);
     ordered.push(ticker);
   };
@@ -3786,18 +3869,32 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
   for (const card of ranked) {
     if (isEntryEligible(card) && hasRealExecutableDepth(card)) add(card.ticker);
   }
+  // Eligible signal markets are the second priority after campaign-critical
+  // tickers, regardless of whether discovery has already verified depth.
   for (const market of discovery.getMarketsForSignals()) add(market.ticker);
-  for (const card of ranked) add(card.ticker);
+  // Fill from the live universe before using the cached live set. Discovery
+  // can expose a fixture fallback, so the production/live filter above is
+  // applied to every source rather than trusting source order.
+  if (discovery.hasLiveUniverse()) {
+    for (const market of discovery.getUniverse()) add(market.ticker);
+  }
+  for (const market of marketsCache) add(market.ticker);
+  // Bridge recommendations may not yet be in marketsCache; only admit them
+  // when they are already represented by a live market identity.
+  for (const card of ranked) if (marketByTicker.has(card.ticker)) add(card.ticker);
   return ordered;
 }
 
 function refreshOrderbookTracking(now = Date.now()): void {
-  const critical = campaignCriticalOrderbookTickers(now);
   const desired = desiredOrderbookTickers(now);
+  const desiredSet = new Set(desired);
+  const critical = campaignCriticalOrderbookTickers(now).filter((ticker) => desiredSet.has(ticker));
   const selection = selectBoundedOrderbookTracking({
     critical,
     desired,
-    current: orderbookTrackedTickers,
+    // Do not retain a ticker that has left the live production universe; the
+    // rotation helper is sticky only for still-valid entries.
+    current: orderbookTrackedTickers.filter((ticker) => desiredSet.has(ticker)),
     now,
     lastRotationAt: orderbookLastRotationAt,
     cursor: orderbookRotationCursor,
@@ -4493,11 +4590,32 @@ function invalidateLiveCertificate(reason: string) {
 function setupIpc() {
   ipcMain.on('renderer:heartbeat', (event, payload: { painted?: boolean; at?: number; sequence?: number } | undefined) => {
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    const before = rendererHeartbeatMonitor.snapshot();
     rendererHeartbeatMonitor.recordHeartbeat({
       receivedAt: Date.now(),
       reportedAt: payload?.at,
       painted: payload?.painted,
+      sequence: payload?.sequence,
     });
+    const after = rendererHeartbeatMonitor.snapshot();
+    if (before.firstHeartbeatAt == null && after.firstHeartbeatAt != null) startupTrace('renderer-first-heartbeat');
+    if (before.firstPaintedAt == null && after.firstPaintedAt != null) startupTrace('renderer-first-painted-heartbeat');
+  });
+  ipcMain.on('renderer:heartbeat-send-failed', (event) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    rendererHeartbeatMonitor.recordHeartbeatSendFailure();
+  });
+  ipcMain.on('renderer:probe-response', (
+    event,
+    payload: { sentAt?: number; receivedAt?: number; sequence?: number } | undefined,
+  ) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    rendererHeartbeatMonitor.recordProbeResponse({
+      sentAt: payload?.sentAt,
+      receivedAt: Date.now(),
+      sequence: payload?.sequence,
+    });
+    startupTrace(`renderer-probe-response:${payload?.sequence ?? 'unknown'}`);
   });
   ipcMain.handle('nemesis:getState', () => {
     const targetStage = settings.liveStage === 'manual-live' ? 'auto-live' : 'manual-live';
@@ -5079,6 +5197,7 @@ function setupIpc() {
 function createWindow() {
   startupTrace('window-before-create');
   rendererHeartbeatMonitor.reset(Date.now());
+  stopRendererProbe();
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -5102,6 +5221,8 @@ function createWindow() {
   };
   mainWindow.webContents.on('did-fail-load', (_event, code, desc, url) => {
     console.error('[nemesis] did-fail-load', code, desc, url);
+    rendererHeartbeatMonitor.markLoadFailed(`renderer did-fail-load:${code}:${desc}`);
+    startupTrace(`renderer-did-fail-load:${code}`);
     if (devUrl && mainWindow) {
       setTimeout(() => {
         mainWindow?.loadURL(devUrl).catch((err) => console.error('[nemesis] reload failed', err));
@@ -5110,6 +5231,8 @@ function createWindow() {
   });
   mainWindow.webContents.on('did-finish-load', () => {
     startupTrace('renderer-did-finish-load');
+    rendererHeartbeatMonitor.markLoadFinished(Date.now());
+    startRendererProbe();
     forceInitialPaint();
     setTimeout(forceInitialPaint, 250);
     setTimeout(forceInitialPaint, 1_000);
@@ -5139,6 +5262,7 @@ function createWindow() {
     rendererHeartbeatMonitor.markResponsive();
     console.warn('[nemesis] main window became responsive again');
   });
+  mainWindow.on('closed', () => stopRendererProbe());
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
@@ -5372,6 +5496,7 @@ app.whenReady().then(() => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  stopRendererProbe();
   campaignBookTriggerScheduler.stop();
   marketStateStream.stop();
   equityHistoryStream.stop();

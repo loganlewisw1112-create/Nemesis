@@ -8,18 +8,43 @@ function subscribe(channel: string, cb: (payload: unknown) => void): () => void 
 
 let rendererPainted = false;
 let rendererHeartbeatSequence = 0;
-const reportRendererHeartbeat = () => ipcRenderer.send('renderer:heartbeat', {
-  painted: rendererPainted,
-  at: Date.now(),
-  sequence: ++rendererHeartbeatSequence,
-});
+let rendererHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+const reportRendererHeartbeat = () => {
+  const payload = {
+    painted: rendererPainted,
+    at: Date.now(),
+    sequence: ++rendererHeartbeatSequence,
+  };
+  try {
+    ipcRenderer.send('renderer:heartbeat', payload);
+  } catch {
+    try { ipcRenderer.send('renderer:heartbeat-send-failed'); } catch { /* unloading */ }
+  }
+};
+const onRendererProbe = (_event: Electron.IpcRendererEvent, payload: { sentAt?: number; sequence?: number } = {}) => {
+  try {
+    ipcRenderer.send('renderer:probe-response', {
+      sentAt: payload.sentAt,
+      sequence: payload.sequence,
+      receivedAt: Date.now(),
+    });
+  } catch {
+    try { ipcRenderer.send('renderer:heartbeat-send-failed'); } catch { /* unloading */ }
+  }
+};
+ipcRenderer.on('renderer:probe', onRendererProbe);
 reportRendererHeartbeat();
-setInterval(reportRendererHeartbeat, 5_000);
+rendererHeartbeatTimer = setInterval(reportRendererHeartbeat, 5_000);
 window.addEventListener('DOMContentLoaded', () => {
   requestAnimationFrame(() => {
     rendererPainted = true;
     reportRendererHeartbeat();
   });
+}, { once: true });
+window.addEventListener('unload', () => {
+  if (rendererHeartbeatTimer) clearInterval(rendererHeartbeatTimer);
+  rendererHeartbeatTimer = null;
+  ipcRenderer.removeListener('renderer:probe', onRendererProbe);
 }, { once: true });
 
 contextBridge.exposeInMainWorld('nemesis', {

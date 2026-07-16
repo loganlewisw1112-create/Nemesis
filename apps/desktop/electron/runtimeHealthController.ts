@@ -13,6 +13,8 @@ export interface RuntimeComponentHealth {
   name: RuntimeComponentName;
   connected: boolean;
   qualificationReady: boolean;
+  /** Orderbook-specific readiness: the complete unique live tracking set exists. */
+  trackingReady?: boolean;
   lastSuccessAt: number | null;
   lastPingAt?: number | null;
   lastPongAt?: number | null;

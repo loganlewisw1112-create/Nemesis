@@ -17,6 +17,7 @@ export interface KalshiOrderbookStreamTelemetry {
   sequenceGaps: number;
   quarantinedTickers: number;
   authenticated: boolean;
+  trackingReady: boolean;
   qualificationReady: boolean;
   generation: number;
   lastPongAt: number | null;
@@ -206,8 +207,12 @@ export class KalshiOrderbookStream {
       const ageMs = now - book.sequencedDeltaAt;
       return ageMs >= 0 && ageMs <= DEAD_CONNECTION_MS;
     }).length;
+    // Qualification requires the full bounded tracking set. A single fresh
+    // ticker is useful for display, but never sufficient campaign evidence.
+    const trackingReady = this.tickers.size === DEFAULT_MAX_TRACKED_TICKERS;
     const qualificationReady = connected
       && this.authenticated
+      && trackingReady
       && qualifiedTickers > 0;
     return {
       connected,
@@ -219,6 +224,7 @@ export class KalshiOrderbookStream {
       sequenceGaps: this.sequenceGaps,
       quarantinedTickers: this.quarantined.size,
       authenticated: this.authenticated,
+      trackingReady,
       qualificationReady,
       generation: this.generation,
       lastPongAt: this.lastPongAt,
@@ -245,6 +251,7 @@ export class KalshiOrderbookStream {
         lastError: 'credentials required for exchange-timestamped order books',
         authenticated: false,
         transportConnected: false,
+        trackingReady: false,
         qualificationReady: false,
         environment: this.environment,
       });
@@ -570,6 +577,7 @@ export class KalshiOrderbookStream {
       subscriptionUpdateInFlight: telemetry.subscriptionUpdateInFlight,
       transportConnected: telemetry.connected,
       authenticated: telemetry.authenticated,
+      trackingReady: telemetry.trackingReady,
       qualificationReady: telemetry.qualificationReady,
       environment: this.environment,
       endpointClass: 'market-data',

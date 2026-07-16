@@ -431,6 +431,8 @@ export interface ConnectorHealth {
   lastCloseReason?: string | null;
   lastCloseTrigger?: string | null;
   trackedTickers?: number;
+  /** True only when the required unique live orderbook tracking set is complete. */
+  trackingReady?: boolean;
   qualifiedTickers?: number;
   subscriptionUpdates?: number;
   subscriptionUpdateQueueDepth?: number;
