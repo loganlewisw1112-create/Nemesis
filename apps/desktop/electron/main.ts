@@ -550,6 +550,16 @@ function startRendererProbe(): void {
   rendererProbeTimer = setInterval(sendRendererProbe, 5_000);
 }
 
+async function waitForFreshRendererProbe(timeoutMs = 30_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const heartbeat = rendererHeartbeatMonitor.snapshot();
+    if (heartbeat.probeResponseReceived && heartbeat.probeAgeMs <= 15_000 && !heartbeat.blocked) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
 function persistBridgeTelemetry(event: string, detail: Record<string, unknown> = {}): void {
   try {
     ensureDataDir();
@@ -5545,6 +5555,12 @@ app.whenReady().then(async () => {
   // to create a false startup-liveness failure.
   await rendererLoadReadyPromise;
   startupTrace('renderer-load-gate-open');
+  if (!await waitForFreshRendererProbe()) {
+    rendererHeartbeatMonitor.markLoadFailed('renderer did not answer a fresh startup probe');
+    startupTrace('renderer-probe-gate-failed');
+    return;
+  }
+  startupTrace('renderer-probe-gate-open');
   spawnGlobalEventAlpha();
   startupTrace('gea-spawned-feed-held');
   kalshiStream.start();
