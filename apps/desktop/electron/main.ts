@@ -200,7 +200,11 @@ const BRIDGE_HEARTBEAT_MS = 5_000;
 const BRIDGE_TRAFFIC_TTL_MS = 15_000;
 const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
 const RENDERER_MEMORY_SAMPLE_INTERVAL_MS = 30_000;
-const RENDERER_LOAD_RETRY_GRACE_MS = 60_000;
+// Packaged Electron startup can be delayed by a cold profile or a busy
+// desktop. Keep the renderer-load grace bounded, but long enough to cover the
+// five-minute soak warm-up; the renderer must still finish loading and answer
+// a fresh probe before feeds or evidence can start.
+const RENDERER_LOAD_RETRY_GRACE_MS = 5 * 60_000;
 // Discovery still evaluates 500 tickers. Live depth is a smaller, rotating
 // working set so the authenticated socket carries only immediately useful
 // markets; active campaign candidates preempt this set.

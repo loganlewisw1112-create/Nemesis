@@ -191,6 +191,8 @@ try {
   $env:NEMESIS_AUTO_SPAWN_GEA = 'true'
   $env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'
   $env:NEMESIS_RUNTIME_STATUS_PATH = $runtimeStatusPath
+  $env:NEMESIS_STARTUP_TRACE = 'true'
+  $env:NEMESIS_STARTUP_TRACE_FILE = Join-Path $OutputDirectory 'startup-trace.log'
   $devToolsDisabled = $env:NEMESIS_DEVTOOLS -eq 'false'
   $configuredTrackedTickers = [int]$env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS
 
