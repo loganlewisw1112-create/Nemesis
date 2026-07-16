@@ -5231,6 +5231,8 @@ function createWindow() {
   startupTrace('window-after-create');
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
+  const packagedIndexPath = path.join(__dirname, '../dist/index.html');
+  let packagedLoadRetryCount = 0;
   const forceInitialPaint = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.invalidate();
@@ -5238,8 +5240,25 @@ function createWindow() {
   };
   mainWindow.webContents.on('did-fail-load', (_event, code, desc, url) => {
     console.error('[nemesis] did-fail-load', code, desc, url);
+    startupTrace(`renderer-did-fail-load:${code}:${desc}`);
+    // A packaged file load can fail transiently while Electron is starting.
+    // Retry once before declaring the renderer unavailable. The retry is
+    // still inside startup; a renderer process restart later remains fatal.
+    if (!devUrl && packagedLoadRetryCount < 1 && mainWindow && !mainWindow.isDestroyed()) {
+      packagedLoadRetryCount += 1;
+      rendererHeartbeatMonitor.reset(Date.now());
+      startupTrace(`renderer-load-retry:${packagedLoadRetryCount}`);
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        mainWindow.loadFile(packagedIndexPath)
+          .then(() => startupTrace('window-load-file-retry-ok'))
+          .catch((err) => startupTrace(`window-load-file-retry-failed:${err instanceof Error ? err.message : String(err)}`));
+      }, 250);
+      return;
+    }
     rendererHeartbeatMonitor.markLoadFailed(`renderer did-fail-load:${code}:${desc}`);
-    startupTrace(`renderer-did-fail-load:${code}`);
+    resolveRendererLoadReady?.();
+    resolveRendererLoadReady = null;
     if (devUrl && mainWindow) {
       setTimeout(() => {
         mainWindow?.loadURL(devUrl).catch((err) => console.error('[nemesis] reload failed', err));
@@ -5292,9 +5311,8 @@ function createWindow() {
     mainWindow.loadURL(devUrl).catch((err) => console.error('[nemesis] loadURL failed', err));
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    const indexPath = path.join(__dirname, '../dist/index.html');
-    startupTrace(`window-load-file:${indexPath}`);
-    mainWindow.loadFile(indexPath)
+    startupTrace(`window-load-file:${packagedIndexPath}`);
+    mainWindow.loadFile(packagedIndexPath)
       .then(() => startupTrace('window-load-file-ok'))
       .catch((err) => {
         startupTrace(`window-load-file-failed:${err instanceof Error ? err.message : String(err)}`);

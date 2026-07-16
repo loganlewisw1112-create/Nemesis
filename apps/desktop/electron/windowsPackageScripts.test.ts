@@ -163,6 +163,8 @@ describe('Windows package staging scripts', () => {
     expect(main).toContain('await rendererLoadReadyPromise');
     expect(main).toContain("startupTrace('renderer-load-gate-open')");
     expect(main).toContain('heartbeat.loadFinishedAt == null');
+    expect(main).toContain('packagedLoadRetryCount < 1');
+    expect(main).toContain('renderer-load-retry');
   });
 
   it('requires an exact 25-ticker live orderbook set before preflight readiness', () => {
