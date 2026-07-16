@@ -79,6 +79,18 @@ describe('RendererHeartbeatMonitor', () => {
     ]));
   });
 
+  it('accepts a delayed response for a previously sent probe without false mismatch', () => {
+    const monitor = new RendererHeartbeatMonitor(0);
+    monitor.markLoadFinished(1);
+    monitor.recordProbeSent(1_000, 6);
+    monitor.recordProbeSent(2_000, 7);
+    monitor.recordProbeResponse({ receivedAt: 2_100, sentAt: 1_000, sequence: 6 });
+    expect(monitor.snapshot(2_101).blocked).toBe(false);
+    expect(monitor.snapshot(2_101).reasons).not.toContain('renderer probe sequence did not match the latest probe');
+    monitor.recordProbeResponse({ receivedAt: 2_200, sentAt: 2_000, sequence: 7 });
+    expect(monitor.snapshot(2_201).blocked).toBe(false);
+  });
+
   it('latches a renderer restart as an invalidating failure', () => {
     const monitor = new RendererHeartbeatMonitor(0);
     monitor.recordHeartbeat({ receivedAt: 1_000, sequence: 1 });

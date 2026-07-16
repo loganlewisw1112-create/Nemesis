@@ -51,6 +51,8 @@ export class RendererHeartbeatMonitor {
   private lastProbeSentAt: number | null = null;
   private lastProbeResponseAt: number | null = null;
   private lastProbeSequence: number | null = null;
+  private lastProbeResponseSequence: number | null = null;
+  private readonly sentProbes = new Map<number, number>();
   private painted = false;
   private readonly stickyReasons = new Set<string>();
 
@@ -73,6 +75,8 @@ export class RendererHeartbeatMonitor {
     this.lastProbeSentAt = null;
     this.lastProbeResponseAt = null;
     this.lastProbeSequence = null;
+    this.lastProbeResponseSequence = null;
+    this.sentProbes.clear();
     this.painted = false;
     this.stickyReasons.clear();
   }
@@ -132,20 +136,40 @@ export class RendererHeartbeatMonitor {
 
   recordProbeSent(sentAt = Date.now(), sequence = 0): void {
     this.lastProbeSentAt = sentAt;
-    if (sequence > 0) this.lastProbeSequence = sequence;
+    if (sequence > 0) {
+      this.lastProbeSequence = sequence;
+      this.sentProbes.set(sequence, sentAt);
+      while (this.sentProbes.size > 16) {
+        const oldest = this.sentProbes.keys().next().value;
+        if (oldest == null) break;
+        this.sentProbes.delete(oldest);
+      }
+    }
   }
 
   recordProbeResponse(input: { receivedAt?: number; sentAt?: number; sequence?: number } = {}): void {
     const receivedAt = input.receivedAt ?? Date.now();
-    if (this.lastProbeSequence != null && Number.isInteger(input.sequence)
-      && input.sequence! !== this.lastProbeSequence) {
+    const sequence = Number.isInteger(input.sequence) ? input.sequence! : null;
+    const expectedSentAt = sequence == null ? null : this.sentProbes.get(sequence) ?? null;
+    // IPC delivery can reorder responses when the renderer is busy. Validate
+    // the response against a probe that was actually sent, not only the most
+    // recently sent sequence. Unknown sequences remain a blocking failure.
+    if (sequence != null && expectedSentAt == null) {
       this.stickyReasons.add('renderer probe sequence did not match the latest probe');
       return;
     }
-    if (input.sentAt != null && receivedAt - input.sentAt > this.policy.probeMaxAgeMs) {
+    const effectiveSentAt = expectedSentAt ?? input.sentAt ?? null;
+    if (input.sentAt != null && expectedSentAt != null && input.sentAt !== expectedSentAt) {
+      this.stickyReasons.add('renderer probe sequence did not match the latest probe');
+      return;
+    }
+    if (effectiveSentAt != null && receivedAt - effectiveSentAt > this.policy.probeMaxAgeMs) {
       this.stickyReasons.add('renderer probe response exceeded 15 seconds');
     }
-    this.lastProbeResponseAt = receivedAt;
+    if (sequence == null || this.lastProbeResponseSequence == null || sequence >= this.lastProbeResponseSequence) {
+      this.lastProbeResponseAt = receivedAt;
+      this.lastProbeResponseSequence = sequence;
+    }
   }
 
   markUnresponsive(at = Date.now()): void {
@@ -185,7 +209,12 @@ export class RendererHeartbeatMonitor {
     // A probe is allowed its normal response window.  Treat a missing response
     // as stale only after the elapsed time since the latest probe exceeds the
     // limit; otherwise the first probe would invalidate startup immediately.
-    if (this.lastProbeSentAt != null && probeAgeMs > this.policy.probeMaxAgeMs) {
+    const latestProbeWasAnswered = this.lastProbeSequence == null
+      || this.lastProbeResponseSequence === this.lastProbeSequence;
+    const latestProbeAgeMs = this.lastProbeSentAt == null ? 0 : Math.max(0, now - this.lastProbeSentAt);
+    if (this.lastProbeSentAt != null
+      && ((!latestProbeWasAnswered && latestProbeAgeMs > this.policy.probeMaxAgeMs)
+        || probeAgeMs > this.policy.probeMaxAgeMs)) {
       this.stickyReasons.add('renderer probe response was absent or stale');
     }
     if (this.loadFinishedAt != null && unresponsiveForMs > this.policy.unresponsiveMaxMs) {
