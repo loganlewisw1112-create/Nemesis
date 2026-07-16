@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
+import { getKalshiEndpointPolicy } from '@nemesis/core';
 import { ConnectorRegistry } from './registry.js';
 import { KalshiOrderbookStream } from './kalshiOrderbookStream.js';
 
@@ -240,6 +241,17 @@ describe('KalshiOrderbookStream', () => {
       qualificationReady: false,
     });
     stream.stop();
+  });
+
+  it('rotates only through production websocket policy aliases after a failure', () => {
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const policy = getKalshiEndpointPolicy('production').websocketUrls;
+    const internals = stream as unknown as { advanceEndpoint(): void };
+    expect(stream.telemetry().endpointUrl).toBe(policy[0]);
+    internals.advanceEndpoint();
+    expect(stream.telemetry().endpointUrl).toBe(policy[1]);
+    internals.advanceEndpoint();
+    expect(stream.telemetry().endpointUrl).toBe(policy[0]);
   });
 
   it('allows only the current authenticated generation to repair qualification', () => {

@@ -443,6 +443,8 @@ export interface ConnectorHealth {
   qualificationReady?: boolean;
   environment?: KalshiEnvironment;
   endpointClass?: KalshiEndpointClass;
+  /** Redacted endpoint URL currently selected by the environment policy. */
+  endpointUrl?: string | null;
 }
 
 export interface GateStatus {

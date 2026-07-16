@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { getKalshiEndpointPolicy } from '@nemesis/core';
 import { ConnectorRegistry } from './registry.js';
 import { KalshiStream } from './kalshiStream.js';
 
@@ -26,5 +27,16 @@ describe('KalshiStream replay safety', () => {
     expect(seen).toEqual(['KXONE']);
     expect(stream.telemetry().sequenceGaps).toBe(1);
     expect(registry.get('kalshi-ticker-ws')?.qualificationReady).toBe(false);
+  });
+
+  it('rotates only through production websocket policy aliases after a failure', () => {
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const policy = getKalshiEndpointPolicy('production').websocketUrls;
+    const internals = stream as unknown as { advanceEndpoint(): void };
+    expect(stream.telemetry().endpointUrl).toBe(policy[0]);
+    internals.advanceEndpoint();
+    expect(stream.telemetry().endpointUrl).toBe(policy[1]);
+    internals.advanceEndpoint();
+    expect(stream.telemetry().endpointUrl).toBe(policy[0]);
   });
 });

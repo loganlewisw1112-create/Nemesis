@@ -1,5 +1,5 @@
 import { WebSocket } from 'ws';
-import { getKalshiWebSocketUrl, type KalshiEnvironment } from '@nemesis/core';
+import { getKalshiEndpointPolicy, type KalshiEnvironment } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
 
 const PING_INTERVAL_MS = 10_000;
@@ -34,6 +34,7 @@ export interface KalshiTickerStreamTelemetry {
   lastCloseAt: number | null;
   lastCloseCode: number | null;
   lastCloseReason: string | null;
+  endpointUrl: string | null;
 }
 
 type QuoteListener = (quote: KalshiTickerQuote) => void;
@@ -50,6 +51,9 @@ export class KalshiStream {
   private subscriptionPumpTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private generation = 0;
+  // Keep endpoint affinity per stream. A network/DNS failure on the primary
+  // host must not strand the stream when the production alias is available.
+  private endpointIndex = 0;
   private reconnects = 0;
   private sequenceGaps = 0;
   private readonly sequenceBySubscription = new Map<string, number>();
@@ -97,6 +101,7 @@ export class KalshiStream {
       lastCloseAt: this.lastCloseAt,
       lastCloseCode: this.lastCloseCode,
       lastCloseReason: this.lastCloseReason,
+      endpointUrl: this.currentEndpointUrl(),
     };
   }
 
@@ -172,7 +177,20 @@ export class KalshiStream {
     }
 
     const generation = ++this.generation;
-    const socket = new WebSocket(getKalshiWebSocketUrl(this.environment), { headers });
+    const endpointUrl = this.currentEndpointUrl();
+    if (!endpointUrl) {
+      this.authenticated = false;
+      this.registry.recordTelemetry('kalshi-ticker-ws', {
+        status: 'error',
+        lastError: 'no websocket endpoint in selected Kalshi environment policy',
+        authenticated: false,
+        transportConnected: false,
+        qualificationReady: false,
+        environment: this.environment,
+      });
+      return;
+    }
+    const socket = new WebSocket(endpointUrl, { headers });
     this.socket = socket;
     socket.on('open', () => {
       if (!this.isCurrent(socket, generation)) return;
@@ -231,6 +249,7 @@ export class KalshiStream {
     this.clearSubscriptionPump();
     if (!this.started) return;
     this.reconnects += 1;
+    this.advanceEndpoint();
     this.registry.recordTelemetry('kalshi-ticker-ws', {
       status: 'warn',
       lastError: 'ticker websocket disconnected; reconnect scheduled',
@@ -238,6 +257,7 @@ export class KalshiStream {
       transportConnected: false,
       authenticated: false,
       qualificationReady: false,
+      endpointUrl: this.currentEndpointUrl(),
       lastCloseAt: this.lastCloseAt,
       lastCloseCode: this.lastCloseCode,
       lastCloseReason: this.lastCloseReason,
@@ -324,6 +344,7 @@ export class KalshiStream {
       authenticated: telemetry.authenticated,
       qualificationReady: telemetry.qualificationReady,
       environment: telemetry.environment,
+      endpointUrl: telemetry.endpointUrl,
       endpointClass: 'market-data',
     });
     this.registry.recordTelemetry('kalshi-ws', {
@@ -334,6 +355,7 @@ export class KalshiStream {
       authenticated: telemetry.authenticated,
       qualificationReady: telemetry.qualificationReady,
       reconnects: telemetry.reconnects,
+      endpointUrl: telemetry.endpointUrl,
     });
   }
 
@@ -364,6 +386,16 @@ export class KalshiStream {
   private clearSubscriptionPump(): void {
     if (this.subscriptionPumpTimer) clearTimeout(this.subscriptionPumpTimer);
     this.subscriptionPumpTimer = null;
+  }
+
+  private currentEndpointUrl(): string | null {
+    const endpoints = getKalshiEndpointPolicy(this.environment).websocketUrls;
+    return endpoints[this.endpointIndex] ?? endpoints[0] ?? null;
+  }
+
+  private advanceEndpoint(): void {
+    const count = getKalshiEndpointPolicy(this.environment).websocketUrls.length;
+    if (count > 1) this.endpointIndex = (this.endpointIndex + 1) % count;
   }
 }
 

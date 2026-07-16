@@ -1,5 +1,5 @@
 import { WebSocket } from 'ws';
-import { getKalshiWebSocketUrl, type KalshiEnvironment, type KalshiOrderbook, type OrderbookLevel } from '@nemesis/core';
+import { getKalshiEndpointPolicy, type KalshiEnvironment, type KalshiOrderbook, type OrderbookLevel } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
 import type { KalshiWebSocketHeaderProvider } from './kalshiStream.js';
 
@@ -31,6 +31,7 @@ export interface KalshiOrderbookStreamTelemetry {
   subscriptionUpdates: number;
   subscriptionUpdateQueueDepth: number;
   subscriptionUpdateInFlight: boolean;
+  endpointUrl: string | null;
 }
 
 interface MutableBook {
@@ -96,6 +97,9 @@ export class KalshiOrderbookStream {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private generation = 0;
+  // Keep endpoint affinity per stream. A network/DNS failure on the primary
+  // host must not strand the stream when the production alias is available.
+  private endpointIndex = 0;
   private reconnects = 0;
   private sequenceRegressions = 0;
   private sequenceGaps = 0;
@@ -238,6 +242,7 @@ export class KalshiOrderbookStream {
       subscriptionUpdates: this.subscriptionUpdates,
       subscriptionUpdateQueueDepth: this.subscriptionUpdateQueue.length,
       subscriptionUpdateInFlight: this.pendingSubscriptionUpdate != null,
+      endpointUrl: this.currentEndpointUrl(),
     };
   }
 
@@ -258,7 +263,21 @@ export class KalshiOrderbookStream {
       return;
     }
     const generation = ++this.generation;
-    const socket = new WebSocket(getKalshiWebSocketUrl(this.environment), { headers });
+    const endpointUrl = this.currentEndpointUrl();
+    if (!endpointUrl) {
+      this.authenticated = false;
+      this.registry.recordTelemetry('kalshi-orderbook-ws', {
+        status: 'error',
+        lastError: 'no websocket endpoint in selected Kalshi environment policy',
+        authenticated: false,
+        transportConnected: false,
+        trackingReady: false,
+        qualificationReady: false,
+        environment: this.environment,
+      });
+      return;
+    }
+    const socket = new WebSocket(endpointUrl, { headers });
     this.socket = socket;
     socket.on('open', () => {
       if (!this.isCurrent(socket, generation)) return;
@@ -313,6 +332,7 @@ export class KalshiOrderbookStream {
       this.pendingSubscriptionUpdate = null;
       if (!this.started) return;
       this.reconnects += 1;
+      this.advanceEndpoint();
       this.registry.recordTelemetry('kalshi-orderbook-ws', {
         status: 'warn',
         lastError: 'order-book stream disconnected; reconnect scheduled',
@@ -320,6 +340,7 @@ export class KalshiOrderbookStream {
         transportConnected: false,
         authenticated: false,
         qualificationReady: false,
+        endpointUrl: this.currentEndpointUrl(),
         lastCloseAt: this.lastCloseAt,
         lastCloseCode: this.lastCloseCode,
         lastCloseReason: this.lastCloseReason,
@@ -580,6 +601,7 @@ export class KalshiOrderbookStream {
       trackingReady: telemetry.trackingReady,
       qualificationReady: telemetry.qualificationReady,
       environment: this.environment,
+      endpointUrl: telemetry.endpointUrl,
       endpointClass: 'market-data',
     });
     const tickerReady = this.registry.get('kalshi-ticker-ws')?.qualificationReady === true;
@@ -592,6 +614,7 @@ export class KalshiOrderbookStream {
       qualificationReady: tickerReady && telemetry.qualificationReady,
       reconnects: telemetry.reconnects,
       sequenceGaps: telemetry.sequenceGaps,
+      endpointUrl: telemetry.endpointUrl,
     });
   }
 
@@ -643,5 +666,15 @@ export class KalshiOrderbookStream {
 
   private isCurrent(socket: WebSocket, generation: number): boolean {
     return this.socket === socket && this.generation === generation;
+  }
+
+  private currentEndpointUrl(): string | null {
+    const endpoints = getKalshiEndpointPolicy(this.environment).websocketUrls;
+    return endpoints[this.endpointIndex] ?? endpoints[0] ?? null;
+  }
+
+  private advanceEndpoint(): void {
+    const count = getKalshiEndpointPolicy(this.environment).websocketUrls.length;
+    if (count > 1) this.endpointIndex = (this.endpointIndex + 1) % count;
   }
 }
