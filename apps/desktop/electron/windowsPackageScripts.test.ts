@@ -157,4 +157,15 @@ describe('Windows package staging scripts', () => {
     expect(main).toContain('renderer-first-heartbeat');
     expect(main).toContain('renderer-first-painted-heartbeat');
   });
+
+  it('requires an exact 25-ticker live orderbook set before preflight readiness', () => {
+    const main = fs.readFileSync(path.join(repoRoot, 'apps', 'desktop', 'electron', 'main.ts'), 'utf8');
+    const stream = fs.readFileSync(path.join(repoRoot, 'packages', 'connectors', 'src', 'kalshiOrderbookStream.ts'), 'utf8');
+    expect(main).toContain('const ORDERBOOK_TRACKING_LIMIT = 25');
+    expect(main).toContain('orderbook_tracking_set_below_25');
+    expect(main).toContain('orderbook.trackedTickers === ORDERBOOK_TRACKING_LIMIT');
+    expect(main).toContain('trackingReady: orderbook.trackingReady');
+    expect(stream).toContain('const trackingReady = this.tickers.size === DEFAULT_MAX_TRACKED_TICKERS');
+    expect(stream).toContain('&& trackingReady');
+  });
 });
