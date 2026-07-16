@@ -36,6 +36,7 @@ export function createGeaChildEnv(
     NEMESIS_BRIDGE_URL: bridgeUrl,
     NEMESIS_BRIDGE_TOKEN: bridgeToken,
     GEA_COORDINATE_TAPE_WITH_NEMESIS: 'true',
+    NEMESIS_SUPERVISED_GEA: 'true',
   };
   delete childEnv.VITE_DEV_SERVER_URL;
   // GEA consumes only the public, unsigned trade tape. Portfolio and exchange

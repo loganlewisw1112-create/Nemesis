@@ -3901,14 +3901,13 @@ function refreshOrderbookTracking(now = Date.now()): void {
   const desired = desiredOrderbookTickers(now);
   const desiredSet = new Set(desired);
   const critical = campaignCriticalOrderbookTickers(now).filter((ticker) => desiredSet.has(ticker));
-  // Discovery can briefly return fewer than 25 live markets while a refresh is
-  // in flight. Keep an already-complete set intact during that gap; readiness
-  // must not oscillate because a partial universe replaced a complete one.
-  if (desired.length < ORDERBOOK_TRACKING_LIMIT && orderbookTrackedTickers.length >= ORDERBOOK_TRACKING_LIMIT) return;
   const selection = selectBoundedOrderbookTracking({
     critical,
     desired,
-    current: orderbookTrackedTickers,
+    // Never carry a ticker forward unless the latest production/live universe
+    // still validates it. A partial refresh must fail readiness, not preserve
+    // a closed or stale market in the 25-slot set.
+    current: orderbookTrackedTickers.filter((ticker) => desiredSet.has(ticker)),
     now,
     lastRotationAt: orderbookLastRotationAt,
     cursor: orderbookRotationCursor,
@@ -4534,14 +4533,16 @@ function spawnGlobalEventAlpha() {
   });
   geaExitedDuringEvidence = false;
   geaProcess.stderr?.on('data', (d: Buffer) => {
-    process.stderr.write(`[gea] ${d.toString()}`);
     const sanitized = d.toString()
       .replace(/token=[^&\s]+/gi, 'token=[redacted]')
       .replace(/NEMESIS_BRIDGE_TOKEN\s*[:=]\s*[^\s]+/gi, 'NEMESIS_BRIDGE_TOKEN=[redacted]')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 500);
-    if (sanitized) startupTrace(`gea-stderr:${sanitized}`);
+    if (sanitized) {
+      process.stderr.write(`[gea] ${sanitized}\n`);
+      startupTrace(`gea-stderr:${sanitized}`);
+    }
   });
   geaProcess.once('error', (err) => {
     console.warn(`[gea] spawn failed: ${err.message}`);
@@ -4549,9 +4550,9 @@ function spawnGlobalEventAlpha() {
     if (pendingCampaignPointer) geaExitedDuringEvidence = true;
     if (!pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);
   });
-  geaProcess.once('exit', (code) => {
+  geaProcess.once('exit', (code, signal) => {
     console.log(`[gea] exited (code=${code ?? 'null'})`);
-    startupTrace(`gea-exit:${code ?? 'null'}`);
+    startupTrace(`gea-exit:${code ?? 'null'}:signal=${signal ?? 'none'}`);
     geaProcess = null;
     if (pendingCampaignPointer && !closeoutPrepared) geaExitedDuringEvidence = true;
     if (code !== 0 && !pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);

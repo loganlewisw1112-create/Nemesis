@@ -76,6 +76,7 @@ describe('GEA spawn planning', () => {
     expect(env.NEMESIS_BRIDGE_URL).toBe('ws://127.0.0.1:7430');
     expect(env.NEMESIS_BRIDGE_TOKEN).toBe('spawn-secret');
     expect(env.GEA_COORDINATE_TAPE_WITH_NEMESIS).toBe('true');
+    expect(env.NEMESIS_SUPERVISED_GEA).toBe('true');
     expect(env.VITE_DEV_SERVER_URL).toBeUndefined();
     expect(env.NEMESIS_KALSHI_PRIVATE_KEY).toBeUndefined();
     expect(env.NEMESIS_KALSHI_API_KEY_ID).toBeUndefined();

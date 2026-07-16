@@ -10,6 +10,7 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
 });
 
 import { app, BrowserWindow, ipcMain } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import WebSocket, { type RawData } from 'ws';
@@ -89,6 +90,10 @@ const RECONNECT_MAX_MS = 30_000;
 const EXIT_PACKET_TTL_MS = 500;
 
 let mainWindow: BrowserWindow | null = null;
+let rendererLoadRetryCount = 0;
+let rendererLoadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let rendererLoadFailed = false;
+let rendererLoadReady = false;
 let bridgeWs: WebSocket | null = null;
 let bridgeSeq = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -807,7 +812,55 @@ function setupIpc() {
   ipcMain.handle('gea:getIntelligenceState', () => intelligenceState);
 }
 
+function startupTrace(label: string): void {
+  if (process.env.NEMESIS_STARTUP_TRACE !== 'true') return;
+  const line = `[gea:start] ${Date.now()} ${label}`;
+  console.error(line);
+  const traceFile = process.env.NEMESIS_STARTUP_TRACE_FILE;
+  if (!traceFile) return;
+  try {
+    fs.mkdirSync(path.dirname(traceFile), { recursive: true });
+    fs.appendFileSync(traceFile, `${line}\n`);
+  } catch {
+    // Diagnostics must never block GEA startup.
+  }
+}
+
+function handleRendererLoadFailure(detail: string): void {
+  startupTrace(`renderer-load-failed:${detail}`);
+  if (rendererLoadReady || rendererLoadRetryTimer) return;
+  if (rendererLoadRetryCount < 1 && mainWindow && !mainWindow.isDestroyed()) {
+    rendererLoadRetryCount += 1;
+    startupTrace(`renderer-load-retry:${rendererLoadRetryCount}`);
+    rendererLoadRetryTimer = setTimeout(() => {
+      rendererLoadRetryTimer = null;
+      loadRendererPage();
+    }, 250);
+    return;
+  }
+  rendererLoadFailed = true;
+  startupTrace('renderer-load-terminal-failure');
+}
+
+function loadRendererPage(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  const target = devUrl ?? path.join(__dirname, '../dist/index.html');
+  startupTrace(`renderer-load-start:${target}`);
+  const load = devUrl ? mainWindow.loadURL(devUrl) : mainWindow.loadFile(target);
+  load.then(() => startupTrace('renderer-load-promise-ok'))
+    .catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      handleRendererLoadFailure(detail.replace(/\s+/g, ' ').slice(0, 300));
+    });
+}
+
 function createWindow() {
+  if (rendererLoadRetryTimer) clearTimeout(rendererLoadRetryTimer);
+  rendererLoadRetryTimer = null;
+  rendererLoadRetryCount = 0;
+  rendererLoadFailed = false;
+  rendererLoadReady = false;
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -821,15 +874,17 @@ function createWindow() {
     },
   });
 
-  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  startupTrace('window-created');
   mainWindow.once('ready-to-show', () => mainWindow?.show());
-
-  if (devUrl) {
-    mainWindow.loadURL(devUrl).catch((err: Error) => console.error('[gea] loadURL failed', err));
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
-  }
+  mainWindow.webContents.on('did-finish-load', () => {
+    rendererLoadReady = true;
+    startupTrace('renderer-did-finish-load');
+  });
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
+    if (isMainFrame) handleRendererLoadFailure(`${errorCode}:${errorDescription}`);
+  });
+  if (process.env.VITE_DEV_SERVER_URL) mainWindow.webContents.openDevTools({ mode: 'detach' });
+  loadRendererPage();
 }
 
 app.whenReady().then(async () => {
@@ -853,6 +908,12 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  // In supervised mode GEA is a headless worker. A transient renderer load
+  // failure or a closed hidden window must not terminate its bridge/feed work.
+  if (process.env.NEMESIS_SUPERVISED_GEA === 'true') {
+    startupTrace(rendererLoadFailed ? 'window-all-closed-after-renderer-failure' : 'window-all-closed-supervised');
+    return;
+  }
   tapeStartup.dispose();
   if (process.platform !== 'darwin') app.quit();
 });
