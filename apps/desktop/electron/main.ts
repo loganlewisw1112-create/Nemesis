@@ -221,6 +221,7 @@ let rendererLoadReadyPromise: Promise<void> = Promise.resolve();
 let resolveRendererLoadReady: (() => void) | null = null;
 let rendererRetryInProgress = false;
 let rendererProbePendingAfterPaint = false;
+let rendererProbeGateInProgress = false;
 const widgetWindows = new Set<BrowserWindow>();
 const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
@@ -1565,6 +1566,7 @@ function recordCampaignOperationalTelemetry(): void {
       // the bounded renderer retry window, its absence is not a GEA failure;
       // a terminal renderer load failure will block the attempt explicitly.
       geaRunning: rendererLoadRetryGraceActive
+        || rendererProbeGateInProgress
         || process.env.NEMESIS_AUTO_SPAWN_GEA === 'false'
         || Boolean(geaProcess && !geaProcess.killed),
       // Renderer memory/heartbeat faults are already carried with their exact
@@ -5559,10 +5561,15 @@ app.whenReady().then(async () => {
   // to create a false startup-liveness failure.
   await rendererLoadReadyPromise;
   startupTrace('renderer-load-gate-open');
-  if (!await waitForFreshRendererProbe()) {
-    rendererHeartbeatMonitor.markLoadFailed('renderer did not answer a fresh startup probe');
-    startupTrace('renderer-probe-gate-failed');
-    return;
+  rendererProbeGateInProgress = true;
+  try {
+    if (!await waitForFreshRendererProbe()) {
+      rendererHeartbeatMonitor.markLoadFailed('renderer did not answer a fresh startup probe');
+      startupTrace('renderer-probe-gate-failed');
+      return;
+    }
+  } finally {
+    rendererProbeGateInProgress = false;
   }
   startupTrace('renderer-probe-gate-open');
   spawnGlobalEventAlpha();
