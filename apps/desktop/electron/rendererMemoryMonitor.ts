@@ -180,9 +180,11 @@ export class RendererMemoryMonitor {
     }
 
     const trendStart = sample.at - this.policy.trendWindowMs;
-    // Startup allocation is intentionally excluded. The ten-minute growth gate
-    // becomes eligible only after a full post-warm-up trend window exists.
-    const trend = this.samples.filter((item) => item.at >= Math.max(trendStart, warmupCutoffAt));
+    // The first five scored minutes establish the baseline. Exclude that
+    // baseline window from the rolling-growth gate as well as startup, so the
+    // gate measures post-baseline retention rather than normal initial ramp.
+    const baselineWindowEndAt = warmupCutoffAt + this.warmupMs;
+    const trend = this.samples.filter((item) => item.at >= Math.max(trendStart, baselineWindowEndAt));
     const trendSpan = trend.length > 1 ? trend.at(-1)!.at - trend[0]!.at : 0;
     const growthRate = trendSpan >= this.policy.trendWindowMs * 0.9 ? rollingWindowGrowth(trend) : 0;
     if (growthRate > this.policy.trendGrowthLimit) {

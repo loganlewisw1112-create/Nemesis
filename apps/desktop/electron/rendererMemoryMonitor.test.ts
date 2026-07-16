@@ -16,7 +16,8 @@ describe('RendererMemoryMonitor', () => {
     expect(monitor.add({ at: 130, workingSetKb: 109 * MB, rendererPid: 1 }).status).toBe('stable');
     expect(monitor.snapshot().baselineKb).toBe(109.5 * MB);
 
-    expect(monitor.add({ at: 230, workingSetKb: 150 * MB, rendererPid: 1 }).status).toBe('unstable-growth');
+    expect(monitor.add({ at: 230, workingSetKb: 109 * MB, rendererPid: 1 }).status).toBe('stable');
+    expect(monitor.add({ at: 330, workingSetKb: 150 * MB, rendererPid: 1 }).status).toBe('unstable-growth');
   });
 
   it('blocks three consecutive samples above 384MB', () => {
@@ -79,9 +80,10 @@ describe('RendererMemoryMonitor', () => {
     monitor.add({ at: 0, workingSetKb: 80 * MB, painted: true });
     expect(monitor.add({ at: 5 * 60_000, workingSetKb: 100 * MB, painted: true }).status).toBe('stable');
     expect(monitor.add({ at: 10 * 60_000, workingSetKb: 111 * MB, painted: true }).blocked).toBe(false);
-    const result = monitor.add({ at: 15 * 60_000, workingSetKb: 112 * MB, painted: true });
+    expect(monitor.add({ at: 15 * 60_000, workingSetKb: 112 * MB, painted: true }).blocked).toBe(false);
+    const result = monitor.add({ at: 20 * 60_000, workingSetKb: 123 * MB, painted: true });
     expect(result.blocked).toBe(true);
-    expect(result.growthRate).toBeCloseTo(0.12);
+    expect(result.growthRate).toBeGreaterThan(0.10);
   });
 
   it('blocks a thirty-minute projected slope above two percent of baseline per hour', () => {
