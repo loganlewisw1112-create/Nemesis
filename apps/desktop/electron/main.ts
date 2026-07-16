@@ -5233,6 +5233,37 @@ function createWindow() {
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   const packagedIndexPath = path.join(__dirname, '../dist/index.html');
   let packagedLoadRetryCount = 0;
+  let packagedLoadRetryInFlight = false;
+  const handlePackagedLoadFailure = (detail: string) => {
+    if (packagedLoadRetryInFlight) return;
+    if (packagedLoadRetryCount < 1 && mainWindow && !mainWindow.isDestroyed()) {
+      packagedLoadRetryCount += 1;
+      packagedLoadRetryInFlight = true;
+      rendererHeartbeatMonitor.reset(Date.now());
+      startupTrace(`renderer-load-retry:${packagedLoadRetryCount}`);
+      setTimeout(() => {
+        packagedLoadRetryInFlight = false;
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        loadPackagedPage();
+      }, 250);
+      return;
+    }
+    rendererHeartbeatMonitor.markLoadFailed(detail);
+    resolveRendererLoadReady?.();
+    resolveRendererLoadReady = null;
+  };
+  const loadPackagedPage = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    startupTrace(`window-load-file:${packagedIndexPath}`);
+    mainWindow.loadFile(packagedIndexPath)
+      .then(() => startupTrace(packagedLoadRetryCount > 0 ? 'window-load-file-retry-ok' : 'window-load-file-ok'))
+      .catch((err) => {
+        const detail = `renderer loadFile failed: ${err instanceof Error ? err.message : String(err)}`;
+        startupTrace(`window-load-file-failed:${detail}`);
+        if (!devUrl) handlePackagedLoadFailure(detail);
+        else console.error('[nemesis] loadFile failed', err);
+      });
+  };
   const forceInitialPaint = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.invalidate();
@@ -5244,21 +5275,11 @@ function createWindow() {
     // A packaged file load can fail transiently while Electron is starting.
     // Retry once before declaring the renderer unavailable. The retry is
     // still inside startup; a renderer process restart later remains fatal.
-    if (!devUrl && packagedLoadRetryCount < 1 && mainWindow && !mainWindow.isDestroyed()) {
-      packagedLoadRetryCount += 1;
-      rendererHeartbeatMonitor.reset(Date.now());
-      startupTrace(`renderer-load-retry:${packagedLoadRetryCount}`);
-      setTimeout(() => {
-        if (!mainWindow || mainWindow.isDestroyed()) return;
-        mainWindow.loadFile(packagedIndexPath)
-          .then(() => startupTrace('window-load-file-retry-ok'))
-          .catch((err) => startupTrace(`window-load-file-retry-failed:${err instanceof Error ? err.message : String(err)}`));
-      }, 250);
+    if (!devUrl) {
+      handlePackagedLoadFailure(`renderer did-fail-load:${code}:${desc}`);
       return;
     }
     rendererHeartbeatMonitor.markLoadFailed(`renderer did-fail-load:${code}:${desc}`);
-    resolveRendererLoadReady?.();
-    resolveRendererLoadReady = null;
     if (devUrl && mainWindow) {
       setTimeout(() => {
         mainWindow?.loadURL(devUrl).catch((err) => console.error('[nemesis] reload failed', err));
@@ -5311,13 +5332,7 @@ function createWindow() {
     mainWindow.loadURL(devUrl).catch((err) => console.error('[nemesis] loadURL failed', err));
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    startupTrace(`window-load-file:${packagedIndexPath}`);
-    mainWindow.loadFile(packagedIndexPath)
-      .then(() => startupTrace('window-load-file-ok'))
-      .catch((err) => {
-        startupTrace(`window-load-file-failed:${err instanceof Error ? err.message : String(err)}`);
-        console.error('[nemesis] loadFile failed', err);
-      });
+    loadPackagedPage();
   }
   startupTrace('window-create-return');
 }
