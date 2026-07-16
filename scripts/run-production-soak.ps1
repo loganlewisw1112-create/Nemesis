@@ -352,7 +352,7 @@ try {
         # signals are stale as well.
         $runtimeStatusFresh = $null -ne $externalStatusAgeMs -and [double]$externalStatusAgeMs -le 15000
         $rendererHeartbeatFresh = $null -ne $externalStatus.renderer.heartbeatAgeMs -and [double]$externalStatus.renderer.heartbeatAgeMs -le 15000
-        $rendererProbeFresh = [bool]$externalStatus.renderer.probeResponseReceived `
+        $rendererProbeFresh = [bool]$externalStatus.renderer.rendererProbeResponseReceived `
           -and $null -ne $externalStatus.renderer.rendererProbeAgeMs `
           -and [double]$externalStatus.renderer.rendererProbeAgeMs -le 15000
         if ($runtimeStatusFresh -and $rendererHeartbeatFresh -and $rendererProbeFresh) {
@@ -452,7 +452,7 @@ try {
         if ($graceRendererActive -and ($null -eq $graceProcess -or !$graceProcess.Responding)) {
           $graceStatusFresh = $graceStatusAgeMs -le 15000
           $graceHeartbeatFresh = $null -ne $graceStatus.renderer.heartbeatAgeMs -and [double]$graceStatus.renderer.heartbeatAgeMs -le 15000
-          $graceProbeFresh = [bool]$graceStatus.renderer.probeResponseReceived `
+          $graceProbeFresh = [bool]$graceStatus.renderer.rendererProbeResponseReceived `
             -and $null -ne $graceStatus.renderer.rendererProbeAgeMs `
             -and [double]$graceStatus.renderer.rendererProbeAgeMs -le 15000
           if (!$graceStatusFresh -or !$graceHeartbeatFresh -or !$graceProbeFresh) {
