@@ -108,6 +108,39 @@ describe('DiscoveryOrchestrator fixture fallback', () => {
     ]);
   });
 
+  it('continues past sparse zero-volume pages until the 25-market live minimum is available', async () => {
+    const sparse = Array.from({ length: 100 }, (_, index) => ({
+      ticker: `KXEMPTY-${index}`,
+      title: `Empty market ${index}`,
+      status: 'active',
+      yes_bid_dollars: '0.0000',
+      yes_ask_dollars: '0.0000',
+      volume: 0,
+      volume_24h: 0,
+    } satisfies KalshiMarket));
+    const executable = Array.from({ length: 25 }, (_, index) => ({
+      ticker: `KXLIVE-${index}`,
+      title: `Live market ${index}`,
+      status: 'active',
+      yes_bid_dollars: '0.4000',
+      yes_ask_dollars: '0.4100',
+      volume: 1_000 + index,
+      volume_24h: 100 + index,
+    } satisfies KalshiMarket));
+    fetchMarketsMock
+      .mockResolvedValueOnce({ markets: sparse, cursor: 'page-2' })
+      .mockResolvedValueOnce({ markets: executable });
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    discovery.updateSettings({ maxTrackedTickers: 25, universePageSize: 100 });
+
+    await discovery.refreshUniverse();
+
+    expect(fetchMarketsMock).toHaveBeenCalledTimes(2);
+    expect(discovery.getUniverse()).toHaveLength(25);
+    expect(discovery.getUniverse()[0]?.ticker).toBe('KXLIVE-24');
+    expect(discovery.hasLiveUniverse()).toBe(true);
+  });
+
   it('does not treat fixtures as a stale live snapshot after a failed refresh', async () => {
     fetchMarketsMock.mockRejectedValue(new Error('rate limited'));
     const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());

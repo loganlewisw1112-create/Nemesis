@@ -25,6 +25,8 @@ import {
 const UNIVERSE_STALE_MS = 5 * 60_000;
 const ORDERBOOK_TTL_MS = 12_000;
 const REST_DEPTH_FALLBACK_PER_CYCLE = 8;
+const MAX_UNIVERSE_PAGES = 50;
+const MIN_EXECUTABLE_UNIVERSE = 25;
 
 export class DiscoveryOrchestrator {
   settings: DiscoverySettings = { ...DEFAULT_DISCOVERY_SETTINGS };
@@ -167,8 +169,13 @@ export class DiscoveryOrchestrator {
         if (pages === 1) {
           this.registry.recordSuccess('kalshi-rest', Date.now() - start);
         }
-        if (!cursor || merged.length >= this.settings.maxTrackedTickers * 2) break;
-      } while (pages < 10);
+        const executableCount = selectExecutableMarkets(merged).length;
+        // Kalshi may return long runs of newly-created, zero-volume
+        // combination markets before liquid live markets. Keep paging until
+        // the exact orderbook readiness minimum is available; do not let a
+        // shallow page cap manufacture an empty live universe.
+        if (!cursor || executableCount >= Math.min(this.settings.maxTrackedTickers, MIN_EXECUTABLE_UNIVERSE)) break;
+      } while (pages < MAX_UNIVERSE_PAGES);
 
       this.registry.recordSuccess('kalshi-rest', Date.now() - start);
       this.universe = selectExecutableMarkets(merged).slice(0, this.settings.maxTrackedTickers);
