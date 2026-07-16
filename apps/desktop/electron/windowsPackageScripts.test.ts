@@ -158,6 +158,13 @@ describe('Windows package staging scripts', () => {
     expect(main).toContain('renderer-first-painted-heartbeat');
   });
 
+  it('lets the packaged renderer load before starting heavy feed discovery', () => {
+    const main = fs.readFileSync(path.join(repoRoot, 'apps', 'desktop', 'electron', 'main.ts'), 'utf8');
+    expect(main).toContain('await rendererLoadReadyPromise');
+    expect(main).toContain("startupTrace('renderer-load-gate-open')");
+    expect(main).toContain('heartbeat.loadFinishedAt == null');
+  });
+
   it('requires an exact 25-ticker live orderbook set before preflight readiness', () => {
     const main = fs.readFileSync(path.join(repoRoot, 'apps', 'desktop', 'electron', 'main.ts'), 'utf8');
     const stream = fs.readFileSync(path.join(repoRoot, 'packages', 'connectors', 'src', 'kalshiOrderbookStream.ts'), 'utf8');

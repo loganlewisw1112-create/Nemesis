@@ -212,6 +212,8 @@ app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 startupTrace('module-loaded');
 
 let mainWindow: BrowserWindow | null = null;
+let rendererLoadReadyPromise: Promise<void> = Promise.resolve();
+let resolveRendererLoadReady: (() => void) | null = null;
 const widgetWindows = new Set<BrowserWindow>();
 const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
@@ -1018,9 +1020,15 @@ function sampleRendererMemory(): void {
     at: now,
     workingSetKb,
     rendererPid,
-    heartbeatAgeMs: heartbeat.lastHeartbeatAt == null && now <= heartbeat.loadingGraceUntil
+    // Do not feed a pre-load age into the memory gate. Electron can take time
+    // to finish loading the packaged page while the renderer process already
+    // exists; liveness starts only after did-finish-load and the heartbeat
+    // monitor still requires a real heartbeat after that point.
+    heartbeatAgeMs: heartbeat.loadFinishedAt == null
       ? 0
-      : heartbeat.heartbeatAgeMs,
+      : heartbeat.lastHeartbeatAt == null && now <= heartbeat.loadingGraceUntil
+        ? 0
+        : heartbeat.heartbeatAgeMs,
     unresponsiveForMs: heartbeat.unresponsiveForMs,
     painted: heartbeat.painted,
   });
@@ -5202,6 +5210,9 @@ function setupIpc() {
 
 function createWindow() {
   startupTrace('window-before-create');
+  rendererLoadReadyPromise = new Promise<void>((resolve) => {
+    resolveRendererLoadReady = resolve;
+  });
   rendererHeartbeatMonitor.reset(Date.now());
   stopRendererProbe();
   mainWindow = new BrowserWindow({
@@ -5238,6 +5249,8 @@ function createWindow() {
   mainWindow.webContents.on('did-finish-load', () => {
     startupTrace('renderer-did-finish-load');
     rendererHeartbeatMonitor.markLoadFinished(Date.now());
+    resolveRendererLoadReady?.();
+    resolveRendererLoadReady = null;
     startRendererProbe();
     forceInitialPaint();
     setTimeout(forceInitialPaint, 250);
@@ -5291,7 +5304,7 @@ function createWindow() {
   startupTrace('window-create-return');
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   startupTrace('ready');
   loadSettings();
   startupTrace('settings');
@@ -5440,6 +5453,12 @@ app.whenReady().then(() => {
 
   createWindow();
   startupTrace('window-created');
+  // Give the packaged renderer its first turn before starting the feeds and
+  // paginated discovery. Those operations can process thousands of markets
+  // synchronously when responses arrive and otherwise delay page load enough
+  // to create a false startup-liveness failure.
+  await rendererLoadReadyPromise;
+  startupTrace('renderer-load-gate-open');
   spawnGlobalEventAlpha();
   startupTrace('gea-spawned-feed-held');
   kalshiStream.start();
