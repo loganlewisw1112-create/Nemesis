@@ -215,6 +215,7 @@ startupTrace('module-loaded');
 let mainWindow: BrowserWindow | null = null;
 let rendererLoadReadyPromise: Promise<void> = Promise.resolve();
 let resolveRendererLoadReady: (() => void) | null = null;
+let rendererRetryInProgress = false;
 const widgetWindows = new Set<BrowserWindow>();
 const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
@@ -5273,6 +5274,7 @@ function createWindow(rendererRetryOrdinal = 0) {
         // ERR_FAILED can leave the original WebContents unusable. Recreate
         // the window once so the retry gets a fresh renderer process.
         const failedWindow = mainWindow;
+        rendererRetryInProgress = true;
         failedWindow.destroy();
         createWindow(packagedLoadRetryCount);
       }, 250);
@@ -5318,6 +5320,7 @@ function createWindow(rendererRetryOrdinal = 0) {
   });
   mainWindow.webContents.on('did-finish-load', () => {
     startupTrace('renderer-did-finish-load');
+    rendererRetryInProgress = false;
     rendererHeartbeatMonitor.markLoadFinished(Date.now());
     resolveRendererLoadReady?.();
     resolveRendererLoadReady = null;
@@ -5602,5 +5605,9 @@ app.on('will-quit', () => {
 app.on('before-quit', () => startupTrace('app-before-quit'));
 app.on('window-all-closed', () => {
   startupTrace('app-window-all-closed');
+  if (rendererRetryInProgress) {
+    startupTrace('app-window-all-closed-suppressed-during-renderer-retry');
+    return;
+  }
   if (process.platform !== 'darwin') app.quit();
 });
