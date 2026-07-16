@@ -397,8 +397,12 @@ export class FeedHub {
   }
 
   private tradeTapeQualificationReady(now = Date.now()): boolean {
-    return this.tradeFeedState.status === 'ok'
-      && this.tradesFetchedAt > 0
+    // A failed refresh does not make the last successful exchange snapshot
+    // stale. Keep the same 30-second evidence TTL, but avoid turning a
+    // transient request error into an unnecessary qualification outage.
+    // Once the cached snapshot is older than the TTL, it is display-only and
+    // cannot qualify or score evidence.
+    return this.tradesFetchedAt > 0
       && now - this.tradesFetchedAt <= STALE_MS.trades;
   }
 
@@ -579,8 +583,11 @@ export class FeedHub {
         nextRetryAt,
         failureClass,
         freshnessMs: this.tradesFetchedAt > 0 ? Math.max(0, failedAt - this.tradesFetchedAt) : null,
-        transportConnected: false,
-        qualificationReady: false,
+        // Preserve readiness only while the last successful exchange
+        // snapshot remains inside the existing 30-second TTL. This is not a
+        // freshness relaxation: stale cached trades still fail closed.
+        transportConnected: this.tradeTapeQualificationReady(failedAt),
+        qualificationReady: this.tradeTapeQualificationReady(failedAt),
         environment: 'production',
         endpointClass: 'market-data',
       });

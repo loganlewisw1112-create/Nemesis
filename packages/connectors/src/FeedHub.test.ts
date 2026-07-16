@@ -204,6 +204,41 @@ describe('FeedHub trade tape degradation', () => {
     expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
   });
 
+  it('keeps a fresh cached trade snapshot qualification-valid after a transient refresh failure', async () => {
+    const currentTradePayload = {
+      trade_id: 'tr-fresh',
+      ticker: 'KXLIVE',
+      yes_price_dollars: '0.6400',
+      no_price_dollars: '0.3600',
+      count_fp: '2.00',
+      taker_outcome_side: 'yes',
+      taker_book_side: 'bid',
+      created_time: '2026-06-27T11:59:00.000Z',
+    };
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ trades: [currentTradePayload] }))
+      .mockRejectedValue(new Error('fetch failed: transient trade endpoint timeout'));
+    const { hub, registry } = makeHub(fetchFn);
+
+    await refreshTrades(hub);
+    vi.setSystemTime(new Date('2026-06-27T12:00:20.000Z'));
+    const transientRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await transientRefresh;
+
+    expect(hub.getTradeFeedState()).toMatchObject({
+      status: 'degraded',
+      displayOnly: false,
+      qualificationReady: true,
+      cachedTradeCount: 1,
+    });
+    expect(hub.getTradesForTicker('KXLIVE')).toHaveLength(1);
+    expect(registry.get('kalshi-trades')).toMatchObject({
+      qualificationReady: true,
+      transportConnected: true,
+    });
+  });
+
   it('refreshes the trade tape before the 30-second qualification lease expires', () => {
     const { hub } = makeHub(vi.fn<typeof fetch>());
     const firstSuccessAt = Date.now();

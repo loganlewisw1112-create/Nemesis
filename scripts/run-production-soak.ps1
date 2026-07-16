@@ -311,6 +311,7 @@ try {
         externalStatusAgeMs = $externalStatusAgeMs
         runtimeState = if ($null -eq $externalStatus) { $null } else { $externalStatus.runtime.state }
         runtimeAction = if ($null -eq $externalStatus) { $null } else { $externalStatus.runtime.action }
+        runtimeReasons = if ($null -eq $externalStatus -or $null -eq $externalStatus.runtime.reasons) { @() } else { @($externalStatus.runtime.reasons) }
         runtimeLeaseStatus = if ($null -eq $externalStatus) { $null } else { $externalStatus.runtime.lease.status }
         rendererStatus = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.status }
         rendererBlocked = if ($null -eq $externalStatus) { $null } else { [bool]$externalStatus.renderer.blocked }
@@ -322,6 +323,8 @@ try {
         feedQualificationReady = $feedReady
         bridgeQualificationReady = $bridgeReady
         trackedOrderbookTickers = if ($null -eq $externalStatus) { $null } else { $externalStatus.feeds.orderbookWebSocket.trackedTickers }
+        orderbookQualifiedTickers = if ($null -eq $externalStatus) { $null } else { $externalStatus.feeds.orderbookWebSocket.qualifiedTickers }
+        orderbookLastSequencedDeltaAt = if ($null -eq $externalStatus) { $null } else { $externalStatus.feeds.orderbookWebSocket.lastSequencedDeltaAt }
       }
       $samples.Add([pscustomobject]$sample)
       ($sample | ConvertTo-Json -Compress) | Add-Content -LiteralPath $samplesPath -Encoding utf8
