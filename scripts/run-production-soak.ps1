@@ -329,7 +329,7 @@ try {
         rendererSlopeWindowMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.slopeWindowMs }
         rendererHeartbeatAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.heartbeatAgeMs }
         rendererProbeAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.rendererProbeAgeMs }
-        rendererProbeResponseReceived = if ($null -eq $externalStatus) { $null } else { [bool]$externalStatus.renderer.probeResponseReceived }
+        rendererProbeResponseReceived = if ($null -eq $externalStatus) { $null } else { [bool]$externalStatus.renderer.rendererProbeResponseReceived }
         rendererUnresponsiveForMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.unresponsiveForMs }
         feedQualificationReady = $feedReady
         bridgeQualificationReady = $bridgeReady
@@ -544,7 +544,7 @@ try {
   $finalRendererBlocked = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.blocked } elseif ($null -ne $latestRuntimeStatusSample) { [bool]$latestRuntimeStatusSample.rendererBlocked } else { $true }
   $finalRendererHeartbeatAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.heartbeatAgeMs } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererHeartbeatAgeMs } else { $null }
   $finalRendererProbeAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.rendererProbeAgeMs } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererProbeAgeMs } else { $null }
-  $finalRendererProbeResponseReceived = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.probeResponseReceived } elseif ($null -ne $latestRuntimeStatusSample) { [bool]$latestRuntimeStatusSample.rendererProbeResponseReceived } else { $false }
+  $finalRendererProbeResponseReceived = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.rendererProbeResponseReceived } elseif ($null -ne $latestRuntimeStatusSample) { [bool]$latestRuntimeStatusSample.rendererProbeResponseReceived } else { $false }
   $finalRuntimeStatusAgeMs = if ($null -ne $cutoffExternalStatus -and $null -ne $cutoffExternalStatus.updatedAt) {
     [Math]::Max(0, $cutoffCapturedAt.ToUnixTimeMilliseconds() - [double]$cutoffExternalStatus.updatedAt)
   } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.externalStatusAgeMs } else { $null }
