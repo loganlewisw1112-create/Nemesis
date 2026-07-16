@@ -165,6 +165,7 @@ describe('Windows package staging scripts', () => {
     expect(main).toContain('orderbook_tracking_set_below_25');
     expect(main).toContain('orderbook.trackedTickers === ORDERBOOK_TRACKING_LIMIT');
     expect(main).toContain('trackingReady: orderbook.trackingReady');
+    expect(main).toContain('desired.length < ORDERBOOK_TRACKING_LIMIT && orderbookTrackedTickers.length >= ORDERBOOK_TRACKING_LIMIT');
     expect(stream).toContain('const trackingReady = this.tickers.size === DEFAULT_MAX_TRACKED_TICKERS');
     expect(stream).toContain('&& trackingReady');
   });

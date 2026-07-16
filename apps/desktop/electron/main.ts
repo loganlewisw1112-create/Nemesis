@@ -3889,12 +3889,14 @@ function refreshOrderbookTracking(now = Date.now()): void {
   const desired = desiredOrderbookTickers(now);
   const desiredSet = new Set(desired);
   const critical = campaignCriticalOrderbookTickers(now).filter((ticker) => desiredSet.has(ticker));
+  // Discovery can briefly return fewer than 25 live markets while a refresh is
+  // in flight. Keep an already-complete set intact during that gap; readiness
+  // must not oscillate because a partial universe replaced a complete one.
+  if (desired.length < ORDERBOOK_TRACKING_LIMIT && orderbookTrackedTickers.length >= ORDERBOOK_TRACKING_LIMIT) return;
   const selection = selectBoundedOrderbookTracking({
     critical,
     desired,
-    // Do not retain a ticker that has left the live production universe; the
-    // rotation helper is sticky only for still-valid entries.
-    current: orderbookTrackedTickers.filter((ticker) => desiredSet.has(ticker)),
+    current: orderbookTrackedTickers,
     now,
     lastRotationAt: orderbookLastRotationAt,
     cursor: orderbookRotationCursor,
