@@ -213,9 +213,12 @@ export class RendererHeartbeatMonitor {
     const latestProbeWasAnswered = this.lastProbeSequence == null
       || this.lastProbeResponseSequence === this.lastProbeSequence;
     const latestProbeAgeMs = this.lastProbeSentAt == null ? 0 : Math.max(0, now - this.lastProbeSentAt);
+    // While a newer probe is in flight, the age of the previous response is
+    // not a failure. Only the current probe's response deadline matters. Once
+    // that probe is answered, the normal age of the latest response applies.
     if (this.lastProbeSentAt != null
       && ((!latestProbeWasAnswered && latestProbeAgeMs > this.policy.probeMaxAgeMs)
-        || probeAgeMs > this.policy.probeMaxAgeMs)) {
+        || (latestProbeWasAnswered && probeAgeMs > this.policy.probeMaxAgeMs))) {
       this.stickyReasons.add('renderer probe response was absent or stale');
     }
     if (this.loadFinishedAt != null && unresponsiveForMs > this.policy.unresponsiveMaxMs) {

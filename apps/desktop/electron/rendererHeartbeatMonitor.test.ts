@@ -100,6 +100,21 @@ describe('RendererHeartbeatMonitor', () => {
     expect(monitor.snapshot(2_201).blocked).toBe(false);
   });
 
+  it('does not treat the previous response as stale while the latest probe is in flight', () => {
+    const monitor = new RendererHeartbeatMonitor(0);
+    monitor.markLoadFinished(1);
+    monitor.recordHeartbeat({ receivedAt: 1_000, reportedAt: 1_000, sequence: 1, painted: true });
+    monitor.recordProbeSent(1_000, 1);
+    monitor.recordProbeResponse({ receivedAt: 1_100, sentAt: 1_000, sequence: 1 });
+    monitor.recordHeartbeat({ receivedAt: 16_000, reportedAt: 16_000, sequence: 2, painted: true });
+    monitor.recordHeartbeat({ receivedAt: 20_000, reportedAt: 20_000, sequence: 3, painted: true });
+    monitor.recordProbeSent(20_000, 2);
+
+    expect(monitor.snapshot(34_999).blocked).toBe(false);
+    monitor.recordProbeResponse({ receivedAt: 34_000, sentAt: 20_000, sequence: 2 });
+    expect(monitor.snapshot(34_001).blocked).toBe(false);
+  });
+
   it('latches a renderer restart as an invalidating failure', () => {
     const monitor = new RendererHeartbeatMonitor(0);
     monitor.recordHeartbeat({ receivedAt: 1_000, sequence: 1 });
