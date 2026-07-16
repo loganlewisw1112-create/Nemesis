@@ -4532,6 +4532,7 @@ function spawnGlobalEventAlpha() {
     windowsHide: plan.windowsHide,
   });
   geaExitedDuringEvidence = false;
+  startupTrace(`gea-spawned-pid:${geaProcess.pid}`);
   geaProcess.stderr?.on('data', (d: Buffer) => {
     const sanitized = d.toString()
       .replace(/token=[^&\s]+/gi, 'token=[redacted]')
@@ -4545,6 +4546,8 @@ function spawnGlobalEventAlpha() {
     }
   });
   geaProcess.once('error', (err) => {
+    const detail = err instanceof Error ? err.message : String(err);
+    startupTrace(`gea-error:${detail.replace(/\s+/g, ' ').slice(0, 300)}`);
     console.warn(`[gea] spawn failed: ${err.message}`);
     geaProcess = null;
     if (pendingCampaignPointer) geaExitedDuringEvidence = true;
@@ -4556,6 +4559,9 @@ function spawnGlobalEventAlpha() {
     geaProcess = null;
     if (pendingCampaignPointer && !closeoutPrepared) geaExitedDuringEvidence = true;
     if (code !== 0 && !pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);
+  });
+  geaProcess.once('close', (code, signal) => {
+    startupTrace(`gea-close:${code ?? 'null'}:signal=${signal ?? 'none'}`);
   });
 }
 
