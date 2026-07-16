@@ -187,10 +187,13 @@ export class RendererMemoryMonitor {
 
     let slopePerHour = 0;
     if (this.baselineKb != null) {
-      const slopeStart = sample.at - this.policy.slopeWindowMs;
+      // The projected slope describes sustained post-warm-up behavior. Startup
+      // allocation must not enter this regression, and the gate is not eligible
+      // until a complete thirty-minute observation window exists.
+      const slopeStart = Math.max(sample.at - this.policy.slopeWindowMs, warmupCutoffAt);
       const slopeWindow = this.samples.filter((item) => item.at >= slopeStart);
       const slopeSpan = slopeWindow.length > 1 ? slopeWindow.at(-1)!.at - slopeWindow[0]!.at : 0;
-      if (slopeSpan >= this.policy.slopeWindowMs * 0.9) {
+      if (slopeSpan >= this.policy.slopeWindowMs) {
         slopePerHour = normalizedSlopePerHour(slopeWindow, this.baselineKb);
         if (slopePerHour > this.policy.slopeLimitPerHour) {
           reasons.push(`renderer projected slope ${(slopePerHour * 100).toFixed(2)}% of baseline per hour exceeds 2%`);

@@ -93,6 +93,23 @@ describe('RendererMemoryMonitor', () => {
     expect(result.detail).toContain('projected slope');
   });
 
+  it('excludes warm-up allocation and waits for a full thirty-minute slope window', () => {
+    const monitor = new RendererMemoryMonitor(5 * 60_000, 1);
+    monitor.add({ at: 0, workingSetKb: 80 * MB, painted: true });
+    monitor.add({ at: 5 * 60_000, workingSetKb: 100 * MB, painted: true });
+    for (let minute = 10; minute <= 30; minute += 5) {
+      monitor.add({ at: minute * 60_000, workingSetKb: 100 * MB, painted: true });
+    }
+
+    const early = monitor.add({ at: 32 * 60_000, workingSetKb: 101 * MB, painted: true });
+    expect(early.status).toBe('stable');
+    expect(early.slopePerHour).toBe(0);
+
+    const complete = monitor.add({ at: 35 * 60_000, workingSetKb: 100 * MB, painted: true });
+    expect(complete.status).toBe('stable');
+    expect(complete.slopePerHour).toBeLessThanOrEqual(0.02);
+  });
+
   it('blocks a post-paint sample more than fifty percent above baseline', () => {
     const monitor = new RendererMemoryMonitor(0, 1);
     monitor.add({ at: 0, workingSetKb: 100 * MB, painted: true });
