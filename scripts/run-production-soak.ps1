@@ -420,7 +420,10 @@ try {
     # unscored sample interval to export its completed slope and final lease.
     if ($null -eq $runtimeFailure -and $null -ne $scoredDeadline) {
       $closeoutGraceStartedElapsedMs = $runStopwatch.ElapsedMilliseconds
-      $closeoutGraceDeadlineElapsedMs = $closeoutGraceStartedElapsedMs + (($SampleSeconds + 5) * 1000)
+      # The runtime memory sampler is independent of the runner and may tick
+      # once per minute. Keep scoring closed at the exact cutoff, but allow one
+      # complete sampler interval for the runtime slope lease to become valid.
+      $closeoutGraceDeadlineElapsedMs = $closeoutGraceStartedElapsedMs + [Math]::Max(60000, (($SampleSeconds + 5) * 1000))
       while ($runStopwatch.ElapsedMilliseconds -lt $closeoutGraceDeadlineElapsedMs) {
         $graceStatus = $null
         if (Test-Path -LiteralPath $runtimeStatusPath) {
