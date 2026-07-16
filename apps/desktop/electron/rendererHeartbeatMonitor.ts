@@ -204,7 +204,9 @@ export class RendererHeartbeatMonitor {
     // mistaken for a stale heartbeat before the page exists.
     if (this.loadFinishedAt != null && this.lastHeartbeatAt == null && now > loadingGraceUntil) {
       this.stickyReasons.add('renderer heartbeat was absent after the startup loading grace');
-    } else if (this.lastHeartbeatAt != null && heartbeatAgeMs > this.policy.heartbeatMaxAgeMs) {
+    } else if (this.loadFinishedAt != null
+      && this.lastHeartbeatAt != null
+      && heartbeatAgeMs > this.policy.heartbeatMaxAgeMs) {
       this.stickyReasons.add('renderer heartbeat gap exceeded 15 seconds');
     }
     // A probe is allowed its normal response window.  Treat a missing response

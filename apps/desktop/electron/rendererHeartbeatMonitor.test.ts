@@ -31,6 +31,15 @@ describe('RendererHeartbeatMonitor', () => {
     expect(monitor.snapshot(20_101).reasons).toContain('renderer heartbeat IPC delivery exceeded 15 seconds');
   });
 
+  it('does not latch a heartbeat gap before page load completes', () => {
+    const monitor = new RendererHeartbeatMonitor(1_000);
+    monitor.recordHeartbeat({ receivedAt: 2_000, reportedAt: 2_000, sequence: 1 });
+
+    expect(monitor.snapshot(20_000).blocked).toBe(false);
+    monitor.markLoadFinished(20_000);
+    expect(monitor.snapshot(35_001).reasons).toContain('renderer heartbeat gap exceeded 15 seconds');
+  });
+
   it('records the first heartbeat and first painted heartbeat with ordered sequences', () => {
     const monitor = new RendererHeartbeatMonitor(0);
     monitor.markLoadFinished(100);
