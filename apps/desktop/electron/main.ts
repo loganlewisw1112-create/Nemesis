@@ -189,7 +189,11 @@ const PAPER_BROADCAST_THROTTLE_MS = 1_000;
 const PAPER_SUMMARY_BROADCAST_THROTTLE_MS = 5_000;
 const CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS = 500;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
-const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
+// Sparse live-universe pages can require more than the old single-page
+// timeout before 25 executable markets are found. The preflight still has its
+// own 20-minute ceiling; this only prevents a valid paginated discovery from
+// being aborted before the orderbook readiness minimum is reachable.
+const UNIVERSE_FETCH_TIMEOUT_MS = 120_000;
 const REST_HEALTH_POLL_MS = 20_000;
 const UNIVERSE_REFRESH_MS = 5 * 60_000;
 const BRIDGE_HEARTBEAT_MS = 5_000;
