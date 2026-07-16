@@ -216,6 +216,7 @@ let mainWindow: BrowserWindow | null = null;
 let rendererLoadReadyPromise: Promise<void> = Promise.resolve();
 let resolveRendererLoadReady: (() => void) | null = null;
 let rendererRetryInProgress = false;
+let rendererProbePendingAfterPaint = false;
 const widgetWindows = new Set<BrowserWindow>();
 const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
@@ -543,6 +544,7 @@ function sendRendererProbe(): void {
 
 function startRendererProbe(): void {
   stopRendererProbe();
+  rendererProbePendingAfterPaint = false;
   rendererProbeSequence = 0;
   sendRendererProbe();
   rendererProbeTimer = setInterval(sendRendererProbe, 5_000);
@@ -4640,7 +4642,10 @@ function setupIpc() {
     });
     const after = rendererHeartbeatMonitor.snapshot();
     if (before.firstHeartbeatAt == null && after.firstHeartbeatAt != null) startupTrace('renderer-first-heartbeat');
-    if (before.firstPaintedAt == null && after.firstPaintedAt != null) startupTrace('renderer-first-painted-heartbeat');
+    if (before.firstPaintedAt == null && after.firstPaintedAt != null) {
+      startupTrace('renderer-first-painted-heartbeat');
+      if (rendererProbePendingAfterPaint) startRendererProbe();
+    }
   });
   ipcMain.on('renderer:heartbeat-send-failed', (event) => {
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
@@ -5242,6 +5247,7 @@ function createWindow(rendererRetryOrdinal = 0) {
   });
   rendererHeartbeatMonitor.reset(Date.now());
   stopRendererProbe();
+  rendererProbePendingAfterPaint = true;
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -5326,7 +5332,10 @@ function createWindow(rendererRetryOrdinal = 0) {
     rendererHeartbeatMonitor.markLoadFinished(Date.now());
     resolveRendererLoadReady?.();
     resolveRendererLoadReady = null;
-    startRendererProbe();
+    // Wait for the first painted heartbeat before probing. A page can report
+    // did-finish-load while its initial React paint is still busy; probing
+    // before paint measures startup work rather than renderer liveness.
+    if (rendererHeartbeatMonitor.snapshot().firstPaintedAt != null) startRendererProbe();
     forceInitialPaint();
     setTimeout(forceInitialPaint, 250);
     setTimeout(forceInitialPaint, 1_000);
