@@ -11,6 +11,8 @@ const soakResultPath = path.join(soakDir, 'production-soak-result.json');
 const soakSamplesPath = path.join(soakDir, 'production-soak-samples.jsonl');
 const campaignDir = path.join(process.env.APPDATA ?? '', '@nemesis', 'desktop', 'nemesis-data', 'evidence-campaigns');
 const r9Path = path.join(campaignDir, 'nemesis-instrumentation-2026-07-15-r9.jsonl');
+const r3RunId = 'nemesis-instrumentation-2026-07-15-r3';
+const r3Path = path.join(campaignDir, `${r3RunId}.jsonl`);
 const r10RunId = 'nemesis-instrumentation-2026-07-15-r10';
 const r10ResultPath = path.join(campaignDir, `${r10RunId}.result.json`);
 const expectedR9Hash = '7c93e9beafe8ec7af52f7483942f3edccff24e18aeab3f0c209b39cfe4c015ff';
@@ -19,6 +21,14 @@ const generatedAt = new Date().toISOString();
 function readJson(filePath) {
   if (!fs.existsSync(filePath)) return null;
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function readJsonl(filePath) {
+  if (!fs.existsSync(filePath)) return [];
+  return fs.readFileSync(filePath, 'utf8')
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 function sha256File(filePath) {
@@ -57,6 +67,17 @@ const soakSamples = fs.existsSync(soakSamplesPath)
   ? fs.readFileSync(soakSamplesPath, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
   : [];
 const r10 = readJson(r10ResultPath);
+const r3Events = readJsonl(r3Path);
+let r3HashChainValid = r3Events.length > 0;
+let r3PreviousHash = 'GENESIS';
+for (const event of r3Events) {
+  const unsigned = { ...event };
+  delete unsigned.hash;
+  const expectedHash = crypto.createHash('sha256').update(JSON.stringify(unsigned)).digest('hex');
+  if (event.previousHash !== r3PreviousHash || event.hash !== expectedHash) r3HashChainValid = false;
+  r3PreviousHash = event.hash;
+}
+const r3Invalidation = r3Events.find((event) => event.type === 'run_invalidated');
 const verification = readJson(path.join(outputDir, 'verification-summary.json'));
 const soakPassed = soak?.passed === true;
 const r10Passed = r10?.passed === true;
@@ -125,7 +146,7 @@ const soakBody = soak ? `## 30-minute production soak\n\nResult: **${passLabel(s
   : '## 30-minute production soak\n\nNo finalized official soak result was found. R10 remains locked.';
 
 const r10Body = r10 ? `## R10 two-hour instrumentation result\n\nResult: **${passLabel(r10.passed)}**.\n\n- Economically viable candidates: **${r10Metrics?.candidates ?? 'n/a'}**; required at least 20.\n- Terminal lifecycle coverage: **${percent(r10Metrics?.terminalCoverage)}**; required 100%.\n- Diagnostic scheduling coverage: **${percent(r10Metrics?.diagnosticSchedulingCoverage)}**; required at least 95%.\n- Valid diagnostic coverage: **${percent(r10Metrics?.validDiagnosticCoverage)}**; required at least 90%.\n- Valid diagnostic outcomes: **${r10Metrics?.validDiagnosticOutcomes ?? 'n/a'}**.\n- True exchange-book freshness: **${percent(r10Metrics?.freshConfirmationRate)}**; required at least 95%.\n- Ready candidates: **${r10Metrics?.readyCandidates ?? 'n/a'}**.\n- Healthy runtime samples: **${r10Metrics?.runtimeHealthySamples ?? 'n/a'} / ${r10Metrics?.runtimeObservedSamples ?? 'n/a'}**.\n\n${Array.isArray(r10.reasons) && r10.reasons.length > 0 ? `Failure reasons: ${r10.reasons.join('; ')}.` : 'No r10 gate failures were recorded.'}`
-  : '## R10 two-hour instrumentation result\n\nR10 was not run because no eligible finalized soak result was available, or it has not yet finalized.';
+  : `## R10 two-hour instrumentation result\n\nR10 was not run because no eligible finalized soak result was available, or it has not yet finalized.\n\n- Two-hour prerequisite ${r3RunId}: **${r3Invalidation ? 'FAIL / INVALIDATED' : 'not finalized'}**.\n- Prerequisite hash chain: **${r3HashChainValid ? 'valid' : 'not proven'}** across ${r3Events.length} events.\n- Prerequisite terminal reason: **${r3Invalidation?.payload?.reason ?? 'not recorded'}**.`;
 
 const verificationBody = verification
   ? `## Pre-run verification\n\n- Test files: **${verification.testFilesPassed ?? 'n/a'} passed**. Tests: **${verification.testsPassed ?? 'n/a'} passed**.\n- Type-checks: **${verification.typechecksPassed === true ? 'passed' : 'not proven'}**. Production builds: **${verification.productionBuildPassed === true ? 'passed' : 'not proven'}**.\n- Diff checks: **${verification.diffChecksPassed === true ? 'passed' : 'not proven'}**.\n- Preserved r9 hash: **verified**.\n- Frozen commit: \`${soak?.gitCommit ?? verification.gitCommit ?? 'not available'}\`.`
@@ -210,6 +231,7 @@ const sources = [
   source('r9_ledger', 'Preserved r9 schema-v1 campaign ledger and verified SHA-256', 'nemesis-instrumentation-2026-07-15-r9.jsonl'),
   ...(soak ? [source('soak_result', 'Official schema-v2 production soak result', 'soak/production-soak-result.json')] : []),
   ...(r10 ? [source('r10_result', 'Official schema-v2 r10 result', `${r10RunId}.result.json`)] : []),
+  ...(r3Events.length > 0 ? [source('r3_prerequisite', 'Two-hour prerequisite r3 ledger and terminal result', `${r3RunId}.jsonl`)] : []),
   ...(soakAttempts.length > 0 ? [source('soak_attempts', 'Archived schema-v2 soak attempts', 'soak-attempts/')] : []),
   ...(verification ? [source('verification', 'Build, test, type-check, diff, and hash verification summary', 'verification-summary.json')] : []),
   source('notes', 'Evidence inventory and report-generation notes', 'source-notes.md'),
@@ -246,11 +268,12 @@ const inventory = {
   r9: { path: r9Path, sha256: actualR9Hash, verified: true },
   soak: { path: soakResultPath, present: Boolean(soak), passed: soak?.passed ?? null, sha256: fs.existsSync(soakResultPath) ? sha256File(soakResultPath) : null },
   soakAttempts: soakAttempts.map((attempt) => ({ namespace: attempt.namespace, attemptId: attempt.attemptId ?? null, passed: attempt.passed ?? null })),
+  r3: { runId: r3RunId, path: r3Path, present: r3Events.length > 0, eventCount: r3Events.length, hashChainValid: r3HashChainValid, terminalType: r3Events.at(-1)?.type ?? null, terminalReason: r3Invalidation?.payload?.reason ?? null },
   r10: { runId: r10RunId, path: r10ResultPath, present: Boolean(r10), passed: r10?.passed ?? null, sha256: fs.existsSync(r10ResultPath) ? sha256File(r10ResultPath) : null },
   sevenHourUnlocked,
 };
 
-const notes = `# NEMESIS r9 gap closure and r10 report notes\n\nGenerated: ${generatedAt}\n\n- The r9 ledger was read only and verified at SHA-256 ${actualR9Hash}.\n- The interrupted 28.56-minute attempt remains incomplete evidence and is excluded from qualification.\n- Soak state: ${soak ? passLabel(soak.passed) : 'not finalized'}.\n- Archived soak attempts: ${soakAttempts.length}.\n- R10 state: ${r10 ? passLabel(r10.passed) : 'not run or not finalized'}.\n- Seven-hour unlock: ${sevenHourUnlocked ? 'yes' : 'no'}.\n- The report generator recommends the seven-hour campaign only when both the official soak and r10 have passed.\n- Existing reports and historical evidence are not overwritten.\n`;
+const notes = `# NEMESIS r9 gap closure and r10 report notes\n\nGenerated: ${generatedAt}\n\n- The r9 ledger was read only and verified at SHA-256 ${actualR9Hash}.\n- The interrupted 28.56-minute attempt remains incomplete evidence and is excluded from qualification.\n- Soak state: ${soak ? passLabel(soak.passed) : 'not finalized'}.\n- Archived soak attempts: ${soakAttempts.length}.\n- R10 state: ${r10 ? passLabel(r10.passed) : 'not run or not finalized'}.\n- Two-hour prerequisite r3: ${r3Invalidation ? 'invalidated' : r3Events.length > 0 ? 'not invalidated' : 'not found'}; hash chain ${r3HashChainValid ? 'valid' : 'not proven'}.\n- Seven-hour unlock: ${sevenHourUnlocked ? 'yes' : 'no'}.\n- The report generator recommends the seven-hour campaign only when both the official soak and r10 have passed.\n- Existing reports and historical evidence are not overwritten.\n`;
 
 fs.writeFileSync(path.join(outputDir, 'artifact.json'), `${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
 fs.writeFileSync(path.join(outputDir, 'evidence-inventory.json'), `${JSON.stringify(inventory, null, 2)}\n`, 'utf8');
