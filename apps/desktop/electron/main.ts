@@ -200,6 +200,7 @@ const BRIDGE_HEARTBEAT_MS = 5_000;
 const BRIDGE_TRAFFIC_TTL_MS = 15_000;
 const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
 const RENDERER_MEMORY_SAMPLE_INTERVAL_MS = 30_000;
+const RENDERER_LOAD_RETRY_GRACE_MS = 60_000;
 // Discovery still evaluates 500 tickers. Live depth is a smaller, rotating
 // working set so the authenticated socket carries only immediately useful
 // markets; active campaign candidates preempt this set.
@@ -1532,6 +1533,10 @@ function recordCampaignOperationalTelemetry(): void {
   }
   const components = runtimeComponents(now);
   const rendererRuntimeAssessment = currentRendererRuntimeAssessment(now);
+  const rendererHeartbeat = rendererHeartbeatMonitor.snapshot(now);
+  const rendererLoadRetryGraceActive = rendererHeartbeat.loadFinishedAt == null
+    && now - rendererHeartbeat.loadStartedAt <= RENDERER_LOAD_RETRY_GRACE_MS
+    && !rendererHeartbeat.blocked;
   const supervisorState = evidenceRunSupervisor?.snapshot().status;
   if (supervisorState === 'preflight') runtimeHealthController = new RuntimeHealthController();
   latestRuntimeDecision = runtimeHealthController.observe({
@@ -1539,7 +1544,12 @@ function recordCampaignOperationalTelemetry(): void {
     components,
     renderer: rendererRuntimeAssessment,
     process: {
-      geaRunning: process.env.NEMESIS_AUTO_SPAWN_GEA === 'false' || Boolean(geaProcess && !geaProcess.killed),
+      // GEA is intentionally held until the renderer load gate opens. During
+      // the bounded renderer retry window, its absence is not a GEA failure;
+      // a terminal renderer load failure will block the attempt explicitly.
+      geaRunning: rendererLoadRetryGraceActive
+        || process.env.NEMESIS_AUTO_SPAWN_GEA === 'false'
+        || Boolean(geaProcess && !geaProcess.killed),
       // Renderer memory/heartbeat faults are already carried with their exact
       // reasons above. Main-process responsiveness is supervised externally.
       nemesisResponsive: true,
@@ -5224,7 +5234,7 @@ function setupIpc() {
   });
 }
 
-function createWindow() {
+function createWindow(rendererRetryOrdinal = 0) {
   startupTrace('window-before-create');
   rendererLoadReadyPromise = new Promise<void>((resolve) => {
     resolveRendererLoadReady = resolve;
@@ -5248,7 +5258,7 @@ function createWindow() {
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   const packagedIndexPath = path.join(__dirname, '../dist/index.html');
-  let packagedLoadRetryCount = 0;
+  let packagedLoadRetryCount = rendererRetryOrdinal;
   let packagedLoadRetryInFlight = false;
   const handlePackagedLoadFailure = (detail: string) => {
     if (packagedLoadRetryInFlight) return;
@@ -5260,7 +5270,11 @@ function createWindow() {
       setTimeout(() => {
         packagedLoadRetryInFlight = false;
         if (!mainWindow || mainWindow.isDestroyed()) return;
-        loadPackagedPage();
+        // ERR_FAILED can leave the original WebContents unusable. Recreate
+        // the window once so the retry gets a fresh renderer process.
+        const failedWindow = mainWindow;
+        failedWindow.destroy();
+        createWindow(packagedLoadRetryCount);
       }, 250);
       return;
     }
@@ -5317,6 +5331,7 @@ function createWindow() {
   });
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error('[nemesis] render-process-gone', details.reason, details.exitCode);
+    startupTrace(`renderer-process-gone:${details.reason}:${details.exitCode}`);
     rendererHeartbeatMonitor.markRendererGone();
   });
   mainWindow.webContents.on('console-message', (event) => {
@@ -5331,13 +5346,18 @@ function createWindow() {
   });
   mainWindow.on('unresponsive', () => {
     rendererHeartbeatMonitor.markUnresponsive();
+    startupTrace('renderer-unresponsive');
     console.error('[nemesis] main window became unresponsive');
   });
   mainWindow.on('responsive', () => {
     rendererHeartbeatMonitor.markResponsive();
+    startupTrace('renderer-responsive');
     console.warn('[nemesis] main window became responsive again');
   });
-  mainWindow.on('closed', () => stopRendererProbe());
+  mainWindow.on('closed', () => {
+    startupTrace('window-closed');
+    stopRendererProbe();
+  });
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
@@ -5569,6 +5589,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('will-quit', () => {
+  startupTrace('app-will-quit');
   globalShortcut.unregisterAll();
   stopRendererProbe();
   campaignBookTriggerScheduler.stop();
@@ -5578,4 +5599,8 @@ app.on('will-quit', () => {
   kalshiOrderbookStream.stop();
   if (geaProcess && !geaProcess.killed) geaProcess.kill();
 });
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('before-quit', () => startupTrace('app-before-quit'));
+app.on('window-all-closed', () => {
+  startupTrace('app-window-all-closed');
+  if (process.platform !== 'darwin') app.quit();
+});
