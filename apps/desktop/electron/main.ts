@@ -3945,7 +3945,10 @@ function applyBridgeRecommendation(packet: RecommendationPacket) {
     && hasRealExecutableDepth(c)));
   kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
   refreshOrderbookTracking();
-  publishMarketState();
+  // GEA can deliver bursts of recommendations. Coalesce the expensive
+  // market/world snapshot work so the renderer receives one bounded update
+  // per throttle window rather than one full-state broadcast per packet.
+  scheduleMarketStatePublish();
   void evaluateAutoClosePositions('bridge-entry');
   void runThroughputCertification('bridge-entry');
   broadcastPaperUpdate();
