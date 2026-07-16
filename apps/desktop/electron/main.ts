@@ -4525,6 +4525,7 @@ function spawnGlobalEventAlpha() {
   );
 
   if (!plan) return;
+  startupTrace(`gea-spawn:${plan.command}`);
   geaProcess = spawn(plan.command, plan.args, {
     cwd: plan.cwd,
     stdio: ['ignore', 'ignore', 'pipe'],
@@ -4534,6 +4535,13 @@ function spawnGlobalEventAlpha() {
   geaExitedDuringEvidence = false;
   geaProcess.stderr?.on('data', (d: Buffer) => {
     process.stderr.write(`[gea] ${d.toString()}`);
+    const sanitized = d.toString()
+      .replace(/token=[^&\s]+/gi, 'token=[redacted]')
+      .replace(/NEMESIS_BRIDGE_TOKEN\s*[:=]\s*[^\s]+/gi, 'NEMESIS_BRIDGE_TOKEN=[redacted]')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+    if (sanitized) startupTrace(`gea-stderr:${sanitized}`);
   });
   geaProcess.once('error', (err) => {
     console.warn(`[gea] spawn failed: ${err.message}`);
@@ -4543,6 +4551,7 @@ function spawnGlobalEventAlpha() {
   });
   geaProcess.once('exit', (code) => {
     console.log(`[gea] exited (code=${code ?? 'null'})`);
+    startupTrace(`gea-exit:${code ?? 'null'}`);
     geaProcess = null;
     if (pendingCampaignPointer && !closeoutPrepared) geaExitedDuringEvidence = true;
     if (code !== 0 && !pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);
