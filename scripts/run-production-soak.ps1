@@ -328,7 +328,7 @@ try {
         rendererSlopeWindowComplete = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.slopeWindowComplete }
         rendererSlopeWindowMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.slopeWindowMs }
         rendererHeartbeatAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.heartbeatAgeMs }
-        rendererProbeAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.probeAgeMs }
+        rendererProbeAgeMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.rendererProbeAgeMs }
         rendererProbeResponseReceived = if ($null -eq $externalStatus) { $null } else { [bool]$externalStatus.renderer.probeResponseReceived }
         rendererUnresponsiveForMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.unresponsiveForMs }
         feedQualificationReady = $feedReady
@@ -346,8 +346,20 @@ try {
         break
       }
       if ($phase -eq 'scored' -and $rendererLivenessActive -and !$rootProcess.Responding) {
-        if ($null -eq $unresponsiveSince) { $unresponsiveSince = $now.AddSeconds(-2) }
-        elseif (($now - $unresponsiveSince).TotalSeconds -ge 10) {
+        # Windows can briefly report an Electron window as non-responsive while
+        # its event loop is still exporting fresh runtime, heartbeat, and probe
+        # evidence. Only count a process liveness failure when those independent
+        # signals are stale as well.
+        $runtimeStatusFresh = $null -ne $externalStatusAgeMs -and [double]$externalStatusAgeMs -le 15000
+        $rendererHeartbeatFresh = $null -ne $externalStatus.renderer.heartbeatAgeMs -and [double]$externalStatus.renderer.heartbeatAgeMs -le 15000
+        $rendererProbeFresh = [bool]$externalStatus.renderer.probeResponseReceived `
+          -and $null -ne $externalStatus.renderer.rendererProbeAgeMs `
+          -and [double]$externalStatus.renderer.rendererProbeAgeMs -le 15000
+        if ($runtimeStatusFresh -and $rendererHeartbeatFresh -and $rendererProbeFresh) {
+          $unresponsiveSince = $null
+        } elseif ($null -eq $unresponsiveSince) {
+          $unresponsiveSince = $now.AddSeconds(-2)
+        } elseif (($now - $unresponsiveSince).TotalSeconds -ge 10) {
           $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
           break
         }
@@ -438,8 +450,15 @@ try {
           -and $null -ne $graceStatus.renderer `
           -and $null -ne $graceStatus.renderer.rendererLoadFinishedAt
         if ($graceRendererActive -and ($null -eq $graceProcess -or !$graceProcess.Responding)) {
-          $runtimeFailure = 'NEMESIS became unresponsive during unscored closeout'
-          break
+          $graceStatusFresh = $graceStatusAgeMs -le 15000
+          $graceHeartbeatFresh = $null -ne $graceStatus.renderer.heartbeatAgeMs -and [double]$graceStatus.renderer.heartbeatAgeMs -le 15000
+          $graceProbeFresh = [bool]$graceStatus.renderer.probeResponseReceived `
+            -and $null -ne $graceStatus.renderer.rendererProbeAgeMs `
+            -and [double]$graceStatus.renderer.rendererProbeAgeMs -le 15000
+          if (!$graceStatusFresh -or !$graceHeartbeatFresh -or !$graceProbeFresh) {
+            $runtimeFailure = 'NEMESIS became unresponsive during unscored closeout'
+            break
+          }
         }
         Start-Sleep -Seconds 2
       }
@@ -524,7 +543,7 @@ try {
   $finalRendererStatus = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.status } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererStatus } else { $null }
   $finalRendererBlocked = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.blocked } elseif ($null -ne $latestRuntimeStatusSample) { [bool]$latestRuntimeStatusSample.rendererBlocked } else { $true }
   $finalRendererHeartbeatAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.heartbeatAgeMs } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererHeartbeatAgeMs } else { $null }
-  $finalRendererProbeAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.probeAgeMs } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererProbeAgeMs } else { $null }
+  $finalRendererProbeAgeMs = if ($null -ne $cutoffExternalStatus) { $cutoffExternalStatus.renderer.rendererProbeAgeMs } elseif ($null -ne $latestRuntimeStatusSample) { $latestRuntimeStatusSample.rendererProbeAgeMs } else { $null }
   $finalRendererProbeResponseReceived = if ($null -ne $cutoffExternalStatus) { [bool]$cutoffExternalStatus.renderer.probeResponseReceived } elseif ($null -ne $latestRuntimeStatusSample) { [bool]$latestRuntimeStatusSample.rendererProbeResponseReceived } else { $false }
   $finalRuntimeStatusAgeMs = if ($null -ne $cutoffExternalStatus -and $null -ne $cutoffExternalStatus.updatedAt) {
     [Math]::Max(0, $cutoffCapturedAt.ToUnixTimeMilliseconds() - [double]$cutoffExternalStatus.updatedAt)
