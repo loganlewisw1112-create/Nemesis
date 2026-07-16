@@ -159,7 +159,7 @@ describe('KalshiOrderbookStream', () => {
     stream.stop();
   });
 
-  it('bounds live orderbooks to one 50-ticker subscription and updates that subscription in place', () => {
+  it('bounds live orderbooks to one 25-ticker subscription and updates that subscription in place', () => {
     const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
     const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() };
     Object.assign(stream as unknown as Record<string, unknown>, { socket, authenticated: true, generation: 1, started: true });
@@ -167,20 +167,20 @@ describe('KalshiOrderbookStream', () => {
 
     stream.track(tickers);
     expect(socket.send).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(String(socket.send.mock.calls[0]![0])).params.market_tickers).toHaveLength(50);
-    expect(stream.telemetry().trackedTickers).toBe(50);
+    expect(JSON.parse(String(socket.send.mock.calls[0]![0])).params.market_tickers).toHaveLength(25);
+    expect(stream.telemetry().trackedTickers).toBe(25);
     stream.ingest(JSON.stringify({ type: 'subscribed', msg: { channel: 'orderbook_delta', sid: 7 } }), 1);
     expect(socket.send).toHaveBeenCalledTimes(1);
 
-    stream.replaceTracked(tickers.slice(40, 90));
+    stream.replaceTracked(tickers.slice(20, 45));
     expect(socket.send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(String(socket.send.mock.calls[1]![0]))).toMatchObject({
       cmd: 'update_subscription',
       params: { sids: [7], action: 'delete_markets' },
     });
-    expect(JSON.parse(String(socket.send.mock.calls[1]![0])).params.market_tickers).toHaveLength(40);
+    expect(JSON.parse(String(socket.send.mock.calls[1]![0])).params.market_tickers).toHaveLength(20);
     expect(stream.telemetry()).toMatchObject({
-      trackedTickers: 50,
+      trackedTickers: 25,
       subscriptionUpdates: 1,
       subscriptionUpdateQueueDepth: 1,
       subscriptionUpdateInFlight: true,
@@ -190,16 +190,16 @@ describe('KalshiOrderbookStream', () => {
       type: 'ok',
       sid: 7,
       seq: 1,
-      msg: { market_tickers: tickers.slice(0, 40) },
+      msg: { market_tickers: tickers.slice(0, 20) },
     }), 1);
     expect(socket.send).toHaveBeenCalledTimes(3);
     expect(JSON.parse(String(socket.send.mock.calls[2]![0]))).toMatchObject({
       cmd: 'update_subscription',
       params: { sids: [7], action: 'add_markets' },
     });
-    expect(JSON.parse(String(socket.send.mock.calls[2]![0])).params.market_tickers).toHaveLength(40);
+    expect(JSON.parse(String(socket.send.mock.calls[2]![0])).params.market_tickers).toHaveLength(20);
     expect(stream.telemetry()).toMatchObject({
-      trackedTickers: 50,
+      trackedTickers: 25,
       subscriptionUpdates: 2,
       subscriptionUpdateQueueDepth: 0,
       subscriptionUpdateInFlight: true,
@@ -209,7 +209,7 @@ describe('KalshiOrderbookStream', () => {
       type: 'ok',
       sid: 7,
       seq: 2,
-      msg: { market_tickers: tickers.slice(50, 90) },
+      msg: { market_tickers: tickers.slice(25, 45) },
     }), 1);
     expect(stream.telemetry().subscriptionUpdateInFlight).toBe(false);
     stream.stop();

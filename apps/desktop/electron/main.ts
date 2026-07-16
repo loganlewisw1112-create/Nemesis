@@ -195,9 +195,12 @@ const BRIDGE_HEARTBEAT_MS = 5_000;
 const BRIDGE_TRAFFIC_TTL_MS = 15_000;
 const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
 const RENDERER_MEMORY_SAMPLE_INTERVAL_MS = 30_000;
-const ORDERBOOK_TRACKING_LIMIT = 50;
+// Discovery still evaluates 500 tickers. Live depth is a smaller, rotating
+// working set so the authenticated socket carries only immediately useful
+// markets; active campaign candidates preempt this set.
+const ORDERBOOK_TRACKING_LIMIT = 25;
 const ORDERBOOK_ROTATION_INTERVAL_MS = 5 * 60_000;
-const ORDERBOOK_ROTATION_BATCH_SIZE = 8;
+const ORDERBOOK_ROTATION_BATCH_SIZE = 4;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 

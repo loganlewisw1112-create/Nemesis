@@ -5,7 +5,7 @@ import type { KalshiWebSocketHeaderProvider } from './kalshiStream.js';
 
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
-const DEFAULT_MAX_TRACKED_TICKERS = 50;
+const DEFAULT_MAX_TRACKED_TICKERS = 25;
 
 export interface KalshiOrderbookStreamTelemetry {
   connected: boolean;
