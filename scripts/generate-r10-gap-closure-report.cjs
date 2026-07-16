@@ -4,7 +4,9 @@ const path = require('node:path');
 
 const repoRoot = path.resolve(__dirname, '..');
 const workspaceRoot = path.resolve(repoRoot, '..', '..');
-const outputDir = path.join(workspaceRoot, 'output', 'reports', 'nemesis-gap-closure-r10-2026-07-15');
+const outputDir = process.env.NEMESIS_REPORT_OUTPUT_DIR
+  ? path.resolve(process.env.NEMESIS_REPORT_OUTPUT_DIR)
+  : path.join(workspaceRoot, 'output', 'reports', 'nemesis-gap-closure-r10-2026-07-15');
 const soakDir = path.join(outputDir, 'soak');
 const soakAttemptsDir = path.join(outputDir, 'soak-attempts');
 const soakResultPath = path.join(soakDir, 'production-soak-result.json');
