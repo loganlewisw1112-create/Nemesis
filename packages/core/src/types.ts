@@ -7,6 +7,14 @@ export type KalshiEnvironment = 'production' | 'demo';
 
 export type KalshiEndpointClass = 'market-data' | 'portfolio' | 'orders';
 
+export interface KalshiResponseMetadata {
+  environment: KalshiEnvironment;
+  endpointClass: KalshiEndpointClass;
+  sourceBaseUrl: string;
+  status: number;
+  verifiedAt: number;
+}
+
 export interface KalshiEndpointPolicy {
   environment: KalshiEnvironment;
   restBaseUrls: readonly string[];
@@ -22,6 +30,11 @@ export type KalshiFailureClass =
   | 'server'
   | 'timeout'
   | 'network'
+  | 'dns'
+  | 'tcp'
+  | 'tls'
+  | 'connection_reset'
+  | 'configuration'
   | 'invalid_response'
   | 'unknown';
 
@@ -445,6 +458,16 @@ export interface ConnectorHealth {
   endpointClass?: KalshiEndpointClass;
   /** Redacted endpoint URL currently selected by the environment policy. */
   endpointUrl?: string | null;
+  generation?: number;
+  attemptId?: string | null;
+  activeEndpointUrl?: string | null;
+  failedEndpointUrl?: string | null;
+  nextEndpointUrl?: string | null;
+  transportFailureClass?: string | null;
+  errorCode?: string | null;
+  httpStatus?: number | null;
+  switchReason?: string | null;
+  lastExchangeDataAt?: number | null;
 }
 
 export interface GateStatus {

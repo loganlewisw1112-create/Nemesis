@@ -14,6 +14,7 @@ import {
   PRESET_OVERRIDES,
   type KalshiMarket,
   type KalshiOrderbook,
+  type KalshiResponseMetadata,
 } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
 import {
@@ -27,6 +28,12 @@ const ORDERBOOK_TTL_MS = 12_000;
 const REST_DEPTH_FALLBACK_PER_CYCLE = 8;
 const MAX_UNIVERSE_PAGES = 50;
 const MIN_EXECUTABLE_UNIVERSE = 25;
+
+export interface ProductionUniverseRecord {
+  market: KalshiMarket;
+  sourceBaseUrl: string;
+  verifiedAt: number;
+}
 
 export class DiscoveryOrchestrator {
   settings: DiscoverySettings = { ...DEFAULT_DISCOVERY_SETTINGS };
@@ -46,6 +53,7 @@ export class DiscoveryOrchestrator {
   private mode: DiscoveryMode = 'full';
   private depthPassInFlight: Promise<void> | null = null;
   private restDepthCursor = 0;
+  private productionUniverseRecords: ProductionUniverseRecord[] = [];
 
   constructor(private registry: ConnectorRegistry) {}
 
@@ -123,6 +131,10 @@ export class DiscoveryOrchestrator {
     return this.universe;
   }
 
+  getProductionUniverseRecords(): ProductionUniverseRecord[] {
+    return this.productionUniverseRecords.map((record) => ({ ...record, market: { ...record.market } }));
+  }
+
   getMicrostructure(ticker: string, fallbackPrice: number) {
     const d = this.depthByTicker.get(ticker);
     if (d) return { spread: d.spread, depthUsd: d.depthUsd };
@@ -151,17 +163,30 @@ export class DiscoveryOrchestrator {
     if (this.paused) return this.universe;
     const start = Date.now();
     const merged: KalshiMarket[] = [];
+    const productionByTicker = new Map<string, ProductionUniverseRecord>();
     let cursor: string | undefined;
     let pages = 0;
     try {
       do {
+        let responseMetadata: KalshiResponseMetadata | null = null;
         const res = await fetchMarkets({
           limit: this.settings.universePageSize,
           status: 'open',
           cursor,
           signal,
+          onResponseMetadata: (metadata) => { responseMetadata = metadata; },
         });
         merged.push(...res.markets);
+        const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
+        if (verifiedResponse?.environment === 'production' && verifiedResponse.status === 200) {
+          for (const market of res.markets) {
+            productionByTicker.set(market.ticker, {
+              market: { ...market },
+              sourceBaseUrl: verifiedResponse.sourceBaseUrl,
+              verifiedAt: verifiedResponse.verifiedAt,
+            });
+          }
+        }
         cursor = res.cursor;
         pages += 1;
         // Record success on the first successful page so kalshi-rest exits
@@ -179,6 +204,9 @@ export class DiscoveryOrchestrator {
 
       this.registry.recordSuccess('kalshi-rest', Date.now() - start);
       this.universe = selectExecutableMarkets(merged).slice(0, this.settings.maxTrackedTickers);
+      this.productionUniverseRecords = this.universe
+        .map((market) => productionByTicker.get(market.ticker))
+        .filter((record): record is ProductionUniverseRecord => record != null);
       this.universeUpdatedAt = Date.now();
       this.universePages = pages;
       this.liveUniverseLoaded = true;

@@ -14,6 +14,8 @@ import {
 } from './sevenHourCampaign.js';
 
 const startedAt = Date.UTC(2026, 6, 14, 12, 0, 0);
+const productionArtifactHash = 'a'.repeat(64);
+const soakVerificationReceiptHash = 'b'.repeat(64);
 const feePolicy = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'direct' });
 const r9LedgerPath = path.join(
   process.env.APPDATA ?? 'C:\\Users\\logan\\AppData\\Roaming',
@@ -94,6 +96,8 @@ function start(stage: 'instrumentation' | 'seven-hour' = 'seven-hour') {
     settings,
     healthPolicyHash: 'health-a',
     runtimeSidecarPath: 'runtime.jsonl',
+    productionArtifactHash,
+    soakVerificationReceiptHash,
   });
 }
 
@@ -184,6 +188,8 @@ describe('campaign schema-v2 screening and lifecycle', () => {
       stage: 'instrumentation',
       startedAt: manifest.startedAt,
       settings,
+      productionArtifactHash,
+      soakVerificationReceiptHash,
     });
     for (const item of historical) {
       const source = item.candidate;
@@ -413,6 +419,7 @@ describe('campaign schema-v2 screening and lifecycle', () => {
     const tracker = SevenHourCampaignTracker.start({
       runId: 'run-instrumentation-cutoff', evidenceNamespace: 'v2', configurationHash: 'cfg', gitCommit: 'abc',
       stage: 'instrumentation', startedAt, settings: instrumentationSettings,
+      productionArtifactHash, soakVerificationReceiptHash,
     });
     expect(tracker.snapshot().manifest.enrollmentCutoffAt).toBe(startedAt + 100 * 60_000);
     const onTimeAt = startedAt + 100 * 60_000;
@@ -486,6 +493,8 @@ describe('campaign schema-v2 screening and lifecycle', () => {
       startedAt,
       settings,
       restartOrdinal: 1,
+      productionArtifactHash,
+      soakVerificationReceiptHash,
     });
 
     expect(tracker.snapshot().reasons).toContain('campaign attempt used a supervisor recovery restart');

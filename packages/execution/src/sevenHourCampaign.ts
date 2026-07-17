@@ -38,6 +38,8 @@ export interface CampaignRunManifestV2 extends CampaignManifestBase {
   parentRunId?: string;
   restartOrdinal: number;
   healthPolicyHash: string;
+  productionArtifactHash: string;
+  soakVerificationReceiptHash: string;
   runtimeSidecarPath: string;
   finalRuntimeSidecarHash?: string;
 }
@@ -200,6 +202,8 @@ export interface StartCampaignOptions {
   restartOrdinal?: number;
   healthPolicyHash?: string;
   runtimeSidecarPath?: string;
+  productionArtifactHash: string;
+  soakVerificationReceiptHash: string;
 }
 
 export interface RecordScreenedOutInput {
@@ -283,6 +287,12 @@ export class SevenHourCampaignTracker {
   private constructor(private readonly settings: EntryQualificationSettings) {}
 
   static start(options: StartCampaignOptions): SevenHourCampaignTracker {
+    if (!/^[a-f0-9]{64}$/i.test(options.productionArtifactHash)) {
+      throw new Error('production artifact hash must be an explicit SHA-256 digest');
+    }
+    if (!/^[a-f0-9]{64}$/i.test(options.soakVerificationReceiptHash)) {
+      throw new Error('soak verification receipt hash must be an explicit SHA-256 digest');
+    }
     const tracker = new SevenHourCampaignTracker(options.settings);
     const startedAt = options.startedAt ?? Date.now();
     const duration = options.stage === 'instrumentation'
@@ -305,6 +315,8 @@ export class SevenHourCampaignTracker {
       parentRunId: options.parentRunId,
       restartOrdinal: options.restartOrdinal ?? 0,
       healthPolicyHash: options.healthPolicyHash ?? 'not-provided',
+      productionArtifactHash: options.productionArtifactHash,
+      soakVerificationReceiptHash: options.soakVerificationReceiptHash,
       runtimeSidecarPath: options.runtimeSidecarPath ?? '',
     };
     tracker.append('run_started', { manifest }, startedAt, options.runId, options.configurationHash);
@@ -355,6 +367,8 @@ export class SevenHourCampaignTracker {
         ...(schemaVersion === 2 ? {
           restartOrdinal: 0,
           healthPolicyHash: 'unreadable',
+          productionArtifactHash: 'unreadable',
+          soakVerificationReceiptHash: 'unreadable',
           runtimeSidecarPath: '',
         } : {}),
       } as CampaignRunManifest;

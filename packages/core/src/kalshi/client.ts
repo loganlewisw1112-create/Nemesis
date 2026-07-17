@@ -10,9 +10,15 @@ import type {
   KalshiEndpointPolicy,
   KalshiEnvironment,
   KalshiFailureClass,
+  KalshiResponseMetadata,
   OrderbookLevel,
 } from '../types.js';
 import { resilientFetch, sleep } from '../http/resilientFetch.js';
+import {
+  recordKalshiCircuitFailure,
+  recordKalshiCircuitSuccess,
+  reserveKalshiProductionRetry,
+} from './retryCoordinator.js';
 
 export const KALSHI_ENDPOINT_POLICIES: Readonly<Record<KalshiEnvironment, KalshiEndpointPolicy>> = {
   production: {
@@ -60,6 +66,7 @@ export interface FetchOptions {
   cursor?: string;
   authHeaders?: Record<string, string>;
   signal?: AbortSignal;
+  onResponseMetadata?: (metadata: KalshiResponseMetadata) => void;
 }
 
 function centsToProb(v: number | undefined): number | undefined {
@@ -425,6 +432,7 @@ export class KalshiRequestFailure extends Error {
   readonly path: string;
   readonly baseUrl: string | null;
   readonly retryAfterMs: number | null;
+  readonly code: string | null;
 
   constructor(message: string, details: {
     status?: number | null;
@@ -434,6 +442,7 @@ export class KalshiRequestFailure extends Error {
     path: string;
     baseUrl?: string | null;
     retryAfterMs?: number | null;
+    code?: string | null;
     cause?: unknown;
   }) {
     super(message, details.cause === undefined ? undefined : { cause: details.cause });
@@ -445,6 +454,7 @@ export class KalshiRequestFailure extends Error {
     this.path = details.path;
     this.baseUrl = details.baseUrl ?? null;
     this.retryAfterMs = details.retryAfterMs ?? null;
+    this.code = details.code ?? null;
   }
 }
 
@@ -460,16 +470,28 @@ function normalizeFailure(
   if (error instanceof KalshiRequestFailure) return error;
   const message = error instanceof Error ? error.message : String(error);
   const name = error instanceof Error ? error.name : '';
+  const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const cause = record.cause && typeof record.cause === 'object' ? record.cause as Record<string, unknown> : {};
+  const code = typeof (record.code ?? cause.code) === 'string' ? String(record.code ?? cause.code) : null;
+  const combined = `${code ?? ''} ${message}`;
   const classification: KalshiFailureClass = name === 'AbortError'
     ? 'aborted'
     : name === 'SyntaxError'
       ? 'invalid_response'
-      : /timeout|timed out/i.test(message)
+      : /ENOTFOUND|EAI_AGAIN|dns|getaddrinfo/i.test(combined)
+        ? 'dns'
+        : /ECONNRESET|EPIPE|socket hang up|connection reset/i.test(combined)
+          ? 'connection_reset'
+          : /ETIMEDOUT|ESOCKETTIMEDOUT|timeout|timed out/i.test(combined)
         ? 'timeout'
-        : /fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|network|SSL/i.test(message)
-          ? 'network'
-          : 'unknown';
-  return new KalshiRequestFailure(message, { ...context, classification, cause: error });
+            : /CERT_|TLS|SSL|EPROTO|handshake/i.test(combined)
+              ? 'tls'
+              : /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ECONNABORTED/i.test(combined)
+                ? 'tcp'
+                : /fetch failed|network/i.test(combined)
+                  ? 'network'
+                  : 'unknown';
+  return new KalshiRequestFailure(message, { ...context, classification, code, cause: error });
 }
 
 async function kalshiFetch<T>(
@@ -529,14 +551,24 @@ async function kalshiFetch<T>(
           // rotating a 429 through all fallback bases multiplies the rate-limit
           // storm and defeats FeedHub backoff.
           if (res.status >= 400 && res.status < 500) throw lastError;
+          if (res.status >= 500) recordKalshiCircuitFailure(environment, 'kalshi-rest');
           if (res.status >= 500 && attempt < 2) {
-            await sleep(300 * (attempt + 1));
+            const proposed = Date.now() + (300 * (2 ** attempt)) + Math.round(Math.random() * 100);
+            await sleep(Math.max(0, reserveKalshiProductionRetry(environment, proposed, 'kalshi-rest') - Date.now()));
             continue;
           }
           break;
         }
         const payload = await res.json() as T;
+        opts.onResponseMetadata?.({
+          environment,
+          endpointClass,
+          sourceBaseUrl: base,
+          status: res.status,
+          verifiedAt: Date.now(),
+        });
         recordReadSuccess(environment);
+        recordKalshiCircuitSuccess(environment);
         workingBases.set(key, base);
         recordHostResult(environment, endpointClass, base, null);
         return payload;
@@ -550,11 +582,22 @@ async function kalshiFetch<T>(
           throw lastError;
         }
         const moveToAlias = lastError.classification === 'network'
+          || lastError.classification === 'dns'
+          || lastError.classification === 'tcp'
+          || lastError.classification === 'tls'
+          || lastError.classification === 'connection_reset'
           || lastError.classification === 'timeout'
-          || lastError.classification === 'aborted'
-          || lastError.classification === 'invalid_response';
-        if (!moveToAlias && attempt < 2) await sleep(300 * (attempt + 1));
-        if (moveToAlias) break;
+          ;
+        if (!moveToAlias && attempt < 2) {
+          const proposed = Date.now() + (300 * (2 ** attempt)) + Math.round(Math.random() * 100);
+          await sleep(Math.max(0, reserveKalshiProductionRetry(environment, proposed, 'kalshi-rest') - Date.now()));
+        }
+        if (moveToAlias) {
+          recordKalshiCircuitFailure(environment, 'kalshi-rest');
+          const proposed = Date.now() + 300 + Math.round(Math.random() * 100);
+          await sleep(Math.max(0, reserveKalshiProductionRetry(environment, proposed, 'kalshi-rest') - Date.now()));
+          break;
+        }
       }
     }
     if (workingBases.get(key) === base) workingBases.delete(key);

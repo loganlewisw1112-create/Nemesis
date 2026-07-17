@@ -1,5 +1,6 @@
 export * from './types.js';
 export * from './kalshi/client.js';
+export * from './kalshi/retryCoordinator.js';
 export { KALSHI_API_BASE } from './kalshi/client.js';
 export * from './http/resilientFetch.js';
 export * from './fees/kalshiFee.js';

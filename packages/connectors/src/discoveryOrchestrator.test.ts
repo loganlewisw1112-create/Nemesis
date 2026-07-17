@@ -141,6 +141,28 @@ describe('DiscoveryOrchestrator fixture fallback', () => {
     expect(discovery.hasLiveUniverse()).toBe(true);
   });
 
+  it('retains the actual successful production REST host for each admitted market', async () => {
+    fetchMarketsMock.mockImplementation(async (options: { onResponseMetadata?: (metadata: unknown) => void }) => {
+      options.onResponseMetadata?.({
+        environment: 'production',
+        endpointClass: 'market-data',
+        sourceBaseUrl: 'https://api.elections.kalshi.com/trade-api/v2',
+        status: 200,
+        verifiedAt: 1_800_000_000_000,
+      });
+      return { markets: fixtures };
+    });
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+
+    await discovery.refreshUniverse();
+
+    expect(discovery.getProductionUniverseRecords()).toEqual(fixtures.map((market) => ({
+      market,
+      sourceBaseUrl: 'https://api.elections.kalshi.com/trade-api/v2',
+      verifiedAt: 1_800_000_000_000,
+    })));
+  });
+
   it('does not treat fixtures as a stale live snapshot after a failed refresh', async () => {
     fetchMarketsMock.mockRejectedValue(new Error('rate limited'));
     const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());

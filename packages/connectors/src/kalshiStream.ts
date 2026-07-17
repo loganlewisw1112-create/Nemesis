@@ -1,11 +1,24 @@
 import { WebSocket } from 'ws';
 import { getKalshiEndpointPolicy, type KalshiEnvironment } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
+import {
+  KalshiProductionConnectionController,
+  classifyKalshiWebSocketClose,
+  classifyKalshiWebSocketError,
+  createKalshiTransportFailure,
+  type KalshiRetryDecision,
+  type KalshiSocketHealthV2,
+  type KalshiTransportFailure,
+  type KalshiTransportFailureClass,
+} from './kalshiTransportController.js';
 
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
 const SUBSCRIPTION_BATCH_SIZE = 50;
 const SUBSCRIPTION_BATCH_INTERVAL_MS = 250;
+const MAX_TRACKED_TICKERS = 500;
+const MAX_FUTURE_EXCHANGE_TIME_MS = 5_000;
+const MIN_MILLISECOND_EPOCH = 1_500_000_000_000;
 
 export type KalshiWebSocketHeaderProvider = () => Record<string, string> | null;
 
@@ -20,21 +33,14 @@ export interface KalshiTickerQuote {
   exchangeSequence?: number;
 }
 
-export interface KalshiTickerStreamTelemetry {
-  connected: boolean;
-  authenticated: boolean;
-  qualificationReady: boolean;
-  environment: KalshiEnvironment;
-  generation: number;
+export interface KalshiTickerStreamTelemetry extends KalshiSocketHealthV2 {
   trackedTickers: number;
   reconnects: number;
   sequenceGaps: number;
-  lastMessageAt: number | null;
-  lastPongAt: number | null;
   lastCloseAt: number | null;
   lastCloseCode: number | null;
   lastCloseReason: string | null;
-  endpointUrl: string | null;
+  lastSequencedTickerAt: number | null;
 }
 
 type QuoteListener = (quote: KalshiTickerQuote) => void;
@@ -45,15 +51,11 @@ export class KalshiStream {
   private readonly subscribed = new Set<string>();
   private socket: WebSocket | null = null;
   private commandId = 1;
-  private reconnectMs = 1_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private subscriptionPumpTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private generation = 0;
-  // Keep endpoint affinity per stream. A network/DNS failure on the primary
-  // host must not strand the stream when the production alias is available.
-  private endpointIndex = 0;
   private reconnects = 0;
   private sequenceGaps = 0;
   private readonly sequenceBySubscription = new Map<string, number>();
@@ -63,13 +65,25 @@ export class KalshiStream {
   private lastCloseAt: number | null = null;
   private lastCloseCode: number | null = null;
   private lastCloseReason: string | null = null;
+  private connectedAt: number | null = null;
+  private lastSequencedTickerAt: number | null = null;
+  private lastExchangeTimestamp: number | null = null;
+  private pendingFailure: { generation: number; failure: KalshiTransportFailure } | null = null;
+  private readonly pendingSubscriptionCommands = new Set<number>();
   private readonly listeners = new Set<QuoteListener>();
+  private readonly transport: KalshiProductionConnectionController;
 
   constructor(
     private readonly registry: ConnectorRegistry,
     private readonly headers: KalshiWebSocketHeaderProvider = () => null,
     private readonly environment: KalshiEnvironment = 'production',
-  ) {}
+  ) {
+    this.transport = new KalshiProductionConnectionController(
+      environment,
+      getKalshiEndpointPolicy(environment).websocketUrls,
+      { attemptPrefix: 'kalshi-ticker' },
+    );
+  }
 
   onQuote(listener: QuoteListener): () => void {
     this.listeners.add(listener);
@@ -82,11 +96,12 @@ export class KalshiStream {
 
   telemetry(now = Date.now()): KalshiTickerStreamTelemetry {
     const connected = this.socket?.readyState === WebSocket.OPEN;
-    const freshestTrafficAt = Math.max(this.lastMessageAt ?? 0, this.lastPongAt ?? 0);
+    const transport = this.transport.telemetry();
     const qualificationReady = connected
       && this.authenticated
-      && freshestTrafficAt > 0
-      && now - freshestTrafficAt <= DEAD_CONNECTION_MS;
+      && this.lastPongAt != null
+      && now - this.lastPongAt <= DEAD_CONNECTION_MS
+      && this.transport.qualificationReady(now, DEAD_CONNECTION_MS);
     return {
       connected,
       authenticated: this.authenticated,
@@ -101,12 +116,50 @@ export class KalshiStream {
       lastCloseAt: this.lastCloseAt,
       lastCloseCode: this.lastCloseCode,
       lastCloseReason: this.lastCloseReason,
-      endpointUrl: this.currentEndpointUrl(),
+      endpointUrl: transport.activeEndpoint ?? transport.nextEndpoint ?? this.transport.currentEndpoint(),
+      activeEndpoint: transport.activeEndpoint,
+      failedEndpoint: transport.failedEndpoint,
+      nextEndpoint: transport.nextEndpoint,
+      attemptId: transport.attemptId,
+      failureClass: transport.failureClass,
+      errorCode: transport.errorCode,
+      httpStatus: transport.httpStatus,
+      nextRetryAt: transport.nextRetryAt,
+      switchReason: transport.switchReason,
+      subscriptionAcknowledged: transport.subscriptionAcknowledged,
+      lastSequencedTickerAt: this.lastSequencedTickerAt,
+      lastExchangeTimestamp: this.lastExchangeTimestamp,
+      lastExchangeDataAt: transport.lastExchangeDataAt,
+      failureCounters: transport.counters,
     };
   }
 
   track(tickers: string[]): void {
-    for (const ticker of tickers) if (ticker) this.tickers.add(ticker);
+    this.replaceTracked(tickers);
+  }
+
+  replaceTracked(tickers: string[]): void {
+    const replacement = new Set(
+      [...new Set(tickers.map((ticker) => ticker.trim()).filter(Boolean))]
+        .slice(0, MAX_TRACKED_TICKERS),
+    );
+    const removed = [...this.tickers].filter((ticker) => !replacement.has(ticker));
+    const added = [...replacement].filter((ticker) => !this.tickers.has(ticker));
+    if (removed.length === 0 && added.length === 0) return;
+    this.tickers.clear();
+    for (const ticker of replacement) this.tickers.add(ticker);
+    for (const ticker of this.quotes.keys()) if (!replacement.has(ticker)) this.quotes.delete(ticker);
+    for (const ticker of removed) {
+      this.subscribed.delete(ticker);
+    }
+    if (removed.length > 0) this.sequenceBySubscription.clear();
+    if (removed.length > 0 && this.started) {
+      // The ticker protocol does not provide a safe membership replacement
+      // without subscription ids. A fresh generation guarantees the server
+      // and local 500-market sets are identical.
+      this.restart();
+      return;
+    }
     this.subscribeMissing();
   }
 
@@ -119,6 +172,7 @@ export class KalshiStream {
   restart(): void {
     this.sequenceBySubscription.clear();
     if (!this.started) return;
+    this.clearReconnectTimer();
     this.clearSubscriptionPump();
     this.closeCurrentSocket();
     this.connect();
@@ -134,29 +188,54 @@ export class KalshiStream {
   /** Ingest one official packet; public for deterministic replay tests. */
   ingest(raw: string, generation = this.generation): void {
     if (generation !== this.generation) return;
+    const transportGeneration = this.transport.telemetry();
+    if (transportGeneration.generation !== generation || transportGeneration.attemptId == null) return;
     this.lastMessageAt = Date.now();
     try {
       const packet = JSON.parse(raw) as Record<string, unknown>;
       const type = String(packet.type ?? '');
-      const sequence = finiteNumber(packet.seq);
-      if (type === 'ticker' && packet.msg && typeof packet.msg === 'object') {
-        const subscription = String(packet.sid ?? 'default');
-        const previousSequence = this.sequenceBySubscription.get(subscription);
-        if (sequence != null && previousSequence != null && sequence !== previousSequence + 1) {
-          this.sequenceGaps += 1;
-          this.registry.recordWarn('kalshi-ticker-ws', `ticker sequence gap: expected ${previousSequence + 1}, received ${sequence}`);
-          this.restart();
+      const sequence = finiteSequence(packet.seq);
+      if (type === 'ticker') {
+        if (!packet.msg || typeof packet.msg !== 'object') {
+          this.rejectTickerPacket('protocol', 'ticker packet is missing its message body');
           return;
         }
-        if (sequence != null) this.sequenceBySubscription.set(subscription, sequence);
-        this.handleTicker(packet.msg as Record<string, unknown>, sequence ?? undefined);
+        if (sequence == null) {
+          this.sequenceGaps += 1;
+          this.rejectTickerPacket('sequence', 'ticker packet has an invalid exchange sequence');
+          return;
+        }
+        const subscription = String(packet.sid ?? 'default');
+        const previousSequence = this.sequenceBySubscription.get(subscription);
+        if (previousSequence != null && sequence !== previousSequence + 1) {
+          this.sequenceGaps += 1;
+          this.registry.recordWarn('kalshi-ticker-ws', `ticker sequence gap: expected ${previousSequence + 1}, received ${sequence}`);
+          this.restartAfterFailure(createKalshiTransportFailure(
+            'sequence',
+            `ticker sequence gap: expected ${previousSequence + 1}, received ${sequence}`,
+          ));
+          return;
+        }
+        if (this.handleTicker(packet.msg as Record<string, unknown>, sequence, generation)) {
+          this.sequenceBySubscription.set(subscription, sequence);
+        }
       } else if (type === 'subscribed') {
+        const commandId = finiteNumber(packet.id);
+        if (commandId != null) this.pendingSubscriptionCommands.delete(commandId);
+        else if (this.pendingSubscriptionCommands.size === 1) this.pendingSubscriptionCommands.clear();
+        if (this.pendingSubscriptionCommands.size === 0) this.transport.recordSubscriptionAck(generation);
         this.recordHealthy();
       } else if (type === 'error') {
-        this.registry.recordWarn('kalshi-ticker-ws', String((packet.msg as { msg?: string } | undefined)?.msg ?? 'subscription error'));
+        const detail = String((packet.msg as { msg?: string } | undefined)?.msg ?? 'subscription error');
+        this.registry.recordWarn('kalshi-ticker-ws', detail);
+        this.restartAfterFailure(createKalshiTransportFailure('protocol', detail));
       }
-    } catch {
+    } catch (error) {
       this.registry.recordWarn('kalshi-ticker-ws', 'malformed ticker stream message');
+      this.restartAfterFailure(createKalshiTransportFailure(
+        'protocol',
+        error instanceof Error ? error.message : 'malformed ticker stream message',
+      ));
     }
   }
 
@@ -176,9 +255,10 @@ export class KalshiStream {
       return;
     }
 
-    const generation = ++this.generation;
-    const endpointUrl = this.currentEndpointUrl();
-    if (!endpointUrl) {
+    const attempt = this.transport.beginAttempt();
+    if (!attempt) {
+      // Telemetry-only: synthesizing a transport failure without a generation
+      // would corrupt the controller's generation-gated accounting.
       this.authenticated = false;
       this.registry.recordTelemetry('kalshi-ticker-ws', {
         status: 'error',
@@ -190,20 +270,32 @@ export class KalshiStream {
       });
       return;
     }
-    const socket = new WebSocket(endpointUrl, { headers });
+    const { generation, endpoint: endpointUrl } = attempt;
+    this.generation = generation;
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(endpointUrl, { headers });
+    } catch (error) {
+      const decision = this.transport.recordFailure(generation, classifyKalshiWebSocketError(error));
+      this.scheduleReconnect(decision);
+      this.recordHealthy();
+      return;
+    }
     this.socket = socket;
     socket.on('open', () => {
       if (!this.isCurrent(socket, generation)) return;
       this.authenticated = true;
-      this.reconnectMs = 1_000;
       this.subscribed.clear();
       this.sequenceBySubscription.clear();
-      this.lastMessageAt = Date.now();
-      this.lastPongAt = Date.now();
+      this.pendingSubscriptionCommands.clear();
+      this.lastMessageAt = null;
+      this.lastPongAt = null;
+      this.connectedAt = Date.now();
+      this.lastSequencedTickerAt = null;
+      this.lastExchangeTimestamp = null;
       this.startHeartbeat(socket, generation);
       this.recordHealthy();
       this.subscribeMissing();
-      if (this.tickers.size === 0) this.sendSubscription([]);
     });
     socket.on('message', (data) => {
       if (this.isCurrent(socket, generation)) this.ingest(String(data), generation);
@@ -211,14 +303,26 @@ export class KalshiStream {
     socket.on('ping', () => {
       if (!this.isCurrent(socket, generation)) return;
       this.lastMessageAt = Date.now();
-      this.recordHealthy();
     });
     socket.on('pong', () => {
       if (!this.isCurrent(socket, generation)) return;
       this.lastPongAt = Date.now();
+      this.transport.recordPong(generation);
       this.recordHealthy();
     });
-    socket.on('error', () => socket.close());
+    socket.on('error', (error) => {
+      if (!this.isCurrent(socket, generation)) return;
+      this.pendingFailure = { generation, failure: classifyKalshiWebSocketError(error) };
+      socket.close();
+    });
+    socket.on('unexpected-response', (_request, response) => {
+      if (!this.isCurrent(socket, generation)) return;
+      response.resume();
+      this.restartAfterFailure(classifyKalshiWebSocketError({
+        statusCode: response.statusCode,
+        message: `websocket handshake returned HTTP ${response.statusCode}`,
+      }));
+    });
     socket.on('close', (code, reason) => this.handleClose(socket, generation, code, reason.toString('utf8') || null));
   }
 
@@ -227,9 +331,13 @@ export class KalshiStream {
     this.heartbeatTimer = setInterval(() => {
       if (!this.isCurrent(socket, generation) || socket.readyState !== WebSocket.OPEN) return;
       const now = Date.now();
-      const freshestTrafficAt = Math.max(this.lastMessageAt ?? 0, this.lastPongAt ?? 0);
-      if (freshestTrafficAt === 0 || now - freshestTrafficAt > DEAD_CONNECTION_MS) {
+      const pongReferenceAt = this.lastPongAt ?? this.connectedAt;
+      if (pongReferenceAt == null || now - pongReferenceAt > DEAD_CONNECTION_MS) {
         this.registry.recordWarn('kalshi-ticker-ws', 'ticker websocket liveness expired');
+        this.pendingFailure = {
+          generation,
+          failure: createKalshiTransportFailure('timeout', 'ticker websocket pong expired'),
+        };
         socket.terminate();
         return;
       }
@@ -244,30 +352,32 @@ export class KalshiStream {
     this.lastCloseReason = reason;
     this.socket = null;
     this.authenticated = false;
+    this.connectedAt = null;
     this.subscribed.clear();
     this.clearHeartbeatTimer();
     this.clearSubscriptionPump();
+    const pendingFailure = this.pendingFailure?.generation === generation ? this.pendingFailure.failure : null;
+    this.pendingFailure = null;
+    const failure = pendingFailure ?? classifyKalshiWebSocketClose(code, reason, !this.started);
     if (!this.started) return;
     this.reconnects += 1;
-    this.advanceEndpoint();
+    const decision = this.transport.recordFailure(generation, failure);
+    const transport = this.transport.telemetry();
     this.registry.recordTelemetry('kalshi-ticker-ws', {
-      status: 'warn',
-      lastError: 'ticker websocket disconnected; reconnect scheduled',
+      status: decision.retry ? 'warn' : 'error',
+      lastError: decision.retry
+        ? 'ticker websocket disconnected; reconnect scheduled'
+        : `ticker websocket stopped after ${failure.classification}`,
       reconnects: this.reconnects,
       transportConnected: false,
       authenticated: false,
       qualificationReady: false,
-      endpointUrl: this.currentEndpointUrl(),
+      endpointUrl: transport.nextEndpoint ?? transport.failedEndpoint,
       lastCloseAt: this.lastCloseAt,
       lastCloseCode: this.lastCloseCode,
       lastCloseReason: this.lastCloseReason,
     });
-    const waitMs = this.reconnectMs;
-    this.reconnectMs = Math.min(30_000, this.reconnectMs * 2);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, waitMs);
+    this.scheduleReconnect(decision);
   }
 
   private subscribeMissing(): void {
@@ -295,23 +405,47 @@ export class KalshiStream {
 
   private sendSubscription(tickers: string[]): void {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
+    const id = this.commandId++;
+    this.transport.recordSubscriptionPending(this.generation);
     this.socket.send(JSON.stringify({
-      id: this.commandId++,
+      id,
       cmd: 'subscribe',
       params: tickers.length > 0
         ? { channels: ['ticker'], market_tickers: tickers }
         : { channels: ['ticker'] },
     }));
+    this.pendingSubscriptionCommands.add(id);
   }
 
-  private handleTicker(msg: Record<string, unknown>, sequence?: number): void {
+  private handleTicker(msg: Record<string, unknown>, sequence: number, generation: number): boolean {
     const ticker = String(msg.market_ticker ?? msg.ticker ?? '');
-    if (!ticker) return;
+    if (!ticker) {
+      this.rejectTickerPacket('protocol', 'ticker packet has no market ticker');
+      return false;
+    }
+    if (!this.tickers.has(ticker) || !this.subscribed.has(ticker)) {
+      this.rejectTickerPacket('protocol', `ticker packet referenced an unexpected market: ${ticker}`);
+      return false;
+    }
+    const hasBid = msg.yes_bid_dollars != null || msg.yes_bid != null;
+    const hasAsk = msg.yes_ask_dollars != null || msg.yes_ask != null;
     const yesBid = parsePrice(msg.yes_bid_dollars, msg.yes_bid);
     const yesAsk = parsePrice(msg.yes_ask_dollars, msg.yes_ask);
-    if (yesBid === undefined && yesAsk === undefined) return;
+    if ((!hasBid && !hasAsk)
+      || (hasBid && !validProbability(yesBid))
+      || (hasAsk && !validProbability(yesAsk))
+      || (yesBid != null && yesAsk != null && yesAsk < yesBid)) {
+      this.rejectTickerPacket('protocol', `ticker packet has invalid price bounds for ${ticker}`);
+      return false;
+    }
     const bid = yesBid ?? yesAsk ?? 0.5;
     const ask = yesAsk ?? yesBid ?? bid;
+    const now = Date.now();
+    const exchangeTimestamp = validExchangeTimestamp(msg, now);
+    if (exchangeTimestamp == null) {
+      this.rejectTickerPacket('protocol', `ticker packet has an invalid exchange timestamp for ${ticker}`);
+      return false;
+    }
     const quote: KalshiTickerQuote = {
       ticker,
       yesBid: bid,
@@ -319,12 +453,24 @@ export class KalshiStream {
       yesPrice: (bid + ask) / 2,
       spread: Math.max(0.005, ask - bid),
       volume: finiteNumber(msg.volume_fp ?? msg.volume ?? msg.volume_24h) ?? 0,
-      updatedAt: Date.now(),
+      updatedAt: exchangeTimestamp ?? now,
       exchangeSequence: sequence,
     };
     this.quotes.set(ticker, quote);
+    this.lastSequencedTickerAt = now;
+    this.lastExchangeTimestamp = exchangeTimestamp;
+    this.transport.recordExchangeData(generation, exchangeTimestamp);
     this.recordHealthy();
     for (const listener of this.listeners) listener(quote);
+    return true;
+  }
+
+  private rejectTickerPacket(
+    classification: Extract<KalshiTransportFailureClass, 'protocol' | 'sequence'>,
+    detail: string,
+  ): void {
+    this.registry.recordWarn('kalshi-ticker-ws', detail);
+    this.restartAfterFailure(createKalshiTransportFailure(classification, detail));
   }
 
   private recordHealthy(): void {
@@ -346,6 +492,17 @@ export class KalshiStream {
       environment: telemetry.environment,
       endpointUrl: telemetry.endpointUrl,
       endpointClass: 'market-data',
+      generation: telemetry.generation,
+      attemptId: telemetry.attemptId,
+      activeEndpointUrl: telemetry.activeEndpoint,
+      failedEndpointUrl: telemetry.failedEndpoint,
+      nextEndpointUrl: telemetry.nextEndpoint,
+      transportFailureClass: telemetry.failureClass,
+      errorCode: telemetry.errorCode,
+      httpStatus: telemetry.httpStatus,
+      nextRetryAt: telemetry.nextRetryAt,
+      switchReason: telemetry.switchReason,
+      lastExchangeDataAt: telemetry.lastExchangeTimestamp,
     });
     this.registry.recordTelemetry('kalshi-ws', {
       status: telemetry.qualificationReady ? 'ok' : 'warn',
@@ -365,7 +522,9 @@ export class KalshiStream {
     const socket = this.socket;
     this.socket = null;
     this.authenticated = false;
+    this.connectedAt = null;
     this.subscribed.clear();
+    this.pendingSubscriptionCommands.clear();
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close();
   }
 
@@ -388,15 +547,32 @@ export class KalshiStream {
     this.subscriptionPumpTimer = null;
   }
 
-  private currentEndpointUrl(): string | null {
-    const endpoints = getKalshiEndpointPolicy(this.environment).websocketUrls;
-    return endpoints[this.endpointIndex] ?? endpoints[0] ?? null;
+  private restartAfterFailure(failure: KalshiTransportFailure): void {
+    if (!this.started) {
+      this.transport.recordFailure(this.generation, failure);
+      this.recordHealthy();
+      return;
+    }
+    const decision = this.transport.recordFailure(this.generation, failure);
+    this.clearSubscriptionPump();
+    this.closeCurrentSocket();
+    this.scheduleReconnect(decision);
+    this.recordHealthy();
   }
 
-  private advanceEndpoint(): void {
-    const count = getKalshiEndpointPolicy(this.environment).websocketUrls.length;
-    if (count > 1) this.endpointIndex = (this.endpointIndex + 1) % count;
+  private scheduleReconnect(decision: KalshiRetryDecision): void {
+    this.clearReconnectTimer();
+    if (!this.started || !decision.retry || decision.delayMs == null) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, decision.delayMs);
   }
+}
+
+function finiteSequence(value: unknown): number | null {
+  const sequence = finiteNumber(value);
+  return sequence != null && Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -409,4 +585,23 @@ function parsePrice(dollars: unknown, cents: unknown): number | undefined {
   if (dollarValue != null) return dollarValue;
   const centValue = finiteNumber(cents);
   return centValue == null ? undefined : centValue / 100;
+}
+
+function validProbability(value: number | undefined): value is number {
+  return value != null && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function validExchangeTimestamp(msg: Record<string, unknown>, now: number): number | null {
+  const raw = msg.ts_ms ?? msg.timestamp_ms ?? msg.ts ?? msg.timestamp;
+  let timestamp: number;
+  if (typeof raw === 'number') timestamp = raw;
+  else if (typeof raw === 'string' && /^\d+(?:\.\d+)?$/.test(raw.trim())) timestamp = Number(raw);
+  else if (typeof raw === 'string') timestamp = Date.parse(raw);
+  else return null;
+  if (!Number.isFinite(timestamp)
+    || !Number.isInteger(timestamp)
+    || timestamp < MIN_MILLISECOND_EPOCH
+    || timestamp > now + MAX_FUTURE_EXCHANGE_TIME_MS
+    || now - timestamp > DEAD_CONNECTION_MS) return null;
+  return timestamp;
 }

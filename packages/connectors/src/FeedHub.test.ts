@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resetKalshiHostCache, type KalshiTrade } from '@nemesis/core';
+import {
+  resetKalshiHostCache,
+  resetKalshiProductionRetryCoordinatorForTests,
+  type KalshiTrade,
+} from '@nemesis/core';
 import { tradeToThesis } from '@nemesis/pods';
 import { FeedHub } from './FeedHub.js';
 import { ConnectorRegistry } from './registry.js';
@@ -29,6 +33,7 @@ describe('FeedHub trade tape degradation', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-06-27T12:00:00.000Z'));
     resetKalshiHostCache();
+    resetKalshiProductionRetryCoordinatorForTests();
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
 

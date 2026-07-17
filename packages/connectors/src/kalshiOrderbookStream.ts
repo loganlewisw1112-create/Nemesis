@@ -1,14 +1,35 @@
 import { WebSocket } from 'ws';
-import { getKalshiEndpointPolicy, type KalshiEnvironment, type KalshiOrderbook, type OrderbookLevel } from '@nemesis/core';
+import {
+  getKalshiEndpointPolicy,
+  type KalshiEnvironment,
+  type KalshiMarket,
+  type KalshiOrderbook,
+  type OrderbookLevel,
+} from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
 import type { KalshiWebSocketHeaderProvider } from './kalshiStream.js';
+import {
+  ProductionMarketProvenanceStore,
+  type ProductionMarketProvenance,
+} from './productionMarketProvenance.js';
+import {
+  KalshiProductionConnectionController,
+  classifyKalshiWebSocketClose,
+  classifyKalshiWebSocketError,
+  createKalshiTransportFailure,
+  type KalshiSocketHealthV2,
+  type KalshiTransportFailure,
+  type KalshiTransportFailureClass,
+} from './kalshiTransportController.js';
 
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
 const DEFAULT_MAX_TRACKED_TICKERS = 25;
+const MAX_QUALIFICATION_EXCHANGE_AGE_MS = 1_000;
+const MAX_EXCHANGE_FUTURE_SKEW_MS = 5_000;
+const MIN_MILLISECOND_TIMESTAMP = 1_000_000_000_000;
 
-export interface KalshiOrderbookStreamTelemetry {
-  connected: boolean;
+export interface KalshiOrderbookStreamTelemetry extends KalshiSocketHealthV2 {
   trackedTickers: number;
   booksWithExchangeTime: number;
   qualifiedTickers: number;
@@ -16,14 +37,13 @@ export interface KalshiOrderbookStreamTelemetry {
   sequenceRegressions: number;
   sequenceGaps: number;
   quarantinedTickers: number;
-  authenticated: boolean;
   trackingReady: boolean;
-  qualificationReady: boolean;
-  generation: number;
-  lastPongAt: number | null;
-  lastMessageAt: number | null;
+  trackingRevision: number;
+  acknowledgedTrackingRevision: number | null;
+  serverTrackedTickers: number;
+  verifiedTrackedTickers: number;
+  membershipAcknowledged: boolean;
   lastSequencedDeltaAt: number | null;
-  lastExchangeTimestamp: number | null;
   lastCloseAt: number | null;
   lastCloseCode: number | null;
   lastCloseReason: string | null;
@@ -31,7 +51,44 @@ export interface KalshiOrderbookStreamTelemetry {
   subscriptionUpdates: number;
   subscriptionUpdateQueueDepth: number;
   subscriptionUpdateInFlight: boolean;
-  endpointUrl: string | null;
+}
+
+/**
+ * Definitive orderbook tracking evidence record. `trackingStateV2()` projects
+ * the live telemetry into exactly this shape; the desktop runtime status
+ * emits it verbatim, so runners and verifiers read one authoritative object.
+ */
+export interface OrderbookTrackingStateV2 {
+  requiredTickers: 25;
+  trackedTickers: number;
+  verifiedTrackedTickers: number;
+  serverTrackedTickers: number;
+  qualifiedTickers: number;
+  reconnects: number;
+  sequenceGaps: number;
+  sequenceRegressions: number;
+  trackingRevision: number;
+  acknowledgedTrackingRevision: number | null;
+  membershipAcknowledged: boolean;
+  subscriptionUpdateQueueDepth: number;
+  subscriptionUpdateInFlight: boolean;
+  trackingReady: boolean;
+  qualificationReady: boolean;
+  authenticated: boolean;
+  connected: boolean;
+  lastSequencedDeltaAt: number | null;
+  lastExchangeTimestamp: number | null;
+  activeEndpoint: string | null;
+  failedEndpoint: string | null;
+  nextEndpoint: string | null;
+  generation: number;
+  attemptId: string | null;
+  failureClass: KalshiTransportFailureClass | null;
+  errorCode: string | null;
+  httpStatus: number | null;
+  nextRetryAt: number | null;
+  switchReason: string | null;
+  failureCounters: Readonly<Record<KalshiTransportFailureClass, number>>;
 }
 
 interface MutableBook {
@@ -42,6 +99,8 @@ interface MutableBook {
   sourceTimestamp?: number;
   receivedAt: number;
   sequencedDeltaAt?: number;
+  snapshotTrackingRevision?: number;
+  deltaTrackingRevision?: number;
 }
 
 type BookUpdateListener = (book: KalshiOrderbook) => void;
@@ -57,12 +116,33 @@ interface PendingSubscriptionUpdate extends SubscriptionUpdateCommand {
   id: number;
 }
 
+interface InitialSubscriptionCommand {
+  id: number;
+  revision: number;
+  marketTickers: string[];
+}
+
+interface PendingTransportFailure {
+  generation: number;
+  failure: KalshiTransportFailure;
+}
+
 function parseNumber(value: unknown): number | undefined {
   const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function parseLevels(value: unknown): Map<number, number> {
+function parseSequence(value: unknown): number | undefined {
+  const parsed = parseNumber(value);
+  return parsed != null && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function internalPrice(price: number, side: 'yes' | 'no'): number {
+  const normalized = side === 'no' ? 1 - price : price;
+  return Math.round(normalized * 1_000_000_000) / 1_000_000_000;
+}
+
+function parseLevels(value: unknown, side: 'yes' | 'no'): Map<number, number> {
   const levels = new Map<number, number>();
   if (!Array.isArray(value)) return levels;
   for (const row of value) {
@@ -70,7 +150,7 @@ function parseLevels(value: unknown): Map<number, number> {
     const price = parseNumber(row[0]);
     const quantity = parseNumber(row[1]);
     if (price == null || quantity == null || price <= 0 || price >= 1 || quantity <= 0) continue;
-    levels.set(price, quantity);
+    levels.set(internalPrice(price, side), quantity);
   }
   return levels;
 }
@@ -90,20 +170,18 @@ export class KalshiOrderbookStream {
   private readonly tickersBySubscription = new Map<string, Set<string>>();
   private readonly subscriptionIdByKey = new Map<string, number>();
   private readonly pendingSnapshotRepair = new Map<string, Set<string>>();
+  private readonly snapshotRequestRevisionBySubscription = new Map<string, number>();
   private socket: WebSocket | null = null;
   private started = false;
   private commandId = 1;
-  private reconnectDelayMs = 1_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private generation = 0;
-  // Keep endpoint affinity per stream. A network/DNS failure on the primary
-  // host must not strand the stream when the production alias is available.
-  private endpointIndex = 0;
   private reconnects = 0;
   private sequenceRegressions = 0;
   private sequenceGaps = 0;
   private authenticated = false;
+  private connectedAt: number | null = null;
   private lastMessageAt: number | null = null;
   private lastPongAt: number | null = null;
   private lastSequencedDeltaAt: number | null = null;
@@ -113,17 +191,29 @@ export class KalshiOrderbookStream {
   private lastCloseReason: string | null = null;
   private lastCloseTrigger: string | null = null;
   private pendingCloseTrigger: string | null = null;
+  private pendingTransportFailure: PendingTransportFailure | null = null;
   private subscriptionUpdates = 0;
   private readonly subscriptionUpdateQueue: SubscriptionUpdateCommand[] = [];
   private pendingSubscriptionUpdate: PendingSubscriptionUpdate | null = null;
+  private initialSubscriptionCommand: InitialSubscriptionCommand | null = null;
+  private trackingRevision = 0;
+  private acknowledgedTrackingRevision: number | null = null;
   private readonly bookUpdateListeners = new Set<BookUpdateListener>();
+  private readonly transportController: KalshiProductionConnectionController;
 
   constructor(
     private readonly registry: ConnectorRegistry,
     private readonly headers: KalshiWebSocketHeaderProvider,
     private readonly environment: KalshiEnvironment = 'production',
     private readonly maxTrackedTickers = DEFAULT_MAX_TRACKED_TICKERS,
-  ) {}
+    private readonly marketProvenance = new ProductionMarketProvenanceStore(),
+  ) {
+    this.transportController = new KalshiProductionConnectionController(
+      environment,
+      getKalshiEndpointPolicy(environment).websocketUrls,
+      { attemptPrefix: 'kalshi-orderbook-ws' },
+    );
+  }
 
   start(): void {
     if (this.started) return;
@@ -136,8 +226,11 @@ export class KalshiOrderbookStream {
     this.tickersBySubscription.clear();
     this.subscriptionIdByKey.clear();
     this.pendingSnapshotRepair.clear();
+    this.snapshotRequestRevisionBySubscription.clear();
     this.subscriptionUpdateQueue.length = 0;
     this.pendingSubscriptionUpdate = null;
+    this.initialSubscriptionCommand = null;
+    this.acknowledgedTrackingRevision = null;
     this.closeCurrentSocket();
     if (this.started) this.connect();
   }
@@ -149,22 +242,31 @@ export class KalshiOrderbookStream {
     this.closeCurrentSocket();
   }
 
-  track(tickers: string[]): void {
-    for (const ticker of tickers) {
-      if (!ticker || this.tickers.has(ticker) || this.tickers.size >= this.maxTrackedTickers) continue;
+  recordProductionMarkets(
+    markets: KalshiMarket[],
+    sourceBaseUrl: string,
+    verifiedAt = Date.now(),
+  ): ProductionMarketProvenance[] {
+    return this.marketProvenance.recordMany(markets, {
+      environment: this.environment,
+      sourceBaseUrl,
+      verifiedAt,
+    });
+  }
+
+  track(tickers: string[], now = Date.now()): void {
+    const before = this.tickers.size;
+    for (const ticker of this.marketProvenance.selectVerified(tickers, this.maxTrackedTickers, now)) {
+      if (this.tickers.has(ticker) || this.tickers.size >= this.maxTrackedTickers) continue;
       this.tickers.add(ticker);
     }
+    if (this.tickers.size !== before) this.markTrackingChanged();
     this.subscribeMissing();
   }
 
   /** Replaces the bounded live-book working set without accumulating stale thesis tickers. */
-  replaceTracked(tickers: string[]): void {
-    const desired = new Set<string>();
-    for (const ticker of tickers) {
-      if (!ticker || desired.has(ticker)) continue;
-      desired.add(ticker);
-      if (desired.size >= this.maxTrackedTickers) break;
-    }
+  replaceTracked(tickers: string[], now = Date.now()): void {
+    const desired = new Set(this.marketProvenance.selectVerified(tickers, this.maxTrackedTickers, now));
     if (desired.size === this.tickers.size && [...desired].every((ticker) => this.tickers.has(ticker))) return;
     const removed = [...this.tickers].filter((ticker) => !desired.has(ticker));
     this.tickers.clear();
@@ -173,6 +275,7 @@ export class KalshiOrderbookStream {
       this.books.delete(ticker);
       this.quarantined.delete(ticker);
     }
+    this.markTrackingChanged();
     this.subscribeMissing();
   }
 
@@ -181,8 +284,8 @@ export class KalshiOrderbookStream {
     return () => this.bookUpdateListeners.delete(listener);
   }
 
-  getBook(ticker: string): KalshiOrderbook | null {
-    if (this.quarantined.has(ticker)) return null;
+  getBook(ticker: string, now = Date.now()): KalshiOrderbook | null {
+    if (this.quarantined.has(ticker) || !this.marketProvenance.has(ticker, now)) return null;
     const book = this.books.get(ticker);
     if (!book) return null;
     const yes = sortedLevels(book.yes);
@@ -206,18 +309,43 @@ export class KalshiOrderbookStream {
 
   telemetry(now = Date.now()): KalshiOrderbookStreamTelemetry {
     const connected = this.socket?.readyState === WebSocket.OPEN;
+    const verifiedTrackedTickers = [...this.tickers]
+      .filter((ticker) => this.marketProvenance.has(ticker, now)).length;
     const qualifiedTickers = [...this.books.values()].filter((book) => {
-      if (this.quarantined.has(book.ticker) || book.sourceTimestamp == null || book.sequencedDeltaAt == null) return false;
-      const ageMs = now - book.sequencedDeltaAt;
-      return ageMs >= 0 && ageMs <= DEAD_CONNECTION_MS;
+      if (this.quarantined.has(book.ticker)
+        || !this.tickers.has(book.ticker)
+        || !this.marketProvenance.has(book.ticker, now)
+        || book.sourceTimestamp == null
+        || book.sequencedDeltaAt == null
+        || book.snapshotTrackingRevision !== this.trackingRevision
+        || book.deltaTrackingRevision !== this.trackingRevision) return false;
+      const receiveAgeMs = now - book.sequencedDeltaAt;
+      const exchangeAgeMs = now - book.sourceTimestamp;
+      return receiveAgeMs >= 0
+        && receiveAgeMs <= DEAD_CONNECTION_MS
+        && exchangeAgeMs >= 0
+        && exchangeAgeMs <= MAX_QUALIFICATION_EXCHANGE_AGE_MS;
     }).length;
-    // Qualification requires the full bounded tracking set. A single fresh
-    // ticker is useful for display, but never sufficient campaign evidence.
-    const trackingReady = this.tickers.size === DEFAULT_MAX_TRACKED_TICKERS;
+    const membershipAcknowledged = this.acknowledgedTrackingRevision === this.trackingRevision
+      && this.initialSubscriptionCommand == null
+      && this.pendingSubscriptionUpdate == null
+      && this.subscriptionUpdateQueue.length === 0
+      && this.subscribed.size === this.tickers.size
+      && [...this.tickers].every((ticker) => this.subscribed.has(ticker));
+    // Qualification requires exactly 25 current production REST proofs and
+    // an acknowledgement for the same immutable membership revision.
+    const trackingReady = this.tickers.size === DEFAULT_MAX_TRACKED_TICKERS
+      && verifiedTrackedTickers === DEFAULT_MAX_TRACKED_TICKERS
+      && membershipAcknowledged;
+    const pongFresh = this.lastPongAt != null
+      && now - this.lastPongAt >= 0
+      && now - this.lastPongAt <= DEAD_CONNECTION_MS;
     const qualificationReady = connected
       && this.authenticated
+      && pongFresh
       && trackingReady
       && qualifiedTickers > 0;
+    const transport = this.transportController.telemetry();
     return {
       connected,
       trackedTickers: this.tickers.size,
@@ -228,8 +356,14 @@ export class KalshiOrderbookStream {
       sequenceGaps: this.sequenceGaps,
       quarantinedTickers: this.quarantined.size,
       authenticated: this.authenticated,
+      subscriptionAcknowledged: membershipAcknowledged,
       trackingReady,
       qualificationReady,
+      trackingRevision: this.trackingRevision,
+      acknowledgedTrackingRevision: this.acknowledgedTrackingRevision,
+      serverTrackedTickers: this.subscribed.size,
+      verifiedTrackedTickers,
+      membershipAcknowledged,
       generation: this.generation,
       lastPongAt: this.lastPongAt,
       lastMessageAt: this.lastMessageAt,
@@ -241,8 +375,56 @@ export class KalshiOrderbookStream {
       lastCloseTrigger: this.lastCloseTrigger,
       subscriptionUpdates: this.subscriptionUpdates,
       subscriptionUpdateQueueDepth: this.subscriptionUpdateQueue.length,
-      subscriptionUpdateInFlight: this.pendingSubscriptionUpdate != null,
+      subscriptionUpdateInFlight: this.initialSubscriptionCommand != null || this.pendingSubscriptionUpdate != null,
       endpointUrl: this.currentEndpointUrl(),
+      activeEndpoint: transport.activeEndpoint,
+      failedEndpoint: transport.failedEndpoint,
+      nextEndpoint: transport.nextEndpoint,
+      environment: this.environment,
+      attemptId: transport.attemptId,
+      failureClass: transport.failureClass,
+      errorCode: transport.errorCode,
+      httpStatus: transport.httpStatus,
+      nextRetryAt: transport.nextRetryAt,
+      switchReason: transport.switchReason,
+      lastExchangeDataAt: transport.lastExchangeDataAt,
+      failureCounters: transport.counters,
+    };
+  }
+
+  trackingStateV2(now = Date.now()): OrderbookTrackingStateV2 {
+    const telemetry = this.telemetry(now);
+    return {
+      requiredTickers: DEFAULT_MAX_TRACKED_TICKERS,
+      trackedTickers: telemetry.trackedTickers,
+      verifiedTrackedTickers: telemetry.verifiedTrackedTickers,
+      serverTrackedTickers: telemetry.serverTrackedTickers,
+      qualifiedTickers: telemetry.qualifiedTickers,
+      reconnects: telemetry.reconnects,
+      sequenceGaps: telemetry.sequenceGaps,
+      sequenceRegressions: telemetry.sequenceRegressions,
+      trackingRevision: telemetry.trackingRevision,
+      acknowledgedTrackingRevision: telemetry.acknowledgedTrackingRevision,
+      membershipAcknowledged: telemetry.membershipAcknowledged,
+      subscriptionUpdateQueueDepth: telemetry.subscriptionUpdateQueueDepth,
+      subscriptionUpdateInFlight: telemetry.subscriptionUpdateInFlight,
+      trackingReady: telemetry.trackingReady,
+      qualificationReady: telemetry.qualificationReady,
+      authenticated: telemetry.authenticated,
+      connected: telemetry.connected,
+      lastSequencedDeltaAt: telemetry.lastSequencedDeltaAt,
+      lastExchangeTimestamp: telemetry.lastExchangeTimestamp,
+      activeEndpoint: telemetry.activeEndpoint,
+      failedEndpoint: telemetry.failedEndpoint,
+      nextEndpoint: telemetry.nextEndpoint,
+      generation: telemetry.generation,
+      attemptId: telemetry.attemptId,
+      failureClass: telemetry.failureClass,
+      errorCode: telemetry.errorCode,
+      httpStatus: telemetry.httpStatus,
+      nextRetryAt: telemetry.nextRetryAt,
+      switchReason: telemetry.switchReason,
+      failureCounters: telemetry.failureCounters,
     };
   }
 
@@ -262,9 +444,10 @@ export class KalshiOrderbookStream {
       });
       return;
     }
-    const generation = ++this.generation;
-    const endpointUrl = this.currentEndpointUrl();
-    if (!endpointUrl) {
+    const attempt = this.transportController.beginAttempt();
+    if (!attempt) {
+      // Telemetry-only: synthesizing a transport failure without a generation
+      // would corrupt the controller's generation-gated accounting.
       this.authenticated = false;
       this.registry.recordTelemetry('kalshi-orderbook-ws', {
         status: 'error',
@@ -277,25 +460,31 @@ export class KalshiOrderbookStream {
       });
       return;
     }
+    const { generation, endpoint: endpointUrl } = attempt;
+    this.generation = generation;
     const socket = new WebSocket(endpointUrl, { headers });
     this.socket = socket;
     socket.on('open', () => {
       if (!this.isCurrent(socket, generation)) return;
       this.authenticated = true;
-      this.reconnectDelayMs = 1_000;
       this.subscribed.clear();
       this.books.clear();
       this.sequenceBySubscription.clear();
       this.tickersBySubscription.clear();
       this.subscriptionIdByKey.clear();
       this.pendingSnapshotRepair.clear();
+      this.snapshotRequestRevisionBySubscription.clear();
       this.subscriptionUpdateQueue.length = 0;
       this.pendingSubscriptionUpdate = null;
+      this.initialSubscriptionCommand = null;
+      this.acknowledgedTrackingRevision = null;
       this.pendingCloseTrigger = null;
+      this.pendingTransportFailure = null;
       this.lastSequencedDeltaAt = null;
       for (const ticker of this.tickers) this.quarantined.add(ticker);
-      this.lastMessageAt = Date.now();
-      this.lastPongAt = Date.now();
+      this.connectedAt = Date.now();
+      this.lastMessageAt = this.connectedAt;
+      this.lastPongAt = null;
       this.startHeartbeat(socket, generation);
       this.recordHealth();
       this.subscribeMissing();
@@ -311,28 +500,47 @@ export class KalshiOrderbookStream {
     socket.on('pong', () => {
       if (!this.isCurrent(socket, generation)) return;
       this.lastPongAt = Date.now();
+      this.transportController.recordPong(generation);
       this.recordHealth();
     });
     socket.on('error', (error) => {
-      this.pendingCloseTrigger = `socket_error:${error instanceof Error ? error.message : String(error)}`;
+      if (!this.isCurrent(socket, generation)) return;
+      const failure = classifyKalshiWebSocketError(error);
+      this.pendingTransportFailure = { generation, failure };
+      this.pendingCloseTrigger = `socket_error:${failure.classification}`;
       socket.close();
+    });
+    socket.on('unexpected-response', (_request, response) => {
+      if (!this.isCurrent(socket, generation)) return;
+      response.resume();
+      this.restartAfterFailure(generation, classifyKalshiWebSocketError({
+        statusCode: response.statusCode,
+        message: `websocket handshake returned HTTP ${response.statusCode}`,
+      }));
     });
     socket.on('close', (code, reason) => {
       if (!this.isCurrent(socket, generation)) return;
       this.lastCloseAt = Date.now();
       this.lastCloseCode = code;
       this.lastCloseTrigger = this.pendingCloseTrigger ?? 'remote_close_without_reason';
-      this.lastCloseReason = reason.toString('utf8') || this.lastCloseTrigger;
+      const rawReason = reason.toString('utf8') || null;
+      const failure = this.pendingTransportFailure?.generation === generation
+        ? this.pendingTransportFailure.failure
+        : classifyKalshiWebSocketClose(code, rawReason, !this.started);
+      this.lastCloseReason = failure.closeReason ?? (rawReason ? failure.detail : this.lastCloseTrigger);
+      const retry = this.transportController.recordFailure(generation, failure);
+      const transportTelemetry = this.transportController.telemetry();
       this.pendingCloseTrigger = null;
+      this.pendingTransportFailure = null;
       this.socket = null;
       this.authenticated = false;
+      this.connectedAt = null;
       this.clearHeartbeatTimer();
       this.subscribed.clear();
       this.subscriptionUpdateQueue.length = 0;
       this.pendingSubscriptionUpdate = null;
-      if (!this.started) return;
+      if (!this.started || !retry.retry) return;
       this.reconnects += 1;
-      this.advanceEndpoint();
       this.registry.recordTelemetry('kalshi-orderbook-ws', {
         status: 'warn',
         lastError: 'order-book stream disconnected; reconnect scheduled',
@@ -340,14 +548,13 @@ export class KalshiOrderbookStream {
         transportConnected: false,
         authenticated: false,
         qualificationReady: false,
-        endpointUrl: this.currentEndpointUrl(),
+        endpointUrl: transportTelemetry.failedEndpoint,
         lastCloseAt: this.lastCloseAt,
         lastCloseCode: this.lastCloseCode,
         lastCloseReason: this.lastCloseReason,
         lastCloseTrigger: this.lastCloseTrigger,
       });
-      const waitMs = this.reconnectDelayMs;
-      this.reconnectDelayMs = Math.min(30_000, this.reconnectDelayMs * 2);
+      const waitMs = retry.delayMs ?? 0;
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null;
         this.connect();
@@ -360,39 +567,39 @@ export class KalshiOrderbookStream {
     if (socket?.readyState !== WebSocket.OPEN) return;
     const subscriptionEntry = [...this.subscriptionIdByKey.entries()][0];
     if (!subscriptionEntry) {
-      if (this.subscribed.size > 0 || this.tickers.size === 0) return;
+      if (this.initialSubscriptionCommand || this.tickers.size === 0) return;
       const initial = [...this.tickers];
+      const id = this.commandId++;
       try {
         socket.send(JSON.stringify({
-          id: this.commandId++,
+          id,
           cmd: 'subscribe',
-          params: { channels: ['orderbook_delta'], market_tickers: initial },
+          params: {
+            channels: ['orderbook_delta'],
+            market_tickers: initial,
+            use_yes_price: true,
+          },
         }));
       } catch {
-        this.pendingCloseTrigger = 'initial_subscription_send_failed';
+        this.setPendingFailure(this.generation, createKalshiTransportFailure('tcp', 'initial subscription send failed'), 'initial_subscription_send_failed');
         socket.close();
         return;
       }
-      for (const ticker of initial) this.subscribed.add(ticker);
+      this.initialSubscriptionCommand = {
+        id,
+        revision: this.trackingRevision,
+        marketTickers: initial,
+      };
       return;
     }
 
+    if (this.initialSubscriptionCommand || this.pendingSubscriptionUpdate || this.subscriptionUpdateQueue.length > 0) return;
     const [subscription, sid] = subscriptionEntry;
     const removed = [...this.subscribed].filter((ticker) => !this.tickers.has(ticker));
     const added = [...this.tickers].filter((ticker) => !this.subscribed.has(ticker));
     this.enqueueSubscriptionUpdate({ sid, marketTickers: removed, action: 'delete_markets' });
     this.enqueueSubscriptionUpdate({ sid, marketTickers: added, action: 'add_markets' });
-    const subscriptionTickers = this.tickersBySubscription.get(subscription) ?? new Set<string>();
-    for (const ticker of removed) {
-      this.subscribed.delete(ticker);
-      subscriptionTickers.delete(ticker);
-    }
-    for (const ticker of added) {
-      this.subscribed.add(ticker);
-      this.quarantined.add(ticker);
-      subscriptionTickers.add(ticker);
-    }
-    this.tickersBySubscription.set(subscription, subscriptionTickers);
+    if (removed.length === 0 && added.length === 0) this.acknowledgeMembershipAndRequestSnapshots(subscription, sid);
   }
 
   /** Ingests one official WebSocket packet; public to support deterministic replay tests. */
@@ -407,38 +614,63 @@ export class KalshiOrderbookStream {
       const acknowledgesPendingUpdate = type === 'ok'
         && packetCommandId != null
         && packetCommandId === this.pendingSubscriptionUpdate?.id;
+      const rejectsInitialSubscription = type === 'error'
+        && packetCommandId != null
+        && packetCommandId === this.initialSubscriptionCommand?.id;
+      if (rejectsInitialSubscription) {
+        const errorMessage = String((msg as { msg?: unknown } | null)?.msg ?? 'initial subscription failed');
+        this.initialSubscriptionCommand = null;
+        const failure = createKalshiTransportFailure('protocol', errorMessage);
+        this.registry.recordWarn('kalshi-orderbook-ws', failure.detail);
+        this.setPendingFailure(generation, failure, 'initial_subscription_error');
+        this.socket?.close();
+        return;
+      }
       if (type === 'error' && packetCommandId != null && packetCommandId === this.pendingSubscriptionUpdate?.id) {
         const errorMessage = String((msg as { msg?: unknown } | null)?.msg ?? 'subscription update failed');
         this.pendingSubscriptionUpdate = null;
         this.subscriptionUpdateQueue.length = 0;
-        this.registry.recordWarn('kalshi-orderbook-ws', errorMessage);
-        this.pendingCloseTrigger = `subscription_update_error:${errorMessage}`;
+        const failure = createKalshiTransportFailure('protocol', errorMessage);
+        this.registry.recordWarn('kalshi-orderbook-ws', failure.detail);
+        this.setPendingFailure(generation, failure, 'subscription_update_error');
         this.socket?.close();
         return;
       }
       if (type === 'subscribed') {
-        const subscribedSid = parseNumber(msg?.sid ?? packet.sid);
+        const subscribedSid = parseSequence(msg?.sid ?? packet.sid);
         if (subscribedSid != null) {
           const subscription = String(subscribedSid);
           this.subscriptionIdByKey.set(subscription, subscribedSid);
-          this.tickersBySubscription.set(subscription, new Set(this.subscribed));
+          const initial = this.initialSubscriptionCommand;
+          if (initial && (packetCommandId == null || packetCommandId === initial.id)) {
+            this.subscribed.clear();
+            for (const ticker of initial.marketTickers) this.subscribed.add(ticker);
+            this.tickersBySubscription.set(subscription, new Set(initial.marketTickers));
+            this.initialSubscriptionCommand = null;
+            this.transportController.recordSubscriptionAck(generation);
+          }
           this.subscribeMissing();
         }
         this.recordHealth();
         return;
       }
-      const sequence = parseNumber(packet.seq);
+      const sequence = parseSequence(packet.seq);
       if (sequence == null) {
         if (acknowledgesPendingUpdate) {
           this.registry.recordWarn('kalshi-orderbook-ws', 'subscription update acknowledgement lacked a sequence');
-          this.pendingCloseTrigger = 'subscription_update_ack_missing_sequence';
+          this.setPendingFailure(generation, createKalshiTransportFailure('protocol', 'subscription update acknowledgement lacked a valid sequence'), 'subscription_update_ack_missing_sequence');
           this.socket?.close();
           return;
         }
-        if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
+        if (type === 'error') {
+          const detail = String((msg as { msg?: unknown } | null)?.msg ?? 'unsolicited subscription error');
+          this.registry.recordWarn('kalshi-orderbook-ws', detail);
+          this.setPendingFailure(generation, createKalshiTransportFailure('protocol', detail), 'unsolicited_protocol_error');
+          this.socket?.close();
+        }
         return;
       }
-      const numericSubscriptionId = parseNumber(packet.sid);
+      const numericSubscriptionId = parseSequence(packet.sid);
       const subscription = numericSubscriptionId == null ? 'default' : String(numericSubscriptionId);
       if (numericSubscriptionId != null) this.subscriptionIdByKey.set(subscription, numericSubscriptionId);
       const subscriptionTickers = this.tickersBySubscription.get(subscription) ?? new Set<string>();
@@ -455,7 +687,7 @@ export class KalshiOrderbookStream {
       if (previousSequence != null && sequence !== previousSequence + 1) {
         if (acknowledgesPendingUpdate) {
           this.registry.recordWarn('kalshi-orderbook-ws', 'subscription update acknowledgement broke sequence continuity');
-          this.pendingCloseTrigger = 'subscription_update_ack_sequence_gap';
+          this.setPendingFailure(generation, createKalshiTransportFailure('sequence', 'subscription update acknowledgement broke sequence continuity'), 'subscription_update_ack_sequence_gap');
           this.socket?.close();
           return;
         }
@@ -467,7 +699,7 @@ export class KalshiOrderbookStream {
         return;
       }
       this.sequenceBySubscription.set(subscription, sequence);
-      if (acknowledgesPendingUpdate) this.pendingSubscriptionUpdate = null;
+      if (acknowledgesPendingUpdate) this.completePendingSubscriptionUpdate(subscription);
       if (this.started && ticker && !this.tickers.has(ticker)) {
         this.books.delete(ticker);
         this.quarantined.delete(ticker);
@@ -475,30 +707,55 @@ export class KalshiOrderbookStream {
         return;
       }
       if (!ticker || !msg) {
-        if (type === 'error') this.registry.recordWarn('kalshi-ws', String((msg as { msg?: unknown } | null)?.msg ?? 'subscription error'));
+        if (type === 'error') {
+          const detail = String((msg as { msg?: unknown } | null)?.msg ?? 'unsolicited subscription error');
+          this.registry.recordWarn('kalshi-orderbook-ws', detail);
+          this.setPendingFailure(generation, createKalshiTransportFailure('protocol', detail), 'unsolicited_protocol_error');
+          this.socket?.close();
+          return;
+        }
         this.recordHealth();
-        if (acknowledgesPendingUpdate) this.pumpSubscriptionUpdates();
+        if (acknowledgesPendingUpdate) {
+          this.pumpSubscriptionUpdates();
+          this.subscribeMissing();
+        }
         return;
       }
       if (type === 'orderbook_snapshot') this.applySnapshot(subscription, ticker, sequence, msg);
       else if (type === 'orderbook_delta') {
         this.applyDelta(ticker, sequence, msg);
-        const book = this.getBook(ticker);
+        const book = this.getBook(ticker, Date.now());
         if (book?.sourceTimestamp != null) {
           for (const listener of this.bookUpdateListeners) listener(book);
         }
       }
       else return;
       this.recordHealth();
+      if (acknowledgesPendingUpdate) {
+        this.pumpSubscriptionUpdates();
+        this.subscribeMissing();
+      }
     } catch {
       this.registry.recordWarn('kalshi-ws', 'malformed order-book stream message');
+      this.setPendingFailure(generation, createKalshiTransportFailure('protocol', 'malformed order-book stream message'), 'malformed_protocol_message');
+      this.socket?.close();
     }
   }
 
   private applySnapshot(subscription: string, ticker: string, sequence: number, msg: Record<string, unknown>): void {
-    const yes = parseLevels(msg.yes_dollars_fp ?? msg.yes_dollars ?? msg.yes);
-    const no = parseLevels(msg.no_dollars_fp ?? msg.no_dollars ?? msg.no);
-    this.books.set(ticker, { ticker, yes, no, sequence, receivedAt: Date.now() });
+    const yes = parseLevels(msg.yes_dollars_fp ?? msg.yes_dollars ?? msg.yes, 'yes');
+    const no = parseLevels(msg.no_dollars_fp ?? msg.no_dollars ?? msg.no, 'no');
+    const snapshotTrackingRevision = !this.started || this.acknowledgedTrackingRevision === this.trackingRevision
+      ? this.trackingRevision
+      : undefined;
+    this.books.set(ticker, {
+      ticker,
+      yes,
+      no,
+      sequence,
+      receivedAt: Date.now(),
+      snapshotTrackingRevision,
+    });
     // A snapshot repairs structure, but qualification stays quarantined until a
     // later sequenced exchange delta proves the stream is advancing.
     this.quarantined.add(ticker);
@@ -520,18 +777,84 @@ export class KalshiOrderbookStream {
     const price = parseNumber(msg.price_dollars ?? msg.price_dollars_fp ?? msg.price);
     const delta = parseNumber(msg.delta_fp ?? msg.delta);
     const timestamp = parseNumber(msg.ts_ms) ?? (typeof msg.ts === 'string' ? Date.parse(msg.ts) : undefined);
-    if (!side || price == null || delta == null || timestamp == null || !Number.isFinite(timestamp)) return;
+    const receivedAt = Date.now();
+    if (!side || price == null || price <= 0 || price >= 1 || delta == null || timestamp == null
+      || !this.isValidExchangeTimestamp(timestamp, receivedAt)) {
+      this.quarantined.add(ticker);
+      return;
+    }
     const levels = book[side];
-    const next = (levels.get(price) ?? 0) + delta;
-    if (next <= 0) levels.delete(price);
-    else levels.set(price, next);
+    const normalizedPrice = internalPrice(price, side);
+    const next = (levels.get(normalizedPrice) ?? 0) + delta;
+    if (next <= 0) levels.delete(normalizedPrice);
+    else levels.set(normalizedPrice, next);
     book.sequence = sequence;
     book.sourceTimestamp = timestamp;
-    book.receivedAt = Date.now();
+    book.receivedAt = receivedAt;
     this.lastSequencedDeltaAt = book.receivedAt;
     book.sequencedDeltaAt = book.receivedAt;
+    book.deltaTrackingRevision = book.snapshotTrackingRevision === this.trackingRevision
+      && (!this.started || this.acknowledgedTrackingRevision === this.trackingRevision)
+      ? this.trackingRevision
+      : undefined;
     this.lastExchangeTimestamp = timestamp;
-    this.quarantined.delete(ticker);
+    if (book.deltaTrackingRevision === this.trackingRevision) {
+      this.quarantined.delete(ticker);
+      this.transportController.recordExchangeData(this.generation, timestamp);
+    }
+  }
+
+  private markTrackingChanged(): void {
+    this.trackingRevision += 1;
+    this.acknowledgedTrackingRevision = null;
+    this.snapshotRequestRevisionBySubscription.clear();
+    for (const ticker of this.tickers) {
+      this.books.delete(ticker);
+      this.quarantined.add(ticker);
+    }
+  }
+
+  private completePendingSubscriptionUpdate(subscription: string): void {
+    const pending = this.pendingSubscriptionUpdate;
+    if (!pending) return;
+    const subscriptionTickers = this.tickersBySubscription.get(subscription) ?? new Set<string>();
+    if (pending.action === 'delete_markets') {
+      for (const ticker of pending.marketTickers) {
+        this.subscribed.delete(ticker);
+        subscriptionTickers.delete(ticker);
+      }
+    } else if (pending.action === 'add_markets') {
+      for (const ticker of pending.marketTickers) {
+        this.subscribed.add(ticker);
+        subscriptionTickers.add(ticker);
+        this.quarantined.add(ticker);
+      }
+    }
+    this.tickersBySubscription.set(subscription, subscriptionTickers);
+    this.pendingSubscriptionUpdate = null;
+  }
+
+  private acknowledgeMembershipAndRequestSnapshots(subscription: string, sid: number): void {
+    const membershipMatches = this.subscribed.size === this.tickers.size
+      && [...this.tickers].every((ticker) => this.subscribed.has(ticker));
+    if (!membershipMatches || this.pendingSubscriptionUpdate || this.subscriptionUpdateQueue.length > 0) return;
+    if (this.acknowledgedTrackingRevision === this.trackingRevision) return;
+    this.acknowledgedTrackingRevision = this.trackingRevision;
+    if (this.snapshotRequestRevisionBySubscription.get(subscription) === this.trackingRevision) return;
+    this.snapshotRequestRevisionBySubscription.set(subscription, this.trackingRevision);
+    const affected = [...this.tickers].sort();
+    this.pendingSnapshotRepair.set(subscription, new Set(affected));
+    for (const ticker of affected) {
+      this.books.delete(ticker);
+      this.quarantined.add(ticker);
+    }
+    this.enqueueSubscriptionUpdate({ sid, marketTickers: affected, action: 'get_snapshot' });
+  }
+
+  private isValidExchangeTimestamp(timestamp: number, now: number): boolean {
+    return Number.isSafeInteger(timestamp)
+      && timestamp >= MIN_MILLISECOND_TIMESTAMP
+      && timestamp <= now + MAX_EXCHANGE_FUTURE_SKEW_MS;
   }
 
   private quarantineSubscriptionAndRequestSnapshot(
@@ -566,10 +889,10 @@ export class KalshiOrderbookStream {
     this.heartbeatTimer = setInterval(() => {
       if (!this.isCurrent(socket, generation) || socket.readyState !== WebSocket.OPEN) return;
       const now = Date.now();
-      const freshestTrafficAt = Math.max(this.lastMessageAt ?? 0, this.lastPongAt ?? 0);
-      if (freshestTrafficAt === 0 || now - freshestTrafficAt > DEAD_CONNECTION_MS) {
-        this.registry.recordWarn('kalshi-orderbook-ws', 'order-book websocket liveness expired');
-        this.pendingCloseTrigger = 'local_liveness_expired';
+      const pongReferenceAt = this.lastPongAt ?? this.connectedAt;
+      if (pongReferenceAt == null || now - pongReferenceAt > DEAD_CONNECTION_MS) {
+        this.registry.recordWarn('kalshi-orderbook-ws', 'order-book websocket pong expired');
+        this.setPendingFailure(generation, createKalshiTransportFailure('timeout', 'order-book websocket pong expired'), 'local_pong_expired');
         socket.terminate();
         return;
       }
@@ -623,10 +946,32 @@ export class KalshiOrderbookStream {
     const socket = this.socket;
     this.socket = null;
     this.authenticated = false;
+    this.connectedAt = null;
     this.subscribed.clear();
     this.subscriptionUpdateQueue.length = 0;
     this.pendingSubscriptionUpdate = null;
+    this.initialSubscriptionCommand = null;
+    this.acknowledgedTrackingRevision = null;
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close();
+  }
+
+  private restartAfterFailure(generation: number, failure: KalshiTransportFailure): void {
+    const decision = this.transportController.recordFailure(generation, failure);
+    this.closeCurrentSocket();
+    this.recordHealth();
+    if (!this.started || !decision.retry || decision.delayMs == null) return;
+    this.reconnects += 1;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, decision.delayMs);
+  }
+
+  private setPendingFailure(generation: number, failure: KalshiTransportFailure, trigger: string): void {
+    if (generation !== this.generation) return;
+    this.pendingTransportFailure = { generation, failure };
+    this.pendingCloseTrigger = trigger;
   }
 
   private clearHeartbeatTimer(): void {
@@ -659,7 +1004,7 @@ export class KalshiOrderbookStream {
       this.subscriptionUpdates += 1;
     } catch {
       this.subscriptionUpdateQueue.unshift(command);
-      this.pendingCloseTrigger = 'subscription_update_send_failed';
+      this.setPendingFailure(this.generation, createKalshiTransportFailure('tcp', 'subscription update send failed'), 'subscription_update_send_failed');
       this.socket.close();
     }
   }
@@ -669,12 +1014,6 @@ export class KalshiOrderbookStream {
   }
 
   private currentEndpointUrl(): string | null {
-    const endpoints = getKalshiEndpointPolicy(this.environment).websocketUrls;
-    return endpoints[this.endpointIndex] ?? endpoints[0] ?? null;
-  }
-
-  private advanceEndpoint(): void {
-    const count = getKalshiEndpointPolicy(this.environment).websocketUrls.length;
-    if (count > 1) this.endpointIndex = (this.endpointIndex + 1) % count;
+    return this.transportController.currentEndpoint();
   }
 }
