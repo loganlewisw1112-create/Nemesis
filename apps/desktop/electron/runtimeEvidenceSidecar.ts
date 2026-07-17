@@ -73,8 +73,16 @@ export class RuntimeEvidenceSidecar {
     gitCommit: string;
     configurationHash: string;
     healthPolicyHash: string;
+    productionArtifactHash: string;
+    soakVerificationReceiptHash: string;
     at?: number;
   }): RuntimeEvidenceSidecar {
+    if (!/^[a-f0-9]{64}$/i.test(input.productionArtifactHash)) {
+      throw new Error('production artifact hash must be an explicit SHA-256 digest');
+    }
+    if (!/^[a-f0-9]{64}$/i.test(input.soakVerificationReceiptHash)) {
+      throw new Error('soak verification receipt hash must be an explicit SHA-256 digest');
+    }
     if (fs.existsSync(filePath)) throw new Error(`runtime sidecar already exists: ${filePath}`);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const store = new RuntimeEvidenceSidecar(filePath, input.runId);
@@ -82,6 +90,8 @@ export class RuntimeEvidenceSidecar {
       gitCommit: input.gitCommit,
       configurationHash: input.configurationHash,
       healthPolicyHash: input.healthPolicyHash,
+      productionArtifactHash: input.productionArtifactHash,
+      soakVerificationReceiptHash: input.soakVerificationReceiptHash,
     }, input.at);
     return store;
   }

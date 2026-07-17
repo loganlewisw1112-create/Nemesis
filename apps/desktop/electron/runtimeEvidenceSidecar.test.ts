@@ -11,6 +11,9 @@ afterEach(() => {
 });
 
 describe('RuntimeEvidenceSidecar', () => {
+  const productionArtifactHash = 'a'.repeat(64);
+  const soakVerificationReceiptHash = 'b'.repeat(64);
+
   it('writes a hash-linked fsynced stream and produces a stable final file hash', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nemesis-runtime-sidecar-'));
     roots.push(root);
@@ -20,6 +23,8 @@ describe('RuntimeEvidenceSidecar', () => {
       gitCommit: 'abc',
       configurationHash: 'cfg',
       healthPolicyHash: 'health',
+      productionArtifactHash,
+      soakVerificationReceiptHash,
       at: 1,
     });
     sidecar.appendSample({ state: 'healthy' }, 2);
@@ -33,6 +38,10 @@ describe('RuntimeEvidenceSidecar', () => {
       'runtime_transition',
       'runtime_finalized',
     ]);
+    expect(replay.events[0]?.payload).toMatchObject({
+      productionArtifactHash,
+      soakVerificationReceiptHash,
+    });
     expect(hash).toMatch(/^[a-f0-9]{64}$/);
     expect(() => sidecar.appendSample({}, 5)).toThrow(/finalized/);
   });
@@ -42,7 +51,7 @@ describe('RuntimeEvidenceSidecar', () => {
     roots.push(root);
     const filePath = path.join(root, 'runtime.jsonl');
     const sidecar = RuntimeEvidenceSidecar.create(filePath, {
-      runId: 'r10', gitCommit: 'abc', configurationHash: 'cfg', healthPolicyHash: 'health', at: 1,
+      runId: 'r10', gitCommit: 'abc', configurationHash: 'cfg', healthPolicyHash: 'health', productionArtifactHash, soakVerificationReceiptHash, at: 1,
     });
     sidecar.appendSample({ state: 'healthy' }, 2);
     fs.writeFileSync(filePath, fs.readFileSync(filePath, 'utf8').replace('healthy', 'failed'), 'utf8');
@@ -55,7 +64,21 @@ describe('RuntimeEvidenceSidecar', () => {
     const parentIsAFile = path.join(root, 'not-a-directory');
     fs.writeFileSync(parentIsAFile, 'occupied', 'utf8');
     expect(() => RuntimeEvidenceSidecar.create(path.join(parentIsAFile, 'runtime.jsonl'), {
-      runId: 'r10', gitCommit: 'abc', configurationHash: 'cfg', healthPolicyHash: 'health', at: 1,
+      runId: 'r10', gitCommit: 'abc', configurationHash: 'cfg', healthPolicyHash: 'health', productionArtifactHash, soakVerificationReceiptHash, at: 1,
     })).toThrow();
+  });
+
+  it('refuses to start without explicit upstream evidence hashes', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nemesis-runtime-sidecar-identity-'));
+    roots.push(root);
+    expect(() => RuntimeEvidenceSidecar.create(path.join(root, 'runtime.jsonl'), {
+      runId: 'r10',
+      gitCommit: 'abc',
+      configurationHash: 'cfg',
+      healthPolicyHash: 'health',
+      productionArtifactHash: '',
+      soakVerificationReceiptHash,
+      at: 1,
+    })).toThrow(/production artifact hash/i);
   });
 });

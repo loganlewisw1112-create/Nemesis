@@ -22,6 +22,8 @@ describe('evidence campaign invalidation script', () => {
         stage: 'instrumentation',
         startedAt: Date.now(),
         settings: DEFAULT_ENTRY_QUALIFICATION,
+        productionArtifactHash: 'a'.repeat(64),
+        soakVerificationReceiptHash: 'b'.repeat(64),
       });
       fs.writeFileSync(filePath, `${tracker.allEvents().map((event) => JSON.stringify(event)).join('\n')}\n`);
       fs.writeFileSync(path.join(campaignDir, 'active-campaign.json'), JSON.stringify({

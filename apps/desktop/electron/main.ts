@@ -49,6 +49,7 @@ import {
   evaluateLiveUnlock,
   kalshiFeeForOrder,
   isKnownKalshiFeePolicy,
+  kalshiProductionCircuitSnapshot,
   positionUnrealizedPnl,
   type AutoCloseDecision,
   type AutoCloseSettings,
@@ -60,6 +61,7 @@ import {
   type KalshiMarket,
   type KalshiOrderbook,
   type KalshiFeePolicy,
+  type KalshiResponseMetadata,
   type OpportunityRadarRow,
   type PriceTick,
   type PaperPortfolio,
@@ -69,7 +71,7 @@ import {
   type GeoMarket,
   type WorldEventsPayload,
 } from '@nemesis/core';
-import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, type ProductionUniverseRecord } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -153,6 +155,7 @@ import { VersionedStateStream } from './stateStreamCoalescer.js';
 import { RuntimeStatusExporter, runtimeStatusPathFromEnvironment } from './runtimeStatusExport.js';
 import { RendererHeartbeatMonitor } from './rendererHeartbeatMonitor.js';
 import { selectBoundedOrderbookTracking } from './orderbookTrackingRotation.js';
+import { assessProductionObservation, productionObservationStateHash } from './productionObservation.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -176,6 +179,7 @@ const STRATEGY_VALIDATION_PATH = path.join(DATA_DIR, 'paper-strategy-validation-
 const CAMPAIGN_DIR = path.join(DATA_DIR, 'evidence-campaigns');
 const ACTIVE_CAMPAIGN_PATH = path.join(CAMPAIGN_DIR, 'active-campaign.json');
 const BRIDGE_TELEMETRY_PATH = path.join(DATA_DIR, 'bridge-telemetry.jsonl');
+const PRODUCTION_OBSERVATION_MODE = process.env.NEMESIS_PRODUCTION_OBSERVATION === 'true';
 
 const MAX_TICKS = 120;
 const LIQUIDITY_PREFILTER_MAX_AGE_MS = 45_000;
@@ -252,9 +256,11 @@ let reviewOnly = false;
 let marketsCache: KalshiMarket[] = [];
 let marketFeedReady = false;
 let geaMarkets: KalshiMarket[] = [];
+const productionMarketRecords = new Map<string, ProductionUniverseRecord>();
 const paperDesk = new PaperDesk(DEFAULT_PAPER_CASH);
 const paperBuyExecutionCoordinator = new PaperExecutionCoordinator();
 const paperOrderBook = new PaperOrderBook();
+let productionObservationBaselineHash: string | null = null;
 const auditLog = new AuditLog();
 const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
 const opportunityQueue = new OpportunityThroughputQueue(DEFAULT_OPPORTUNITY_THROUGHPUT);
@@ -694,16 +700,19 @@ function ensureShutdownCounters() {
 }
 
 function recordDryRunInvalidation() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   recordInvalidation(ensureShutdownCounters());
   saveSessionStats();
 }
 
 function recordDryRunAbnormalExecution() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   recordAbnormalExecution(ensureShutdownCounters());
   saveSessionStats();
 }
 
 function resetDryRunInvalidationStreak() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   const shutdown = ensureShutdownCounters();
   if (shutdown.consecutiveInvalidations === 0) return;
   resetInvalidationStreak(shutdown);
@@ -795,6 +804,8 @@ interface ActiveCampaignPointer {
   parentRunId: string | null;
   restartOrdinal: number;
   healthPolicyHash: string;
+  productionArtifactHash: string;
+  soakVerificationReceiptHash: string;
   runtimeSidecarPath: string;
   runtimeLedgerPath: string;
   controlPath: string;
@@ -805,17 +816,15 @@ function readActiveCampaignPointer(): ActiveCampaignPointer | null {
   if (!fs.existsSync(ACTIVE_CAMPAIGN_PATH)) return null;
   try {
     const pointer = JSON.parse(fs.readFileSync(ACTIVE_CAMPAIGN_PATH, 'utf8')) as ActiveCampaignPointer;
-    if (pointer.schemaVersion !== 2 || !pointer.evidenceNamespace || !['instrumentation', 'seven-hour'].includes(pointer.stage)) return null;
-    const expected = path.resolve(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.jsonl`);
-    if (path.resolve(pointer.filePath) !== expected) return null;
-    if (!pointer.runtimeSidecarPath || !pointer.runtimeLedgerPath || !pointer.controlPath) return null;
-    return pointer;
+    return campaignPointerValidationError(pointer) == null ? pointer : null;
   } catch {
     return null;
   }
 }
 
 function writeActiveCampaignPointer(pointer: ActiveCampaignPointer): void {
+  const validationError = campaignPointerValidationError(pointer);
+  if (validationError) throw new Error(`refusing invalid active campaign pointer: ${validationError}`);
   fs.mkdirSync(CAMPAIGN_DIR, { recursive: true });
   writeAtomicJson(ACTIVE_CAMPAIGN_PATH, pointer);
 }
@@ -829,22 +838,84 @@ function writeAtomicJson(filePath: string, value: unknown): void {
 
 function configuredCampaignPointer(stage: ActiveCampaignPointer['stage'], evidenceNamespace: string): ActiveCampaignPointer {
   const namespace = campaignNamespace(evidenceNamespace);
-  return {
+  const healthPolicyHash = process.env.NEMESIS_HEALTH_POLICY_HASH?.trim();
+  const productionArtifactHash = process.env.NEMESIS_PRODUCTION_ARTIFACT_HASH?.trim();
+  const soakVerificationReceiptHash = process.env.NEMESIS_SOAK_VERIFICATION_RECEIPT_HASH?.trim();
+  const runtimeSidecarPath = process.env.NEMESIS_EVIDENCE_RUNTIME_SIDECAR?.trim();
+  const runtimeLedgerPath = process.env.NEMESIS_EVIDENCE_RUNTIME_LEDGER?.trim();
+  const controlPath = process.env.NEMESIS_EVIDENCE_CONTROL?.trim();
+  if (process.env.NEMESIS_EVIDENCE_PREFLIGHT !== 'true') {
+    throw new Error('supervised evidence must begin in preflight mode');
+  }
+  if (!healthPolicyHash || !productionArtifactHash || !soakVerificationReceiptHash || !runtimeSidecarPath || !runtimeLedgerPath || !controlPath) {
+    throw new Error('supervised evidence requires explicit upstream hashes, health-policy, runtime, and control paths');
+  }
+  const pointer: ActiveCampaignPointer = {
     schemaVersion: 2,
     evidenceNamespace: namespace,
     stage,
     filePath: path.join(CAMPAIGN_DIR, `${namespace}.jsonl`),
     parentRunId: process.env.NEMESIS_EVIDENCE_PARENT_RUN_ID?.trim() || null,
     restartOrdinal: Number.parseInt(process.env.NEMESIS_EVIDENCE_RESTART_ORDINAL ?? '0', 10) || 0,
-    healthPolicyHash: process.env.NEMESIS_HEALTH_POLICY_HASH?.trim()
-      || createHash('sha256').update('runtime-health-v2').digest('hex'),
-    runtimeSidecarPath: process.env.NEMESIS_EVIDENCE_RUNTIME_SIDECAR?.trim()
-      || path.join(CAMPAIGN_DIR, `${namespace}.runtime.json`),
-    runtimeLedgerPath: process.env.NEMESIS_EVIDENCE_RUNTIME_LEDGER?.trim()
-      || path.join(CAMPAIGN_DIR, `${namespace}.runtime.jsonl`),
-    controlPath: process.env.NEMESIS_EVIDENCE_CONTROL?.trim()
-      || path.join(CAMPAIGN_DIR, `${namespace}.control.json`),
-    status: process.env.NEMESIS_EVIDENCE_PREFLIGHT === 'true' ? 'preflight' : 'active',
+    healthPolicyHash,
+    productionArtifactHash,
+    soakVerificationReceiptHash,
+    runtimeSidecarPath,
+    runtimeLedgerPath,
+    controlPath,
+    status: 'preflight',
+  };
+  const validationError = campaignPointerValidationError(pointer);
+  if (validationError) throw new Error(validationError);
+  return pointer;
+}
+
+function campaignPointerValidationError(pointer: ActiveCampaignPointer): string | null {
+  if (pointer.schemaVersion !== 2) return 'schema version must be 2';
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(pointer.evidenceNamespace)) return 'evidence namespace is invalid';
+  if (!['instrumentation', 'seven-hour'].includes(pointer.stage)) return 'campaign stage is invalid';
+  if (!['preflight', 'active', 'closeout'].includes(pointer.status)) return 'campaign status is invalid';
+  if (!Number.isInteger(pointer.restartOrdinal) || pointer.restartOrdinal < 0 || pointer.restartOrdinal > 2) {
+    return 'restart ordinal must be 0, 1, or 2';
+  }
+  if (!/^[a-f0-9]{64}$/i.test(pointer.healthPolicyHash)) return 'health policy hash is invalid';
+  if (!/^[a-f0-9]{64}$/i.test(pointer.productionArtifactHash)) return 'production artifact hash is invalid';
+  if (!/^[a-f0-9]{64}$/i.test(pointer.soakVerificationReceiptHash)) return 'soak verification receipt hash is invalid';
+  if (pointer.parentRunId != null && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(pointer.parentRunId)) {
+    return 'parent run id is invalid';
+  }
+  const expectedPaths: ReadonlyArray<[string, string]> = [
+    [pointer.filePath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.jsonl`)],
+    [pointer.runtimeSidecarPath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.runtime.json`)],
+    [pointer.runtimeLedgerPath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.runtime.jsonl`)],
+    [pointer.controlPath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.control.json`)],
+  ];
+  return expectedPaths.some(([actual, expected]) => !actual || path.resolve(actual) !== path.resolve(expected))
+    ? 'campaign artifact paths must match the isolated namespace'
+    : null;
+}
+
+function currentOrderbookTrackingState(now = Date.now()) {
+  // The stream owns the definitive OrderbookTrackingStateV2 projection so
+  // runners and verifiers read one authoritative object.
+  return kalshiOrderbookStream.trackingStateV2(now);
+}
+
+function currentFeedHealthSnapshot(now = Date.now()) {
+  const base = feedHub.getFeedHealthSnapshot(now);
+  const ticker = kalshiStream.telemetry(now);
+  const orderbook = kalshiOrderbookStream.telemetry(now);
+  const tickerWebSocket = { ...(base.tickerWebSocket ?? {}), ...ticker };
+  const orderbookWebSocket = { ...(base.orderbookWebSocket ?? {}), ...orderbook };
+  return {
+    ...base,
+    tickerWebSocket,
+    orderbookWebSocket,
+    transportCircuit: kalshiProductionCircuitSnapshot('production', now),
+    qualificationReady: base.restMarkets?.qualificationReady === true
+      && base.tradeTape?.qualificationReady === true
+      && ticker.qualificationReady
+      && orderbook.qualificationReady,
   };
 }
 
@@ -866,7 +937,15 @@ function runtimeStatusPayload(
     renderer: currentRendererRuntimeAssessment(now),
     bridge: { ...bridgeStatus },
     processes,
-    feeds: feedHub.getFeedHealthSnapshot(),
+    feeds: currentFeedHealthSnapshot(now),
+    orderbookTracking: currentOrderbookTrackingState(now),
+    productionObservation: currentProductionObservationState(),
+    evidenceIdentity: pointer ? {
+      gitCommit: process.env.NEMESIS_GIT_COMMIT?.trim() ?? null,
+      healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
+    } : null,
     ...detail,
   };
 }
@@ -892,6 +971,17 @@ function startEvidenceCampaign(pointer: ActiveCampaignPointer, startedAt: number
   campaignEntryConfirmationEngine = new EntryConfirmationEngine(config);
   const isNewLedger = !fs.existsSync(pointer.filePath);
   const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
+  if (
+    pointer.status !== 'preflight'
+    || pendingCampaignPointer !== pointer
+    || !evidenceRunSupervisor
+    || evidenceRunSupervisor.snapshot().status !== 'active'
+    || !runtimeEvidenceSidecar
+  ) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: successful supervised preflight authorization is required');
+    return false;
+  }
   if (!isNewLedger) {
     reviewOnly = true;
     console.error('[nemesis] evidence campaign restart refused: attempts require an isolated namespace and fresh clock');
@@ -900,6 +990,11 @@ function startEvidenceCampaign(pointer: ActiveCampaignPointer, startedAt: number
   if (!frozenCommit) {
     reviewOnly = true;
     console.error('[nemesis] evidence campaign not started: NEMESIS_GIT_COMMIT is required');
+    return false;
+  }
+  if (!PRODUCTION_OBSERVATION_MODE || !currentProductionObservationState().qualificationReady) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: locked production observation state is required');
     return false;
   }
   if ((settings.kalshiAccountPrecision ?? 'unknown') === 'unknown') {
@@ -923,6 +1018,8 @@ function startEvidenceCampaign(pointer: ActiveCampaignPointer, startedAt: number
     parentRunId: pointer.parentRunId ?? undefined,
     restartOrdinal: pointer.restartOrdinal,
     healthPolicyHash: pointer.healthPolicyHash,
+    productionArtifactHash: pointer.productionArtifactHash,
+    soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
     runtimeSidecarPath: pointer.runtimeLedgerPath,
   }, config);
   pointer.status = 'active';
@@ -944,14 +1041,25 @@ function initializeEvidenceCampaign(): void {
     ? requestedStage
     : undefined;
   const requestedNamespace = process.env.NEMESIS_EVIDENCE_NAMESPACE;
-  let pointer: ActiveCampaignPointer | null = requestedNamespace && stage
-    ? configuredCampaignPointer(stage, requestedNamespace)
-    : readActiveCampaignPointer();
-  if (!pointer && stage) {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    pointer = configuredCampaignPointer(stage, `${stage}-${stamp}`);
+  if (!requestedStage && !requestedNamespace) return;
+  if (!stage || !requestedNamespace || process.env.NEMESIS_EVIDENCE_PREFLIGHT !== 'true') {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: explicit stage, namespace, and preflight mode are required');
+    return;
   }
-  if (!pointer) return;
+  if (fs.existsSync(ACTIVE_CAMPAIGN_PATH)) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: an active pointer already exists and attempts cannot resume');
+    return;
+  }
+  let pointer: ActiveCampaignPointer;
+  try {
+    pointer = configuredCampaignPointer(stage, requestedNamespace);
+  } catch (error) {
+    reviewOnly = true;
+    console.error(`[nemesis] evidence campaign not started: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
   const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
   if (!frozenCommit) {
     reviewOnly = true;
@@ -960,42 +1068,40 @@ function initializeEvidenceCampaign(): void {
   }
   pendingCampaignPointer = pointer;
   writeActiveCampaignPointer(pointer);
-  if (pointer.status === 'preflight') {
-    if (fs.existsSync(pointer.filePath) || fs.existsSync(pointer.runtimeLedgerPath)) {
-      reviewOnly = true;
-      invalidateEvidenceAttempt(['preflight namespace is not clean'], Date.now(), false);
-      return;
-    }
-    try {
-      runtimeEvidenceSidecar = RuntimeEvidenceSidecar.create(pointer.runtimeLedgerPath, {
-        runId: pointer.evidenceNamespace,
-        gitCommit: frozenCommit,
-        configurationHash: strategyConfigHash(),
-        healthPolicyHash: pointer.healthPolicyHash,
-      });
-      evidenceRunSupervisor = new EvidenceRunSupervisor({
-        at: Date.now(),
-        runId: pointer.evidenceNamespace,
-        parentRunId: pointer.parentRunId,
-        restartOrdinal: pointer.restartOrdinal,
-        evidenceNamespace: pointer.evidenceNamespace,
-        gitCommit: frozenCommit,
-        configurationHash: strategyConfigHash(),
-        healthPolicyHash: pointer.healthPolicyHash,
-        stage: pointer.stage,
-        runtimeSidecarPath: pointer.runtimeLedgerPath,
-      });
-      campaignEvidencePaused = true;
-      writeRuntimeStatus('preflight', {}, true);
-    } catch (error) {
-      reviewOnly = true;
-      invalidateEvidenceAttempt([
-        `runtime evidence startup failed: ${error instanceof Error ? error.message : String(error)}`,
-      ], Date.now(), false);
-    }
+  if (fs.existsSync(pointer.filePath) || fs.existsSync(pointer.runtimeLedgerPath) || fs.existsSync(pointer.runtimeSidecarPath)) {
+    reviewOnly = true;
+    invalidateEvidenceAttempt(['preflight namespace is not clean'], Date.now(), false);
     return;
   }
-  startEvidenceCampaign(pointer, Date.now());
+  try {
+    runtimeEvidenceSidecar = RuntimeEvidenceSidecar.create(pointer.runtimeLedgerPath, {
+      runId: pointer.evidenceNamespace,
+      gitCommit: frozenCommit,
+      configurationHash: strategyConfigHash(),
+      healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
+    });
+    evidenceRunSupervisor = new EvidenceRunSupervisor({
+      at: Date.now(),
+      runId: pointer.evidenceNamespace,
+      parentRunId: pointer.parentRunId,
+      restartOrdinal: pointer.restartOrdinal,
+      evidenceNamespace: pointer.evidenceNamespace,
+      gitCommit: frozenCommit,
+      configurationHash: strategyConfigHash(),
+      healthPolicyHash: pointer.healthPolicyHash,
+      stage: pointer.stage,
+      runtimeSidecarPath: pointer.runtimeLedgerPath,
+    });
+    campaignEvidencePaused = true;
+    writeRuntimeStatus('preflight', {}, true);
+  } catch (error) {
+    reviewOnly = true;
+    invalidateEvidenceAttempt([
+      `runtime evidence startup failed: ${error instanceof Error ? error.message : String(error)}`,
+    ], Date.now(), false);
+  }
 }
 
 function campaignSnapshot() {
@@ -1011,8 +1117,65 @@ function campaignSnapshot() {
 }
 
 function campaignMutationLockReason(): string | null {
+  if (PRODUCTION_OBSERVATION_MODE && !pendingCampaignPointer) {
+    return 'paper/live mutation locked during production observation';
+  }
   if (!pendingCampaignPointer) return null;
   return `paper/live mutation locked during supervised evidence state ${pendingCampaignPointer.status}`;
+}
+
+function protectedArtifactDigest(filePath: string): string {
+  try {
+    if (!fs.existsSync(filePath)) return 'missing';
+    return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+  } catch {
+    return 'unreadable';
+  }
+}
+
+function productionObservationInput() {
+  const portfolio = paperDesk.snapshot();
+  return {
+    enabled: PRODUCTION_OBSERVATION_MODE,
+    liveEnabled: settings.liveEnabled === true,
+    autoLiveEnabled: settings.autoLiveEnabled === true,
+    dryRun: settings.dryRun === true,
+    demoMode: settings.demoMode === true,
+    paperPositions: portfolio.positions,
+    paperTrades: portfolio.trades,
+    workingOrders: paperOrderBook.working(),
+    paperPortfolio: portfolio,
+    paperOrderState: paperOrderBook.snapshot(),
+    protectedArtifacts: {
+      settings: protectedArtifactDigest(SETTINGS_PATH),
+      discoverySettings: protectedArtifactDigest(DISCOVERY_SETTINGS_PATH),
+      credentials: protectedArtifactDigest(KALSHI_CREDENTIALS_PATH),
+      paperPortfolio: protectedArtifactDigest(PAPER_PATH),
+      paperOrders: protectedArtifactDigest(PAPER_ORDERS_PATH),
+      equityHistory: protectedArtifactDigest(EQUITY_HISTORY_PATH),
+      sessionStats: protectedArtifactDigest(SESSION_STATS_PATH),
+      autoCloseState: protectedArtifactDigest(AUTO_CLOSE_PATH),
+      paperQualification: protectedArtifactDigest(PAPER_QUALIFICATION_PATH),
+      strategyValidation: protectedArtifactDigest(STRATEGY_VALIDATION_PATH),
+    },
+    configurationHash: strategyConfigHash(),
+    protectedRuntimeState: {
+      settings,
+      discoverySettings: discovery.settings,
+      sessionStats: sessionStatsData,
+      equityHistory,
+      autoCloseStates: [...autoCloseStates.entries()],
+      autoCloseDecisions,
+    },
+  };
+}
+
+function captureProductionObservationBaseline(): void {
+  productionObservationBaselineHash = productionObservationStateHash(productionObservationInput());
+}
+
+function currentProductionObservationState() {
+  return assessProductionObservation(productionObservationInput(), productionObservationBaselineHash);
 }
 
 function sampleRendererMemory(): void {
@@ -1059,7 +1222,7 @@ function sampleRendererMemory(): void {
 
 function runtimeComponents(now: number): RuntimeComponentHealth[] {
   refreshBridgeConnectivity(now);
-  const feeds = feedHub.getFeedHealthSnapshot(now);
+  const feeds = currentFeedHealthSnapshot(now);
   const ticker = kalshiStream.telemetry(now);
   const orderbook = kalshiOrderbookStream.telemetry(now);
   const component = (
@@ -1085,6 +1248,8 @@ function runtimeComponents(now: number): RuntimeComponentHealth[] {
       qualificationReady: ticker.qualificationReady,
       lastSuccessAt: ticker.lastMessageAt,
       lastPongAt: ticker.lastPongAt,
+      retryAt: ticker.nextRetryAt,
+      failureClass: ticker.failureClass,
       failures: ticker.sequenceGaps,
       maxAgeMs: 25_000,
     },
@@ -1097,6 +1262,8 @@ function runtimeComponents(now: number): RuntimeComponentHealth[] {
         && orderbook.booksWithExchangeTime > 0,
       lastSuccessAt: orderbook.lastMessageAt,
       lastPongAt: orderbook.lastPongAt,
+      retryAt: orderbook.nextRetryAt,
+      failureClass: orderbook.failureClass,
       failures: orderbook.sequenceGaps + orderbook.sequenceRegressions,
       maxAgeMs: 25_000,
     },
@@ -1122,7 +1289,7 @@ function runtimeComponents(now: number): RuntimeComponentHealth[] {
 }
 
 function updatePreflightCycleCounts(): void {
-  const feeds = feedHub.getFeedHealthSnapshot();
+  const feeds = currentFeedHealthSnapshot();
   const restAt = feeds.restMarkets?.lastSuccess ?? 0;
   const tradeAt = feeds.tradeTape?.lastSuccess ?? 0;
   if (restAt > preflightRestSuccessAt) {
@@ -1139,7 +1306,8 @@ function preflightHealthyForStability(): boolean {
   const ticker = kalshiStream.telemetry();
   const orderbook = kalshiOrderbookStream.telemetry();
   const heartbeat = rendererHeartbeatMonitor.snapshot();
-  return settings.liveEnabled !== true
+  return currentProductionObservationState().qualificationReady
+    && settings.liveEnabled !== true
     && settings.autoLiveEnabled !== true
     && settings.dryRun === true
     && paperDesk.snapshot().positions.length === 0
@@ -1175,13 +1343,8 @@ function preflightReadinessDetail(): Record<string, unknown> {
     preflightFailureReason: orderbook.trackedTickers < ORDERBOOK_TRACKING_LIMIT
       ? 'orderbook_tracking_set_below_25'
       : null,
-    orderbookTracking: {
-      trackedTickers: orderbook.trackedTickers,
-      requiredTickers: ORDERBOOK_TRACKING_LIMIT,
-      trackingReady: orderbook.trackingReady,
-      authenticated: orderbook.authenticated,
-      connected: orderbook.connected,
-    },
+    orderbookTracking: currentOrderbookTrackingState(),
+    productionObservation: currentProductionObservationState(),
   };
 }
 
@@ -1224,6 +1387,13 @@ function writeCampaignResult(result: ReturnType<SevenHourCampaignStore['snapshot
     passed: result.passed,
     reasons: result.reasons,
     manifest: result.manifest,
+    evidenceIdentity: {
+      gitCommit: result.manifest.gitCommit,
+      configurationHash: result.manifest.configurationHash,
+      healthPolicyHash: result.manifest.schemaVersion === 2 ? result.manifest.healthPolicyHash : null,
+      productionArtifactHash: result.manifest.schemaVersion === 2 ? result.manifest.productionArtifactHash : null,
+      soakVerificationReceiptHash: result.manifest.schemaVersion === 2 ? result.manifest.soakVerificationReceiptHash : null,
+    },
     metrics: {
       candidates: result.candidates.length,
       screenedOut: result.screenedOut?.length ?? 0,
@@ -1270,6 +1440,8 @@ function writePreflightFailureResult(reason: string, now: number, restartable: b
       parentRunId: pointer.parentRunId,
       restartOrdinal: pointer.restartOrdinal,
       healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
       stage: pointer.stage,
       status: 'invalidated',
       invalidationReason: reason,
@@ -1377,6 +1549,8 @@ function finishOfflineCampaignFinalization(now: number): void {
       parentRunId: pointer.parentRunId ?? undefined,
       restartOrdinal: pointer.restartOrdinal,
       healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
       runtimeSidecarPath: pointer.runtimeLedgerPath,
     }, entryQualificationSettings());
     const replayed = replayedStore.snapshot();
@@ -1426,8 +1600,8 @@ function finalizeCampaign(now: number): void {
   campaignFinalizationTimer = setTimeout(() => {
     campaignFinalizationTimer = null;
     campaignFinalizationState = 'done';
-    invalidateEvidenceAttempt(['unclean shutdown: GEA did not exit within 30 seconds'], Date.now(), false);
-  }, 30_000);
+    invalidateEvidenceAttempt(['unclean shutdown: GEA did not exit within 20 seconds'], Date.now(), false);
+  }, 20_000);
 }
 
 function invalidateEvidenceAttempt(reasons: readonly string[], now: number, restartable = true): void {
@@ -1478,6 +1652,20 @@ function processEvidenceSupervisor(now: number): void {
   }
   if (state === 'preflight') {
     updatePreflightCycleCounts();
+    const ticker = kalshiStream.telemetry(now);
+    const orderbook = kalshiOrderbookStream.telemetry(now);
+    const permanentTransportFailure = [ticker.failureClass, orderbook.failureClass]
+      .find((failure) => failure === 'authentication' || failure === 'authorization' || failure === 'configuration');
+    if (permanentTransportFailure) {
+      invalidateEvidenceAttempt([`permanent Kalshi websocket failure: ${permanentTransportFailure}`], now, false);
+      return;
+    }
+    const freshProductionMarkets = [...productionMarketRecords.keys()]
+      .filter((ticker) => productionMarketRecord(ticker, now) != null).length;
+    if (discovery.hasLiveUniverse() && preflightRestCycles >= 3 && freshProductionMarkets < ORDERBOOK_TRACKING_LIMIT) {
+      invalidateEvidenceAttempt(['orderbook_tracking_set_below_25'], now, false);
+      return;
+    }
     const continuouslyHealthy = preflightHealthyForStability();
     const readyForStart = continuouslyHealthy && latestRendererMemoryAssessment.status === 'stable';
     const decision = evidenceRunSupervisor.observePreflight(now, continuouslyHealthy, readyForStart);
@@ -1541,6 +1729,13 @@ function recordCampaignOperationalTelemetry(): void {
     invalidateEvidenceAttempt([activeSnapshot.manifest.invalidationReason ?? 'campaign configuration invalidated'], now, false);
     return;
   }
+  const productionObservation = currentProductionObservationState();
+  if (pendingCampaignPointer && !productionObservation.qualificationReady) {
+    invalidateEvidenceAttempt([
+      `production observation integrity failed: ${productionObservation.reasons.join('; ')}`,
+    ], now, false);
+    return;
+  }
   if (pendingCampaignPointer && !getLiveCreds()) {
     invalidateEvidenceAttempt(['protected Kalshi credentials became unavailable'], now, false);
     return;
@@ -1597,6 +1792,9 @@ function recordCampaignOperationalTelemetry(): void {
       renderer: rendererRuntimeAssessment,
       bridge: { ...bridgeStatus },
       processes,
+      feeds: currentFeedHealthSnapshot(now),
+      orderbookTracking: currentOrderbookTrackingState(now),
+      productionObservation,
     }, now);
   } catch (error) {
     invalidateEvidenceAttempt([`runtime evidence persistence failed: ${error instanceof Error ? error.message : String(error)}`], now, false);
@@ -1641,6 +1839,7 @@ function strategyValidationSnapshot(): StrategyValidationSnapshot | null {
     !snapshot.paused
     && (snapshot.strategyConfigHash !== strategyConfigHash() || snapshot.strategyEngineVersion !== PAPER_STRATEGY_ENGINE_VERSION)
   ) {
+    if (PRODUCTION_OBSERVATION_MODE) return snapshot;
     try {
       strategyValidationStore.record((tracker) => tracker.pause('strategy configuration or engine version changed'));
     } catch (error) {
@@ -1692,6 +1891,7 @@ function pilotValidationSnapshot() {
 function recordStrategyValidation(
   mutation: (tracker: StrategyValidationStore['tracker']) => StrategyValidationEvent | StrategyValidationEvent[],
 ): boolean {
+  if (PRODUCTION_OBSERVATION_MODE) return false;
   if (!strategyValidationStore) return false;
   try {
     strategyValidationStore.record(mutation);
@@ -1708,6 +1908,7 @@ function qualificationSnapshot(now = Date.now()): PaperQualificationSnapshot | n
   if (snapshot.integrityError) return snapshot;
   const actualHash = strategyConfigHash();
   if (snapshot.configurationValid && snapshot.strategyConfigHash !== actualHash) {
+    if (PRODUCTION_OBSERVATION_MODE) return snapshot;
     try {
       qualificationStore.record((tracker) => tracker.invalidateConfiguration(actualHash, now));
     } catch (error) {
@@ -1721,6 +1922,7 @@ function qualificationSnapshot(now = Date.now()): PaperQualificationSnapshot | n
 function recordQualification(
   mutation: (tracker: PaperQualificationStore['tracker']) => PaperQualificationEvent | PaperQualificationEvent[],
 ): void {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (!qualificationStore) return;
   try {
     qualificationStore.record(mutation);
@@ -1742,6 +1944,7 @@ function recordPaperBlock(input: {
   blocksLiveUnlock?: boolean;
   formalQualificationEligible?: boolean;
 }) {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (isAbnormalExecutionCode(input.code)) recordDryRunAbnormalExecution();
   const blocksLiveUnlock = input.blocksLiveUnlock ?? isAbnormalExecutionCode(input.code);
   auditLog.append({
@@ -1765,11 +1968,13 @@ function recordPaperBlock(input: {
 }
 
 function recordSettingsManualOverride() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   recordManualOverride(ensureShutdownCounters());
   saveSessionStats();
 }
 
 function tickApiHealthDegraded() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   const now = Date.now();
   const elapsed = now - lastApiHealthTickAt;
   lastApiHealthTickAt = now;
@@ -1857,6 +2062,16 @@ function loadSettings() {
       autoLiveEnabled: false,
       // Supervised evidence always uses the production market-data feeds in
       // dry-run mode; demo fixtures must never satisfy feed readiness.
+      demoMode: false,
+      dryRun: true,
+    });
+  }
+  if (PRODUCTION_OBSERVATION_MODE) {
+    settings = normalizeGuardrailSettings({
+      ...settings,
+      liveEnabled: false,
+      liveStage: 'paper',
+      autoLiveEnabled: false,
       demoMode: false,
       dryRun: true,
     });
@@ -2131,6 +2346,11 @@ function recordTick(ticker: string, yesPrice: number, spread: number, netEdge: n
 
 function snapshotEquity(force = false) {
   const now = Date.now();
+  if (PRODUCTION_OBSERVATION_MODE) {
+    // Renderer summaries may calculate mark-to-market values, but production
+    // observation must not append paper equity or session-stat evidence.
+    return;
+  }
   if (!force && now - lastEquitySnapshotAt < EQUITY_SNAPSHOT_MIN_MS) {
     refreshDailyPnl();
     return;
@@ -2327,12 +2547,12 @@ async function executeReservedStrictPaperBuyForCard(
   contracts: number | undefined,
   source: 'manual' | 'working-order' | 'throughput',
 ): Promise<PaperBuyResult> {
-  const mutationLock = campaignMutationLockReason();
-  if (mutationLock && source !== 'throughput') {
-    return { ok: false, aborted: true, abortReason: mutationLock, error: mutationLock, abortCode: 'campaign_mutation_lock', queueState: 'blocked_final', wouldMutate: false };
-  }
   const activeCampaign = source === 'throughput' ? campaignSnapshot() : null;
   const evidenceOnlyCampaign = isEvidenceOnlyCampaignExecution(source, activeCampaign);
+  const mutationLock = campaignMutationLockReason();
+  if (mutationLock && !evidenceOnlyCampaign) {
+    return { ok: false, aborted: true, abortReason: mutationLock, error: mutationLock, abortCode: 'campaign_mutation_lock', queueState: 'blocked_final', wouldMutate: false };
+  }
   if (evidenceOnlyCampaign && campaignEvidencePaused) {
     const reason = `campaign evidence paused while runtime is ${latestRuntimeDecision?.state ?? 'not ready'}`;
     return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_runtime_paused', queueState: 'blocked_retryable', wouldMutate: false };
@@ -2996,6 +3216,7 @@ function recordQualificationClose(
 }
 
 async function evaluateQualificationFollowUps(): Promise<void> {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (!qualificationStore || qualificationFollowUpRunning) return;
   qualificationFollowUpRunning = true;
   try {
@@ -3019,6 +3240,7 @@ async function evaluateQualificationFollowUps(): Promise<void> {
 }
 
 async function evaluateStrategyValidationFollowUps(): Promise<void> {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (!strategyValidationStore || strategyValidationFollowUpRunning) return;
   const snapshot = strategyValidationSnapshot();
   if (!snapshot || snapshot.stage !== 'shadow' || snapshot.paused) return;
@@ -3080,6 +3302,7 @@ async function executeAutoCloseDecision(
   decision: AutoCloseDecision,
   prepared?: { book: KalshiOrderbook; mark: number },
 ): Promise<boolean> {
+  if (campaignMutationLockReason()) return false;
   if (decision.action === 'hold' || decision.contracts < 1) return false;
   if (settings.killSwitchActive) return false;
   const card = cardForPosition(pos);
@@ -3198,6 +3421,7 @@ const SETTLEMENT_TICKER_COOLDOWN_MS = 10 * 60_000;
 let settlementSweepRunning = false;
 
 async function sweepSettledPositions() {
+  if (campaignMutationLockReason()) return;
   if (settlementSweepRunning) return;
   settlementSweepRunning = true;
   let settledCount = 0;
@@ -3880,18 +4104,53 @@ function campaignCriticalOrderbookTickers(now = Date.now()): string[] {
   return ordered;
 }
 
+function productionMarketRecord(ticker: string, now = Date.now()): ProductionUniverseRecord | null {
+  const record = productionMarketRecords.get(ticker);
+  if (!record) return null;
+  if (now < record.verifiedAt || now > record.verifiedAt + DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS) return null;
+  return record;
+}
+
+function recordProductionUniverse(records: readonly ProductionUniverseRecord[]): void {
+  const now = Date.now();
+  for (const [ticker, record] of productionMarketRecords) {
+    if (now > record.verifiedAt + DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS) productionMarketRecords.delete(ticker);
+  }
+  for (const record of records) {
+    const accepted = kalshiOrderbookStream.recordProductionMarkets(
+      [record.market],
+      record.sourceBaseUrl,
+      record.verifiedAt,
+    );
+    if (accepted.length === 1) productionMarketRecords.set(record.market.ticker, {
+      market: { ...record.market },
+      sourceBaseUrl: record.sourceBaseUrl,
+      verifiedAt: record.verifiedAt,
+    });
+    else productionMarketRecords.delete(record.market.ticker);
+  }
+  while (productionMarketRecords.size > 1_000) {
+    const oldest = [...productionMarketRecords.entries()]
+      .sort((left, right) => left[1].verifiedAt - right[1].verifiedAt)[0]?.[0];
+    if (!oldest) break;
+    productionMarketRecords.delete(oldest);
+  }
+}
+
 /** Only production, currently live markets can enter the authenticated book set. */
 function isProductionLiveTicker(ticker: string | undefined, market?: KalshiMarket): boolean {
   if (!ticker || /^DEMO(?:[-_]|$)/i.test(ticker)) return false;
-  if (!market) return false;
-  const status = market.status.toLowerCase();
+  const verified = productionMarketRecord(ticker);
+  if (!market || !verified || verified.market.ticker !== market.ticker) return false;
+  const status = verified.market.status.toLowerCase();
   return status === 'active' || status === 'open';
 }
 
 function desiredOrderbookTickers(now = Date.now()): string[] {
   const marketByTicker = new Map<string, KalshiMarket>();
-  for (const market of discovery.getUniverse()) marketByTicker.set(market.ticker, market);
-  for (const market of marketsCache) if (!marketByTicker.has(market.ticker)) marketByTicker.set(market.ticker, market);
+  for (const [ticker, record] of productionMarketRecords) {
+    if (productionMarketRecord(ticker, now)) marketByTicker.set(ticker, record.market);
+  }
   const ordered = campaignCriticalOrderbookTickers(now)
     .filter((ticker) => isProductionLiveTicker(ticker, marketByTicker.get(ticker)));
   const seen = new Set(ordered);
@@ -3926,6 +4185,18 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
   return ordered;
 }
 
+function refreshTickerTracking(now = Date.now()): void {
+  const ordered = desiredOrderbookTickers(now);
+  const seen = new Set(ordered);
+  for (const [ticker] of productionMarketRecords) {
+    if (seen.has(ticker) || !productionMarketRecord(ticker, now)) continue;
+    seen.add(ticker);
+    ordered.push(ticker);
+    if (ordered.length >= 500) break;
+  }
+  kalshiStream.replaceTracked(ordered.slice(0, 500));
+}
+
 function refreshOrderbookTracking(now = Date.now()): void {
   const desired = desiredOrderbookTickers(now);
   const desiredSet = new Set(desired);
@@ -3948,18 +4219,47 @@ function refreshOrderbookTracking(now = Date.now()): void {
   orderbookLastRotationAt = selection.lastRotationAt;
   orderbookRotationCursor = selection.cursor;
   kalshiOrderbookStream.replaceTracked(selection.tickers);
+  refreshTickerTracking(now);
 }
 
-function applyBridgeRecommendation(packet: RecommendationPacket) {
-  const market = marketsCache.find((m) => m.ticker === packet.ticker)
-    ?? geaMarkets.find((m) => m.ticker === packet.ticker);
+async function applyBridgeRecommendation(packet: RecommendationPacket) {
+  let market = productionMarketRecord(packet.ticker)?.market;
+  if (!market) {
+    let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
+    try {
+      const hydrated = await fetchMarket(packet.ticker, {
+        environment: 'production',
+        onResponseMetadata: (metadata) => { responseMetadata = metadata; },
+      });
+      const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
+      if (!verifiedResponse || verifiedResponse.environment !== 'production' || verifiedResponse.status !== 200) {
+        throw new Error('production REST provenance was not returned');
+      }
+      const record: ProductionUniverseRecord = {
+        market: hydrated,
+        sourceBaseUrl: verifiedResponse.sourceBaseUrl,
+        verifiedAt: verifiedResponse.verifiedAt,
+      };
+      recordProductionUniverse([record]);
+      market = productionMarketRecord(packet.ticker)?.market;
+    } catch (error) {
+      auditLog.append({
+        action: 'gate_block',
+        ticker: packet.ticker,
+        detail: `GEA recommendation rejected: production REST hydration failed (${error instanceof Error ? error.message : String(error)})`,
+        ok: false,
+      });
+      saveAuditLog();
+      return;
+    }
+  }
+  if (!market) return;
   geaMarkets = upsertRecommendationMarket(geaMarkets, packet, market);
   marketsCache = mergeGeaMarkets(marketsCache);
   geaTheses = upsertRecommendationThesis(geaTheses, packet, market).map(applyDepthToCard);
   theses = replaceGeaTheses(theses);
   opportunityQueue.discover(geaTheses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
-  kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
   refreshOrderbookTracking();
   // GEA can deliver bursts of recommendations. Coalesce the expensive
   // market/world snapshot work so the renderer receives one bounded update
@@ -4059,11 +4359,48 @@ interface RefreshMarketsOptions {
 }
 
 const runUniverseDiscovery = createSingleFlight(() => withAbortTimeout(
-  (signal) => discovery.refreshUniverse(signal),
+  async (signal) => {
+    const markets = await discovery.refreshUniverse(signal);
+    recordProductionUniverse(discovery.getProductionUniverseRecords());
+    refreshOrderbookTracking();
+    return markets;
+  },
   UNIVERSE_FETCH_TIMEOUT_MS,
   'universe fetch timed out',
 ));
 const runRestHealthProbe = createSingleFlight(() => registry.pingKalshiRest());
+
+async function reverifyTrackedProductionMarkets(): Promise<void> {
+  if (settings.demoMode || orderbookTrackedTickers.length === 0) return;
+  const tickers = [...new Set([
+    ...campaignCriticalOrderbookTickers(),
+    ...orderbookTrackedTickers,
+  ])].slice(0, ORDERBOOK_TRACKING_LIMIT);
+  const concurrency = 5;
+  for (let index = 0; index < tickers.length; index += concurrency) {
+    await Promise.all(tickers.slice(index, index + concurrency).map(async (ticker) => {
+      let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
+      try {
+        const market = await fetchMarket(ticker, {
+          environment: 'production',
+          onResponseMetadata: (metadata) => { responseMetadata = metadata; },
+        });
+        const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
+        if (verifiedResponse?.environment !== 'production' || verifiedResponse.status !== 200) return;
+        recordProductionUniverse([{
+          market,
+          sourceBaseUrl: verifiedResponse.sourceBaseUrl,
+          verifiedAt: verifiedResponse.verifiedAt,
+        }]);
+      } catch {
+        // Existing proof expires naturally. A failed refresh never extends it.
+      }
+    }));
+  }
+  refreshOrderbookTracking();
+}
+
+const runProductionMarketReverification = createSingleFlight(reverifyTrackedProductionMarkets);
 
 function recordKalshiRestFailure(error: unknown): void {
   registry.recordError(
@@ -4084,8 +4421,6 @@ async function refreshMarkets(options: RefreshMarketsOptions = {}) {
     // a stale snapshot) so tickets are never held hostage by a slow API.
     if (discovery.getUniverse().length > 0) {
       marketsCache = mergeGeaMarkets(discovery.getUniverse());
-      const universeTickers = discovery.getUniverse().map((market) => market.ticker);
-      kalshiStream.track(universeTickers);
     }
     const signalMarkets = discovery.getUniverse().length > 0
       ? discovery.getMarketsForSignals()
@@ -4272,7 +4607,6 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
   theses = replaceGeaTheses(built);
   opportunityQueue.discover(theses.filter((c) => isEntryEligible(c)
     && hasRealExecutableDepth(c)));
-  kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
   refreshOrderbookTracking();
 
   for (const c of theses) {
@@ -4297,6 +4631,7 @@ function getLiveCreds(): LiveCredentials | null {
 }
 
 async function activateKillSwitch(source: 'ipc' | 'shortcut'): Promise<GuardrailSettings> {
+  if (PRODUCTION_OBSERVATION_MODE) return settings;
   settings.killSwitchActive = true;
   settings.liveEnabled = false;
   await cancelAllLiveOrders(getLiveCreds(), settings);
@@ -4474,7 +4809,7 @@ function setupBridgeServer() {
           if (bridgeStatus.brainRole && nextRole && bridgeStatus.brainRole !== nextRole) bridgeStatus.failovers += 1;
           bridgeStatus.brainRole = nextRole;
           broadcastBridgeStatus();
-          applyBridgeRecommendation(valid.payload as RecommendationPacket);
+          void applyBridgeRecommendation(valid.payload as RecommendationPacket);
           broadcast('bridge:recommendation', valid.payload);
         } else if (valid.type === 'brain:exit') {
           applyBridgeExitRecommendation(valid.payload as ExitRecommendation);
@@ -4760,7 +5095,10 @@ function setupIpc() {
       saveSettings();
     }
     broadcast('settings:update', settings);
-    if (result.ok) kalshiOrderbookStream.restart();
+    if (result.ok) {
+      kalshiStream.restart();
+      kalshiOrderbookStream.restart();
+    }
     return result;
   });
 
@@ -4772,6 +5110,7 @@ function setupIpc() {
     }
     const status = clearStoredKalshiCredentials();
     broadcast('settings:update', settings);
+    kalshiStream.restart();
     kalshiOrderbookStream.restart();
     return { ok: true, status };
   });
@@ -4809,6 +5148,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:passQuiz', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; configuration is frozen` };
     settings = { ...settings, humanQuizPassed: true };
     saveSettings();
     saveAuditLog();
@@ -4817,6 +5158,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:passBacktest', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { passed: false, error: `${mutationLock}; configuration is frozen` };
     const result = runFeeAwareBacktest(journal.list());
     settings = { ...settings, backtestPassed: result.passed };
     saveSettings();
@@ -4827,6 +5170,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:quarantinePlaybook', (_e, playbook: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; strategy state is frozen` };
     quarantine.evaluate({ playbook: playbook as never, signals: 25, wins: 5, losses: 20, staleRate: 0.1, disagreementRate: 0.1, fillDrag: 0.05 });
     return quarantine.listFrozen();
   });
@@ -5090,6 +5435,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:advanceStrategyStage', (_e, stage: StrategyValidationStage, confirmation: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     try {
       if (!strategyValidationStore) throw new Error('strategy validation store is unavailable');
       const current = strategyValidationSnapshot();
@@ -5183,6 +5530,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:getDiscoveryState', () => discovery.getState());
 
   ipcMain.handle('nemesis:updateDiscoverySettings', (_e, partial: Partial<DiscoverySettings>) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; discovery configuration is frozen`, state: discovery.getState() };
     discovery.updateSettings(partial);
     qualificationSnapshot();
     saveDiscoverySettings();
@@ -5191,12 +5540,16 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:pauseDiscovery', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; discovery state is frozen`, state: discovery.getState() };
     discovery.pause();
     broadcastDiscovery();
     return discovery.getState();
   });
 
   ipcMain.handle('nemesis:resumeDiscovery', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; discovery state is frozen`, state: discovery.getState() };
     discovery.resume();
     broadcastDiscovery();
     return discovery.getState();
@@ -5431,6 +5784,10 @@ app.whenReady().then(async () => {
   startupTrace('paper-qualification');
   initializeStrategyValidation();
   startupTrace('strategy-validation');
+  // Establish the immutable observation baseline only after every protected
+  // paper/config store has completed its one-time startup recovery.
+  captureProductionObservationBaseline();
+  startupTrace('production-observation-baseline');
   initializeEvidenceCampaign();
   startupTrace('evidence-campaign');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
@@ -5615,6 +5972,7 @@ app.whenReady().then(async () => {
       startupTrace('market-feed-ready');
       setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
       setInterval(() => { void runUniverseRefresh(); }, UNIVERSE_REFRESH_MS);
+      setInterval(() => { void runProductionMarketReverification(); }, 20_000);
     }
   })();
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);

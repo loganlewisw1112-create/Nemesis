@@ -42,6 +42,8 @@ function open(filePath: string) {
   return SevenHourCampaignStore.open(filePath, {
     runId: 'run-1', evidenceNamespace: 'run-1', configurationHash: 'cfg-1', gitCommit: 'abc',
     stage: 'seven-hour', startedAt: 1_000, settings,
+    productionArtifactHash: 'a'.repeat(64),
+    soakVerificationReceiptHash: 'b'.repeat(64),
   }, settings);
 }
 

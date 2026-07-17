@@ -48,6 +48,17 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain("$env:NEMESIS_DEVTOOLS = 'false'");
     expect(script).toContain('dist-electron\\main.js');
     expect(script).toContain('Assert-PassingSoak');
+    expect(script).toContain('Assert-VerifiedSoakReceipt');
+    expect(script).toContain('verify-evidence-receipt.cjs');
+    expect(script).toContain('[string]$R10VerificationReceiptPath');
+    expect(script).toContain('[string]$SoakManifestPath');
+    expect(script).toContain('[string]$SoakSamplesPath');
+    expect(script).toContain('check-production-soak.cjs');
+    expect(script).toContain('check-evidence-campaign.cjs');
+    expect(script).toContain('NEMESIS_PRODUCTION_ARTIFACT_HASH');
+    expect(script).toContain('NEMESIS_SOAK_VERIFICATION_RECEIPT_HASH');
+    expect(script).toContain('[int]$MaxRecoveryAttempts = 0');
+    expect(script).toContain('Official r10 requires MaxRecoveryAttempts=0');
     expect(script).toContain('warmupMinutes -ne 5');
     expect(script).toContain('scoredDurationMinutes -ne 30');
     expect(script).toContain('slopeWindowComplete -ne $true');
@@ -67,6 +78,10 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('Stop-CapturedProcessTree');
     expect(script).toContain('Update-ProcessCapture');
     expect(script).toContain('Mark-UncleanShutdown');
+    expect(script).toContain('verify-evidence-campaign.cjs');
+    expect(script).toContain('Assert-NewCampaignNamespace');
+    expect(script).not.toContain('Remove-Item -LiteralPath $sidecarPath');
+    expect(script).not.toContain('Remove-Item -LiteralPath $controlPath');
     expect(script).toContain("$result.passed -ne $true");
     expect(script).not.toContain('npm run dev');
   });
@@ -76,6 +91,8 @@ describe('Windows package staging scripts', () => {
 
     expect(script).toContain('[int]$DurationMinutes = 30');
     expect(script).toContain('[int]$WarmupMinutes = 5');
+    expect(script).toContain('[string]$ReadinessReceiptPath');
+    expect(script).toContain("$readiness.receiptType -ne 'ReadinessReceipt'");
     expect(script).toContain("$env:NEMESIS_DEVTOOLS = 'false'");
     expect(script).toContain("$env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'");
     expect(script).toContain('productionArtifactHash');
@@ -102,6 +119,9 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('totalRuntimeMinutes');
     expect(script).toContain('phaseCoverage');
     expect(script).toContain('retryIdentity');
+    expect(script).toContain('sampleChainHead');
+    expect(script).toContain('previousSampleHash');
+    expect(script).toContain('typedFailureClasses');
     expect(script).toContain('configurationHash');
     expect(script).toContain('processRestartCount');
     expect(script).toContain('emergencyMitigationCount');
@@ -113,19 +133,35 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('remained unresponsive for at least ten seconds');
   });
 
-  it('generates the r10 report from evidence and unlocks seven hours only after both passes', () => {
+  it('generates the r10 report only from explicit verified inputs', () => {
     const script = fs.readFileSync(path.join(repoRoot, 'scripts', 'generate-r10-gap-closure-report.cjs'), 'utf8');
 
-    expect(script).toContain("const sevenHourUnlocked = soakPassed && r10Passed");
-    expect(script).toContain("'soak_failed_r10_not_run'");
-    expect(script).toContain("'soak_passed_r10_failed'");
-    expect(script).toContain("'soak_and_r10_passed'");
+    expect(script).toContain('const sevenHourUnlocked = readinessPassed && soakPassed && r10Passed');
+    expect(script).toContain("requireAllOrNone(inputs, ['soak-result', 'soak-manifest', 'soak-samples', 'soak-runtime-status', 'soak-cutoff-status', 'soak-receipt'])");
+    expect(script).toContain("requireAllOrNone(inputs, ['r10-ledger', 'r10-runtime-ledger', 'r10-result', 'r10-summary', 'r10-receipt'])");
+    expect(script).toContain('validateVerificationReceipt');
+    expect(script).toContain("'readiness_failed_no_timer_started'");
     expect(script).toContain('artifact.json');
     expect(script).toContain('evidence-inventory.json');
     expect(script).toContain('source-notes.md');
     expect(script).toContain('expectedR9Hash');
     expect(script).toContain("sample.phase === 'scored'");
-    expect(script).toContain("'not evaluated'");
+    expect(script).not.toContain('readdirSync');
+    expect(script).not.toContain('soakAttemptsDir');
+    expect(script).toContain("flag: 'wx'");
+  });
+
+  it('keeps readiness timer-free and tests every approved production alias', () => {
+    const script = fs.readFileSync(path.join(repoRoot, 'scripts', 'run-production-readiness.ps1'), 'utf8');
+
+    expect(script).toContain("'https://external-api.kalshi.com/trade-api/v2'");
+    expect(script).toContain("'https://api.elections.kalshi.com/trade-api/v2'");
+    expect(script).toContain("'wss://external-api-ws.kalshi.com/trade-api/ws/v2'");
+    expect(script).toContain("'wss://api.elections.kalshi.com/trade-api/ws/v2'");
+    expect(script).toContain('timerStarted = $false');
+    expect(script).toContain('readiness gap occurred during the continuous hold');
+    expect(script).toContain('$status.orderbookTracking.trackedTickers -eq 25');
+    expect(script).toContain('$status.productionObservation.qualificationReady -eq $true');
   });
 
   it('keeps empty-paper renderer updates at the five-second summary cadence', () => {

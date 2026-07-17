@@ -36,12 +36,15 @@ export function createGeaChildEnv(
     NEMESIS_BRIDGE_URL: bridgeUrl,
     NEMESIS_BRIDGE_TOKEN: bridgeToken,
     GEA_COORDINATE_TAPE_WITH_NEMESIS: 'true',
+    // Supervised GEA must not create its own unauthenticated Kalshi websocket.
+    // NEMESIS owns authenticated streaming and sends qualified state over the
+    // protected bridge; GEA may continue to use unsigned production REST.
+    GEA_TAPE_STREAM: 'false',
     NEMESIS_SUPERVISED_GEA: 'true',
   };
   delete childEnv.VITE_DEV_SERVER_URL;
-  // GEA consumes only the public, unsigned trade tape. Portfolio and exchange
-  // websocket credentials stay inside NEMESIS and must never cross the child
-  // process boundary.
+  // Portfolio and exchange websocket credentials stay inside NEMESIS and must
+  // never cross the child process boundary.
   for (const key of [
     'NEMESIS_KALSHI_PRIVATE_KEY',
     'NEMESIS_KALSHI_API_KEY',
