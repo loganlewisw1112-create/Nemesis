@@ -12,11 +12,35 @@ param(
   [string]$AccountPrecision,
 
   [ValidateRange(0, 2)]
-  [int]$MaxRecoveryAttempts = 2,
+  [int]$MaxRecoveryAttempts = 0,
 
+  [Parameter(Mandatory = $true)]
   [string]$SoakResultPath,
 
-  [string]$R10ResultPath
+  [Parameter(Mandatory = $true)]
+  [string]$SoakManifestPath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$SoakSamplesPath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$SoakRuntimeStatusPath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$SoakCutoffStatusPath,
+
+  [Parameter(Mandatory = $true)]
+  [string]$SoakVerificationReceiptPath,
+
+  [string]$R10ResultPath,
+
+  [string]$R10VerificationReceiptPath,
+
+  [string]$R10LedgerPath,
+
+  [string]$R10RuntimeLedgerPath,
+
+  [string]$R10SummaryPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,15 +51,10 @@ $mainEntry = Join-Path $desktopRoot 'dist-electron\main.js'
 $electronExe = Join-Path $repoRoot 'node_modules\electron\dist\electron.exe'
 $campaignDir = Join-Path $env:APPDATA '@nemesis\desktop\nemesis-data\evidence-campaigns'
 $activePointerPath = Join-Path $campaignDir 'active-campaign.json'
-$healthPolicy = 'runtime-health-v2:5s-runtime:30s-renderer:384mb-3x:512mb-hard:10m-10pct:30m-2pct:component-ttl:15s-lease'
-$healthPolicyHash = [Convert]::ToHexString(
-  [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($healthPolicy))
-).ToLowerInvariant()
+$healthPolicyPath = Join-Path $repoRoot 'config\evidence-health-policy-v3.json'
+if (!(Test-Path -LiteralPath $healthPolicyPath)) { throw 'Versioned evidence health policy is missing.' }
+$healthPolicyHash = (Get-FileHash -LiteralPath $healthPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $stageDurationMs = if ($Stage -eq 'instrumentation') { 2 * 60 * 60 * 1000 } else { 7 * 60 * 60 * 1000 }
-if ([string]::IsNullOrWhiteSpace($SoakResultPath)) {
-  $SoakResultPath = Join-Path $workspaceRoot 'output\reports\nemesis-gap-closure-r10-2026-07-15\soak\production-soak-result.json'
-}
-
 function Read-JsonHashtable([string]$Path) {
   if (!(Test-Path -LiteralPath $Path)) { return $null }
   try { return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable }
@@ -95,8 +114,8 @@ function Get-ProductionArtifactFingerprint {
 function Assert-PassingSoak([string]$Path, [string]$Commit, [hashtable]$Artifact) {
   $soak = Read-JsonHashtable $Path
   if ($null -eq $soak) { throw "A readable passing five-minute warm-up plus 30-minute scored production soak result is required: $Path" }
-  if ($soak.schemaVersion -ne 2 -or $soak.runType -ne 'production-stress-soak' -or $soak.passed -ne $true) {
-    throw "Production soak result is not a passing schema-v2 stress soak: $Path"
+  if ($soak.schemaVersion -ne 3 -or $soak.runType -ne 'production-stress-soak' -or $soak.passed -ne $true) {
+    throw "Production soak result is not a passing schema-v3 stress soak: $Path"
   }
   if ([string]$soak.gitCommit -ne $Commit) { throw 'Production soak commit does not match frozen HEAD.' }
   if ([double]$soak.warmupMinutes -ne 5 -or [double]$soak.scoredDurationMinutes -ne 30 -or
@@ -111,7 +130,7 @@ function Assert-PassingSoak([string]$Path, [string]$Commit, [hashtable]$Artifact
   }
   if ([double]$soak.rendererSampleCoverage -lt 0.99 -or [double]$soak.geaSampleCoverage -lt 0.99 -or
     [double]$soak.runtimeStatusCoverage -lt 0.99 -or [double]$soak.feedReadinessCoverage -lt 0.995 -or
-    [double]$soak.bridgeReadinessCoverage -lt 0.995) {
+    [double]$soak.bridgeReadinessCoverage -lt 0.995 -or [double]$soak.productionObservationCoverage -ne 1) {
     throw 'Production soak evidence coverage is below the required 99% runtime or 99.5% feed/bridge gate.'
   }
   if ($null -eq $soak.rendererP95Mb -or [double]$soak.rendererP95Mb -gt 384 -or
@@ -129,6 +148,7 @@ function Assert-PassingSoak([string]$Path, [string]$Commit, [hashtable]$Artifact
     $null -eq $soak.finalRuntimeStatusAgeMs -or [double]$soak.finalRuntimeStatusAgeMs -gt 60000 -or
     $null -eq $soak.finalRendererHeartbeatAgeMs -or [double]$soak.finalRendererHeartbeatAgeMs -gt 15000 -or
     [string]::IsNullOrWhiteSpace([string]$soak.configurationHash) -or
+    [string]::IsNullOrWhiteSpace([string]$soak.healthPolicyHash) -or
     [string]::IsNullOrWhiteSpace([string]$soak.retryIdentity.attemptId) -or
     [int]$soak.retryIdentity.retryOrdinal -lt 0 -or [int]$soak.retryIdentity.retryOrdinal -gt 2) {
     throw 'Production soak cutoff, configuration, or retry identity evidence is incomplete.'
@@ -144,7 +164,42 @@ function Assert-PassingSoak([string]$Path, [string]$Commit, [hashtable]$Artifact
   return $soak
 }
 
-function Assert-CleanR10Unlock([string]$Path, [string]$Commit, [hashtable]$Soak) {
+function Assert-VerifiedSoakReceipt([string]$Path, [hashtable]$Soak) {
+  $receipt = Read-JsonHashtable $Path
+  if ($null -eq $receipt -or $receipt.receiptType -ne 'EvidenceVerificationReceipt' -or $receipt.verified -ne $true) {
+    throw 'An independently passing EvidenceVerificationReceipt is required before r10.'
+  }
+  if ([string]$receipt.runId -ne [string]$Soak.attemptId -or
+      [string]$receipt.gitCommit -ne [string]$Soak.gitCommit -or
+      [string]$receipt.configurationHash -ne [string]$Soak.configurationHash -or
+      [string]$receipt.healthPolicyHash -ne [string]$Soak.healthPolicyHash -or
+      [string]$receipt.productionArtifactHash -ne [string]$Soak.productionArtifactHash -or
+      [string]$receipt.sampleChainHead -ne [string]$Soak.sampleChainHead -or
+      @($receipt.failures).Count -ne 0) {
+    throw 'The soak verification receipt does not match the explicit passing soak input.'
+  }
+  return $receipt
+}
+
+function Assert-NewCampaignNamespace([string]$RunId) {
+  $paths = @(
+    (Join-Path $campaignDir "$RunId.jsonl"),
+    (Join-Path $campaignDir "$RunId.runtime.json"),
+    (Join-Path $campaignDir "$RunId.runtime.jsonl"),
+    (Join-Path $campaignDir "$RunId.control.json"),
+    (Join-Path $campaignDir "$RunId.result.json"),
+    (Join-Path $campaignDir "$RunId.summary.md"),
+    (Join-Path $campaignDir "$RunId.manifest.json"),
+    (Join-Path $campaignDir "$RunId.startup-trace.log"),
+    (Join-Path $campaignDir "$RunId.unclean-shutdown.json"),
+    (Join-Path $campaignDir "$RunId.verification-receipt.json"),
+    (Join-Path $campaignDir "$RunId.launcher-result.json")
+  )
+  $collision = @($paths | Where-Object { Test-Path -LiteralPath $_ })
+  if ($collision.Count -gt 0) { throw "Evidence namespace '$RunId' is immutable and already contains an artifact." }
+}
+
+function Assert-CleanR10Unlock([string]$Path, [string]$Commit, [hashtable]$Soak, [string]$SoakReceiptPath) {
   if ([string]::IsNullOrWhiteSpace($Path)) {
     throw 'Seven-hour monitoring requires -R10ResultPath pointing to the clean passing schema-v2 r10 result.'
   }
@@ -163,6 +218,11 @@ function Assert-CleanR10Unlock([string]$Path, [string]$Commit, [hashtable]$Soak)
     throw 'Seven-hour monitoring remains locked because the supplied result is not the matching r10 run.'
   }
   if ([string]$manifest.gitCommit -ne $Commit) { throw 'The r10 commit does not match frozen HEAD.' }
+  if ([string]$manifest.healthPolicyHash -ne $healthPolicyHash `
+    -or [string]$manifest.productionArtifactHash -ne [string]$Soak.productionArtifactHash `
+    -or [string]$manifest.soakVerificationReceiptHash -ne (Get-FileHash -LiteralPath $SoakReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+    throw 'Seven-hour monitoring remains locked because r10 is not bound to the soak artifact, receipt, and health policy.'
+  }
   if ([int]$manifest.restartOrdinal -ne 0 -or [string]$result.runId -match '-recovery-' -or [string]$manifest.runId -match '-recovery-') {
     throw 'Seven-hour monitoring remains locked because r10 used a restart or recovery namespace.'
   }
@@ -207,6 +267,7 @@ function Update-ProcessCapture([hashtable]$Capture) {
 }
 
 function Get-LiveCapturedProcessIds([hashtable]$Capture) {
+  Update-ProcessCapture $Capture
   $live = [Collections.Generic.List[int]]::new()
   foreach ($pidValue in @($Capture.Order)) {
     $row = Get-CimInstance Win32_Process -Filter "ProcessId = $pidValue" -ErrorAction SilentlyContinue
@@ -223,6 +284,9 @@ function Stop-CapturedProcessTree([hashtable]$Capture) {
     if ($null -ne $row -and (Get-ProcessMarker $row) -eq [string]$Capture.Markers[$pidValue]) {
       Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
     }
+  }
+  if (!(Wait-ForCapturedExit $Capture ([DateTimeOffset]::UtcNow.AddSeconds(10)))) {
+    throw 'Captured NEMESIS process tree survived forced termination; active pointer remains for manual recovery.'
   }
 }
 
@@ -302,7 +366,52 @@ try {
 
   $artifact = Get-ProductionArtifactFingerprint
   $soak = Assert-PassingSoak $SoakResultPath $commit $artifact
-  if ($Stage -eq 'seven-hour') { Assert-CleanR10Unlock $R10ResultPath $commit $soak }
+  & node (Join-Path $PSScriptRoot 'check-production-soak.cjs') `
+    --result $SoakResultPath `
+    --manifest $SoakManifestPath `
+    --samples $SoakSamplesPath `
+    --runtime-status $SoakRuntimeStatusPath `
+    --cutoff-status $SoakCutoffStatusPath
+  if ($LASTEXITCODE -ne 0) { throw 'The explicit soak evidence failed fresh offline verification.' }
+  & node (Join-Path $PSScriptRoot 'verify-evidence-receipt.cjs') `
+    --receipt $SoakVerificationReceiptPath `
+    --result $SoakResultPath `
+    --manifest $SoakManifestPath `
+    --samples $SoakSamplesPath `
+    --runtime-status $SoakRuntimeStatusPath `
+    --cutoff-status $SoakCutoffStatusPath `
+    --run-type production-stress-soak
+  if ($LASTEXITCODE -ne 0) { throw 'The supplied soak verification receipt failed independent integrity checking.' }
+  $soakReceipt = Assert-VerifiedSoakReceipt $SoakVerificationReceiptPath $soak
+  if ($Stage -eq 'seven-hour') {
+    Assert-CleanR10Unlock $R10ResultPath $commit $soak $SoakVerificationReceiptPath
+    if ([string]::IsNullOrWhiteSpace($R10VerificationReceiptPath) `
+      -or [string]::IsNullOrWhiteSpace($R10LedgerPath) `
+      -or [string]::IsNullOrWhiteSpace($R10RuntimeLedgerPath) `
+      -or [string]::IsNullOrWhiteSpace($R10SummaryPath)) {
+      throw 'Seven-hour monitoring requires explicit r10 ledger, runtime ledger, result, summary, and verifier receipt inputs.'
+    }
+    & node (Join-Path $PSScriptRoot 'check-evidence-campaign.cjs') `
+      --ledger $R10LedgerPath `
+      --runtime-ledger $R10RuntimeLedgerPath `
+      --result $R10ResultPath `
+      --summary $R10SummaryPath
+    if ($LASTEXITCODE -ne 0) { throw 'Seven-hour monitoring remains locked because fresh r10 verification failed.' }
+    & node (Join-Path $PSScriptRoot 'verify-evidence-receipt.cjs') `
+      --receipt $R10VerificationReceiptPath `
+      --result $R10ResultPath `
+      --ledger $R10LedgerPath `
+      --runtime-ledger $R10RuntimeLedgerPath `
+      --summary $R10SummaryPath `
+      --run-type r10-instrumentation
+    if ($LASTEXITCODE -ne 0) { throw 'Seven-hour monitoring remains locked because the r10 receipt failed integrity checking.' }
+  }
+  if ($Stage -eq 'instrumentation' -and $Namespace -match '(^|[-_.])r10($|[-_.])' -and $MaxRecoveryAttempts -ne 0) {
+    throw 'Official r10 requires MaxRecoveryAttempts=0; a recovery namespace cannot unlock seven-hour monitoring.'
+  }
+  if (Test-Path -LiteralPath $activePointerPath) {
+    throw 'An active campaign pointer already exists; resolve it without deleting or reusing its namespace.'
+  }
   New-Item -ItemType Directory -Path $campaignDir -Force | Out-Null
 
   $parentRunId = $Namespace
@@ -312,7 +421,11 @@ try {
     $runtimeLedgerPath = Join-Path $campaignDir "$runId.runtime.jsonl"
     $controlPath = Join-Path $campaignDir "$runId.control.json"
     $resultPath = Join-Path $campaignDir "$runId.result.json"
-    Remove-Item -LiteralPath $sidecarPath, $controlPath -Force -ErrorAction SilentlyContinue
+    $ledgerPath = Join-Path $campaignDir "$runId.jsonl"
+    $summaryPath = Join-Path $campaignDir "$runId.summary.md"
+    $verificationReceiptPath = Join-Path $campaignDir "$runId.verification-receipt.json"
+    $launcherResultPath = Join-Path $campaignDir "$runId.launcher-result.json"
+    Assert-NewCampaignNamespace $runId
 
     $env:NEMESIS_EVIDENCE_CAMPAIGN_STAGE = $Stage
     $env:NEMESIS_EVIDENCE_NAMESPACE = $runId
@@ -325,8 +438,15 @@ try {
     $env:NEMESIS_EVIDENCE_CONTROL = $controlPath
     $env:NEMESIS_HEALTH_POLICY_HASH = $healthPolicyHash
     $env:NEMESIS_GIT_COMMIT = $commit
+    $env:NEMESIS_PRODUCTION_ARTIFACT_HASH = [string]$artifact.hash
+    $env:NEMESIS_SOAK_VERIFICATION_RECEIPT_HASH = (Get-FileHash -LiteralPath $SoakVerificationReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $env:NEMESIS_KALSHI_ACCOUNT_PRECISION = $AccountPrecision
     $env:NEMESIS_DEVTOOLS = 'false'
+    $env:NEMESIS_PRODUCTION_OBSERVATION = 'true'
+    $env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'
+    $env:NEMESIS_AUTO_SPAWN_GEA = 'true'
+    $env:NEMESIS_STARTUP_TRACE = 'true'
+    $env:NEMESIS_STARTUP_TRACE_FILE = Join-Path $campaignDir "$runId.startup-trace.log"
     Remove-Item Env:VITE_DEV_SERVER_URL -ErrorAction SilentlyContinue
 
     Write-Host "Launching preflight for '$runId' from the exact production artifact that passed soak $SoakResultPath"
@@ -364,6 +484,17 @@ try {
         Clear-ActivePointer $runId
         $result = Read-JsonHashtable $resultPath
         if ($null -eq $result -or $result.schemaVersion -ne 2) { throw "Finalized run '$runId' did not produce a readable schema-v2 result." }
+        & node (Join-Path $PSScriptRoot 'verify-evidence-campaign.cjs') `
+          --ledger $ledgerPath `
+          --runtime-ledger $runtimeLedgerPath `
+          --result $resultPath `
+          --summary $summaryPath `
+          --receipt $verificationReceiptPath
+        if ($LASTEXITCODE -ne 0) { throw "Independent evidence verification rejected finalized run '$runId'." }
+        $verificationReceipt = Read-JsonHashtable $verificationReceiptPath
+        if ($null -eq $verificationReceipt -or $verificationReceipt.verified -ne $true -or @($verificationReceipt.failures).Count -ne 0) {
+          throw "Independent evidence verification receipt is missing or failed for '$runId'."
+        }
         if ($result.passed -ne $true) {
           [Console]::Error.WriteLine("Evidence attempt '$runId' finalized as FAIL: $(@($result.reasons) -join '; ')")
           exit 2
@@ -379,6 +510,18 @@ try {
         continue
       }
       throw "Evidence attempt '$runId' ended as '$($terminal.state)'."
+    } catch {
+      if (!(Test-Path -LiteralPath $launcherResultPath)) {
+        Write-DurableJson $launcherResultPath @{
+          schemaVersion = 1
+          runId = $runId
+          passed = $false
+          terminal = $true
+          failureClass = 'launcher_unexpected'
+          at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        }
+      }
+      throw
     } finally {
       Update-ProcessCapture $capture
       if (@(Get-LiveCapturedProcessIds $capture).Count -gt 0) { Stop-CapturedProcessTree $capture }

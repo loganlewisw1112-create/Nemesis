@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 3,
+  "runtimeSampleSeconds": 5,
+  "rendererSampleSeconds": 30,
+  "rendererP95Mb": 384,
+  "rendererMaximumMb": 512,
+  "rendererTenMinuteGrowthMaximum": 0.1,
+  "rendererSlopePerHourMaximum": 0.02,
+  "rendererHeartbeatMaximumAgeSeconds": 15,
+  "rendererProbeMaximumAgeSeconds": 15,
+  "rendererUnresponsiveMaximumSeconds": 10,
+  "runtimeCoverageMinimum": 0.99,
+  "feedCoverageMinimum": 0.995,
+  "bridgeCoverageMinimum": 0.995,
+  "trackedOrderbookTickers": 25,
+  "productionObservationCoverageMinimum": 1,
+  "recoveryHealthySnapshotsRequired": 3,
+  "recoveryInvalidationSeconds": 30
+}

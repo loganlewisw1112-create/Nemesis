@@ -11,15 +11,22 @@ param(
   [ValidateRange(0, 2)]
   [int]$RetryOrdinal = 0,
 
+  [string]$SeriesId,
+
   [string]$AttemptId,
 
   [string]$ParentAttemptId,
+
+  [string]$ParentResultPath,
 
   [string]$ExpectedArtifactHash,
 
   [string]$ExpectedEntryHash,
 
   [int]$ExpectedArtifactFileCount,
+
+  [Parameter(Mandatory = $true)]
+  [string]$ReadinessReceiptPath,
 
   [string]$OutputDirectory
 )
@@ -31,8 +38,9 @@ $desktopRoot = Join-Path $repoRoot 'apps\desktop'
 $mainEntry = Join-Path $desktopRoot 'dist-electron\main.js'
 $electronExe = Join-Path $repoRoot 'node_modules\electron\dist\electron.exe'
 if ([string]::IsNullOrWhiteSpace($AttemptId)) { $AttemptId = "soak-attempt-$($RetryOrdinal + 1)" }
+if ([string]::IsNullOrWhiteSpace($SeriesId)) { $SeriesId = $AttemptId }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-  $OutputDirectory = Join-Path $workspaceRoot 'output\reports\nemesis-gap-closure-r10-2026-07-15\soak'
+  $OutputDirectory = Join-Path $workspaceRoot "output\reports\nemesis-gap-closure-r10-2026-07-16\soak\$AttemptId"
 }
 
 function Get-Percentile([double[]]$Values, [double]$Percentile) {
@@ -124,24 +132,74 @@ function Get-ProcessTree([int]$RootProcessId) {
   return @($all | Where-Object { $seen.Contains([int]$_.ProcessId) })
 }
 
-function Stop-CapturedProcesses([Collections.Generic.HashSet[int]]$ProcessIds) {
-  foreach ($processId in @($ProcessIds) | Sort-Object -Descending) {
-    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+function Get-ProcessMarker([object]$Row) {
+  try { return ([DateTime]$Row.CreationDate).ToUniversalTime().Ticks.ToString() }
+  catch { return '' }
+}
+
+function New-ProcessCapture([int]$RootProcessId) {
+  $capture = @{ Markers = @{}; Order = [Collections.Generic.List[int]]::new() }
+  $root = Get-CimInstance Win32_Process -Filter "ProcessId = $RootProcessId" -ErrorAction SilentlyContinue
+  if ($null -ne $root) {
+    $capture.Markers[$RootProcessId] = Get-ProcessMarker $root
+    $capture.Order.Add($RootProcessId)
+  }
+  return $capture
+}
+
+function Update-ProcessCapture([hashtable]$Capture) {
+  $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate)
+  $changed = $true
+  while ($changed) {
+    $changed = $false
+    foreach ($row in $all) {
+      $id = [int]$row.ProcessId
+      if ($Capture.Markers.ContainsKey($id) -or !$Capture.Markers.ContainsKey([int]$row.ParentProcessId)) { continue }
+      $Capture.Markers[$id] = Get-ProcessMarker $row
+      $Capture.Order.Add($id)
+      $changed = $true
+    }
+  }
+}
+
+function Get-LiveCapturedProcessIds([hashtable]$Capture) {
+  Update-ProcessCapture $Capture
+  $live = [Collections.Generic.List[int]]::new()
+  foreach ($id in $Capture.Order) {
+    $row = Get-CimInstance Win32_Process -Filter "ProcessId = $id" -ErrorAction SilentlyContinue
+    if ($null -ne $row -and (Get-ProcessMarker $row) -eq [string]$Capture.Markers[$id]) { $live.Add($id) }
+  }
+  return $live
+}
+
+function Wait-CapturedExit([hashtable]$Capture, [DateTimeOffset]$Deadline) {
+  do {
+    if (@(Get-LiveCapturedProcessIds $Capture).Count -eq 0) { return $true }
+    Start-Sleep -Milliseconds 250
+  } while ([DateTimeOffset]::UtcNow -lt $Deadline)
+  return @(Get-LiveCapturedProcessIds $Capture).Count -eq 0
+}
+
+function Stop-CapturedProcesses([hashtable]$Capture) {
+  Update-ProcessCapture $Capture
+  foreach ($processId in @($Capture.Order) | Sort-Object -Descending) {
+    $row = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+    if ($null -ne $row -and (Get-ProcessMarker $row) -eq [string]$Capture.Markers[$processId]) {
+      Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 
 if (Test-Path -LiteralPath $OutputDirectory) {
-  $existingAttemptFiles = @(Get-ChildItem -LiteralPath $OutputDirectory -Force)
-  if ($existingAttemptFiles.Count -gt 0) {
-    throw "Soak attempt namespace is immutable and already contains evidence: $OutputDirectory"
-  }
+  throw "Soak attempt namespace is immutable and already exists: $OutputDirectory"
 }
-New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $samplesPath = Join-Path $OutputDirectory 'production-soak-samples.jsonl'
 $resultPath = Join-Path $OutputDirectory 'production-soak-result.json'
 $manifestPath = Join-Path $OutputDirectory 'production-soak-attempt-manifest.json'
 $runtimeStatusPath = Join-Path $OutputDirectory 'production-soak-runtime-status.json'
 $cutoffStatusPath = Join-Path $OutputDirectory 'production-soak-runtime-status-at-cutoff.json'
+$process = $null
+$capture = $null
 Push-Location $repoRoot
 try {
   $dirty = @(git status --porcelain)
@@ -149,21 +207,52 @@ try {
   $commit = (git rev-parse HEAD).Trim()
   if (!$commit) { throw 'Unable to resolve the frozen git commit.' }
 
-  if ($RetryOrdinal -eq 0) {
-    Write-Host "Building frozen production soak at $commit"
-    npm run build
-    if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE." }
-  } elseif (
+  if ($RetryOrdinal -eq 0 -and (![string]::IsNullOrWhiteSpace($ParentAttemptId) -or ![string]::IsNullOrWhiteSpace($ParentResultPath))) {
+    throw 'Retry lineage fields are prohibited for ordinal zero.'
+  }
+
+  if ($RetryOrdinal -gt 0 -and (
     [string]::IsNullOrWhiteSpace($ParentAttemptId) -or
+    [string]::IsNullOrWhiteSpace($ParentResultPath) -or
     [string]::IsNullOrWhiteSpace($ExpectedArtifactHash) -or
     [string]::IsNullOrWhiteSpace($ExpectedEntryHash) -or
     $ExpectedArtifactFileCount -le 0
-  ) {
+  )) {
     throw 'A retry requires parent attempt identity and the exact original production artifact fingerprint.'
+  }
+  if ($RetryOrdinal -gt 0) {
+    if (!(Test-Path -LiteralPath $ParentResultPath)) { throw 'The explicit parent soak result is missing.' }
+    $parentResult = Get-Content -LiteralPath $ParentResultPath -Raw | ConvertFrom-Json
+    $parentClasses = @($parentResult.typedFailureClasses)
+    $allowedRetryClasses = @('dns', 'tcp', 'tls', 'connection_reset', 'timeout', 'http_5xx', 'abnormal_close', 'server', 'network', 'rate_limit', 'bridge_transport')
+    if ($parentResult.schemaVersion -ne 3 -or $parentResult.runType -ne 'production-stress-soak' `
+      -or $parentResult.passed -eq $true -or $parentResult.retryEligible -ne $true `
+      -or [string]$parentResult.attemptId -ne $ParentAttemptId `
+      -or [string]$parentResult.seriesId -ne $SeriesId `
+      -or [int]$parentResult.retryIdentity.retryOrdinal -ne ($RetryOrdinal - 1) `
+      -or $parentClasses.Count -eq 0 `
+      -or @($parentClasses | Where-Object { $_ -notin $allowedRetryClasses }).Count -gt 0) {
+      throw 'The parent result does not authorize the next external-fault-only retry ordinal.'
+    }
+    if ([string]$parentResult.productionArtifactHash -ne $ExpectedArtifactHash `
+      -or [string]$parentResult.productionEntryHash -ne $ExpectedEntryHash `
+      -or [int]$parentResult.productionArtifactFileCount -ne $ExpectedArtifactFileCount) {
+      throw 'The parent retry result does not match the supplied frozen artifact identity.'
+    }
   }
   if (!(Test-Path -LiteralPath $mainEntry)) { throw "Production entry is missing: $mainEntry" }
   if (!(Test-Path -LiteralPath $electronExe)) { throw "Electron launcher is missing: $electronExe" }
   $artifact = Get-ProductionArtifactFingerprint
+  if (!(Test-Path -LiteralPath $ReadinessReceiptPath)) { throw 'A passing explicit readiness receipt is required before a soak namespace can be created.' }
+  & node (Join-Path $PSScriptRoot 'verify-readiness-receipt.cjs') $ReadinessReceiptPath
+  if ($LASTEXITCODE -ne 0) { throw 'The readiness receipt failed its independent integrity check.' }
+  $readiness = Get-Content -LiteralPath $ReadinessReceiptPath -Raw | ConvertFrom-Json
+  if ($readiness.receiptType -ne 'ReadinessReceipt' -or $readiness.passed -ne $true -or $readiness.timerStarted -ne $false `
+    -or [string]$readiness.gitCommit -ne $commit -or [string]$readiness.productionArtifactHash -ne [string]$artifact.hash `
+    -or $readiness.matchingArtifactHashes -ne $true -or $readiness.cleanShutdown -ne $true `
+    -or [double]$readiness.holdMinutes -lt 10 -or @($readiness.acceptanceFailures).Count -ne 0) {
+    throw 'Readiness receipt does not prove a clean ten-minute hold for this exact commit and artifact.'
+  }
   if ($RetryOrdinal -gt 0 -and (
     $artifact.hash -ne $ExpectedArtifactHash -or
     $artifact.entryHash -ne $ExpectedEntryHash -or
@@ -179,8 +268,42 @@ try {
     trackedOrderbookTickers = 25
     orderbookRotationSize = 4
     devToolsClosed = $true
+    productionObservation = $true
+    mutationPolicy = 'all-paper-live-mutations-blocked'
+    readinessReceiptSha256 = Get-FileSha256OrNull $ReadinessReceiptPath
   }
   $configurationHash = Get-Sha256Text ($configuration | ConvertTo-Json -Compress)
+  $healthPolicyPath = Join-Path $repoRoot 'config\evidence-health-policy-v3.json'
+  if (!(Test-Path -LiteralPath $healthPolicyPath)) { throw 'Versioned evidence health policy is missing.' }
+  $healthPolicyHash = (Get-FileHash -LiteralPath $healthPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ([string]$readiness.healthPolicyHash -ne $healthPolicyHash) {
+    throw 'Readiness receipt health policy does not match the frozen soak policy.'
+  }
+  if ($RetryOrdinal -gt 0 -and (
+    [string]$parentResult.gitCommit -ne $commit -or
+    [string]$parentResult.configurationHash -ne $configurationHash -or
+    [string]$parentResult.healthPolicyHash -ne $healthPolicyHash -or
+    [string]$parentResult.readinessReceiptSha256 -ne (Get-FileSha256OrNull $ReadinessReceiptPath)
+  )) {
+    throw 'Retry lineage does not match the original commit, configuration, readiness receipt, and health policy.'
+  }
+  $credentialPath = Join-Path $env:APPDATA '@nemesis\desktop\nemesis-data\kalshi-credentials.v1.json'
+  $hasEnvironmentCredential = ![string]::IsNullOrWhiteSpace($env:NEMESIS_KALSHI_PRIVATE_KEY) -and (
+    ![string]::IsNullOrWhiteSpace($env:NEMESIS_KALSHI_API_KEY_ID) -or
+    ![string]::IsNullOrWhiteSpace($env:NEMESIS_KALSHI_API_KEY)
+  )
+  if (!$hasEnvironmentCredential -and !(Test-Path -LiteralPath $credentialPath)) {
+    throw 'Protected Kalshi credentials are not present; the soak cannot authenticate production WebSockets.'
+  }
+  $r9Path = Join-Path $env:APPDATA '@nemesis\desktop\nemesis-data\evidence-campaigns\nemesis-instrumentation-2026-07-15-r9.jsonl'
+  $expectedR9Hash = '7c93e9beafe8ec7af52f7483942f3edccff24e18aeab3f0c209b39cfe4c015ff'
+  if (!(Test-Path -LiteralPath $r9Path) -or (Get-FileSha256OrNull $r9Path) -ne $expectedR9Hash) {
+    throw 'Immutable r9 evidence is missing or its SHA-256 no longer matches the archived baseline.'
+  }
+
+  # Only now may an official attempt namespace exist. All clean-tree, build,
+  # artifact, credential-presence, configuration, and r9 checks passed first.
+  New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
 
   foreach ($name in @(
     'NEMESIS_EVIDENCE_CAMPAIGN_STAGE', 'NEMESIS_EVIDENCE_NAMESPACE', 'NEMESIS_EVIDENCE_PARENT_RUN_ID',
@@ -188,15 +311,18 @@ try {
     'NEMESIS_EVIDENCE_RUNTIME_LEDGER', 'NEMESIS_EVIDENCE_CONTROL', 'NEMESIS_RUNTIME_STATUS_PATH', 'VITE_DEV_SERVER_URL'
   )) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
   $env:NEMESIS_DEVTOOLS = 'false'
+  $env:NEMESIS_PRODUCTION_OBSERVATION = 'true'
   $env:NEMESIS_AUTO_SPAWN_GEA = 'true'
   $env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'
   $env:NEMESIS_RUNTIME_STATUS_PATH = $runtimeStatusPath
+  $env:NEMESIS_HEALTH_POLICY_HASH = $healthPolicyHash
   $env:NEMESIS_STARTUP_TRACE = 'true'
   $env:NEMESIS_STARTUP_TRACE_FILE = Join-Path $OutputDirectory 'startup-trace.log'
   $devToolsDisabled = $env:NEMESIS_DEVTOOLS -eq 'false'
   $configuredTrackedTickers = [int]$env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS
 
   $process = Start-Process -FilePath $electronExe -ArgumentList @('"' + $mainEntry + '"') -WorkingDirectory $desktopRoot -PassThru
+  $capture = New-ProcessCapture $process.Id
   $startedAt = [DateTimeOffset]::UtcNow
   $runStopwatch = [Diagnostics.Stopwatch]::StartNew()
   $warmupTargetMs = $WarmupMinutes * 60 * 1000
@@ -207,8 +333,6 @@ try {
   $scoredClosedElapsedMs = $null
   $nextSampleElapsedMs = 0
   $samples = [Collections.Generic.List[object]]::new()
-  $capturedProcessIds = [Collections.Generic.HashSet[int]]::new()
-  $null = $capturedProcessIds.Add($process.Id)
   $runtimeFailure = $null
   $cutoffExternalStatus = $null
   $cutoffCapturedAt = $null
@@ -216,15 +340,20 @@ try {
   $rendererLivenessActive = $false
   $lastProgressMinute = -1
   $cleanShutdown = $false
+  $sampleSequence = 0
+  $sampleChainHead = ('0' * 64)
 
   [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     attemptId = $AttemptId
     parentAttemptId = if ([string]::IsNullOrWhiteSpace($ParentAttemptId)) { $null } else { $ParentAttemptId }
     retryOrdinal = $RetryOrdinal
+    seriesId = $SeriesId
     maximumRetryOrdinal = 2
     gitCommit = $commit
     configurationHash = $configurationHash
+    healthPolicyHash = $healthPolicyHash
+    readinessReceiptSha256 = Get-FileSha256OrNull $ReadinessReceiptPath
     configuration = $configuration
     productionArtifactHash = $artifact.hash
     productionArtifactFileCount = $artifact.fileCount
@@ -254,8 +383,8 @@ try {
       $processElapsedMinutes = $runStopwatch.Elapsed.TotalMinutes
       $scoredElapsedMinutes = if ($phase -eq 'scored') { ($runStopwatch.ElapsedMilliseconds - $scoredStartedElapsedMs) / 60000 } else { $null }
 
+      Update-ProcessCapture $capture
       $tree = @(Get-ProcessTree $process.Id)
-      foreach ($row in $tree) { $null = $capturedProcessIds.Add([int]$row.ProcessId) }
       $rendererRows = @($tree | Where-Object { $_.ParentProcessId -eq $process.Id -and $_.CommandLine -match '--type=renderer' })
       $geaRows = @($tree | Where-Object { $_.CommandLine -match 'global-event-alpha[\\/].*dist-electron[\\/]main\.js|Global Event Alpha\.exe' })
       $rendererMb = @($rendererRows | ForEach-Object {
@@ -301,7 +430,7 @@ try {
         -and [double]$externalStatusAgeMs -le 15000 `
         -and $externalStatus.feeds.qualificationReady -eq $true
       $sample = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 3
         at = $now.ToUnixTimeMilliseconds()
         phase = $phase
         elapsedMinutes = [Math]::Round($processElapsedMinutes, 4)
@@ -333,12 +462,26 @@ try {
         rendererUnresponsiveForMs = if ($null -eq $externalStatus) { $null } else { $externalStatus.renderer.unresponsiveForMs }
         feedQualificationReady = $feedReady
         bridgeQualificationReady = $bridgeReady
-        trackedOrderbookTickers = if ($null -eq $externalStatus) { $null } else { $externalStatus.feeds.orderbookWebSocket.trackedTickers }
-        orderbookQualifiedTickers = if ($null -eq $externalStatus) { $null } else { $externalStatus.feeds.orderbookWebSocket.qualifiedTickers }
-        orderbookLastSequencedDeltaAt = if ($null -eq $externalStatus) { $null } else { $externalStatus.feeds.orderbookWebSocket.lastSequencedDeltaAt }
+        trackedOrderbookTickers = if ($null -eq $externalStatus) { $null } else { $externalStatus.orderbookTracking.trackedTickers }
+        orderbookQualifiedTickers = if ($null -eq $externalStatus) { $null } else { $externalStatus.orderbookTracking.qualifiedTickers }
+        orderbookLastSequencedDeltaAt = if ($null -eq $externalStatus) { $null } else { $externalStatus.orderbookTracking.lastSequencedDeltaAt }
+        orderbookTrackingReady = if ($null -eq $externalStatus) { $false } else { $externalStatus.orderbookTracking.trackingReady -eq $true }
+        productionObservationReady = if ($null -eq $externalStatus) { $false } else { $externalStatus.productionObservation.qualificationReady -eq $true }
+        productionObservationUnchanged = if ($null -eq $externalStatus) { $false } else { $externalStatus.productionObservation.unchanged -eq $true }
+        productionObservationStateHash = if ($null -eq $externalStatus) { $null } else { $externalStatus.productionObservation.stateHash }
       }
       $samples.Add([pscustomobject]$sample)
-      ($sample | ConvertTo-Json -Compress) | Add-Content -LiteralPath $samplesPath -Encoding utf8
+      $sampleSequence += 1
+      $payloadJson = $sample | ConvertTo-Json -Compress
+      $sampleHash = Get-Sha256Text "$sampleChainHead|$payloadJson"
+      [ordered]@{
+        sequence = $sampleSequence
+        previousSampleHash = $sampleChainHead
+        payloadJson = $payloadJson
+        payload = $sample
+        sampleHash = $sampleHash
+      } | ConvertTo-Json -Compress | Add-Content -LiteralPath $samplesPath -Encoding utf8
+      $sampleChainHead = $sampleHash
 
       if ($sample.runtimeState -eq 'invalidated') {
         $runtimeReasons = if ($null -eq $externalStatus.runtime.reasons) { 'no reason was exported' } else { @($externalStatus.runtime.reasons) -join '; ' }
@@ -405,8 +548,24 @@ try {
           throw
         }
         if ($phase -eq 'scored' -and $rendererLivenessActive -and !$probeProcess.Responding) {
-          if ($null -eq $unresponsiveSince) { $unresponsiveSince = $probeAt.AddSeconds(-2) }
-          elseif (($probeAt - $unresponsiveSince).TotalSeconds -ge 10) {
+          $probeStatus = $null
+          if (Test-Path -LiteralPath $runtimeStatusPath) {
+            try { $probeStatus = Get-Content -LiteralPath $runtimeStatusPath -Raw | ConvertFrom-Json } catch { }
+          }
+          $probeStatusAgeMs = if ($null -eq $probeStatus) { $null } else { [Math]::Max(0, $probeAt.ToUnixTimeMilliseconds() - [double]$probeStatus.updatedAt) }
+          $probeStatusFresh = $null -ne $probeStatusAgeMs -and $probeStatusAgeMs -le 15000
+          $probeHeartbeatFresh = $null -ne $probeStatus `
+            -and $null -ne $probeStatus.renderer.heartbeatAgeMs `
+            -and [double]$probeStatus.renderer.heartbeatAgeMs -le 15000
+          $probeReplyFresh = $null -ne $probeStatus `
+            -and $probeStatus.renderer.rendererProbeResponseReceived -eq $true `
+            -and $null -ne $probeStatus.renderer.rendererProbeAgeMs `
+            -and [double]$probeStatus.renderer.rendererProbeAgeMs -le 15000
+          if ($probeStatusFresh -and $probeHeartbeatFresh -and $probeReplyFresh) {
+            $unresponsiveSince = $null
+          } elseif ($null -eq $unresponsiveSince) {
+            $unresponsiveSince = $probeAt
+          } elseif (($probeAt - $unresponsiveSince).TotalSeconds -ge 10) {
             $runtimeFailure = 'NEMESIS remained unresponsive for at least ten seconds during soak'
             break
           }
@@ -472,21 +631,25 @@ try {
       try { $cutoffExternalStatus = Get-Content -LiteralPath $runtimeStatusPath -Raw | ConvertFrom-Json } catch { }
     }
     [ordered]@{
-      schemaVersion = 2
+      schemaVersion = 3
       capturedAt = $cutoffCapturedAt.ToUnixTimeMilliseconds()
       status = $cutoffExternalStatus
     } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $cutoffStatusPath -Encoding utf8
     if ($null -eq $runtimeFailure -and $null -ne $cutoffExternalStatus -and $cutoffExternalStatus.runtime.state -eq 'invalidated') {
       $runtimeFailure = "NEMESIS runtime health invalidated at cutoff: $(@($cutoffExternalStatus.runtime.reasons) -join '; ')"
     }
+    Update-ProcessCapture $capture
     $process.Refresh()
     if (!$process.HasExited) {
       try { $null = (Get-Process -Id $process.Id -ErrorAction Stop).CloseMainWindow() } catch { }
-      $null = $process.WaitForExit(30000)
     }
-    $remainingCaptured = @($capturedProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-    $cleanShutdown = $remainingCaptured.Count -eq 0
-    if (!$cleanShutdown) { Stop-CapturedProcesses $capturedProcessIds }
+    $forcedShutdown = $false
+    if (!(Wait-CapturedExit $capture ([DateTimeOffset]::UtcNow.AddSeconds(30)))) {
+      $forcedShutdown = $true
+      Stop-CapturedProcesses $capture
+      $null = Wait-CapturedExit $capture ([DateTimeOffset]::UtcNow.AddSeconds(10))
+    }
+    $cleanShutdown = !$forcedShutdown -and @(Get-LiveCapturedProcessIds $capture).Count -eq 0
   }
 
   $finishedAt = [DateTimeOffset]::UtcNow
@@ -529,12 +692,19 @@ try {
   $runtimeStatusCoverage = [Math]::Min(1.0, [double]$runtimeStatusSamples.Count / [double]$expectedScoredSampleCount)
   $feedReadyCount = @($scoredSamples | Where-Object { $_.feedQualificationReady -eq $true }).Count
   $bridgeReadyCount = @($scoredSamples | Where-Object { $_.bridgeQualificationReady -eq $true }).Count
+  $productionObservationReadyCount = @($scoredSamples | Where-Object {
+    $_.productionObservationReady -eq $true -and $_.productionObservationUnchanged -eq $true
+  }).Count
+  $productionObservationHashes = @($scoredSamples | Where-Object {
+    ![string]::IsNullOrWhiteSpace([string]$_.productionObservationStateHash)
+  } | ForEach-Object { [string]$_.productionObservationStateHash } | Sort-Object -Unique)
   $rendererProbeSamples = @($scoredSamples | Where-Object {
     $_.rendererProbeResponseReceived -eq $true -and $null -ne $_.rendererProbeAgeMs -and [double]$_.rendererProbeAgeMs -le 15000
   })
   $rendererProbeCoverage = [Math]::Min(1.0, [double]$rendererProbeSamples.Count / [double]$expectedScoredSampleCount)
   $feedReadinessCoverage = [Math]::Min(1.0, [double]$feedReadyCount / [double]$expectedScoredSampleCount)
   $bridgeReadinessCoverage = [Math]::Min(1.0, [double]$bridgeReadyCount / [double]$expectedScoredSampleCount)
+  $productionObservationCoverage = [Math]::Min(1.0, [double]$productionObservationReadyCount / [double]$expectedScoredSampleCount)
   $rendererBlockedSamples = @($runtimeStatusSamples | Where-Object { $_.rendererBlocked -eq $true }).Count
   $runtimeInvalidatedSamples = @($runtimeStatusSamples | Where-Object { $_.runtimeState -eq 'invalidated' }).Count
   $emergencyMitigationCount = @($runtimeStatusSamples | Where-Object { $_.runtimeAction -in @('stop', 'invalidate') }).Count
@@ -564,15 +734,30 @@ try {
     -and $cutoffExternalStatus.bridge.peerRole -eq 'gea' `
     -and [double]$cutoffExternalStatus.bridge.pongCount -gt 0 `
     -and $null -ne $cutoffExternalStatus.bridge.roundTripMs
-  $finalTrackedOrderbookTickers = if ($null -eq $cutoffExternalStatus) { $null } else { $cutoffExternalStatus.feeds.orderbookWebSocket.trackedTickers }
+  $finalTrackedOrderbookTickers = if ($null -eq $cutoffExternalStatus) { $null } else { $cutoffExternalStatus.orderbookTracking.trackedTickers }
+  $finalOrderbookTrackingReady = $null -ne $cutoffExternalStatus -and $cutoffExternalStatus.orderbookTracking.trackingReady -eq $true
+  $finalProductionObservationReady = $null -ne $cutoffExternalStatus -and $cutoffExternalStatus.productionObservation.qualificationReady -eq $true
   $runtimeSlopeWindowComplete = $null -ne $cutoffExternalStatus -and $cutoffExternalStatus.renderer.slopeWindowComplete -eq $true
   $runtimeSlopeWindowMs = if ($null -eq $cutoffExternalStatus) { 0 } else { [double]$cutoffExternalStatus.renderer.slopeWindowMs }
   $runtimeSlopePerHour = if ($null -eq $cutoffExternalStatus) { $null } else { $cutoffExternalStatus.renderer.slopePerHour }
   $orderbookCloseCode = if ($null -eq $cutoffExternalStatus) { $null } else { $cutoffExternalStatus.feeds.orderbookWebSocket.lastCloseCode }
   $orderbookReconnects = if ($null -eq $cutoffExternalStatus) { 0 } else { [int]$cutoffExternalStatus.feeds.orderbookWebSocket.reconnects }
   $bridgeReconnects = if ($null -eq $cutoffExternalStatus) { 0 } else { [int]$cutoffExternalStatus.bridge.reconnects }
-  $temporaryExternalFailure = ($orderbookCloseCode -in @(1006, 1001, 1011, 429, 502, 503, 504)) -or
-    ($bridgeReconnects -gt 0 -and !$finalBridgeReady)
+  $typedFailureClasses = [Collections.Generic.List[string]]::new()
+  if ($null -ne $cutoffExternalStatus) {
+    foreach ($failureClass in @(
+      $cutoffExternalStatus.feeds.restMarkets.failureClass,
+      $cutoffExternalStatus.feeds.tradeTape.failureClass,
+      $cutoffExternalStatus.feeds.tickerWebSocket.failureClass,
+      $cutoffExternalStatus.orderbookTracking.failureClass
+    )) {
+      if (![string]::IsNullOrWhiteSpace([string]$failureClass)) { $typedFailureClasses.Add([string]$failureClass) }
+    }
+  }
+  if ($bridgeReconnects -gt 0 -and !$finalBridgeReady) { $typedFailureClasses.Add('bridge_transport') }
+  $temporaryFailureClasses = @('dns', 'tcp', 'tls', 'connection_reset', 'timeout', 'http_5xx', 'abnormal_close', 'server', 'network', 'rate_limit', 'bridge_transport')
+  $temporaryExternalFailure = $typedFailureClasses.Count -gt 0 `
+    -and @($typedFailureClasses | Where-Object { $_ -notin $temporaryFailureClasses }).Count -eq 0
   $slopeWindowComplete = $slopeEvidence.slopeWindowComplete -eq $true -and $runtimeSlopeWindowComplete
   $slopeWindowMs = [Math]::Min([double]$slopeEvidence.slopeWindowMs, $runtimeSlopeWindowMs)
 
@@ -596,6 +781,8 @@ try {
   if ($runtimeStatusCoverage -lt 0.99) { $acceptanceFailures.Add('runtime-status evidence coverage is below 99%') }
   if ($feedReadinessCoverage -lt 0.995) { $acceptanceFailures.Add('feed readiness coverage is below 99.5%') }
   if ($bridgeReadinessCoverage -lt 0.995) { $acceptanceFailures.Add('authenticated bridge readiness coverage is below 99.5%') }
+  if ($productionObservationCoverage -lt 1.0) { $acceptanceFailures.Add('locked production-observation evidence is incomplete') }
+  if ($productionObservationHashes.Count -ne 1) { $acceptanceFailures.Add('protected paper or safety state hash changed during the soak') }
   if ($rendererBlockedSamples -ne 0) { $acceptanceFailures.Add('renderer emitted a blocking sample') }
   if ($runtimeInvalidatedSamples -ne 0) { $acceptanceFailures.Add('runtime emitted an invalidated sample') }
   if ($processRestartCount -ne 0) { $acceptanceFailures.Add('a renderer or GEA process restarted') }
@@ -610,15 +797,44 @@ try {
   if (!$devToolsDisabled) { $acceptanceFailures.Add('DevTools were not disabled') }
   if ($configuredTrackedTickers -ne 500) { $acceptanceFailures.Add('discovery was not configured for 500 markets') }
   if ([int]$finalTrackedOrderbookTickers -ne 25) { $acceptanceFailures.Add('stable orderbook set did not contain 25 markets at cutoff') }
+  if (!$finalOrderbookTrackingReady) { $acceptanceFailures.Add('orderbook tracking revision was not server-confirmed and data-ready at cutoff') }
+  if (!$finalProductionObservationReady) { $acceptanceFailures.Add('production observation was not locked and unchanged at cutoff') }
   if (!$cleanShutdown) { $acceptanceFailures.Add('captured process tree did not shut down cleanly') }
   if (!$matchingArtifactHashes) { $acceptanceFailures.Add('production artifact hashes changed during the soak') }
   $passed = $acceptanceFailures.Count -eq 0
 
-  $failureText = $acceptanceFailures -join '; '
-  $nonRetryablePattern = 'integrity|credential|authenticat|memory|renderer|configuration|code|disk|hash|artifact|restart|DevTools'
-  $externalPattern = 'Kalshi|feed|bridge|websocket|orderbook|trade tape|rate limit|429|timeout|remote close|traffic'
-  $rootFailureText = if ($null -ne $runtimeFailure) { $runtimeFailure } else { $failureText }
-  $retryEligible = !$passed -and $RetryOrdinal -lt 2 -and $temporaryExternalFailure -and $failureText -notmatch $nonRetryablePattern
+  $nonExternalGateFailure = !$warmupDurationComplete `
+    -or !$scoredDurationComplete `
+    -or !$slopeWindowComplete `
+    -or $null -eq $slopeEvidence.slopePerHour -or [double]$slopeEvidence.slopePerHour -gt 0.02 `
+    -or $null -eq $runtimeSlopePerHour -or [double]$runtimeSlopePerHour -gt 0.02 `
+    -or $null -eq $p95Mb -or $p95Mb -gt 384 `
+    -or $null -eq $maxMb -or $maxMb -gt 512 `
+    -or $null -eq $maxTenMinuteGrowth -or $maxTenMinuteGrowth -gt 0.10 `
+    -or $rendererSampleCoverage -lt 0.99 `
+    -or $rendererProbeCoverage -lt 0.99 `
+    -or $geaSampleCoverage -lt 0.99 `
+    -or $runtimeStatusCoverage -lt 0.99 `
+    -or $productionObservationCoverage -lt 1.0 `
+    -or $productionObservationHashes.Count -ne 1 `
+    -or $rendererBlockedSamples -ne 0 `
+    -or $runtimeInvalidatedSamples -ne 0 `
+    -or $processRestartCount -ne 0 `
+    -or $emergencyMitigationCount -ne 0 `
+    -or $finalRendererStatus -ne 'stable' `
+    -or $finalRendererBlocked `
+    -or $finalRuntimeState -ne 'healthy' `
+    -or $null -eq $finalRuntimeStatusAgeMs -or [double]$finalRuntimeStatusAgeMs -gt 60000 `
+    -or $null -eq $finalRendererHeartbeatAgeMs -or [double]$finalRendererHeartbeatAgeMs -gt 15000 `
+    -or !$finalRendererProbeResponseReceived `
+    -or $null -eq $finalRendererProbeAgeMs -or [double]$finalRendererProbeAgeMs -gt 15000 `
+    -or [int]$finalTrackedOrderbookTickers -ne 25 `
+    -or !$finalOrderbookTrackingReady `
+    -or !$finalProductionObservationReady `
+    -or !$devToolsDisabled `
+    -or !$cleanShutdown `
+    -or !$matchingArtifactHashes
+  $retryEligible = !$passed -and $RetryOrdinal -lt 2 -and $temporaryExternalFailure -and !$nonExternalGateFailure
 
   $evidenceArtifactHashes = [ordered]@{
     samplesSha256 = Get-FileSha256OrNull $samplesPath
@@ -626,12 +842,15 @@ try {
     cutoffStatusSha256 = Get-FileSha256OrNull $cutoffStatusPath
   }
   $result = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     runType = 'production-stress-soak'
     attemptId = $AttemptId
+    seriesId = $SeriesId
     parentAttemptId = if ([string]::IsNullOrWhiteSpace($ParentAttemptId)) { $null } else { $ParentAttemptId }
     gitCommit = $commit
     configurationHash = $configurationHash
+    healthPolicyHash = $healthPolicyHash
+    readinessReceiptSha256 = Get-FileSha256OrNull $ReadinessReceiptPath
     startedAt = $startedAt.ToUnixTimeMilliseconds()
     scoredStartedAt = if ($null -eq $scoredStartedAt) { $null } else { $scoredStartedAt.ToUnixTimeMilliseconds() }
     scoredClosedAt = if ($null -eq $scoredClosedAt) { $null } else { $scoredClosedAt.ToUnixTimeMilliseconds() }
@@ -668,11 +887,14 @@ try {
     externalStatusCoverage = $runtimeStatusCoverage
     feedReadinessCoverage = $feedReadinessCoverage
     bridgeReadinessCoverage = $bridgeReadinessCoverage
+    productionObservationCoverage = $productionObservationCoverage
+    productionObservationStateHash = if ($productionObservationHashes.Count -eq 1) { $productionObservationHashes[0] } else { $null }
     rendererBlockedSampleCount = $rendererBlockedSamples
     runtimeInvalidatedSampleCount = $runtimeInvalidatedSamples
     processRestartCount = $processRestartCount
     emergencyMitigationCount = $emergencyMitigationCount
     temporaryExternalFailure = $temporaryExternalFailure
+    typedFailureClasses = @($typedFailureClasses | Select-Object -Unique)
     orderbookCloseCode = $orderbookCloseCode
     orderbookReconnects = $orderbookReconnects
     bridgeReconnects = $bridgeReconnects
@@ -697,6 +919,7 @@ try {
     productionEntryHash = $artifact.entryHash
     matchingArtifactHashes = $matchingArtifactHashes
     evidenceArtifactHashes = $evidenceArtifactHashes
+    sampleChainHead = $sampleChainHead
     cleanShutdown = $cleanShutdown
     runtimeFailure = $runtimeFailure
     acceptanceFailures = @($acceptanceFailures)
@@ -705,13 +928,16 @@ try {
   }
   $result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $resultPath -Encoding utf8
   [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     attemptId = $AttemptId
+    seriesId = $SeriesId
     parentAttemptId = if ([string]::IsNullOrWhiteSpace($ParentAttemptId)) { $null } else { $ParentAttemptId }
     retryOrdinal = $RetryOrdinal
     maximumRetryOrdinal = 2
     gitCommit = $commit
     configurationHash = $configurationHash
+    healthPolicyHash = $healthPolicyHash
+    readinessReceiptSha256 = Get-FileSha256OrNull $ReadinessReceiptPath
     configuration = $configuration
     productionArtifactHash = $artifact.hash
     productionArtifactFileCount = $artifact.fileCount
@@ -722,10 +948,51 @@ try {
     cutoffStatus = if ($passed) { 'passed' } else { 'failed' }
     cleanShutdown = $cleanShutdown
     evidenceArtifactHashes = $evidenceArtifactHashes
+    sampleChainHead = $sampleChainHead
+    sampleCount = $samples.Count
     namespace = $OutputDirectory
   } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding utf8
   Write-Host "Soak result: $(if ($passed) { 'PASS' } else { 'FAIL' }) - $resultPath"
   if (!$passed) { exit 1 }
+} catch {
+  if ($null -ne $capture) {
+    if ($null -ne $process -and !$process.HasExited) { try { $null = (Get-Process -Id $process.Id -ErrorAction Stop).CloseMainWindow() } catch { } }
+    if (!(Wait-CapturedExit $capture ([DateTimeOffset]::UtcNow.AddSeconds(30)))) {
+      Stop-CapturedProcesses $capture
+      $null = Wait-CapturedExit $capture ([DateTimeOffset]::UtcNow.AddSeconds(10))
+    }
+  }
+  if (Test-Path -LiteralPath $OutputDirectory) {
+    $failedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $terminalFailure = [ordered]@{
+      schemaVersion = 3
+      runType = 'production-stress-soak'
+      attemptId = $AttemptId
+      seriesId = $SeriesId
+      retryOrdinal = $RetryOrdinal
+      passed = $false
+      retryEligible = $false
+      failureClass = 'runner_unexpected'
+      acceptanceFailures = @('runner stopped on an unexpected internal error')
+      finishedAt = $failedAt
+    }
+    $terminalFailure | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $resultPath -Encoding utf8
+    [ordered]@{
+      schemaVersion = 3
+      attemptId = $AttemptId
+      seriesId = $SeriesId
+      retryOrdinal = $RetryOrdinal
+      cutoffStatus = 'failed'
+      terminalFailureClass = 'runner_unexpected'
+      finishedAt = $failedAt
+      namespace = $OutputDirectory
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+  }
+  throw
 } finally {
+  if ($null -ne $capture -and @(Get-LiveCapturedProcessIds $capture).Count -gt 0) {
+    Stop-CapturedProcesses $capture
+    $null = Wait-CapturedExit $capture ([DateTimeOffset]::UtcNow.AddSeconds(10))
+  }
   Pop-Location
 }
