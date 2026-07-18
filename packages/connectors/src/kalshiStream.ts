@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs';
 import { WebSocket } from 'ws';
 import { getKalshiEndpointPolicy, type KalshiEnvironment } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
@@ -19,6 +20,21 @@ const SUBSCRIPTION_BATCH_INTERVAL_MS = 250;
 const MAX_TRACKED_TICKERS = 500;
 const MAX_FUTURE_EXCHANGE_TIME_MS = 5_000;
 const MIN_MILLISECOND_EPOCH = 1_500_000_000_000;
+
+/**
+ * Diagnostic only, off unless NEMESIS_TICKER_CAPTURE_PATH is set. Records raw
+ * subscription-control packets so the subscribed-ack contract can be read off
+ * the wire instead of assumed. Remove once the ack accounting is settled.
+ */
+const TICKER_CAPTURE_PATH = process.env.NEMESIS_TICKER_CAPTURE_PATH ?? null;
+function captureControlPacket(label: string, detail: string): void {
+  if (!TICKER_CAPTURE_PATH) return;
+  try {
+    appendFileSync(TICKER_CAPTURE_PATH, `${Date.now()} ${label} ${detail}\n`);
+  } catch {
+    // Diagnostics must never disturb the stream.
+  }
+}
 
 export type KalshiWebSocketHeaderProvider = () => Record<string, string> | null;
 
@@ -207,8 +223,13 @@ export class KalshiStream {
         this.handleTicker(packet.msg as Record<string, unknown>, generation);
       } else if (type === 'subscribed') {
         const commandId = finiteNumber(packet.id);
+        captureControlPacket(
+          'subscribed',
+          `parsedId=${commandId ?? 'NONE'} pendingBefore=[${[...this.pendingSubscriptionCommands].join(',')}] raw=${raw}`,
+        );
         if (commandId != null) this.pendingSubscriptionCommands.delete(commandId);
         else if (this.pendingSubscriptionCommands.size === 1) this.pendingSubscriptionCommands.clear();
+        captureControlPacket('subscribed-after', `pendingAfter=[${[...this.pendingSubscriptionCommands].join(',')}]`);
         if (this.pendingSubscriptionCommands.size === 0) this.transport.recordSubscriptionAck(generation);
         this.recordHealthy();
       } else if (type === 'error') {
@@ -401,6 +422,7 @@ export class KalshiStream {
         : { channels: ['ticker'] },
     }));
     this.pendingSubscriptionCommands.add(id);
+    captureControlPacket('sent-subscribe', `id=${id} tickers=${tickers.length} pendingNow=[${[...this.pendingSubscriptionCommands].join(',')}]`);
   }
 
   private handleTicker(msg: Record<string, unknown>, generation: number): boolean {
