@@ -58,7 +58,9 @@ export class KalshiStream {
   private generation = 0;
   private reconnects = 0;
   private sequenceGaps = 0;
-  private readonly sequenceBySubscription = new Map<string, number>();
+  // Kalshi's ticker channel carries no per-message sequence, so integrity is
+  // enforced by per-market exchange-timestamp monotonicity instead.
+  private readonly lastExchangeTsByTicker = new Map<string, number>();
   private lastMessageAt: number | null = null;
   private lastPongAt: number | null = null;
   private authenticated = false;
@@ -152,7 +154,7 @@ export class KalshiStream {
     for (const ticker of removed) {
       this.subscribed.delete(ticker);
     }
-    if (removed.length > 0) this.sequenceBySubscription.clear();
+    if (removed.length > 0) this.lastExchangeTsByTicker.clear();
     if (removed.length > 0 && this.started) {
       // The ticker protocol does not provide a safe membership replacement
       // without subscription ids. A fresh generation guarantees the server
@@ -170,7 +172,7 @@ export class KalshiStream {
   }
 
   restart(): void {
-    this.sequenceBySubscription.clear();
+    this.lastExchangeTsByTicker.clear();
     if (!this.started) return;
     this.clearReconnectTimer();
     this.clearSubscriptionPump();
@@ -194,31 +196,15 @@ export class KalshiStream {
     try {
       const packet = JSON.parse(raw) as Record<string, unknown>;
       const type = String(packet.type ?? '');
-      const sequence = finiteSequence(packet.seq);
       if (type === 'ticker') {
+        // The Kalshi ticker channel emits a full snapshot per update with no
+        // per-message sequence number; ordering and replay protection come
+        // from the per-market exchange timestamp (validated in handleTicker).
         if (!packet.msg || typeof packet.msg !== 'object') {
           this.rejectTickerPacket('protocol', 'ticker packet is missing its message body');
           return;
         }
-        if (sequence == null) {
-          this.sequenceGaps += 1;
-          this.rejectTickerPacket('sequence', 'ticker packet has an invalid exchange sequence');
-          return;
-        }
-        const subscription = String(packet.sid ?? 'default');
-        const previousSequence = this.sequenceBySubscription.get(subscription);
-        if (previousSequence != null && sequence !== previousSequence + 1) {
-          this.sequenceGaps += 1;
-          this.registry.recordWarn('kalshi-ticker-ws', `ticker sequence gap: expected ${previousSequence + 1}, received ${sequence}`);
-          this.restartAfterFailure(createKalshiTransportFailure(
-            'sequence',
-            `ticker sequence gap: expected ${previousSequence + 1}, received ${sequence}`,
-          ));
-          return;
-        }
-        if (this.handleTicker(packet.msg as Record<string, unknown>, sequence, generation)) {
-          this.sequenceBySubscription.set(subscription, sequence);
-        }
+        this.handleTicker(packet.msg as Record<string, unknown>, generation);
       } else if (type === 'subscribed') {
         const commandId = finiteNumber(packet.id);
         if (commandId != null) this.pendingSubscriptionCommands.delete(commandId);
@@ -286,7 +272,7 @@ export class KalshiStream {
       if (!this.isCurrent(socket, generation)) return;
       this.authenticated = true;
       this.subscribed.clear();
-      this.sequenceBySubscription.clear();
+      this.lastExchangeTsByTicker.clear();
       this.pendingSubscriptionCommands.clear();
       this.lastMessageAt = null;
       this.lastPongAt = null;
@@ -417,7 +403,7 @@ export class KalshiStream {
     this.pendingSubscriptionCommands.add(id);
   }
 
-  private handleTicker(msg: Record<string, unknown>, sequence: number, generation: number): boolean {
+  private handleTicker(msg: Record<string, unknown>, generation: number): boolean {
     const ticker = String(msg.market_ticker ?? msg.ticker ?? '');
     if (!ticker) {
       this.rejectTickerPacket('protocol', 'ticker packet has no market ticker');
@@ -446,6 +432,15 @@ export class KalshiStream {
       this.rejectTickerPacket('protocol', `ticker packet has an invalid exchange timestamp for ${ticker}`);
       return false;
     }
+    // Replay/out-of-order protection without a sequence number: a ticker update
+    // whose exchange timestamp predates the newest one already seen for this
+    // market is stale and dropped, but does not fault the whole stream.
+    const previousExchangeTs = this.lastExchangeTsByTicker.get(ticker);
+    if (previousExchangeTs != null && exchangeTimestamp < previousExchangeTs) {
+      this.registry.recordWarn('kalshi-ticker-ws', `dropped stale ticker update for ${ticker}`);
+      return false;
+    }
+    this.lastExchangeTsByTicker.set(ticker, exchangeTimestamp);
     const quote: KalshiTickerQuote = {
       ticker,
       yesBid: bid,
@@ -454,7 +449,6 @@ export class KalshiStream {
       spread: Math.max(0.005, ask - bid),
       volume: finiteNumber(msg.volume_fp ?? msg.volume ?? msg.volume_24h) ?? 0,
       updatedAt: exchangeTimestamp ?? now,
-      exchangeSequence: sequence,
     };
     this.quotes.set(ticker, quote);
     this.lastSequencedTickerAt = now;
@@ -568,11 +562,6 @@ export class KalshiStream {
       this.connect();
     }, decision.delayMs);
   }
-}
-
-function finiteSequence(value: unknown): number | null {
-  const sequence = finiteNumber(value);
-  return sequence != null && Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
 }
 
 function finiteNumber(value: unknown): number | null {

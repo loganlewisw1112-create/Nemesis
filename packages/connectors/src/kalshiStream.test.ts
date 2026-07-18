@@ -62,18 +62,22 @@ describe('KalshiStream replay safety', () => {
     expect(stream.getQuote('KXSTALE')).toBeUndefined();
   });
 
-  it('detects sequence gaps before publishing a newer quote', () => {
+  it('publishes seq-less ticker updates and drops stale exchange timestamps without faulting', () => {
+    // The Kalshi ticker channel carries no per-message sequence; integrity is
+    // by per-market exchange-timestamp monotonicity.
     const registry = new ConnectorRegistry();
     const stream = new KalshiStream(registry, () => null);
-    const seen: string[] = [];
-    stream.onQuote((quote) => seen.push(quote.ticker));
-    const { generation } = primeCurrentGeneration(stream, ['KXONE', 'KXTWO']);
+    const seen: number[] = [];
+    stream.onQuote((quote) => seen.push(quote.updatedAt));
+    const { generation } = primeCurrentGeneration(stream, ['KXONE']);
     const now = Date.now();
-    stream.ingest(JSON.stringify({ type: 'ticker', sid: 1, seq: 10, msg: { market_ticker: 'KXONE', yes_bid: 40, yes_ask: 42, ts_ms: now } }), generation);
-    stream.ingest(JSON.stringify({ type: 'ticker', sid: 1, seq: 12, msg: { market_ticker: 'KXTWO', yes_bid: 45, yes_ask: 47, ts_ms: now } }), generation);
-    expect(seen).toEqual(['KXONE']);
-    expect(stream.telemetry().sequenceGaps).toBe(1);
-    expect(registry.get('kalshi-ticker-ws')?.qualificationReady).toBe(false);
+    stream.ingest(JSON.stringify({ type: 'ticker', sid: 1, msg: { market_ticker: 'KXONE', yes_bid: 40, yes_ask: 42, ts_ms: now } }), generation);
+    stream.ingest(JSON.stringify({ type: 'ticker', sid: 1, msg: { market_ticker: 'KXONE', yes_bid: 41, yes_ask: 43, ts_ms: now + 1_000 } }), generation);
+    // A stale update (older exchange timestamp) is dropped, not faulted.
+    stream.ingest(JSON.stringify({ type: 'ticker', sid: 1, msg: { market_ticker: 'KXONE', yes_bid: 10, yes_ask: 90, ts_ms: now - 5_000 } }), generation);
+    expect(seen).toEqual([now, now + 1_000]);
+    expect(stream.telemetry().sequenceGaps).toBe(0);
+    expect(stream.telemetry().failureClass).toBeNull();
   });
 
   it('requires ack, a real pong, and a current sequenced exchange timestamp', () => {
@@ -145,20 +149,6 @@ describe('KalshiStream replay safety', () => {
 
     stream.track(['KX-499', 'KX-NEW', 'KX-NEW']);
     expect(stream.telemetry().trackedTickers).toBe(2);
-  });
-
-  it.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects unsafe exchange sequence %s before caching or emitting', (sequence) => {
-    const stream = new KalshiStream(new ConnectorRegistry(), () => null);
-    const seen: string[] = [];
-    stream.onQuote((quote) => seen.push(quote.ticker));
-    const { generation } = primeCurrentGeneration(stream, ['KXBADSEQ']);
-    stream.ingest(JSON.stringify({
-      type: 'ticker', sid: 1, seq: sequence,
-      msg: { market_ticker: 'KXBADSEQ', yes_bid: 40, yes_ask: 42, ts_ms: Date.now() },
-    }), generation);
-    expect(stream.getQuote('KXBADSEQ')).toBeUndefined();
-    expect(seen).toEqual([]);
-    expect(stream.telemetry().failureClass).toBe('sequence');
   });
 
   it.each([
