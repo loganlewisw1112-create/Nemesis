@@ -25,7 +25,11 @@ import {
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
 const DEFAULT_MAX_TRACKED_TICKERS = 25;
-const MAX_QUALIFICATION_EXCHANGE_AGE_MS = 1_000;
+// Bounded freshness proves the stream is live, not that every second trades:
+// a book with sequence continuity, a live pong, and an unchanged state is
+// still current. One second disqualified the whole feed whenever no tracked
+// market happened to tick, so the bound aligns with the liveness window.
+const MAX_QUALIFICATION_EXCHANGE_AGE_MS = DEAD_CONNECTION_MS;
 const MAX_EXCHANGE_FUTURE_SKEW_MS = 5_000;
 const MIN_MILLISECOND_TIMESTAMP = 1_000_000_000_000;
 

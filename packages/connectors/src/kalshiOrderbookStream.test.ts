@@ -211,7 +211,7 @@ describe('KalshiOrderbookStream', () => {
     expect(stream.getBook('KXA')).toMatchObject({ sequence: 3 });
   });
 
-  it('stops qualification when exchange time exceeds one second even while pongs remain live', () => {
+  it('stops qualification when exchange time exceeds the liveness window even while pongs remain live', () => {
     vi.useFakeTimers();
     const deltaAt = 1_700_000_000_000;
     vi.setSystemTime(deltaAt);
@@ -237,15 +237,17 @@ describe('KalshiOrderbookStream', () => {
       msg: { market_ticker: 'KXTEST', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: deltaAt },
     }), 1);
 
-    expect(stream.telemetry(deltaAt + 1_000).qualificationReady).toBe(true);
+    // A quiet-but-live book stays qualified inside the 25s liveness window.
+    expect(stream.telemetry(deltaAt + 1_001).qualificationReady).toBe(true);
+    expect(stream.telemetry(deltaAt + 25_000).qualificationReady).toBe(true);
     Object.assign(stream as unknown as Record<string, unknown>, {
-      lastPongAt: deltaAt + 1_001,
-      lastMessageAt: deltaAt + 1_001,
+      lastPongAt: deltaAt + 25_001,
+      lastMessageAt: deltaAt + 25_001,
     });
-    expect(stream.telemetry(deltaAt + 1_001)).toMatchObject({
+    expect(stream.telemetry(deltaAt + 25_001)).toMatchObject({
       connected: true,
       qualificationReady: false,
-      lastPongAt: deltaAt + 1_001,
+      lastPongAt: deltaAt + 25_001,
       lastSequencedDeltaAt: deltaAt,
       lastExchangeTimestamp: deltaAt,
     });
