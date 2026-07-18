@@ -348,11 +348,13 @@ describe('KalshiOrderbookStream', () => {
       cmd: 'update_subscription',
       params: { sids: [7], action: 'get_snapshot' },
     });
+    // get_snapshot is fire-and-forget (Kalshi answers with snapshots, not an
+    // `ok`), so membership is acknowledged as soon as the add/delete acks land.
     expect(stream.telemetry()).toMatchObject({
-      subscriptionUpdateInFlight: true,
+      subscriptionUpdateInFlight: false,
       serverTrackedTickers: 25,
       acknowledgedTrackingRevision: 2,
-      membershipAcknowledged: false,
+      membershipAcknowledged: true,
     });
     stream.stop();
   });
@@ -556,9 +558,11 @@ describe('KalshiOrderbookStream', () => {
       authenticated: true,
       quarantinedTickers: 2,
       qualifiedTickers: 1,
-      // The healthy book remains available for display, but an in-flight
-      // repair prevents the orderbook feed from qualifying.
-      qualificationReady: false,
+      // Quarantined books are excluded from qualification while their repair
+      // snapshots are outstanding; the healthy proven book keeps the feed
+      // qualified, and the recorded sequence gap still fails any zero-fault
+      // readiness hold.
+      qualificationReady: true,
     });
 
     // The official sequenced OK response advances continuity without mutating

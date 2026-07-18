@@ -988,26 +988,34 @@ export class KalshiOrderbookStream {
   }
 
   private pumpSubscriptionUpdates(): void {
-    if (this.pendingSubscriptionUpdate || this.socket?.readyState !== WebSocket.OPEN) return;
-    const command = this.subscriptionUpdateQueue.shift();
-    if (!command) return;
-    const pending: PendingSubscriptionUpdate = { ...command, id: this.commandId++ };
-    try {
-      this.socket.send(JSON.stringify({
-        id: pending.id,
-        cmd: 'update_subscription',
-        params: {
-          sids: [pending.sid],
-          market_tickers: pending.marketTickers,
-          action: pending.action,
-        },
-      }));
-      this.pendingSubscriptionUpdate = pending;
-      this.subscriptionUpdates += 1;
-    } catch {
-      this.subscriptionUpdateQueue.unshift(command);
-      this.setPendingFailure(this.generation, createKalshiTransportFailure('tcp', 'subscription update send failed'), 'subscription_update_send_failed');
-      this.socket.close();
+    while (!this.pendingSubscriptionUpdate && this.socket?.readyState === WebSocket.OPEN) {
+      const command = this.subscriptionUpdateQueue.shift();
+      if (!command) return;
+      const pending: PendingSubscriptionUpdate = { ...command, id: this.commandId++ };
+      try {
+        this.socket.send(JSON.stringify({
+          id: pending.id,
+          cmd: 'update_subscription',
+          params: {
+            sids: [pending.sid],
+            market_tickers: pending.marketTickers,
+            action: pending.action,
+          },
+        }));
+        this.subscriptionUpdates += 1;
+        // get_snapshot does not modify the subscription and Kalshi answers it
+        // with orderbook_snapshot messages only — no `ok` acknowledgement —
+        // so it must not hold the pending-update slot. Per-ticker completion
+        // is tracked by pendingSnapshotRepair as each snapshot arrives.
+        if (command.action !== 'get_snapshot') {
+          this.pendingSubscriptionUpdate = pending;
+        }
+      } catch {
+        this.subscriptionUpdateQueue.unshift(command);
+        this.setPendingFailure(this.generation, createKalshiTransportFailure('tcp', 'subscription update send failed'), 'subscription_update_send_failed');
+        this.socket.close();
+        return;
+      }
     }
   }
 
