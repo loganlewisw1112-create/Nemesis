@@ -242,6 +242,13 @@ try {
   # Transport liveness is bounded by the same dead-connection window the streams
   # themselves use, so the hold fails on a genuinely dead socket and nothing else.
   $deadConnectionMs = 25000
+  # Adding tickers to the tracked set issues a subscribe command, and
+  # subscriptionAcknowledged is false while one is in flight. Wire capture shows
+  # Kalshi acks in ~240ms, far inside the 5s sample interval, so a single
+  # unacknowledged sample is a healthy in-flight subscribe rather than a fault.
+  # Requiring two consecutive misses still fails a subscription that never acks.
+  $tickerSubAckMisses = 0
+  $orderbookSubAckMisses = 0
   # Market activity is a property of the tracked markets, not of our feed, so it
   # is recorded across the hold as evidence rather than gating it instantaneously.
   $marketActivitySamples = [Collections.Generic.List[object]]::new()
@@ -274,14 +281,23 @@ try {
     # the tracked markets went quiet past the liveness window -- a routine lull on
     # Kalshi even mid-session. Only transport liveness gates the hold.
     $statusAt = [double]$status.updatedAt
-    $tickerPongAt = $status.feeds.tickerWebSocket.lastPongAt
-    $orderbookPongAt = $status.feeds.orderbookWebSocket.lastPongAt
-    $tickerPongAgeMs = if ($null -eq $tickerPongAt) { [double]::PositiveInfinity } else { [Math]::Max(0, $statusAt - [double]$tickerPongAt) }
-    $orderbookPongAgeMs = if ($null -eq $orderbookPongAt) { [double]::PositiveInfinity } else { [Math]::Max(0, $statusAt - [double]$orderbookPongAt) }
+    # Transport liveness is the age of the most recent traffic of any kind. A
+    # stream sets lastPongAt to null on every (re)connect and only pings every
+    # 10s, so keying purely on the pong reports a freshly connected socket as
+    # infinitely stale. Server pings and data both prove the socket is alive,
+    # which is exactly what this condition is meant to establish.
+    $tickerTrafficAt = @($status.feeds.tickerWebSocket.lastPongAt, $status.feeds.tickerWebSocket.lastMessageAt) `
+      | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } | Measure-Object -Maximum
+    $orderbookTrafficAt = @($status.feeds.orderbookWebSocket.lastPongAt, $status.feeds.orderbookWebSocket.lastMessageAt) `
+      | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } | Measure-Object -Maximum
+    $tickerPongAgeMs = if ($tickerTrafficAt.Count -eq 0) { [double]::PositiveInfinity } else { [Math]::Max(0, $statusAt - $tickerTrafficAt.Maximum) }
+    $orderbookPongAgeMs = if ($orderbookTrafficAt.Count -eq 0) { [double]::PositiveInfinity } else { [Math]::Max(0, $statusAt - $orderbookTrafficAt.Maximum) }
     $tickerDataAt = $status.feeds.tickerWebSocket.lastExchangeDataAt
     $orderbookDataAt = $status.feeds.orderbookWebSocket.lastExchangeDataAt
     $tickerExchangeDataAgeMs = if ($null -eq $tickerDataAt) { $null } else { [Math]::Max(0, $statusAt - [double]$tickerDataAt) }
     $orderbookExchangeDataAgeMs = if ($null -eq $orderbookDataAt) { $null } else { [Math]::Max(0, $statusAt - [double]$orderbookDataAt) }
+    $tickerSubAckMisses = if ($status.feeds.tickerWebSocket.subscriptionAcknowledged -eq $true) { 0 } else { $tickerSubAckMisses + 1 }
+    $orderbookSubAckMisses = if ($status.orderbookTracking.membershipAcknowledged -eq $true) { 0 } else { $orderbookSubAckMisses + 1 }
     # Named conditions so a mid-hold gap records exactly which gate dropped.
     $conditions = [ordered]@{
       status_fresh = $ageMs -le 15000
@@ -299,11 +315,11 @@ try {
       orderbook_pong_fresh = $orderbookPongAgeMs -le $deadConnectionMs
       orderbook_authenticated = $status.feeds.orderbookWebSocket.authenticated -eq $true
       ticker_authenticated = $status.feeds.tickerWebSocket.authenticated -eq $true
-      ticker_subscription_acknowledged = $status.feeds.tickerWebSocket.subscriptionAcknowledged -eq $true
+      ticker_subscription_acknowledged = $tickerSubAckMisses -lt 2
       orderbook_tracked = $status.orderbookTracking.trackedTickers -eq $OrderbookTarget
       orderbook_verified = $status.orderbookTracking.verifiedTrackedTickers -eq $OrderbookTarget
       orderbook_server = $status.orderbookTracking.serverTrackedTickers -eq $OrderbookTarget
-      orderbook_membership_acknowledged = $status.orderbookTracking.membershipAcknowledged -eq $true
+      orderbook_membership_acknowledged = $orderbookSubAckMisses -lt 2
       orderbook_tracking_ready = $status.orderbookTracking.trackingReady -eq $true
       bridge_qualified = $status.bridge.qualificationReady -eq $true
       bridge_pongs = [int]$status.bridge.pongCount -ge 3
