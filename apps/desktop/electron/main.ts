@@ -4179,13 +4179,17 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
   // Eligible signal markets are the second priority after campaign-critical
   // tickers, regardless of whether discovery has already verified depth.
   for (const market of discovery.getMarketsForSignals()) add(market.ticker);
-  // Fill from the live universe before using the cached live set. Discovery
-  // can expose a fixture fallback, so the production/live filter above is
-  // applied to every source rather than trusting source order.
-  if (discovery.hasLiveUniverse()) {
-    for (const market of discovery.getUniverse()) add(market.ticker);
-  }
-  for (const market of marketsCache) add(market.ticker);
+  // Fill remaining slots most-active-first: qualification requires tracked
+  // books to keep producing sequenced deltas inside the liveness window, so
+  // quiet markets in the tracked set starve readiness during trading lulls.
+  // Discovery can expose a fixture fallback, so the production/live filter
+  // above is applied to every source rather than trusting source order.
+  const fill: KalshiMarket[] = [];
+  if (discovery.hasLiveUniverse()) fill.push(...discovery.getUniverse());
+  fill.push(...marketsCache);
+  fill.sort((left, right) => finiteCampaignNumber(right.volume_24h ?? right.volume, 0)
+    - finiteCampaignNumber(left.volume_24h ?? left.volume, 0));
+  for (const market of fill) add(market.ticker);
   // Bridge recommendations may not yet be in marketsCache; only admit them
   // when they are already represented by a live market identity.
   for (const card of ranked) if (marketByTicker.has(card.ticker)) add(card.ticker);
