@@ -383,6 +383,7 @@ const unsupervisedRuntimeStatusExporter = new RuntimeStatusExporter(runtimeStatu
 let lastDiscoveryRevision = '';
 let lastWorldRevision = '';
 let orderbookTrackedTickers: string[] = [];
+let tickerTrackedTickers: string[] = [];
 let orderbookLastRotationAt = 0;
 let orderbookRotationCursor = 0;
 const campaignBookTriggerScheduler = new CampaignBookTriggerScheduler(
@@ -4220,13 +4221,26 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
 function refreshTickerTracking(now = Date.now()): void {
   const ordered = desiredOrderbookTickers(now);
   const seen = new Set(ordered);
+  // Ticker membership is additive. Removing a ticker forces a full stream
+  // restart (the ticker protocol has no subscription ids, so replacement means
+  // a fresh generation), and a restart fails a readiness hold by design. Since
+  // the desired set is now ranked on the live trade tape it reshuffles on every
+  // refresh, so carrying previously tracked markets forward is what keeps the
+  // stream stable; entries leave only when they stop verifying as production
+  // live, or when the 500-market ceiling forces them out.
+  for (const ticker of tickerTrackedTickers) {
+    if (seen.has(ticker) || !productionMarketRecord(ticker, now)) continue;
+    seen.add(ticker);
+    ordered.push(ticker);
+  }
   for (const [ticker] of productionMarketRecords) {
     if (seen.has(ticker) || !productionMarketRecord(ticker, now)) continue;
     seen.add(ticker);
     ordered.push(ticker);
     if (ordered.length >= 500) break;
   }
-  kalshiStream.replaceTracked(ordered.slice(0, 500));
+  tickerTrackedTickers = ordered.slice(0, 500);
+  kalshiStream.replaceTracked(tickerTrackedTickers);
 }
 
 function refreshOrderbookTracking(now = Date.now()): void {
