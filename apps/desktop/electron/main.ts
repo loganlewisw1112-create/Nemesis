@@ -212,7 +212,14 @@ const RENDERER_LOAD_RETRY_GRACE_MS = 5 * 60_000;
 // Discovery still evaluates 500 tickers. Live depth is a smaller, rotating
 // working set so the authenticated socket carries only immediately useful
 // markets; active campaign candidates preempt this set.
-const ORDERBOOK_TRACKING_LIMIT = 25;
+// Production qualification requires exactly 25 tracked markets. The target is
+// overridable (1..25) only for reduced-bar validation rehearsals when the live
+// universe is thin; offline evidence verifiers remain pinned at 25, so a
+// reduced-bar run can never verify as a real qualification.
+const ORDERBOOK_TRACKING_LIMIT = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_ORDERBOOK_TRACKING_LIMIT ?? '', 10);
+  return Number.isInteger(raw) && raw >= 1 && raw <= 25 ? raw : 25;
+})();
 const ORDERBOOK_ROTATION_INTERVAL_MS = 5 * 60_000;
 const ORDERBOOK_ROTATION_BATCH_SIZE = 4;
 
@@ -249,7 +256,7 @@ const kalshiOrderbookStream = new KalshiOrderbookStream(registry, () => {
   return credentials
     ? authHeaders(credentials.apiKeyId, credentials.privateKeyPem, 'GET', '/trade-api/ws/v2')
     : null;
-});
+}, 'production', ORDERBOOK_TRACKING_LIMIT);
 let theses: ThesisCard[] = [];
 let geaTheses: ThesisCard[] = [];
 let reviewOnly = false;

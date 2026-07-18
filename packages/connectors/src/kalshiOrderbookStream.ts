@@ -59,7 +59,8 @@ export interface KalshiOrderbookStreamTelemetry extends KalshiSocketHealthV2 {
  * emits it verbatim, so runners and verifiers read one authoritative object.
  */
 export interface OrderbookTrackingStateV2 {
-  requiredTickers: 25;
+  /** Configured production tracking target (25 in production). */
+  requiredTickers: number;
   trackedTickers: number;
   verifiedTrackedTickers: number;
   serverTrackedTickers: number;
@@ -332,10 +333,11 @@ export class KalshiOrderbookStream {
       && this.subscriptionUpdateQueue.length === 0
       && this.subscribed.size === this.tickers.size
       && [...this.tickers].every((ticker) => this.subscribed.has(ticker));
-    // Qualification requires exactly 25 current production REST proofs and
-    // an acknowledgement for the same immutable membership revision.
-    const trackingReady = this.tickers.size === DEFAULT_MAX_TRACKED_TICKERS
-      && verifiedTrackedTickers === DEFAULT_MAX_TRACKED_TICKERS
+    // Qualification requires exactly the configured production target of
+    // current production REST proofs (25 in production) and an acknowledgement
+    // for the same immutable membership revision.
+    const trackingReady = this.tickers.size === this.maxTrackedTickers
+      && verifiedTrackedTickers === this.maxTrackedTickers
       && membershipAcknowledged;
     const pongFresh = this.lastPongAt != null
       && now - this.lastPongAt >= 0
@@ -395,7 +397,7 @@ export class KalshiOrderbookStream {
   trackingStateV2(now = Date.now()): OrderbookTrackingStateV2 {
     const telemetry = this.telemetry(now);
     return {
-      requiredTickers: DEFAULT_MAX_TRACKED_TICKERS,
+      requiredTickers: this.maxTrackedTickers,
       trackedTickers: telemetry.trackedTickers,
       verifiedTrackedTickers: telemetry.verifiedTrackedTickers,
       serverTrackedTickers: telemetry.serverTrackedTickers,

@@ -160,7 +160,8 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain("'wss://api.elections.kalshi.com/trade-api/ws/v2'");
     expect(script).toContain('timerStarted = $false');
     expect(script).toContain('readiness gap occurred during the continuous hold');
-    expect(script).toContain('$status.orderbookTracking.trackedTickers -eq 25');
+    expect(script).toContain('$status.orderbookTracking.trackedTickers -eq $OrderbookTarget');
+    expect(script).toContain('[int]$OrderbookTarget = 25');
     expect(script).toContain('$status.productionObservation.qualificationReady -eq $true');
   });
 
@@ -206,12 +207,15 @@ describe('Windows package staging scripts', () => {
   it('requires an exact 25-ticker live orderbook set before preflight readiness', () => {
     const main = fs.readFileSync(path.join(repoRoot, 'apps', 'desktop', 'electron', 'main.ts'), 'utf8');
     const stream = fs.readFileSync(path.join(repoRoot, 'packages', 'connectors', 'src', 'kalshiOrderbookStream.ts'), 'utf8');
-    expect(main).toContain('const ORDERBOOK_TRACKING_LIMIT = 25');
+    // The production target defaults to 25 and is clamped to 1..25; a reduced
+    // override only lowers the runtime bar, never the offline verifiers.
+    expect(main).toContain("Number.parseInt(process.env.NEMESIS_ORDERBOOK_TRACKING_LIMIT ?? '', 10)");
+    expect(main).toContain('raw >= 1 && raw <= 25 ? raw : 25');
     expect(main).toContain('orderbook_tracking_set_below_25');
     expect(main).toContain('orderbook.trackedTickers === ORDERBOOK_TRACKING_LIMIT');
     expect(main).toContain('trackingReady: orderbook.trackingReady');
     expect(main).toContain('current: orderbookTrackedTickers.filter((ticker) => desiredSet.has(ticker))');
-    expect(stream).toContain('const trackingReady = this.tickers.size === DEFAULT_MAX_TRACKED_TICKERS');
+    expect(stream).toContain('const trackingReady = this.tickers.size === this.maxTrackedTickers');
     expect(stream).toContain('&& trackingReady');
   });
 });

@@ -6,7 +6,13 @@ param(
   [int]$HoldMinutes = 10,
 
   [ValidateRange(10, 30)]
-  [int]$CeilingMinutes = 20
+  [int]$CeilingMinutes = 20,
+
+  # Production qualification requires exactly 25. Lower values run a reduced-bar
+  # validation rehearsal (the receipt records the target and offline verifiers
+  # stay pinned at 25, so a reduced hold can never pass real qualification).
+  [ValidateRange(1, 25)]
+  [int]$OrderbookTarget = 25
 )
 
 $ErrorActionPreference = 'Stop'
@@ -212,6 +218,7 @@ try {
   $env:NEMESIS_PRODUCTION_OBSERVATION = 'true'
   $env:NEMESIS_DEVTOOLS = 'false'
   $env:NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS = '500'
+  $env:NEMESIS_ORDERBOOK_TRACKING_LIMIT = "$OrderbookTarget"
   $env:NEMESIS_AUTO_SPAWN_GEA = 'true'
   $env:NEMESIS_RUNTIME_STATUS_PATH = $runtimeStatusPath
   $env:NEMESIS_HEALTH_POLICY_HASH = $healthPolicyHash
@@ -264,9 +271,9 @@ try {
       -and $status.feeds.qualificationReady -eq $true `
       -and $status.feeds.tickerWebSocket.authenticated -eq $true `
       -and $status.feeds.tickerWebSocket.subscriptionAcknowledged -eq $true `
-      -and $status.orderbookTracking.trackedTickers -eq 25 `
-      -and $status.orderbookTracking.verifiedTrackedTickers -eq 25 `
-      -and $status.orderbookTracking.serverTrackedTickers -eq 25 `
+      -and $status.orderbookTracking.trackedTickers -eq $OrderbookTarget `
+      -and $status.orderbookTracking.verifiedTrackedTickers -eq $OrderbookTarget `
+      -and $status.orderbookTracking.serverTrackedTickers -eq $OrderbookTarget `
       -and $status.orderbookTracking.membershipAcknowledged -eq $true `
       -and $status.orderbookTracking.trackingReady -eq $true `
       -and $status.bridge.qualificationReady -eq $true `
@@ -320,6 +327,7 @@ try {
     holdMinutes = $HoldMinutes; holdStartedAt = if ($null -eq $holdStartedAt) { $null } else { $holdStartedAt.ToUnixTimeMilliseconds() }
     holdCompletedAt = if ($null -eq $holdCompletedAt) { $null } else { $holdCompletedAt.ToUnixTimeMilliseconds() }
     continuousHoldSamples = $samples; restCycles = $restSuccesses.Count; tradeCycles = $tradeSuccesses.Count
+    orderbookTarget = $OrderbookTarget; reducedBarRehearsal = ($OrderbookTarget -ne 25)
     networkChecks = $networkChecks; gitCommit = $commit; productionArtifactHash = $artifactBefore.hash
     healthPolicyHash = $healthPolicyHash
     matchingArtifactHashes = $artifactAfter.hash -eq $artifactBefore.hash; cleanShutdown = $cleanShutdown
