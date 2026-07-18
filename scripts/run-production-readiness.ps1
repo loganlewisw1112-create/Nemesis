@@ -261,25 +261,30 @@ try {
       + [int]$status.orderbookTracking.sequenceRegressions `
       + [int](Get-CounterTotal $status.feeds.tickerWebSocket.failureCounters) `
       + [int](Get-CounterTotal $status.orderbookTracking.failureCounters)
-    $ready = $ageMs -le 15000 `
-      -and $status.productionObservation.qualificationReady -eq $true `
-      -and $status.renderer.rendererLoadFinishedAt -ne $null `
-      -and $status.renderer.heartbeatPainted -eq $true `
-      -and [double]$status.renderer.heartbeatAgeMs -le 15000 `
-      -and $status.renderer.rendererProbeResponseReceived -eq $true `
-      -and [double]$status.renderer.rendererProbeAgeMs -le 15000 `
-      -and $status.feeds.qualificationReady -eq $true `
-      -and $status.feeds.tickerWebSocket.authenticated -eq $true `
-      -and $status.feeds.tickerWebSocket.subscriptionAcknowledged -eq $true `
-      -and $status.orderbookTracking.trackedTickers -eq $OrderbookTarget `
-      -and $status.orderbookTracking.verifiedTrackedTickers -eq $OrderbookTarget `
-      -and $status.orderbookTracking.serverTrackedTickers -eq $OrderbookTarget `
-      -and $status.orderbookTracking.membershipAcknowledged -eq $true `
-      -and $status.orderbookTracking.trackingReady -eq $true `
-      -and $status.bridge.qualificationReady -eq $true `
-      -and [int]$status.bridge.pongCount -ge 3 `
-      -and $restSuccesses.Count -ge 3 `
-      -and $tradeSuccesses.Count -ge 3
+    # Named conditions so a mid-hold gap records exactly which gate dropped.
+    $conditions = [ordered]@{
+      status_fresh = $ageMs -le 15000
+      production_observation = $status.productionObservation.qualificationReady -eq $true
+      renderer_loaded = $status.renderer.rendererLoadFinishedAt -ne $null
+      renderer_painted = $status.renderer.heartbeatPainted -eq $true
+      renderer_heartbeat_fresh = [double]$status.renderer.heartbeatAgeMs -le 15000
+      renderer_probe_received = $status.renderer.rendererProbeResponseReceived -eq $true
+      renderer_probe_fresh = [double]$status.renderer.rendererProbeAgeMs -le 15000
+      feeds_qualified = $status.feeds.qualificationReady -eq $true
+      ticker_authenticated = $status.feeds.tickerWebSocket.authenticated -eq $true
+      ticker_subscription_acknowledged = $status.feeds.tickerWebSocket.subscriptionAcknowledged -eq $true
+      orderbook_tracked = $status.orderbookTracking.trackedTickers -eq $OrderbookTarget
+      orderbook_verified = $status.orderbookTracking.verifiedTrackedTickers -eq $OrderbookTarget
+      orderbook_server = $status.orderbookTracking.serverTrackedTickers -eq $OrderbookTarget
+      orderbook_membership_acknowledged = $status.orderbookTracking.membershipAcknowledged -eq $true
+      orderbook_tracking_ready = $status.orderbookTracking.trackingReady -eq $true
+      bridge_qualified = $status.bridge.qualificationReady -eq $true
+      bridge_pongs = [int]$status.bridge.pongCount -ge 3
+      rest_cycles = $restSuccesses.Count -ge 3
+      trade_cycles = $tradeSuccesses.Count -ge 3
+    }
+    $failingConditions = @($conditions.Keys | Where-Object { $conditions[$_] -ne $true })
+    $ready = $failingConditions.Count -eq 0
     $permanentFailure = @($status.feeds.tickerWebSocket.failureClass, $status.orderbookTracking.failureClass) | Where-Object { $_ -in @('authentication', 'authorization', 'configuration') } | Select-Object -First 1
     if ($permanentFailure) { $failure = "permanent production transport failure: $permanentFailure"; break }
     if ($null -eq $holdStartedAt -and $ready) {
@@ -288,7 +293,10 @@ try {
       $orderbookHoldGeneration = [int]$status.orderbookTracking.generation
       $holdTransportFaultBaseline = $transportFaultCount
     }
-    elseif ($null -ne $holdStartedAt -and !$ready) { $failure = 'readiness gap occurred during the continuous hold'; break }
+    elseif ($null -ne $holdStartedAt -and !$ready) {
+      $failure = "readiness gap occurred during the continuous hold: $($failingConditions -join ', ')"
+      break
+    }
     if ($null -ne $holdStartedAt) {
       if ([int]$status.feeds.tickerWebSocket.generation -ne $tickerHoldGeneration `
         -or [int]$status.orderbookTracking.generation -ne $orderbookHoldGeneration) {
