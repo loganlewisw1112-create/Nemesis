@@ -4223,13 +4223,20 @@ function refreshTickerTracking(now = Date.now()): void {
   const seen = new Set(ordered);
   // Ticker membership is additive. Removing a ticker forces a full stream
   // restart (the ticker protocol has no subscription ids, so replacement means
-  // a fresh generation), and a restart fails a readiness hold by design. Since
-  // the desired set is now ranked on the live trade tape it reshuffles on every
-  // refresh, so carrying previously tracked markets forward is what keeps the
-  // stream stable; entries leave only when they stop verifying as production
-  // live, or when the 500-market ceiling forces them out.
+  // a fresh generation), and a restart fails a readiness hold by design.
+  //
+  // Carry every previously tracked ticker forward unconditionally. Re-checking
+  // productionMarketRecord here would drop entries purely because their 30s
+  // provenance TTL lapsed -- the re-verify loop only refreshes the <=25
+  // orderbook tickers, so most of the set goes stale between the 5-minute
+  // universe refreshes and the resulting removals restarted the stream mid-hold.
+  // Admission is already gated by isProductionLiveTicker above, and the strict
+  // per-cycle production check that qualification actually depends on is applied
+  // to the orderbook set in refreshOrderbookTracking, not here; this stream is a
+  // quote feed. A closed market simply stops ticking, and growth stays bounded
+  // by the 500-market ceiling below.
   for (const ticker of tickerTrackedTickers) {
-    if (seen.has(ticker) || !productionMarketRecord(ticker, now)) continue;
+    if (seen.has(ticker)) continue;
     seen.add(ticker);
     ordered.push(ticker);
   }
