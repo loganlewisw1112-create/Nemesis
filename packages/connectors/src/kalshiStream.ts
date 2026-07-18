@@ -205,7 +205,15 @@ export class KalshiStream {
           return;
         }
         this.handleTicker(packet.msg as Record<string, unknown>, generation);
-      } else if (type === 'subscribed') {
+      } else if (type === 'subscribed' || type === 'ok') {
+        // Kalshi answers the first subscribe on a connection with `subscribed`,
+        // but answers any later subscribe against an existing sid with `ok`,
+        // carrying the same command id and the merged market_tickers list
+        // (proven by wire capture). Both are acknowledgements. Treating only
+        // `subscribed` as one left every additive subscribe pending forever, so
+        // subscriptionAcknowledged latched false and never recovered. This was
+        // unreachable while membership changes forced a reconnect, because a
+        // fresh connection always answers `subscribed`.
         const commandId = finiteNumber(packet.id);
         if (commandId != null) this.pendingSubscriptionCommands.delete(commandId);
         else if (this.pendingSubscriptionCommands.size === 1) this.pendingSubscriptionCommands.clear();

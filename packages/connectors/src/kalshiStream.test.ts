@@ -107,6 +107,47 @@ describe('KalshiStream replay safety', () => {
     expect(stream.telemetry(now + 25_001).qualificationReady).toBe(false);
   });
 
+  it('accepts type:ok as a subscription acknowledgement', () => {
+    // Kalshi answers the first subscribe on a connection with `subscribed`, but
+    // answers a later subscribe against an existing sid with `ok` carrying the
+    // same command id and the merged market_tickers list. Wire capture:
+    // {"type":"ok","id":3,"sid":1,"msg":{"market_tickers":[...]}}
+    // Treating only `subscribed` as an ack latched subscriptionAcknowledged
+    // false forever once ticker tracking became additive.
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const { generation, internals } = primeCurrentGeneration(stream, ['KXREADY']);
+    internals.socket = { readyState: WebSocket.OPEN };
+
+    const pending = internals as unknown as { pendingSubscriptionCommands: Set<number> };
+    pending.pendingSubscriptionCommands.add(7);
+    internals.transport.recordSubscriptionPending(generation);
+    expect(stream.telemetry().subscriptionAcknowledged).toBe(false);
+
+    stream.ingest(JSON.stringify({
+      type: 'ok', id: 7, sid: 1, msg: { market_tickers: ['KXREADY'] },
+    }), generation);
+
+    expect(pending.pendingSubscriptionCommands.size).toBe(0);
+    expect(stream.telemetry().subscriptionAcknowledged).toBe(true);
+  });
+
+  it('keeps a subscription pending until every outstanding command is acknowledged', () => {
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const { generation, internals } = primeCurrentGeneration(stream, ['KXREADY']);
+    internals.socket = { readyState: WebSocket.OPEN };
+
+    const pending = internals as unknown as { pendingSubscriptionCommands: Set<number> };
+    pending.pendingSubscriptionCommands.add(1);
+    pending.pendingSubscriptionCommands.add(2);
+    internals.transport.recordSubscriptionPending(generation);
+
+    stream.ingest(JSON.stringify({ type: 'ok', id: 1, sid: 1 }), generation);
+    expect(stream.telemetry().subscriptionAcknowledged).toBe(false);
+
+    stream.ingest(JSON.stringify({ type: 'subscribed', id: 2 }), generation);
+    expect(stream.telemetry().subscriptionAcknowledged).toBe(true);
+  });
+
   it('rejects seconds, stale, and materially future exchange timestamps', () => {
     vi.useFakeTimers();
     const now = 1_700_000_100_000;
