@@ -71,7 +71,7 @@ import {
   type GeoMarket,
   type WorldEventsPayload,
 } from '@nemesis/core';
-import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, type ProductionUniverseRecord } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, type ProductionUniverseRecord } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -237,7 +237,12 @@ const widgetWindows = new Set<BrowserWindow>();
 const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
 const feedHub = new FeedHub(registry);
-const activeTradeMarketResolver = new ActiveTradeMarketResolver();
+// Hydrate enough tape-active markets to fill the whole tracked set. The default
+// of 6 left most orderbook slots to the fill path below, which could only offer
+// dormant markets and starved qualification.
+const activeTradeMarketResolver = new ActiveTradeMarketResolver({
+  maxMarkets: ORDERBOOK_TRACKING_LIMIT,
+});
 const kalshiStream = new KalshiStream(registry, () => {
   const credentials = getLiveCreds();
   return credentials
@@ -4182,14 +4187,30 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
   // Fill remaining slots most-active-first: qualification requires tracked
   // books to keep producing sequenced deltas inside the liveness window, so
   // quiet markets in the tracked set starve readiness during trading lulls.
+  // Rank on the live trade tape rather than volume_24h: the markets listing
+  // reports volume_24h as 0 for every market (only the single-market endpoint
+  // populates it), so ranking on that field was a silent no-op that let dormant
+  // auto-generated markets take every slot.
   // Discovery can expose a fixture fallback, so the production/live filter
   // above is applied to every source rather than trusting source order.
+  const tapeNotionalByTicker = new Map<string, number>();
+  for (const trade of feedHub.getTradeTape()) {
+    const notional = tradeNotionalUsd(trade);
+    if (!Number.isFinite(notional) || notional <= 0) continue;
+    tapeNotionalByTicker.set(trade.ticker, (tapeNotionalByTicker.get(trade.ticker) ?? 0) + notional);
+  }
   const fill: KalshiMarket[] = [];
   if (discovery.hasLiveUniverse()) fill.push(...discovery.getUniverse());
   fill.push(...marketsCache);
-  fill.sort((left, right) => finiteCampaignNumber(right.volume_24h ?? right.volume, 0)
-    - finiteCampaignNumber(left.volume_24h ?? left.volume, 0));
-  for (const market of fill) add(market.ticker);
+  const tapeActivity = (market: KalshiMarket): number => tapeNotionalByTicker.get(market.ticker)
+    ?? finiteCampaignNumber(market.volume_24h, 0);
+  fill.sort((left, right) => tapeActivity(right) - tapeActivity(left));
+  for (const market of fill) {
+    // Provisional parlay markets are ~90% of the open universe and quote no
+    // depth; admit one only when the tape proves it is actually trading.
+    if (market.is_provisional === true && !tapeNotionalByTicker.has(market.ticker)) continue;
+    add(market.ticker);
+  }
   // Bridge recommendations may not yet be in marketsCache; only admit them
   // when they are already represented by a live market identity.
   for (const card of ranked) if (marketByTicker.has(card.ticker)) add(card.ticker);

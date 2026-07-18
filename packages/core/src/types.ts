@@ -58,6 +58,8 @@ export interface KalshiMarket {
   volume_fp?: string;
   volume_24h_fp?: string;
   open_interest_fp?: string;
+  /** Auto-generated multi-leg parlay markets; ~90% of the open universe and effectively never traded. */
+  is_provisional?: boolean;
   category?: string;
   close_time?: string;
   event_ticker?: string;
