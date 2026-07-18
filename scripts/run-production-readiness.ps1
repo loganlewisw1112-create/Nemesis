@@ -239,6 +239,12 @@ try {
   $tickerHoldGeneration = $null
   $orderbookHoldGeneration = $null
   $holdTransportFaultBaseline = $null
+  # Transport liveness is bounded by the same dead-connection window the streams
+  # themselves use, so the hold fails on a genuinely dead socket and nothing else.
+  $deadConnectionMs = 25000
+  # Market activity is a property of the tracked markets, not of our feed, so it
+  # is recorded across the hold as evidence rather than gating it instantaneously.
+  $marketActivitySamples = [Collections.Generic.List[object]]::new()
   while ([DateTimeOffset]::UtcNow -lt $deadline) {
     Start-Sleep -Seconds 5
     Update-ProcessCapture $capture
@@ -261,6 +267,21 @@ try {
       + [int]$status.orderbookTracking.sequenceRegressions `
       + [int](Get-CounterTotal $status.feeds.tickerWebSocket.failureCounters) `
       + [int](Get-CounterTotal $status.orderbookTracking.failureCounters)
+    # Feed health is split into transport liveness (a property of our connection,
+    # directly measured by pong freshness and fault counters) and market activity
+    # (a property of the tracked markets). The composite feeds.qualificationReady
+    # folded both together, so an entirely healthy feed failed the hold whenever
+    # the tracked markets went quiet past the liveness window -- a routine lull on
+    # Kalshi even mid-session. Only transport liveness gates the hold.
+    $statusAt = [double]$status.updatedAt
+    $tickerPongAt = $status.feeds.tickerWebSocket.lastPongAt
+    $orderbookPongAt = $status.feeds.orderbookWebSocket.lastPongAt
+    $tickerPongAgeMs = if ($null -eq $tickerPongAt) { [double]::PositiveInfinity } else { [Math]::Max(0, $statusAt - [double]$tickerPongAt) }
+    $orderbookPongAgeMs = if ($null -eq $orderbookPongAt) { [double]::PositiveInfinity } else { [Math]::Max(0, $statusAt - [double]$orderbookPongAt) }
+    $tickerDataAt = $status.feeds.tickerWebSocket.lastExchangeDataAt
+    $orderbookDataAt = $status.feeds.orderbookWebSocket.lastExchangeDataAt
+    $tickerExchangeDataAgeMs = if ($null -eq $tickerDataAt) { $null } else { [Math]::Max(0, $statusAt - [double]$tickerDataAt) }
+    $orderbookExchangeDataAgeMs = if ($null -eq $orderbookDataAt) { $null } else { [Math]::Max(0, $statusAt - [double]$orderbookDataAt) }
     # Named conditions so a mid-hold gap records exactly which gate dropped.
     $conditions = [ordered]@{
       status_fresh = $ageMs -le 15000
@@ -270,7 +291,13 @@ try {
       renderer_heartbeat_fresh = [double]$status.renderer.heartbeatAgeMs -le 15000
       renderer_probe_received = $status.renderer.rendererProbeResponseReceived -eq $true
       renderer_probe_fresh = [double]$status.renderer.rendererProbeAgeMs -le 15000
-      feeds_qualified = $status.feeds.qualificationReady -eq $true
+      feeds_rest_qualified = $status.feeds.restMarkets.qualificationReady -eq $true
+      feeds_tape_qualified = $status.feeds.tradeTape.qualificationReady -eq $true
+      ticker_transport_connected = $status.feeds.tickerWebSocket.transportConnected -eq $true
+      ticker_pong_fresh = $tickerPongAgeMs -le $deadConnectionMs
+      orderbook_transport_connected = $status.feeds.orderbookWebSocket.transportConnected -eq $true
+      orderbook_pong_fresh = $orderbookPongAgeMs -le $deadConnectionMs
+      orderbook_authenticated = $status.feeds.orderbookWebSocket.authenticated -eq $true
       ticker_authenticated = $status.feeds.tickerWebSocket.authenticated -eq $true
       ticker_subscription_acknowledged = $status.feeds.tickerWebSocket.subscriptionAcknowledged -eq $true
       orderbook_tracked = $status.orderbookTracking.trackedTickers -eq $OrderbookTarget
@@ -308,6 +335,12 @@ try {
         break
       }
       $samples += 1
+      $null = $marketActivitySamples.Add([pscustomobject]@{
+        tickerExchangeDataAgeMs = $tickerExchangeDataAgeMs
+        orderbookExchangeDataAgeMs = $orderbookExchangeDataAgeMs
+        qualifiedTickers = [int]$status.orderbookTracking.qualifiedTickers
+        booksWithExchangeTime = [int]$status.feeds.orderbookWebSocket.booksWithExchangeTime
+      })
       if (($now - $holdStartedAt).TotalMinutes -ge $HoldMinutes) {
         # Credit is granted only by this fresh ready sample, never by shutdown time.
         $holdCompletedAt = $now
@@ -328,6 +361,24 @@ try {
   $cleanShutdown = !$forcedShutdown -and $shutdownSurvivors.Count -eq 0
   $artifactAfter = Get-ArtifactFingerprint
   $holdComplete = $null -ne $holdCompletedAt
+  # Reported, never gating: how alive the tracked markets were across the hold.
+  $marketActivity = if ($marketActivitySamples.Count -eq 0) { $null } else {
+    $tickerAges = @($marketActivitySamples | ForEach-Object { $_.tickerExchangeDataAgeMs } | Where-Object { $null -ne $_ })
+    $orderbookAges = @($marketActivitySamples | ForEach-Object { $_.orderbookExchangeDataAgeMs } | Where-Object { $null -ne $_ })
+    $qualified = @($marketActivitySamples | ForEach-Object { $_.qualifiedTickers })
+    $books = @($marketActivitySamples | ForEach-Object { $_.booksWithExchangeTime })
+    @{
+      samples = $marketActivitySamples.Count
+      tickerExchangeDataAgeMsMax = if ($tickerAges.Count) { [int](($tickerAges | Measure-Object -Maximum).Maximum) } else { $null }
+      tickerExchangeDataAgeMsMean = if ($tickerAges.Count) { [int](($tickerAges | Measure-Object -Average).Average) } else { $null }
+      orderbookExchangeDataAgeMsMax = if ($orderbookAges.Count) { [int](($orderbookAges | Measure-Object -Maximum).Maximum) } else { $null }
+      orderbookExchangeDataAgeMsMean = if ($orderbookAges.Count) { [int](($orderbookAges | Measure-Object -Average).Average) } else { $null }
+      qualifiedTickersMax = if ($qualified.Count) { [int](($qualified | Measure-Object -Maximum).Maximum) } else { $null }
+      qualifiedTickersMean = if ($qualified.Count) { [int](($qualified | Measure-Object -Average).Average) } else { $null }
+      booksWithExchangeTimeMax = if ($books.Count) { [int](($books | Measure-Object -Maximum).Maximum) } else { $null }
+      samplesExceedingLivenessWindow = @($tickerAges | Where-Object { $_ -gt $deadConnectionMs }).Count
+    }
+  }
   $passed = $null -eq $failure -and $holdComplete -and $cleanShutdown -and $artifactAfter.hash -eq $artifactBefore.hash
   Write-Receipt @{
     schemaVersion = 1; receiptType = 'ReadinessReceipt'; runId = [IO.Path]::GetFileNameWithoutExtension($ReceiptPath)
@@ -336,6 +387,7 @@ try {
     holdCompletedAt = if ($null -eq $holdCompletedAt) { $null } else { $holdCompletedAt.ToUnixTimeMilliseconds() }
     continuousHoldSamples = $samples; restCycles = $restSuccesses.Count; tradeCycles = $tradeSuccesses.Count
     orderbookTarget = $OrderbookTarget; reducedBarRehearsal = ($OrderbookTarget -ne 25)
+    marketActivity = $marketActivity
     networkChecks = $networkChecks; gitCommit = $commit; productionArtifactHash = $artifactBefore.hash
     healthPolicyHash = $healthPolicyHash
     matchingArtifactHashes = $artifactAfter.hash -eq $artifactBefore.hash; cleanShutdown = $cleanShutdown
