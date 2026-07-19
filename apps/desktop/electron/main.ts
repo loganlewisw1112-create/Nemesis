@@ -1272,9 +1272,18 @@ function runtimeComponents(now: number): RuntimeComponentHealth[] {
     component('rest-markets', feeds.restMarkets ?? undefined),
     component('trade-tape', feeds.tradeTape ?? undefined),
     {
+      // Runtime health asks whether the RUNTIME is healthy, so these components
+      // report transport liveness. Keying on the market-activity-inclusive
+      // qualificationReady made an ordinary trading lull look like a failing
+      // component: the controller opened a recovery window and invalidated the
+      // run after 30s, which aborted a soak 11% into its scored minutes with
+      // "orderbook-websocket is not qualification-ready (7628ms old)" while both
+      // sockets were connected, authenticated and answering pings. Whether the
+      // tracked markets are trading is asserted separately, by the readiness
+      // conditions and the soak cutoff checks.
       name: 'ticker-websocket',
       connected: ticker.connected,
-      qualificationReady: ticker.qualificationReady,
+      qualificationReady: ticker.transportQualificationReady,
       lastSuccessAt: ticker.lastMessageAt,
       lastPongAt: ticker.lastPongAt,
       retryAt: ticker.nextRetryAt,
@@ -1286,9 +1295,13 @@ function runtimeComponents(now: number): RuntimeComponentHealth[] {
       name: 'orderbook-websocket',
       connected: orderbook.connected,
       trackingReady: orderbook.trackingReady,
-      qualificationReady: orderbook.qualificationReady
-        && orderbook.trackingReady
-        && orderbook.booksWithExchangeTime > 0,
+      // Transport liveness only, for the reason above. trackingReady is
+      // deliberately not folded in either: membershipAcknowledged goes false
+      // while a routine membership update is in flight, and a component that
+      // flaps on every universe refresh is not a useful health signal. It stays
+      // reported on the line above, and is asserted directly by the readiness
+      // runner and the soak cutoff check on finalOrderbookTrackingReady.
+      qualificationReady: orderbook.transportQualificationReady,
       lastSuccessAt: orderbook.lastMessageAt,
       lastPongAt: orderbook.lastPongAt,
       retryAt: orderbook.nextRetryAt,
