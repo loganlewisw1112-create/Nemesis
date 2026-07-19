@@ -85,7 +85,15 @@ export interface FeedHealthSnapshot {
 }
 
 function tradeBackoffMs(failureCount: number): number {
-  return Math.min(TRADE_BACKOFF_MAX_MS, TRADE_BACKOFF_BASE_MS * (2 ** Math.max(0, failureCount - 1)));
+  // A single failed poll retries at the rate-limit floor. The 30s evidence TTL
+  // is sized to absorb exactly one missed cycle (tradeTapeQualificationReady's
+  // comment: a transient request error must not become a qualification outage),
+  // but jumping straight to the 30s backoff base guaranteed one -- the retry
+  // could not even start until ~45s after the last success. Exponential backoff
+  // still applies from the second consecutive failure, and a server-directed
+  // Retry-After always wins via the Math.max at the call site.
+  if (failureCount <= 1) return TRADE_MIN_REQUEST_INTERVAL_MS;
+  return Math.min(TRADE_BACKOFF_MAX_MS, TRADE_BACKOFF_BASE_MS * (2 ** (failureCount - 2)));
 }
 
 export class FeedHub {

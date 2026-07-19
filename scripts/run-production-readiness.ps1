@@ -251,6 +251,8 @@ try {
   $orderbookSubAckMisses = 0
   $orderbookTrackingReadyMisses = 0
   $orderbookSettleMisses = 0
+  $restQualifiedMisses = 0
+  $tapeQualifiedMisses = 0
   # Market activity is a property of the tracked markets, not of our feed, so it
   # is recorded across the hold as evidence rather than gating it instantaneously.
   $marketActivitySamples = [Collections.Generic.List[object]]::new()
@@ -316,6 +318,13 @@ try {
     $orderbookSettled = $status.orderbookTracking.subscriptionUpdateInFlight -ne $true `
       -and [int]$status.orderbookTracking.subscriptionUpdateQueueDepth -eq 0
     $orderbookSettleMisses = if ($orderbookSettled) { 0 } else { $orderbookSettleMisses + 1 }
+    # The REST poll qualifications have a 30s evidence TTL over a 15s poll floor,
+    # so one failed or slow request can breach the TTL until its retry lands.
+    # Tolerate up to 25s of continuous unqualification -- the same bound the
+    # dead-connection detector uses -- and fail beyond it, which still catches a
+    # polling loop that has genuinely stopped recovering.
+    $restQualifiedMisses = if ($status.feeds.restMarkets.qualificationReady -eq $true) { 0 } else { $restQualifiedMisses + 1 }
+    $tapeQualifiedMisses = if ($status.feeds.tradeTape.qualificationReady -eq $true) { 0 } else { $tapeQualifiedMisses + 1 }
     # Named conditions so a mid-hold gap records exactly which gate dropped.
     $conditions = [ordered]@{
       status_fresh = $ageMs -le 15000
@@ -325,8 +334,8 @@ try {
       renderer_heartbeat_fresh = [double]$status.renderer.heartbeatAgeMs -le 15000
       renderer_probe_received = $status.renderer.rendererProbeResponseReceived -eq $true
       renderer_probe_fresh = [double]$status.renderer.rendererProbeAgeMs -le 15000
-      feeds_rest_qualified = $status.feeds.restMarkets.qualificationReady -eq $true
-      feeds_tape_qualified = $status.feeds.tradeTape.qualificationReady -eq $true
+      feeds_rest_qualified = $restQualifiedMisses -lt 5
+      feeds_tape_qualified = $tapeQualifiedMisses -lt 5
       ticker_transport_connected = $status.feeds.tickerWebSocket.transportConnected -eq $true
       ticker_pong_fresh = $tickerPongAgeMs -le $deadConnectionMs
       orderbook_transport_connected = $status.feeds.orderbookWebSocket.transportConnected -eq $true
