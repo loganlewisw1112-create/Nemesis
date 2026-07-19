@@ -250,6 +250,7 @@ try {
   $tickerSubAckMisses = 0
   $orderbookSubAckMisses = 0
   $orderbookTrackingReadyMisses = 0
+  $orderbookSettleMisses = 0
   # Market activity is a property of the tracked markets, not of our feed, so it
   # is recorded across the hold as evidence rather than gating it instantaneously.
   $marketActivitySamples = [Collections.Generic.List[object]]::new()
@@ -305,6 +306,16 @@ try {
     # membership still fails immediately -- only the acknowledgement round trip
     # is tolerated, and only for a single sample.
     $orderbookTrackingReadyMisses = if ($status.orderbookTracking.trackingReady -eq $true) { 0 } else { $orderbookTrackingReadyMisses + 1 }
+    # A membership update clears the server-confirmed set and repopulates it on
+    # acknowledgement, so serverTrackedTickers is 0 mid-update BY CONSTRUCTION
+    # and membershipAcknowledged is false with it. Assert the server count only
+    # while membership is settled, and require it to settle: an update that
+    # never completes fails through orderbook_membership_settled below. The
+    # locally computed tracked and verified counts do not dip during an update,
+    # so they stay strict and instantaneous.
+    $orderbookSettled = $status.orderbookTracking.subscriptionUpdateInFlight -ne $true `
+      -and [int]$status.orderbookTracking.subscriptionUpdateQueueDepth -eq 0
+    $orderbookSettleMisses = if ($orderbookSettled) { 0 } else { $orderbookSettleMisses + 1 }
     # Named conditions so a mid-hold gap records exactly which gate dropped.
     $conditions = [ordered]@{
       status_fresh = $ageMs -le 15000
@@ -325,7 +336,8 @@ try {
       ticker_subscription_acknowledged = $tickerSubAckMisses -lt 2
       orderbook_tracked = $status.orderbookTracking.trackedTickers -eq $OrderbookTarget
       orderbook_verified = $status.orderbookTracking.verifiedTrackedTickers -eq $OrderbookTarget
-      orderbook_server = $status.orderbookTracking.serverTrackedTickers -eq $OrderbookTarget
+      orderbook_server = (-not $orderbookSettled) -or ($status.orderbookTracking.serverTrackedTickers -eq $OrderbookTarget)
+      orderbook_membership_settled = $orderbookSettleMisses -lt 3
       orderbook_membership_acknowledged = $orderbookSubAckMisses -lt 2
       orderbook_tracking_ready = $orderbookTrackingReadyMisses -lt 2
       bridge_qualified = $status.bridge.qualificationReady -eq $true
