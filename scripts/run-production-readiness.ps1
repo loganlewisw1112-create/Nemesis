@@ -396,6 +396,15 @@ try {
     }
   }
   $passed = $null -eq $failure -and $holdComplete -and $cleanShutdown -and $artifactAfter.hash -eq $artifactBefore.hash
+  # Must be a typed array variable, never an inline `if` expression: PowerShell
+  # unwraps an empty array returned from an if-block to $null, ConvertTo-Json
+  # then emits `acceptanceFailures: null`, and @($null).Count is 1 -- so every
+  # consumer that gates on `@(...).Count -ne 0` (run-production-soak.ps1:253)
+  # rejects an otherwise passing receipt.
+  $acceptanceFailures = [string[]]@()
+  if (-not $passed) {
+    $acceptanceFailures = [string[]]@($failure ?? 'readiness ceiling elapsed before a continuous hold completed')
+  }
   Write-Receipt @{
     schemaVersion = 1; receiptType = 'ReadinessReceipt'; runId = [IO.Path]::GetFileNameWithoutExtension($ReceiptPath)
     verifiedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); passed = $passed; timerStarted = $false
@@ -408,7 +417,7 @@ try {
     healthPolicyHash = $healthPolicyHash
     matchingArtifactHashes = $artifactAfter.hash -eq $artifactBefore.hash; cleanShutdown = $cleanShutdown
     finalStatusHash = if (Test-Path -LiteralPath $runtimeStatusPath) { (Get-FileHash -LiteralPath $runtimeStatusPath -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
-    acceptanceFailures = if ($passed) { @() } else { @($failure ?? 'readiness ceiling elapsed before a continuous hold completed') }
+    acceptanceFailures = $acceptanceFailures
   }
   if (!$passed) { exit 2 }
 } catch {
