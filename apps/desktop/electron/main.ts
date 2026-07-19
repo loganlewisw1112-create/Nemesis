@@ -1366,9 +1366,14 @@ function preflightHealthyForStability(): boolean {
     && preflightRestCycles >= 3
     && preflightTradeCycles >= 3
     && ticker.authenticated
-    && ticker.qualificationReady
+    // Transport liveness, not market activity. This predicate arms the campaign
+    // stability window, so keying on the market-inclusive qualificationReady let
+    // an ordinary trading lull reset the window and could keep a campaign from
+    // ever starting. Real market presence is still required alongside, by
+    // trackedTickers === LIMIT, trackingReady, and booksWithExchangeTime > 0.
+    && ticker.transportQualificationReady
     && orderbook.authenticated
-    && orderbook.qualificationReady
+    && orderbook.transportQualificationReady
     && orderbook.trackedTickers === ORDERBOOK_TRACKING_LIMIT
     && orderbook.trackingReady
     && orderbook.booksWithExchangeTime > 0
