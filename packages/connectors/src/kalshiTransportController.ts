@@ -69,6 +69,13 @@ export interface KalshiSocketHealthV2 {
   connected: boolean;
   authenticated: boolean;
   qualificationReady: boolean;
+  /**
+   * Transport liveness alone: connected, authenticated, acknowledged and
+   * answering pings, with no recorded failure. Unlike qualificationReady this
+   * excludes market-data recency, which is a property of the tracked markets
+   * rather than of the connection.
+   */
+  transportQualificationReady: boolean;
   environment: KalshiEnvironment;
   generation: number;
   attemptId: string | null;
@@ -223,6 +230,15 @@ export class KalshiProductionConnectionController {
     this.lastExchangeDataAt = exchangeTimestamp;
     this.tryResetBackoff();
     return true;
+  }
+
+  /**
+   * Transport liveness without the market-data recency requirement. A healthy
+   * socket tracking markets that simply are not trading is still a healthy
+   * socket; conflating the two made a feed look dead during ordinary lulls.
+   */
+  transportQualificationReady(): boolean {
+    return this.failure == null && this.subscriptionAcknowledged && this.pongReceived;
   }
 
   qualificationReady(now = this.now(), maxExchangeAgeMs = 25_000): boolean {

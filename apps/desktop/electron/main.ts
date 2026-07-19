@@ -925,10 +925,26 @@ function currentFeedHealthSnapshot(now = Date.now()) {
     tickerWebSocket,
     orderbookWebSocket,
     transportCircuit: kalshiProductionCircuitSnapshot('production', now),
+    // Feed qualification means OUR FEED is healthy: REST and tape polling
+    // current, both sockets connected, authenticated, membership acknowledged,
+    // answering pings, no recorded failure. It deliberately does NOT require the
+    // tracked markets to be ticking. Market liveness is a property of the
+    // markets, and folding it in here made a perfectly healthy feed read as
+    // unqualified during ordinary Kalshi lulls -- measured at 32-58% of samples
+    // even while the exchange was busy, which no consumer gating on sustained
+    // coverage could ever satisfy. Market activity is reported separately below
+    // so callers can still evidence it.
     qualificationReady: base.restMarkets?.qualificationReady === true
       && base.tradeTape?.qualificationReady === true
-      && ticker.qualificationReady
-      && orderbook.qualificationReady,
+      && ticker.transportQualificationReady
+      && orderbook.transportQualificationReady,
+    marketDataActive: ticker.qualificationReady && orderbook.qualificationReady,
+    tickerExchangeDataAgeMs: ticker.lastExchangeDataAt == null
+      ? null
+      : Math.max(0, now - ticker.lastExchangeDataAt),
+    orderbookExchangeDataAgeMs: orderbook.lastExchangeDataAt == null
+      ? null
+      : Math.max(0, now - orderbook.lastExchangeDataAt),
   };
 }
 

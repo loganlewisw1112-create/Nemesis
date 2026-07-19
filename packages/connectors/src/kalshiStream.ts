@@ -104,10 +104,20 @@ export class KalshiStream {
       && this.lastPongAt != null
       && now - this.lastPongAt <= DEAD_CONNECTION_MS
       && this.transport.qualificationReady(now, DEAD_CONNECTION_MS);
+    // Pong-or-traffic, not pong alone: lastPongAt is null on every fresh
+    // connection until the first ping cycle completes, so keying purely on it
+    // reports a healthy new socket as dead.
+    const livenessAt = Math.max(this.lastPongAt ?? 0, this.lastMessageAt ?? 0, this.connectedAt ?? 0);
+    const transportQualificationReady = connected
+      && this.authenticated
+      && livenessAt > 0
+      && now - livenessAt <= DEAD_CONNECTION_MS
+      && this.transport.transportQualificationReady();
     return {
       connected,
       authenticated: this.authenticated,
       qualificationReady,
+      transportQualificationReady,
       environment: this.environment,
       generation: this.generation,
       trackedTickers: this.tickers.size,

@@ -79,6 +79,7 @@ export interface OrderbookTrackingStateV2 {
   subscriptionUpdateInFlight: boolean;
   trackingReady: boolean;
   qualificationReady: boolean;
+  transportQualificationReady: boolean;
   authenticated: boolean;
   connected: boolean;
   lastSequencedDeltaAt: number | null;
@@ -351,6 +352,16 @@ export class KalshiOrderbookStream {
       && pongFresh
       && trackingReady
       && qualifiedTickers > 0;
+    // Transport liveness alone. Deliberately excludes qualifiedTickers, which
+    // counts books that produced exchange data inside the liveness window --
+    // a property of whether the tracked markets are trading, not of the socket.
+    // Pong-or-traffic, since lastPongAt is null on every fresh connection.
+    const livenessAt = Math.max(this.lastPongAt ?? 0, this.lastMessageAt ?? 0, this.connectedAt ?? 0);
+    const transportQualificationReady = connected
+      && this.authenticated
+      && livenessAt > 0
+      && now - livenessAt <= DEAD_CONNECTION_MS
+      && trackingReady;
     const transport = this.transportController.telemetry();
     return {
       connected,
@@ -365,6 +376,7 @@ export class KalshiOrderbookStream {
       subscriptionAcknowledged: membershipAcknowledged,
       trackingReady,
       qualificationReady,
+      transportQualificationReady,
       trackingRevision: this.trackingRevision,
       acknowledgedTrackingRevision: this.acknowledgedTrackingRevision,
       serverTrackedTickers: this.subscribed.size,
@@ -416,6 +428,7 @@ export class KalshiOrderbookStream {
       subscriptionUpdateInFlight: telemetry.subscriptionUpdateInFlight,
       trackingReady: telemetry.trackingReady,
       qualificationReady: telemetry.qualificationReady,
+      transportQualificationReady: telemetry.transportQualificationReady,
       authenticated: telemetry.authenticated,
       connected: telemetry.connected,
       lastSequencedDeltaAt: telemetry.lastSequencedDeltaAt,

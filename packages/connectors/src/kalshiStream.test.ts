@@ -107,6 +107,61 @@ describe('KalshiStream replay safety', () => {
     expect(stream.telemetry(now + 25_001).qualificationReady).toBe(false);
   });
 
+  it('stays transport-qualified while the tracked markets are quiet', () => {
+    // A healthy socket tracking markets that simply are not trading is still a
+    // healthy socket. qualificationReady folds in market-data recency and so
+    // drops; transportQualificationReady must not, or every consumer gating on
+    // sustained feed health fails during ordinary Kalshi lulls.
+    vi.useFakeTimers();
+    const now = 1_700_000_000_000;
+    vi.setSystemTime(now);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const { generation, internals } = primeCurrentGeneration(stream, ['KXQUIET']);
+    internals.authenticated = true;
+    internals.lastPongAt = now;
+    internals.socket = { readyState: WebSocket.OPEN };
+    internals.transport.recordPong(generation);
+    stream.ingest(JSON.stringify({ type: 'subscribed', id: 1 }), generation);
+    stream.ingest(JSON.stringify({
+      type: 'ticker', sid: 1, seq: 1,
+      msg: { market_ticker: 'KXQUIET', yes_bid: 40, yes_ask: 42, ts_ms: now },
+    }), generation);
+
+    expect(stream.telemetry(now)).toMatchObject({
+      qualificationReady: true,
+      transportQualificationReady: true,
+    });
+
+    // 60s later: no market has ticked, but pongs keep arriving.
+    const later = now + 60_000;
+    vi.setSystemTime(later);
+    internals.lastPongAt = later - 1_000;
+    internals.transport.recordPong(generation);
+
+    const quiet = stream.telemetry(later);
+    expect(quiet.qualificationReady).toBe(false);
+    expect(quiet.transportQualificationReady).toBe(true);
+  });
+
+  it('drops transport qualification when the socket goes silent', () => {
+    vi.useFakeTimers();
+    const now = 1_700_000_000_000;
+    vi.setSystemTime(now);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const { generation, internals } = primeCurrentGeneration(stream, ['KXQUIET']);
+    internals.authenticated = true;
+    internals.socket = { readyState: WebSocket.OPEN };
+    internals.transport.recordPong(generation);
+    stream.ingest(JSON.stringify({ type: 'subscribed', id: 1 }), generation);
+    internals.lastPongAt = now;
+    internals.lastMessageAt = now;
+    internals.connectedAt = now;
+
+    expect(stream.telemetry(now).transportQualificationReady).toBe(true);
+    // No pong, no traffic of any kind, past the dead-connection bound.
+    expect(stream.telemetry(now + 25_001).transportQualificationReady).toBe(false);
+  });
+
   it('accepts type:ok as a subscription acknowledgement', () => {
     // Kalshi answers the first subscribe on a connection with `subscribed`, but
     // answers a later subscribe against an existing sid with `ok` carrying the
