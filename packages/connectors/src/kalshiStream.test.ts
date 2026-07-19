@@ -9,6 +9,7 @@ interface StreamInternals {
   generation: number;
   authenticated: boolean;
   lastPongAt: number | null;
+  lastMessageAt: number | null;
   connectedAt: number;
   started: boolean;
   socket: WebSocket | { readyState: number };

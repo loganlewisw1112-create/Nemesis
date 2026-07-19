@@ -249,6 +249,7 @@ try {
   # Requiring two consecutive misses still fails a subscription that never acks.
   $tickerSubAckMisses = 0
   $orderbookSubAckMisses = 0
+  $orderbookTrackingReadyMisses = 0
   # Market activity is a property of the tracked markets, not of our feed, so it
   # is recorded across the hold as evidence rather than gating it instantaneously.
   $marketActivitySamples = [Collections.Generic.List[object]]::new()
@@ -298,6 +299,12 @@ try {
     $orderbookExchangeDataAgeMs = if ($null -eq $orderbookDataAt) { $null } else { [Math]::Max(0, $statusAt - [double]$orderbookDataAt) }
     $tickerSubAckMisses = if ($status.feeds.tickerWebSocket.subscriptionAcknowledged -eq $true) { 0 } else { $tickerSubAckMisses + 1 }
     $orderbookSubAckMisses = if ($status.orderbookTracking.membershipAcknowledged -eq $true) { 0 } else { $orderbookSubAckMisses + 1 }
+    # trackingReady embeds membershipAcknowledged, so it dips for the same
+    # in-flight-update reason and needs the same debounce. The tracked/verified/
+    # server counts below stay strict and instantaneous, so a genuinely wrong
+    # membership still fails immediately -- only the acknowledgement round trip
+    # is tolerated, and only for a single sample.
+    $orderbookTrackingReadyMisses = if ($status.orderbookTracking.trackingReady -eq $true) { 0 } else { $orderbookTrackingReadyMisses + 1 }
     # Named conditions so a mid-hold gap records exactly which gate dropped.
     $conditions = [ordered]@{
       status_fresh = $ageMs -le 15000
@@ -320,7 +327,7 @@ try {
       orderbook_verified = $status.orderbookTracking.verifiedTrackedTickers -eq $OrderbookTarget
       orderbook_server = $status.orderbookTracking.serverTrackedTickers -eq $OrderbookTarget
       orderbook_membership_acknowledged = $orderbookSubAckMisses -lt 2
-      orderbook_tracking_ready = $status.orderbookTracking.trackingReady -eq $true
+      orderbook_tracking_ready = $orderbookTrackingReadyMisses -lt 2
       bridge_qualified = $status.bridge.qualificationReady -eq $true
       bridge_pongs = [int]$status.bridge.pongCount -ge 3
       rest_cycles = $restSuccesses.Count -ge 3

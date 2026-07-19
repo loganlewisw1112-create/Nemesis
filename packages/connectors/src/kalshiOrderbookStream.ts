@@ -352,16 +352,21 @@ export class KalshiOrderbookStream {
       && pongFresh
       && trackingReady
       && qualifiedTickers > 0;
-    // Transport liveness alone. Deliberately excludes qualifiedTickers, which
-    // counts books that produced exchange data inside the liveness window --
-    // a property of whether the tracked markets are trading, not of the socket.
+    // Transport liveness alone: is this socket up and healthy. Deliberately
+    // excludes qualifiedTickers (books that produced exchange data inside the
+    // liveness window -- a property of whether markets are trading) and also
+    // trackingReady, because membershipAcknowledged goes false while a routine
+    // membership update is in flight. Both would make a healthy feed flap.
+    // Membership correctness is still asserted directly and strictly, by the
+    // orderbook_tracked/verified/server/membership conditions in the readiness
+    // runner and by the cutoff checks in the soak runner.
     // Pong-or-traffic, since lastPongAt is null on every fresh connection.
     const livenessAt = Math.max(this.lastPongAt ?? 0, this.lastMessageAt ?? 0, this.connectedAt ?? 0);
     const transportQualificationReady = connected
       && this.authenticated
       && livenessAt > 0
       && now - livenessAt <= DEAD_CONNECTION_MS
-      && trackingReady;
+      && this.transportController.transportQualificationReady();
     const transport = this.transportController.telemetry();
     return {
       connected,
