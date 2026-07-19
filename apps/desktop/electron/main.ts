@@ -4268,6 +4268,21 @@ function refreshTickerTracking(now = Date.now()): void {
 
 function refreshOrderbookTracking(now = Date.now()): void {
   const desired = desiredOrderbookTickers(now);
+  // An empty desired set means discovery produced nothing this cycle, not that
+  // we should unsubscribe everything. Production provenance expires after 30s
+  // while the universe only refreshes every 5 minutes, so every record can lapse
+  // at once and starve the set; applying that as a membership update collapsed
+  // tracking to zero markets 17 seconds short of a completed hold. It also
+  // self-latches, because the re-verify loop only refreshes the tickers already
+  // in this set -- at zero there is nothing left to re-verify. Hold the current
+  // membership and let the next cycle recover. A genuinely stale set still fails
+  // readiness through the verified-count conditions, which are checked directly.
+  if (desired.length === 0) {
+    if (orderbookTrackedTickers.length > 0) return;
+    kalshiOrderbookStream.replaceTracked([]);
+    refreshTickerTracking(now);
+    return;
+  }
   const desiredSet = new Set(desired);
   const critical = campaignCriticalOrderbookTickers(now).filter((ticker) => desiredSet.has(ticker));
   const selection = selectBoundedOrderbookTracking({
