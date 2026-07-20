@@ -30,6 +30,29 @@ describe('ConnectorRegistry required REST lease', () => {
     expect(registry.refreshFreshness('kalshi-rest', 30_000, Date.now() + 20_001)?.qualificationReady).toBe(false);
   });
 
+  it('aborts a hung REST health probe at its bounded timeout instead of blocking recovery', async () => {
+    // Regression for the connection_reset that stalled kalshi-rest recovery to
+    // ~69s and broke a G1 hold: the single-flight probe must not hang on a dead
+    // socket, or every recovery tick is suppressed until the OS TCP timeout. The
+    // probe passes a bounded AbortSignal, so a socket that never responds aborts
+    // and frees the single flight. Uses real timers with a tiny timeout override.
+    vi.useRealTimers();
+    const registry = new ConnectorRegistry();
+    let capturedSignal: AbortSignal | undefined;
+    const hangingFetch = ((_url: string, init?: { signal?: AbortSignal }) => {
+      capturedSignal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true });
+      });
+    }) as unknown as typeof fetch;
+
+    await expect(registry.pingKalshiRest(hangingFetch, 20)).rejects.toThrow();
+
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(registry.get('kalshi-rest')?.qualificationReady).toBe(false);
+  });
+
   it('fails qualification immediately for hard authentication failures', () => {
     const registry = new ConnectorRegistry();
     registry.recordSuccess('kalshi-rest', 25);

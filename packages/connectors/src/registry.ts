@@ -3,6 +3,9 @@ import { fetchMarkets, KalshiRequestFailure } from '@nemesis/core';
 
 const REQUIRED_REST_FRESHNESS_MS = 30_000;
 const DEFAULT_RATE_LIMIT_BACKOFF_MS = 1_000;
+// Hard cap on a single REST health probe, kept below the 20s poll interval so a
+// hung or reset socket aborts and lets the next tick recover freshness.
+const REST_PROBE_TIMEOUT_MS = 8_000;
 
 function inferFailureClass(error: string): KalshiFailureClass {
   if (/\b429\b|rate.?limit|too many requests/i.test(error)) return 'rate_limit';
@@ -182,13 +185,22 @@ export class ConnectorRegistry {
     return h?.status === 'ok';
   }
 
-  async pingKalshiRest(fetchFn?: typeof fetch): Promise<void> {
+  async pingKalshiRest(fetchFn?: typeof fetch, timeoutMs = REST_PROBE_TIMEOUT_MS): Promise<void> {
     const start = Date.now();
     const health = this.health.get('kalshi-rest');
     if (health?.nextRetryAt != null && start < health.nextRetryAt) return;
     this.recordAttempt('kalshi-rest', start);
     try {
-      await fetchMarkets({ limit: 1, fetchFn });
+      // Bound the probe below its 20s poll interval. kalshiFetch fans out across
+      // 3 bases x 3 attempts (up to ~90s worst case) and this probe is
+      // single-flight, so an unbounded hung or connection-reset socket suppresses
+      // every subsequent recovery tick and lets kalshi-rest freshness climb past
+      // its qualification TTL. That is the connection_reset that stalled recovery
+      // to ~69s and broke a G1 continuous hold while transport stayed connected.
+      // An 8s abort releases the single flight so the next tick re-qualifies well
+      // inside the TTL. The failure is still recorded, so a genuine outage that
+      // never recovers still de-qualifies and fails the run.
+      await fetchMarkets({ limit: 1, fetchFn, signal: AbortSignal.timeout(timeoutMs) });
       this.recordSuccess('kalshi-rest', Date.now() - start);
     } catch (e) {
       this.recordError(
