@@ -6,6 +6,15 @@ const DEFAULT_RATE_LIMIT_BACKOFF_MS = 1_000;
 // Hard cap on a single REST health probe, kept below the 20s poll interval so a
 // hung or reset socket aborts and lets the next tick recover freshness.
 const REST_PROBE_TIMEOUT_MS = 8_000;
+// Failure classes that de-qualify a feed the instant they occur, never softened
+// by the freshness lease. Matches the readiness runner's own permanent set
+// (run-production-readiness.ps1). Every other class is a transient the lease can
+// absorb while the last success is still fresh.
+const PERMANENT_FAILURE_CLASSES = new Set<KalshiFailureClass>([
+  'authentication',
+  'authorization',
+  'configuration',
+]);
 
 function inferFailureClass(error: string): KalshiFailureClass {
   if (/\b429\b|rate.?limit|too many requests/i.test(error)) return 'rate_limit';
@@ -140,6 +149,23 @@ export class ConnectorRegistry {
       h.status = leaseFresh ? 'warn' : 'error';
       h.qualificationReady = leaseFresh;
       h.transportConnected = true;
+      return;
+    }
+    if (!PERMANENT_FAILURE_CLASSES.has(resolvedFailureClass)) {
+      // A transient network fault -- an aborted or slow poll, a connection reset,
+      // a brief server blip -- must not instantly nuke qualification while the
+      // feed's last success is still within the freshness lease. This mirrors the
+      // rate_limit branch above: live Kalshi infra jitters, and kalshi-rest's only
+      // frequent success source is the single-flight 20s health probe, so one
+      // aborted probe (e.g. bounded out during a busy read-rate-limit queue) would
+      // otherwise de-qualify a feed that is actually healthy and break a 10min+
+      // continuous hold. A genuinely dead feed still de-qualifies: once no success
+      // lands inside the lease the branch below the TTL flips it, and refreshFreshness
+      // fails it on staleness. Only auth/authorization/configuration hard-fail at once.
+      const lastSuccessAgeMs = h.lastSuccess == null ? Number.POSITIVE_INFINITY : now - h.lastSuccess;
+      const leaseFresh = lastSuccessAgeMs <= REQUIRED_REST_FRESHNESS_MS;
+      h.status = leaseFresh ? 'warn' : 'error';
+      h.qualificationReady = leaseFresh;
       return;
     }
     h.status = 'error';

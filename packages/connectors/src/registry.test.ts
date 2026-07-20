@@ -53,6 +53,31 @@ describe('ConnectorRegistry required REST lease', () => {
     expect(registry.get('kalshi-rest')?.qualificationReady).toBe(false);
   });
 
+  it('absorbs a transient network fault while the success lease is still fresh', () => {
+    // Regression for the aborted/timed-out kalshi-rest probe that de-qualified a
+    // healthy feed and broke a G1 hold: a transient class (timeout, reset, abort,
+    // server blip) must keep qualification while a recent success is within the
+    // lease, and only de-qualify once staleness crosses it.
+    const registry = new ConnectorRegistry();
+    registry.recordSuccess('kalshi-rest', 25);
+    vi.advanceTimersByTime(10_000);
+
+    registry.recordError('kalshi-rest', 'The operation was aborted due to timeout', 'timeout');
+    expect(registry.get('kalshi-rest')).toMatchObject({
+      status: 'warn',
+      failureClass: 'timeout',
+      qualificationReady: true,
+    });
+
+    // Beyond the 30s success lease, the same transient class de-qualifies.
+    vi.advanceTimersByTime(21_000);
+    registry.recordError('kalshi-rest', 'connection reset by peer', 'connection_reset');
+    expect(registry.get('kalshi-rest')).toMatchObject({
+      status: 'error',
+      qualificationReady: false,
+    });
+  });
+
   it('fails qualification immediately for hard authentication failures', () => {
     const registry = new ConnectorRegistry();
     registry.recordSuccess('kalshi-rest', 25);
