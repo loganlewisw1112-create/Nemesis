@@ -1,6 +1,14 @@
 import { getKalshiEndpointPolicy, type KalshiEnvironment, type KalshiMarket } from '@nemesis/core';
 
-export const DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS = 30_000;
+/**
+ * Sized against the twenty-second re-verification cycle that refreshes these
+ * proofs. At 30s it carried only ten seconds of margin, and because a whole
+ * tracked set is re-verified in one pass every record shares a verifiedAt and so
+ * expires simultaneously: a single slow or failed cycle took verifiedTrackedTickers
+ * from 25 to 0 in one step and gapped a readiness hold. 90s tolerates four
+ * missed cycles while still proving the market was confirmed live very recently.
+ */
+export const DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS = 90_000;
 
 export interface ProductionMarketProvenance {
   ticker: string;

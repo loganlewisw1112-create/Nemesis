@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { getKalshiEndpointPolicy, resetKalshiProductionRetryCoordinatorForTests } from '@nemesis/core';
 import { ConnectorRegistry } from './registry.js';
+import { DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS } from './productionMarketProvenance.js';
 import { KalshiOrderbookStream, type OrderbookTrackingStateV2 } from './kalshiOrderbookStream.js';
 import {
   createKalshiTransportFailure,
@@ -173,11 +174,12 @@ describe('KalshiOrderbookStream', () => {
     expect(stream.getBook('KXPROVENANCE')).not.toBeNull();
     expect(listener).toHaveBeenCalledTimes(1);
 
-    vi.setSystemTime(at + 30_001);
+    const expiredAt = at + DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS + 1;
+    vi.setSystemTime(expiredAt);
     expect(stream.getBook('KXPROVENANCE')).toBeNull();
     stream.ingest(JSON.stringify({
       type: 'orderbook_delta', seq: 3,
-      msg: { market_ticker: 'KXPROVENANCE', price_dollars: '0.4200', delta_fp: '1.00', side: 'yes', ts_ms: at + 30_001 },
+      msg: { market_ticker: 'KXPROVENANCE', price_dollars: '0.4200', delta_fp: '1.00', side: 'yes', ts_ms: expiredAt },
     }));
     expect(listener).toHaveBeenCalledTimes(1);
   });
@@ -433,7 +435,7 @@ describe('KalshiOrderbookStream', () => {
     expect(stream.telemetry(now)).toMatchObject({ qualifiedTickers: 1, qualificationReady: true });
     expect(stream.getBook('KX-READY')?.no).toContainEqual({ price: 0.41, quantity: 1 });
 
-    expect(stream.telemetry(now + 30_001)).toMatchObject({
+    expect(stream.telemetry(now + DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS + 1)).toMatchObject({
       verifiedTrackedTickers: 0,
       trackingReady: false,
       qualificationReady: false,
