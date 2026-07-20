@@ -1,10 +1,11 @@
+import { memo } from 'react';
 import type { GateStatus } from '@nemesis/core';
 
 interface Props {
   gates: GateStatus[];
 }
 
-export function GuardrailCockpit({ gates }: Props) {
+export const GuardrailCockpit = memo(function GuardrailCockpit({ gates }: Props) {
   return (
     <div style={{ padding: 12 }}>
       <h3 style={{ fontSize: 13, marginBottom: 10, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
@@ -34,4 +35,4 @@ export function GuardrailCockpit({ gates }: Props) {
       </div>
     </div>
   );
-}
+});

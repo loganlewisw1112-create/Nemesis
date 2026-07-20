@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildKalshiFeePolicy, DEFAULT_ENTRY_QUALIFICATION, type ThesisCard } from '@nemesis/core';
 import { qualifyCampaignEnrollment, type DryRunOrder } from '@nemesis/execution';
 import { SevenHourCampaignStore } from './sevenHourCampaignStore.js';
+import { campaignBookUpdateWork } from './campaignRuntime.js';
 
 const roots: string[] = [];
 const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 6, minWindowMs: 50 };
@@ -149,6 +150,54 @@ describe('SevenHourCampaignStore', () => {
     const reread = open(filePath).snapshot();
     expect(reread.integrityError).toBeUndefined();
     expect(reread.candidates[0]!.terminalState).toBe('ready');
+  });
+
+  it('persists appended events without deep-cloning the whole ledger on record() [soak-stall regression]', () => {
+    // Root cause of the recurring soak/R10 invalidations: record() used to call
+    // tracker.allEvents() (a structuredClone of the entire append-only ledger)
+    // twice per call, on the per-orderbook-delta hot path, growing unbounded with
+    // soak duration until it starved the renderer heartbeat past 15s. record() must
+    // instead trust the mutation's returned created-events, i.e. never clone the
+    // ledger — so this cost is O(appended), independent of ledger size.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nemesis-campaign-noclone-'));
+    roots.push(root);
+    const filePath = path.join(root, 'campaign.jsonl');
+    const { card, fill, decision } = fixture();
+
+    const store = open(filePath);
+    const cloneLedger = vi.spyOn(store.tracker, 'allEvents');
+    store.record((tracker) => tracker.enrollQualified({ card, initialFill: fill, screening: decision, completedAt: 1_000 }));
+    const candidateId = store.snapshot().candidates[0]!.candidateId;
+    for (let sequence = 2; sequence <= 40; sequence += 1) {
+      store.record((tracker) => tracker.recordSample(candidateId, sample(sequence)));
+    }
+    // The hot path must never clone the growing ledger, regardless of its size.
+    expect(cloneLedger).not.toHaveBeenCalled();
+
+    // Every appended event is still durably persisted, in order, exactly once.
+    const reread = open(filePath).snapshot();
+    expect(reread.integrityError).toBeUndefined();
+    expect(reread.candidates[0]!.samples.map((item) => item.exchangeSequence))
+      .toEqual([1, ...Array.from({ length: 39 }, (_unused, index) => index + 2)]);
+  });
+
+  it('bookUpdateView() drives campaignBookUpdateWork identically to a full snapshot [hot-path equivalence]', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nemesis-campaign-view-'));
+    roots.push(root);
+    const filePath = path.join(root, 'campaign.jsonl');
+    const { card, fill, decision } = fixture();
+
+    const store = open(filePath);
+    store.record((tracker) => tracker.enrollQualified({ card, initialFill: fill, screening: decision, completedAt: 1_000 }));
+
+    const full = store.snapshot();
+    const view = store.tracker.bookUpdateView();
+    for (const ticker of [card.ticker, 'OTHER']) {
+      for (const now of [1_000, 10_000, 10_000_000]) {
+        expect(campaignBookUpdateWork(ticker, [card], view, now))
+          .toEqual(campaignBookUpdateWork(ticker, [card], full, now));
+      }
+    }
   });
 
   it('fails closed when the hash-chained JSONL ledger is corrupt', () => {

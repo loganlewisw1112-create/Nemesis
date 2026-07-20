@@ -1,3 +1,5 @@
+import { memo } from 'react';
+
 interface Props {
   deployedPct: number;
   dailyPnl: number;
@@ -6,7 +8,7 @@ interface Props {
   playbookDrawdowns: { playbook: string; pnl: number }[];
 }
 
-export function RiskCockpit({
+export const RiskCockpit = memo(function RiskCockpit({
   deployedPct,
   dailyPnl,
   dailyLossCap,
@@ -44,7 +46,7 @@ export function RiskCockpit({
       ))}
     </div>
   );
-}
+});
 
 function MetricBar({
   label,

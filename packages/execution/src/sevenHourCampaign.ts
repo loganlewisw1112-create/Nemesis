@@ -190,6 +190,25 @@ export interface CampaignSnapshot extends CampaignGateResult {
   integrityError?: string;
 }
 
+/**
+ * Minimal read-model for the per-orderbook-delta hot path. It is a structural
+ * subset of {@link CampaignSnapshot} (so a full snapshot is still assignable),
+ * but {@link SevenHourCampaignTracker.bookUpdateView} builds it WITHOUT deep-
+ * cloning the growing candidate/diagnostic/operationalCheck collections — the
+ * clone cost that starved the renderer heartbeat during long soaks.
+ */
+export interface CampaignBookUpdateView {
+  readonly manifest: { readonly status: CampaignRunStatus };
+  readonly candidates: readonly Pick<
+    CampaignCandidateRecord,
+    'economicIdentity' | 'ticker' | 'candidateId' | 'terminalState'
+  >[];
+  readonly diagnostics: readonly Pick<
+    CampaignDiagnosticRecord,
+    'candidateId' | 'status' | 'dueAt'
+  >[];
+}
+
 export interface StartCampaignOptions {
   runId: string;
   evidenceNamespace: string;
@@ -853,6 +872,29 @@ export class SevenHourCampaignTracker {
       diagnosticSchedulingCoverage: round(diagnosticSchedulingCoverage),
       validDiagnosticCoverage: round(validDiagnosticCoverage),
       freshConfirmationRate: round(freshConfirmationRate),
+    };
+  }
+
+  /**
+   * Cheap projection for the high-frequency book-update path. Copies only the
+   * primitive fields campaignBookUpdateWork reads into fresh objects (no
+   * structuredClone, no operationalChecks/samples), so cost is O(candidates +
+   * diagnostics) — bounded by enrolled count, not by soak duration or ledger size.
+   */
+  bookUpdateView(): CampaignBookUpdateView {
+    return {
+      manifest: { status: this.manifest.status },
+      candidates: [...this.candidates.values()].map((candidate) => ({
+        economicIdentity: candidate.economicIdentity,
+        ticker: candidate.ticker,
+        candidateId: candidate.candidateId,
+        terminalState: candidate.terminalState,
+      })),
+      diagnostics: [...this.diagnostics.values()].map((diagnostic) => ({
+        candidateId: diagnostic.candidateId,
+        status: diagnostic.status,
+        dueAt: diagnostic.dueAt,
+      })),
     };
   }
 

@@ -1,4 +1,4 @@
-import { candidateEconomicIdentity, type CampaignSnapshot } from '@nemesis/execution';
+import { candidateEconomicIdentity, type CampaignBookUpdateView, type CampaignSnapshot } from '@nemesis/execution';
 import {
   isKnownKalshiFeePolicy,
   type KalshiOrderbook,
@@ -83,7 +83,7 @@ export function campaignEnrollmentReadiness(
 export function campaignBookUpdateWork(
   ticker: string,
   eligibleCards: readonly ThesisCard[],
-  campaign: CampaignSnapshot | null,
+  campaign: CampaignBookUpdateView | null,
   now = Date.now(),
 ): CampaignBookUpdateWork {
   if (!campaign || campaign.manifest.status !== 'active') {

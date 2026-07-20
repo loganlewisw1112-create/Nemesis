@@ -53,9 +53,14 @@ export class SevenHourCampaignStore {
 
   record<T extends CampaignEvent[]>(mutation: (tracker: SevenHourCampaignTracker) => T): T {
     if (this.persistenceError) throw new Error(`refusing campaign append: ${this.persistenceError}`);
-    const before = this.tracker.allEvents().length;
+    // Every SevenHourCampaignTracker mutation returns exactly the events it appended
+    // to the ledger (its append() results, in push order), or [] when it appended
+    // nothing. That return value is identical to allEvents().slice(before). Using it
+    // avoids structuredClone-ing the entire append-only ledger twice on every call —
+    // O(ledger) work that ran on the per-orderbook-delta hot path and grew unbounded
+    // with soak duration, starving the renderer heartbeat and invalidating soak/R10 runs.
     const result = mutation(this.tracker);
-    const created = this.tracker.allEvents().slice(before);
+    const created: CampaignEvent[] = result;
     if (created.length > 0) {
       try {
         const fd = fs.openSync(this.filePath, 'a');

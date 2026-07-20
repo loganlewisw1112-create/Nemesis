@@ -112,6 +112,7 @@ import {
   candidateEconomicIdentity,
   qualifyCampaignEnrollment,
   calculateEntryEconomics,
+  type CampaignBookUpdateView,
   type CampaignCandidateRecord,
   type CampaignScreenedOut,
   type CampaignScreeningReasonCode,
@@ -1143,6 +1144,24 @@ function campaignSnapshot() {
     reviewOnly = true;
     console.error('[nemesis] evidence campaign failed closed', error);
     return campaignStore.snapshot();
+  }
+}
+
+/**
+ * Hot-path variant of campaignSnapshot() for the per-orderbook-delta stream.
+ * Runs the same config-drift guard but returns the cheap bookUpdateView()
+ * projection instead of a full deep-cloned snapshot, so tens-of-deltas-per-
+ * second processing never clones the growing campaign collections.
+ */
+function campaignBookView(): CampaignBookUpdateView | null {
+  if (!campaignStore) return null;
+  try {
+    campaignStore.record((tracker) => tracker.ensureConfiguration(strategyConfigHash()));
+    return campaignStore.tracker.bookUpdateView();
+  } catch (error) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign failed closed', error);
+    return campaignStore.tracker.bookUpdateView();
   }
 }
 
@@ -5928,7 +5947,7 @@ app.whenReady().then(async () => {
     if (!campaignStore || campaignEvidencePaused) return;
     if (!Number.isInteger(book.sequence)) {
       const completedAt = Date.now();
-      const work = campaignBookUpdateWork(book.ticker, [], campaignSnapshot(), completedAt);
+      const work = campaignBookUpdateWork(book.ticker, [], campaignBookView(), completedAt);
       if (work.diagnostic) {
         pendingCampaignDiagnosticObservations.set(book.ticker, {
           ticker: book.ticker,
@@ -5960,7 +5979,7 @@ app.whenReady().then(async () => {
         completedAt,
         entryQualificationSettings().maxBookAgeMs,
       );
-      const campaign = campaignSnapshot();
+      const campaign = campaignBookView();
       const work = campaignBookUpdateWork(book.ticker, theses.filter((card) =>
         card.ticker === book.ticker
         && isEntryEligible(card)
@@ -5998,7 +6017,7 @@ app.whenReady().then(async () => {
     }).catch((error) => {
       const completedAt = Date.now();
       if (latestCampaignObservationSequence.get(book.ticker) !== sequence) return;
-      const work = campaignBookUpdateWork(book.ticker, [], campaignSnapshot(), completedAt);
+      const work = campaignBookUpdateWork(book.ticker, [], campaignBookView(), completedAt);
       if (work.diagnostic) {
         pendingCampaignDiagnosticObservations.set(book.ticker, {
           ticker: book.ticker,

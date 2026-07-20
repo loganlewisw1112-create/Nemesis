@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import type { AutoCloseDecision, ThesisCard } from '@nemesis/core';
 
@@ -116,11 +116,14 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
     playDing(n.severity);
   }
 
-  function dismiss(id: string) {
+  // Stable identity (refs + setState setter only) so consumers that memoize on
+  // this callback (e.g. the NotificationPanel wrapped in React.memo) can bail
+  // out of re-rendering when nothing else about their props changed.
+  const dismiss = useCallback((id: string) => {
     setNotes((p) => p.filter((n) => n.id !== id));
     clearTimeout(timers.current.get(id));
     timers.current.delete(id);
-  }
+  }, []);
 
   useEffect(() => () => {
     for (const timer of timers.current.values()) clearTimeout(timer);
@@ -222,7 +225,7 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
 const CLR = { info: '#3b82f6', warn: '#f59e0b', success: '#22c55e' } as const;
 const ICO = { close: '⚠️', opportunity: '🎯', profit: '📈', fill: '✅', regime: '🚫' } as const;
 
-export function NotificationPanel({
+export const NotificationPanel = memo(function NotificationPanel({
   notes, onDismiss, onAction,
 }: {
   notes: NemesisNotification[];
@@ -258,4 +261,4 @@ export function NotificationPanel({
       </AnimatePresence>
     </div>
   );
-}
+});

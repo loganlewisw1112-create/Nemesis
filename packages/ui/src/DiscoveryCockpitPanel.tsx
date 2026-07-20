@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { DiscoveryState } from '@nemesis/core';
 
 interface Props {
@@ -16,7 +17,7 @@ const PRESET_LABELS = {
   aggressive: 'Aggressive',
 } as const;
 
-export function DiscoveryCockpitPanel({
+export const DiscoveryCockpitPanel = memo(function DiscoveryCockpitPanel({
   state,
   onPreset,
   onToggle,
@@ -94,7 +95,7 @@ export function DiscoveryCockpitPanel({
       </div>
     </div>
   );
-}
+});
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
