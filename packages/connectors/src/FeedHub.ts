@@ -245,7 +245,16 @@ export class FeedHub {
   }
 
   getFeedHealthSnapshot(now = Date.now()): FeedHealthSnapshot {
-    const restMarkets = this.registry.refreshFreshness('kalshi-rest', 30_000, now) ?? null;
+    // Sized to absorb one missed poll cycle plus its retry, mirroring the trade
+    // tape (a6ce478). The REST health probe ticks every 20s (REST_HEALTH_POLL_MS),
+    // so successful polls land ~20s apart; a single delayed or retried poll pushes
+    // freshness past a bare 30s TTL. Each breach flips qualificationReady false and
+    // counts as a runtime-health recovery, and enough recoveries invalidate a soak
+    // -- exactly the feeds_rest_qualified gap that failed both G1 rehearsals while
+    // the transport stayed connected with zero errors. 60s covers two poll cycles
+    // plus latency. Transport/rate-limit failures still de-qualify immediately via
+    // recordError, so this only tolerates jitter, not an actually dead feed.
+    const restMarkets = this.registry.refreshFreshness('kalshi-rest', 60_000, now) ?? null;
     const tradeTape = this.registry.refreshFreshness('kalshi-trades', STALE_MS.trades, now) ?? null;
     const tickerWebSocket = this.registry.refreshFreshness('kalshi-ticker-ws', 25_000, now) ?? null;
     const orderbookWebSocket = this.registry.refreshFreshness('kalshi-orderbook-ws', 25_000, now) ?? null;

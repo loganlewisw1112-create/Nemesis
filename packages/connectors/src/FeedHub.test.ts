@@ -263,4 +263,21 @@ describe('FeedHub trade tape degradation', () => {
     expect(shouldRefresh(firstSuccessAt + 15_000)).toBe(true);
     expect(firstSuccessAt + 15_000).toBeLessThan(firstSuccessAt + 30_000);
   });
+
+  it('keeps kalshi-rest qualification-ready through one missed 20s poll cycle', () => {
+    // Regression for the feeds_rest_qualified gap that failed both G1 rehearsals:
+    // the REST health probe ticks every 20s, so a single delayed/retried poll left
+    // freshness at ~46-54s while transport stayed connected with zero errors. A bare
+    // 30s TTL flipped qualificationReady false each time, counting as a runtime-health
+    // recovery. The snapshot TTL must tolerate ~2 poll cycles (<=60s) but not a truly
+    // dead feed (>60s).
+    const { hub, registry } = makeHub(vi.fn<typeof fetch>());
+    const at = Date.now();
+    registry.recordSuccess('kalshi-rest', 25);
+
+    // 50s stale: one missed poll cycle -- must stay qualification-ready.
+    expect(hub.getFeedHealthSnapshot(at + 50_000).restMarkets?.qualificationReady).toBe(true);
+    // 61s stale: beyond two poll cycles -- feed is genuinely stale, must de-qualify.
+    expect(hub.getFeedHealthSnapshot(at + 61_000).restMarkets?.qualificationReady).toBe(false);
+  });
 });
