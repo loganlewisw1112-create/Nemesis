@@ -46,7 +46,13 @@ const STALE_MS: Record<string, number> = {
   nhc: 300_000,
   industrial: 300_000,
   sports: 30_000,
-  trades: 30_000,
+  // Sized to absorb one missed poll cycle plus its retry. Background polling
+  // ticks every 8s behind a 15s floor, so successful polls land ~16s apart, and
+  // a single failed request retries 15s later -- 31s total, which a 30s TTL
+  // breached by a second or two. That surfaced as trade-tape flapping
+  // unqualified at 30.8s and 32.2s, each flap counting as a runtime-health
+  // recovery, and three recoveries in ten minutes invalidate a soak.
+  trades: 60_000,
   kalshiWs: 45_000,
   worldNews: 180_000,
   eia: 600_000,

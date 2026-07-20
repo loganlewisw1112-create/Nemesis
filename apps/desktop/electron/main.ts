@@ -384,6 +384,7 @@ let lastDiscoveryRevision = '';
 let lastWorldRevision = '';
 let orderbookTrackedTickers: string[] = [];
 let tickerTrackedTickers: string[] = [];
+let lastTracedRuntimeState: string | null = null;
 let orderbookLastRotationAt = 0;
 let orderbookRotationCursor = 0;
 const campaignBookTriggerScheduler = new CampaignBookTriggerScheduler(
@@ -1266,7 +1267,13 @@ function runtimeComponents(now: number): RuntimeComponentHealth[] {
     retryAt: health?.nextRetryAt ?? null,
     failureClass: health?.failureClass ?? null,
     failures: health?.errorCount1h ?? 0,
-    maxAgeMs: name === 'rest-markets' || name === 'trade-tape' ? 30_000 : undefined,
+    // Both REST pollers run an 8s tick behind a 15s request floor, so healthy
+    // polls land ~16s apart and one failed request pushes the next success to
+    // ~31s. A 30s bound therefore fails on a single dropped request, which the
+    // runtime-health controller counts as a recovery. Measured: trade-tape
+    // flapped at 30.8s and 32.2s. 60s absorbs two missed cycles; sustained
+    // failure beyond that is genuine and should still open a recovery window.
+    maxAgeMs: name === 'rest-markets' || name === 'trade-tape' ? 60_000 : undefined,
   });
   return [
     component('rest-markets', feeds.restMarkets ?? undefined),
@@ -1817,6 +1824,25 @@ function recordCampaignOperationalTelemetry(): void {
     },
   });
   lastRuntimeSampleAt = now;
+  // TEMP diagnostic, off unless NEMESIS_RUNTIME_HEALTH_TRACE_PATH is set. A
+  // recovery that heals between soak samples leaves no trace in the evidence,
+  // so "3 recoveries occurred within ten minutes" arrives with no way to see
+  // WHICH component flapped. Record every state change with its reasons.
+  const runtimeTracePath = process.env.NEMESIS_RUNTIME_HEALTH_TRACE_PATH;
+  if (runtimeTracePath && latestRuntimeDecision.state !== lastTracedRuntimeState) {
+    lastTracedRuntimeState = latestRuntimeDecision.state;
+    try {
+      const unhealthy = components
+        .filter((c) => !(c.connected && c.qualificationReady))
+        .map((c) => `${c.name}(connected=${c.connected},qual=${c.qualificationReady},lastSuccessAt=${c.lastSuccessAt ?? 'null'},age=${c.lastSuccessAt == null ? 'inf' : now - c.lastSuccessAt})`);
+      fs.appendFileSync(
+        runtimeTracePath,
+        `${now} state=${latestRuntimeDecision.state} recoveries=${latestRuntimeDecision.recoveryCount} reasons=[${latestRuntimeDecision.reasons.join(' | ')}] unhealthy=[${unhealthy.join(' ; ')}]\n`,
+      );
+    } catch {
+      // Diagnostics must never disturb the runtime.
+    }
+  }
   if (campaignStore?.snapshot().manifest.status === 'active') {
     runtimeObservedSamples += 1;
     if (latestRuntimeDecision.lease.status === 'healthy') runtimeHealthySamples += 1;
