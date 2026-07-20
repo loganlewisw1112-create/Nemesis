@@ -1824,10 +1824,13 @@ function recordCampaignOperationalTelemetry(): void {
     },
   });
   lastRuntimeSampleAt = now;
-  // TEMP diagnostic, off unless NEMESIS_RUNTIME_HEALTH_TRACE_PATH is set. A
-  // recovery that heals between soak samples leaves no trace in the evidence,
-  // so "3 recoveries occurred within ten minutes" arrives with no way to see
-  // WHICH component flapped. Record every state change with its reasons.
+  // Off unless NEMESIS_RUNTIME_HEALTH_TRACE_PATH is set. A recovery that heals
+  // between soak samples leaves no trace in the evidence, so an invalidation
+  // reading "3 recoveries occurred within ten minutes" arrives with no way to
+  // see WHICH component flapped -- the sampled reasons are empty by then. This
+  // records every state change with its reasons and the offending component
+  // ages, and is what identified the trade-tape TTL breach behind a6ce478.
+  // Keep it: the failure mode is otherwise undiagnosable after the fact.
   const runtimeTracePath = process.env.NEMESIS_RUNTIME_HEALTH_TRACE_PATH;
   if (runtimeTracePath && latestRuntimeDecision.state !== lastTracedRuntimeState) {
     lastTracedRuntimeState = latestRuntimeDecision.state;
