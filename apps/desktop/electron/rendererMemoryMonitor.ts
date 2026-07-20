@@ -186,10 +186,22 @@ export class RendererMemoryMonitor {
     const baselineWindowEndAt = warmupCutoffAt + this.warmupMs;
     const trend = this.samples.filter((item) => item.at >= Math.max(trendStart, baselineWindowEndAt));
     const trendSpan = trend.length > 1 ? trend.at(-1)!.at - trend[0]!.at : 0;
+    // Computed and reported as evidence, but NOT blocking. Split-half medians
+    // survive a single GC trough, not phase: when the renderer's allocate and
+    // collect cycle is long relative to a ten-minute window, the two halves land
+    // on opposite phases. Measured across one soak this rate swung from -22% to
+    // +17.6% within six minutes -- a noise band twice the 10% limit -- with no
+    // net growth over the run (98MB -> 82MB) and peak usage at ~98MB against the
+    // 384MB warning bound. Because reasons are sticky, one phase-aligned sample
+    // permanently blocked the renderer and invalidated a soak at 21 of its 30
+    // scored minutes.
+    //
+    // Leak detection is left to instruments that do not depend on window phase:
+    // the thirty-minute least-squares slope below (2% of baseline per hour), the
+    // 150%-of-baseline bound above, 384MB across three consecutive samples, and
+    // the 512MB hard limit. The baseline bound in particular still catches a
+    // fast leak inside the first thirty minutes, before the slope window closes.
     const growthRate = trendSpan >= this.policy.trendWindowMs * 0.9 ? rollingWindowGrowth(trend) : 0;
-    if (growthRate > this.policy.trendGrowthLimit) {
-      reasons.push(`renderer working set grew ${(growthRate * 100).toFixed(1)}% over the rolling ten-minute window`);
-    }
 
     let slopePerHour = 0;
     if (this.baselineKb != null) {

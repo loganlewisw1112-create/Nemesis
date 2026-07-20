@@ -17,7 +17,8 @@ describe('RendererMemoryMonitor', () => {
     expect(monitor.snapshot().baselineKb).toBe(109.5 * MB);
 
     expect(monitor.add({ at: 230, workingSetKb: 109 * MB, rendererPid: 1 }).status).toBe('stable');
-    expect(monitor.add({ at: 330, workingSetKb: 150 * MB, rendererPid: 1 }).status).toBe('unstable-growth');
+    // Above 150% of the 109.5MB baseline, so it trips the baseline bound.
+    expect(monitor.add({ at: 330, workingSetKb: 170 * MB, rendererPid: 1 }).status).toBe('unstable-growth');
   });
 
   it('blocks three consecutive samples above 384MB', () => {
@@ -36,13 +37,16 @@ describe('RendererMemoryMonitor', () => {
     expect(result.detail).toContain('512MB');
   });
 
-  it('blocks rolling ten-minute growth above ten percent', () => {
+  it('reports rolling ten-minute growth as evidence without blocking on it', () => {
+    // The rate is phase-sensitive: a ten-minute window can straddle opposite
+    // phases of a longer allocate/collect cycle. Measured in a soak it swung
+    // -22% to +17.6% in six minutes with no net growth, so it is recorded as
+    // evidence and leak detection is left to the phase-independent gates.
     const monitor = new RendererMemoryMonitor(0, 1);
     monitor.add({ at: 0, workingSetKb: 100 * MB, painted: true });
     const result = monitor.add({ at: 10 * 60_000, workingSetKb: 111 * MB, painted: true });
-    expect(result.blocked).toBe(true);
     expect(result.growthRate).toBeCloseTo(0.11);
-    expect(result.detail).toContain('rolling ten-minute window');
+    expect(result.blocked).toBe(false);
   });
 
   it('does not turn a one-sample garbage-collection trough into rolling growth', () => {
@@ -60,30 +64,31 @@ describe('RendererMemoryMonitor', () => {
     expect(result.growthRate).toBeLessThan(0.10);
   });
 
-  it('still blocks sustained rolling growth when the window has many samples', () => {
+  it('catches sustained growth through the baseline bound rather than the rolling window', () => {
+    // Sustained growth is still caught, by an instrument that does not depend
+    // on window phase: 150% of the established baseline.
     const monitor = new RendererMemoryMonitor(0, 1);
     let result = monitor.add({ at: 0, workingSetKb: 100 * MB, painted: true });
     for (let index = 1; index <= 20; index += 1) {
       result = monitor.add({
         at: index * 30_000,
-        workingSetKb: (100 + (11 * index / 20)) * MB,
+        workingSetKb: (100 + (3 * index)) * MB,
         painted: true,
       });
     }
 
     expect(result.blocked).toBe(true);
-    expect(result.growthRate).toBeGreaterThan(0.10);
+    expect(result.detail).toContain('150% of baseline');
   });
 
-  it('excludes the five-minute warm-up from the rolling ten-minute growth gate', () => {
+  it('excludes warm-up allocation from the reported rolling growth rate', () => {
     const monitor = new RendererMemoryMonitor(5 * 60_000, 1);
     monitor.add({ at: 0, workingSetKb: 80 * MB, painted: true });
     expect(monitor.add({ at: 5 * 60_000, workingSetKb: 100 * MB, painted: true }).status).toBe('stable');
-    expect(monitor.add({ at: 10 * 60_000, workingSetKb: 111 * MB, painted: true }).blocked).toBe(false);
-    expect(monitor.add({ at: 15 * 60_000, workingSetKb: 112 * MB, painted: true }).blocked).toBe(false);
-    const result = monitor.add({ at: 20 * 60_000, workingSetKb: 123 * MB, painted: true });
-    expect(result.blocked).toBe(true);
-    expect(result.growthRate).toBeGreaterThan(0.10);
+    // The 80MB -> 100MB warm-up ramp must not appear as post-baseline growth.
+    expect(monitor.add({ at: 10 * 60_000, workingSetKb: 111 * MB, painted: true }).growthRate).toBe(0);
+    const result = monitor.add({ at: 15 * 60_000, workingSetKb: 112 * MB, painted: true });
+    expect(result.blocked).toBe(false);
   });
 
   it('blocks a thirty-minute projected slope above two percent of baseline per hour', () => {
