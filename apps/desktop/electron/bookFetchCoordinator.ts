@@ -6,6 +6,15 @@ export interface BookFetchCoordinatorOptions {
   successTtlMs: number;
   maxFailureBackoffMs?: number;
   failureBackoffMs?: Partial<BookFetchFailureBackoffMs>;
+  /**
+   * Per-kind ceilings on the exponential backoff. A rate-limited market must be
+   * retried before its production provenance expires (90s TTL); left uncapped,
+   * the exponential 'rate-limit' backoff (30s → 60s → 120s …) overshoots the TTL
+   * on the third strike, so the market drops out of the tracked set and the
+   * orderbook coverage decays below 25. Capping 'rate-limit' below the TTL keeps
+   * every market eligible for re-verification while it is still backing off.
+   */
+  maxFailureBackoffMsByKind?: Partial<BookFetchFailureBackoffMs>;
   now?: () => number;
 }
 
@@ -30,6 +39,13 @@ const DEFAULT_FAILURE_BACKOFF_MS: BookFetchFailureBackoffMs = {
   'rate-limit': 30_000,
   transient: 5_000,
   other: 10_000,
+};
+
+// Bound the rate-limit backoff below the 90s production-provenance TTL so a
+// rate-limited market always gets at least one more re-verification attempt
+// before its proof lapses and it falls out of the tracked orderbook set.
+const DEFAULT_MAX_FAILURE_BACKOFF_MS_BY_KIND: Partial<BookFetchFailureBackoffMs> = {
+  'rate-limit': 60_000,
 };
 
 export class BookFetchBackoffError extends Error {
@@ -65,6 +81,7 @@ export class BookFetchCoordinator<T> {
   private readonly now: () => number;
   private readonly failureBackoffMs: BookFetchFailureBackoffMs;
   private readonly maxFailureBackoffMs: number;
+  private readonly maxFailureBackoffMsByKind: Partial<BookFetchFailureBackoffMs>;
 
   constructor(
     private readonly load: (ticker: string) => Promise<T>,
@@ -73,6 +90,10 @@ export class BookFetchCoordinator<T> {
     this.now = options.now ?? Date.now;
     this.failureBackoffMs = { ...DEFAULT_FAILURE_BACKOFF_MS, ...options.failureBackoffMs };
     this.maxFailureBackoffMs = options.maxFailureBackoffMs ?? 5 * 60_000;
+    this.maxFailureBackoffMsByKind = {
+      ...DEFAULT_MAX_FAILURE_BACKOFF_MS_BY_KIND,
+      ...options.maxFailureBackoffMsByKind,
+    };
   }
 
   peek(ticker: string): T | null {
@@ -114,8 +135,10 @@ export class BookFetchCoordinator<T> {
         const reason = error instanceof Error ? error.message : String(error);
         const previous = this.failures.get(ticker);
         const failureCount = previous?.kind === kind ? previous.failureCount + 1 : 1;
+        const kindCeilingMs = this.maxFailureBackoffMsByKind[kind] ?? this.maxFailureBackoffMs;
         const delayMs = Math.min(
           this.maxFailureBackoffMs,
+          kindCeilingMs,
           this.failureBackoffMs[kind] * (2 ** (failureCount - 1)),
         );
         this.failures.set(ticker, {

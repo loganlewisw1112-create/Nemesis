@@ -126,6 +126,7 @@ import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
 import { DiscoveryOrchestrator } from './discovery.js';
 import { BookFetchCoordinator, isBookFetchBackoffError } from './bookFetchCoordinator.js';
+import { pacedDispatch } from './pacedDispatch.js';
 import { dedupeByExecutionKey } from './executionConcurrency.js';
 import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
 import { PaperQualificationStore } from './paperQualificationStore.js';
@@ -224,6 +225,19 @@ const ORDERBOOK_TRACKING_LIMIT = (() => {
 const ORDERBOOK_ROTATION_INTERVAL_MS = 5 * 60_000;
 const ORDERBOOK_ROTATION_BATCH_SIZE = 4;
 
+// Production-provenance re-verification cadence and pacing. Every cycle refreshes
+// the (<=25) tracked orderbook markets. Firing all of them at once (the previous
+// concurrency-5 burst) reliably drew Kalshi 429s during a full-bar soak; the
+// un-refreshed markets then lapsed at the 90s provenance TTL and the tracked set
+// decayed below 25, failing R10. Pacing spreads each cycle's requests across
+// REVERIFY_INTERVAL_UTILIZATION of the interval (adaptive gap per market, capped
+// at REVERIFY_MAX_REQUEST_GAP_MS) with at most REVERIFY_MAX_CONCURRENCY in flight,
+// so the full set re-verifies well inside the TTL without ever bursting.
+const REVERIFY_INTERVAL_MS = 20_000;
+const REVERIFY_MAX_CONCURRENCY = 3;
+const REVERIFY_INTERVAL_UTILIZATION = 0.75;
+const REVERIFY_MAX_REQUEST_GAP_MS = 2_000;
+
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
 startupTrace('module-loaded');
@@ -300,7 +314,15 @@ const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
     }
     return book;
   },
-  { successTtlMs: BOOK_CACHE_TTL_MS },
+  {
+    successTtlMs: BOOK_CACHE_TTL_MS,
+    // Keep a rate-limited book fetch retryable before its provenance lapses: cap
+    // the 'rate-limit' backoff at two-thirds of the provenance TTL so a market
+    // never backs off past the window in which it must be re-verified.
+    maxFailureBackoffMsByKind: {
+      'rate-limit': Math.floor(DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS * 2 / 3),
+    },
+  },
 );
 let opportunityRadarRows: OpportunityRadarRow[] = [];
 let watchedTicker: string | null = null;
@@ -4520,33 +4542,42 @@ const runUniverseDiscovery = createSingleFlight(() => withAbortTimeout(
 ));
 const runRestHealthProbe = createSingleFlight(() => registry.pingKalshiRest());
 
+async function refreshProductionMarketProvenance(ticker: string): Promise<void> {
+  let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
+  try {
+    const market = await fetchMarket(ticker, {
+      environment: 'production',
+      onResponseMetadata: (metadata) => { responseMetadata = metadata; },
+    });
+    const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
+    if (verifiedResponse?.environment !== 'production' || verifiedResponse.status !== 200) return;
+    recordProductionUniverse([{
+      market,
+      sourceBaseUrl: verifiedResponse.sourceBaseUrl,
+      verifiedAt: verifiedResponse.verifiedAt,
+    }]);
+  } catch {
+    // Existing proof expires naturally. A failed refresh never extends it.
+  }
+}
+
 async function reverifyTrackedProductionMarkets(): Promise<void> {
   if (settings.demoMode || orderbookTrackedTickers.length === 0) return;
   const tickers = [...new Set([
     ...campaignCriticalOrderbookTickers(),
     ...orderbookTrackedTickers,
   ])].slice(0, ORDERBOOK_TRACKING_LIMIT);
-  const concurrency = 5;
-  for (let index = 0; index < tickers.length; index += concurrency) {
-    await Promise.all(tickers.slice(index, index + concurrency).map(async (ticker) => {
-      let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
-      try {
-        const market = await fetchMarket(ticker, {
-          environment: 'production',
-          onResponseMetadata: (metadata) => { responseMetadata = metadata; },
-        });
-        const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
-        if (verifiedResponse?.environment !== 'production' || verifiedResponse.status !== 200) return;
-        recordProductionUniverse([{
-          market,
-          sourceBaseUrl: verifiedResponse.sourceBaseUrl,
-          verifiedAt: verifiedResponse.verifiedAt,
-        }]);
-      } catch {
-        // Existing proof expires naturally. A failed refresh never extends it.
-      }
-    }));
-  }
+  // Spread the refreshes across the interval rather than bursting them, so the
+  // aggregate request rate stays under Kalshi's limit and every market is
+  // re-verified inside its 90s provenance TTL. See REVERIFY_* constants.
+  const dispatchGapMs = Math.min(
+    REVERIFY_MAX_REQUEST_GAP_MS,
+    Math.floor((REVERIFY_INTERVAL_MS * REVERIFY_INTERVAL_UTILIZATION) / Math.max(1, tickers.length)),
+  );
+  await pacedDispatch(tickers, refreshProductionMarketProvenance, {
+    gapMs: dispatchGapMs,
+    maxConcurrency: REVERIFY_MAX_CONCURRENCY,
+  });
   refreshOrderbookTracking();
 }
 
@@ -6122,7 +6153,7 @@ app.whenReady().then(async () => {
       startupTrace('market-feed-ready');
       setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
       setInterval(() => { void runUniverseRefresh(); }, UNIVERSE_REFRESH_MS);
-      setInterval(() => { void runProductionMarketReverification(); }, 20_000);
+      setInterval(() => { void runProductionMarketReverification(); }, REVERIFY_INTERVAL_MS);
     }
   })();
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
