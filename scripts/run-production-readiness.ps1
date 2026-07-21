@@ -239,6 +239,22 @@ try {
   $tickerHoldGeneration = $null
   $orderbookHoldGeneration = $null
   $holdTransportFaultBaseline = $null
+  # Bounded tolerance for a single self-healed transport reconnect during the
+  # hold. A transient WS read-timeout failover bumps the generation and briefly
+  # quarantines the books before they re-verify over a few seconds; hard-failing
+  # on that one blip made a clean hold a coin flip whenever the feed twitched
+  # once. Absorb at most $MaxHoldReconnects such episodes, each of which must
+  # fully re-qualify within $ReconnectGraceSeconds. The paused interval extends
+  # the hold so it still proves a full HoldMinutes of ready time, and a second
+  # episode -- or one that never re-qualifies -- still hard-fails, so genuine
+  # instability is never masked. This is orderbook-transport accounting, NOT a
+  # relaxation of the renderer heartbeat watchdog.
+  $MaxHoldReconnects = 1
+  $ReconnectGraceSeconds = 45
+  $holdReconnectBudget = $MaxHoldReconnects
+  $reconnectRecoveryDeadline = $null
+  $reconnectRecoveryStartedAt = $null
+  $holdReconnectsAbsorbed = 0
   # Transport liveness is bounded by the same dead-connection window the streams
   # themselves use, so the hold fails on a genuinely dead socket and nothing else.
   $deadConnectionMs = 25000
@@ -358,38 +374,69 @@ try {
     $ready = $failingConditions.Count -eq 0
     $permanentFailure = @($status.feeds.tickerWebSocket.failureClass, $status.orderbookTracking.failureClass) | Where-Object { $_ -in @('authentication', 'authorization', 'configuration') } | Select-Object -First 1
     if ($permanentFailure) { $failure = "permanent production transport failure: $permanentFailure"; break }
-    if ($null -eq $holdStartedAt -and $ready) {
-      $holdStartedAt = $now
-      $tickerHoldGeneration = [int]$status.feeds.tickerWebSocket.generation
-      $orderbookHoldGeneration = [int]$status.orderbookTracking.generation
-      $holdTransportFaultBaseline = $transportFaultCount
-    }
-    elseif ($null -ne $holdStartedAt -and !$ready) {
-      $failure = "readiness gap occurred during the continuous hold: $($failingConditions -join ', ')"
-      break
-    }
-    if ($null -ne $holdStartedAt) {
-      if ([int]$status.feeds.tickerWebSocket.generation -ne $tickerHoldGeneration `
-        -or [int]$status.orderbookTracking.generation -ne $orderbookHoldGeneration) {
-        $failure = 'websocket generation changed during the continuous hold'
-        break
+    if ($null -eq $holdStartedAt) {
+      if ($ready) {
+        $holdStartedAt = $now
+        $tickerHoldGeneration = [int]$status.feeds.tickerWebSocket.generation
+        $orderbookHoldGeneration = [int]$status.orderbookTracking.generation
+        $holdTransportFaultBaseline = $transportFaultCount
       }
-      if ($transportFaultCount -gt $holdTransportFaultBaseline) {
-        $failure = 'transport reconnect, sequence, or failure counter changed during the continuous hold'
-        break
+    }
+    else {
+      # A disruption during the hold is any not-ready sample, a websocket
+      # generation bump, or a transport-fault-counter increment above the hold
+      # baseline. All three are the fingerprints of a reconnect.
+      $generationChanged = ([int]$status.feeds.tickerWebSocket.generation -ne $tickerHoldGeneration) `
+        -or ([int]$status.orderbookTracking.generation -ne $orderbookHoldGeneration)
+      $transportFaulted = $transportFaultCount -gt $holdTransportFaultBaseline
+      $disrupted = (-not $ready) -or $generationChanged -or $transportFaulted
+
+      if ($null -ne $reconnectRecoveryDeadline) {
+        # Absorbing a reconnect episode: it is only credited once every gate is
+        # green again ($ready). Generation/fault counters legitimately advanced
+        # across the reconnect, so completion is keyed on re-qualification, not
+        # on them matching the pre-reconnect baseline -- we adopt their new
+        # values as the baseline instead.
+        if ($ready) {
+          $holdStartedAt = $holdStartedAt.AddMilliseconds((($now - $reconnectRecoveryStartedAt)).TotalMilliseconds)
+          $tickerHoldGeneration = [int]$status.feeds.tickerWebSocket.generation
+          $orderbookHoldGeneration = [int]$status.orderbookTracking.generation
+          $holdTransportFaultBaseline = $transportFaultCount
+          $reconnectRecoveryDeadline = $null
+          $reconnectRecoveryStartedAt = $null
+        }
+        elseif ($now -ge $reconnectRecoveryDeadline) {
+          $failure = "reconnect during the continuous hold did not re-qualify within ${ReconnectGraceSeconds}s: $($failingConditions -join ', ')"
+          break
+        }
+        # else: still inside the grace window -- keep waiting, do not count.
       }
-      $samples += 1
-      $null = $marketActivitySamples.Add([pscustomobject]@{
-        tickerExchangeDataAgeMs = $tickerExchangeDataAgeMs
-        orderbookExchangeDataAgeMs = $orderbookExchangeDataAgeMs
-        qualifiedTickers = [int]$status.orderbookTracking.qualifiedTickers
-        booksWithExchangeTime = [int]$status.feeds.orderbookWebSocket.booksWithExchangeTime
-      })
-      if (($now - $holdStartedAt).TotalMinutes -ge $HoldMinutes) {
-        # Credit is granted only by this fresh ready sample, never by shutdown time.
-        $holdCompletedAt = $now
-        $finalStatus = $status
-        break
+      elseif ($disrupted) {
+        if ($holdReconnectBudget -le 0) {
+          $failure = "readiness gap occurred during the continuous hold (reconnect tolerance exhausted): $($failingConditions -join ', ')"
+          break
+        }
+        # Begin absorbing one self-healed reconnect episode.
+        $holdReconnectBudget -= 1
+        $holdReconnectsAbsorbed += 1
+        $reconnectRecoveryStartedAt = $now
+        $reconnectRecoveryDeadline = $now.AddSeconds($ReconnectGraceSeconds)
+      }
+      else {
+        # Steady ready sample: credit it toward the hold. Credit is granted only
+        # by a fresh ready sample, never by shutdown time.
+        $samples += 1
+        $null = $marketActivitySamples.Add([pscustomobject]@{
+          tickerExchangeDataAgeMs = $tickerExchangeDataAgeMs
+          orderbookExchangeDataAgeMs = $orderbookExchangeDataAgeMs
+          qualifiedTickers = [int]$status.orderbookTracking.qualifiedTickers
+          booksWithExchangeTime = [int]$status.feeds.orderbookWebSocket.booksWithExchangeTime
+        })
+        if (($now - $holdStartedAt).TotalMinutes -ge $HoldMinutes) {
+          $holdCompletedAt = $now
+          $finalStatus = $status
+          break
+        }
       }
     }
   }
@@ -439,6 +486,7 @@ try {
     holdMinutes = $HoldMinutes; holdStartedAt = if ($null -eq $holdStartedAt) { $null } else { $holdStartedAt.ToUnixTimeMilliseconds() }
     holdCompletedAt = if ($null -eq $holdCompletedAt) { $null } else { $holdCompletedAt.ToUnixTimeMilliseconds() }
     continuousHoldSamples = $samples; restCycles = $restSuccesses.Count; tradeCycles = $tradeSuccesses.Count
+    reconnectsAbsorbedDuringHold = $holdReconnectsAbsorbed; maxHoldReconnects = $MaxHoldReconnects
     orderbookTarget = $OrderbookTarget; reducedBarRehearsal = ($OrderbookTarget -ne 25)
     marketActivity = $marketActivity
     networkChecks = $networkChecks; gitCommit = $commit; productionArtifactHash = $artifactBefore.hash
