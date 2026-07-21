@@ -91,13 +91,49 @@ describe('RendererMemoryMonitor', () => {
     expect(result.blocked).toBe(false);
   });
 
-  it('blocks a thirty-minute projected slope above two percent of baseline per hour', () => {
+  it('blocks a projected slope above two percent only after it persists across consecutive samples', () => {
     const monitor = new RendererMemoryMonitor(0, 1);
+    // Dense linear leak at ~2.2%/hr of the 100MB baseline, so every complete
+    // 30-minute window reads an over-limit slope and the breach persists.
+    let last = monitor.add({ at: 0, workingSetKb: 100 * MB, painted: true });
+    for (let minute = 1; minute <= 32; minute += 1) {
+      last = monitor.add({ at: minute * 60_000, workingSetKb: (100 + (minute / 60) * 2.2) * MB, painted: true });
+      if (minute === 30) {
+        // First complete-window breach: recorded but NOT yet blocking. A lone
+        // phase-aligned slope reading must not invalidate a bounded, sawtoothing
+        // renderer (the b4e6e43 false positive).
+        expect(last.slopePerHour).toBeGreaterThan(0.02);
+        expect(last.status).toBe('stable');
+        expect(last.blocked).toBe(false);
+      }
+      if (minute === 31) {
+        // Second consecutive breach, still tolerated.
+        expect(last.status).toBe('stable');
+        expect(last.blocked).toBe(false);
+      }
+    }
+    // Third consecutive over-limit window: a sustained trend, so it blocks.
+    expect(last.blocked).toBe(true);
+    expect(last.slopePerHour).toBeGreaterThan(0.02);
+    expect(last.detail).toContain('consecutive');
+  });
+
+  it('resets the breach counter when the trailing-window slope falls back under the limit', () => {
+    const monitor = new RendererMemoryMonitor(0, 1);
+    // Two consecutive over-limit windows (the rise stays in view via the retained
+    // predecessor), tolerated because they never reach three...
     monitor.add({ at: 0, workingSetKb: 100 * MB, painted: true });
-    const result = monitor.add({ at: 30 * 60_000, workingSetKb: 101.1 * MB, painted: true });
-    expect(result.blocked).toBe(true);
-    expect(result.slopePerHour).toBeGreaterThan(0.02);
-    expect(result.detail).toContain('projected slope');
+    const breach1 = monitor.add({ at: 30 * 60_000, workingSetKb: 101.1 * MB, painted: true });
+    const breach2 = monitor.add({ at: 31 * 60_000, workingSetKb: 101.2 * MB, painted: true });
+    expect(breach1.slopePerHour).toBeGreaterThan(0.02);
+    expect(breach1.blocked).toBe(false);
+    expect(breach2.blocked).toBe(false);
+    // ...then a later window sits entirely on the settled, flat plateau, so its
+    // slope is ~0: the counter resets and the renderer stays stable.
+    const settled = monitor.add({ at: 100 * 60_000, workingSetKb: 101.2 * MB, painted: true });
+    expect(settled.slopePerHour).toBeLessThanOrEqual(0.02);
+    expect(settled.status).toBe('stable');
+    expect(settled.blocked).toBe(false);
   });
 
   it('excludes warm-up allocation and waits for a full thirty-minute slope window', () => {

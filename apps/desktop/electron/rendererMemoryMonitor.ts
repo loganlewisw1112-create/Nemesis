@@ -15,6 +15,7 @@ export interface RendererMemoryPolicy {
   trendGrowthLimit: number;
   slopeWindowMs: number;
   slopeLimitPerHour: number;
+  consecutiveSlopeSamples: number;
   baselineMultiplierLimit: number;
   heartbeatMaxAgeMs: number;
   unresponsiveMaxMs: number;
@@ -45,6 +46,7 @@ export const DEFAULT_RENDERER_MEMORY_POLICY: Readonly<RendererMemoryPolicy> = Ob
   trendGrowthLimit: 0.10,
   slopeWindowMs: 30 * 60_000,
   slopeLimitPerHour: 0.02,
+  consecutiveSlopeSamples: 3,
   baselineMultiplierLimit: 1.5,
   heartbeatMaxAgeMs: 15_000,
   unresponsiveMaxMs: 10_000,
@@ -124,6 +126,7 @@ export class RendererMemoryMonitor {
   private stickyReasons = new Set<string>();
   private latestSlopePerHour = 0;
   private latestSlopeWindowMs = 0;
+  private consecutiveSlopeBreaches = 0;
 
   constructor(
     private readonly warmupMs = 5 * 60_000,
@@ -221,9 +224,28 @@ export class RendererMemoryMonitor {
       this.latestSlopeWindowMs = slopeSpan;
       if (slopeSpan >= this.policy.slopeWindowMs) {
         slopePerHour = normalizedSlopePerHour(slopeWindow, this.baselineKb);
+        // A single 30-minute least-squares slope reading is still phase-sensitive
+        // when the renderer's allocate/collect sawtooth period is comparable to the
+        // window: a window that happens to end on an allocation peak reports a
+        // positive slope over otherwise-flat, bounded memory. This is the same
+        // failure that b4e6e43 de-fanged for the sibling ten-minute rolling-growth
+        // gate -- one phase-aligned sample permanently invalidated a soak with no
+        // net growth. A genuine leak holds the slope above the limit sample after
+        // sample; a phase artifact does not. So only fail once the breach persists
+        // across consecutiveSlopeSamples readings -- the same shape as the 384MB
+        // consecutive-warning gate. A fast leak is still caught on a single sample
+        // by the 150%-of-baseline, 384MB, and 512MB bounds above, which are
+        // phase-independent and remain instantaneous.
         if (slopePerHour > this.policy.slopeLimitPerHour) {
-          reasons.push(`renderer projected slope ${(slopePerHour * 100).toFixed(2)}% of baseline per hour exceeds 2%`);
+          this.consecutiveSlopeBreaches += 1;
+          if (this.consecutiveSlopeBreaches >= this.policy.consecutiveSlopeSamples) {
+            reasons.push(`renderer projected slope ${(slopePerHour * 100).toFixed(2)}% of baseline per hour exceeds 2% for ${this.policy.consecutiveSlopeSamples} consecutive samples`);
+          }
+        } else {
+          this.consecutiveSlopeBreaches = 0;
         }
+      } else {
+        this.consecutiveSlopeBreaches = 0;
       }
     }
     this.latestSlopePerHour = slopePerHour;
