@@ -2,11 +2,32 @@
 
 [![NEMESIS CI](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml/badge.svg)](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml)
 
-Current as of July 4, 2026.
+Current as of July 20, 2026.
 
 NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha (GEA) intelligence app. It is built for event-market thesis discovery, fillability-aware ticket ranking, paper execution, profit-retention research, fail-closed bridge recommendations, and staged live-trading readiness.
 
 The default posture is intentionally conservative: demo mode on, dry-run on, live trading locked, auto-live disabled, and ProfitOS auto-close limited to paper positions.
+
+## R10 Readiness Status (2026-07-20)
+
+Progress toward the R10 gate (readiness hold → full-25 production soak → gap-closure report) that
+qualifies NEMESIS for paper and small live trading:
+
+- **Renderer soak-stall bug: fixed and proven.** The append-only campaign ledger was `structuredClone`d
+  twice on the per-orderbook-delta hot path, starving the event loop until the renderer heartbeat
+  watchdog invalidated the run. Fixed on the hot path; a full 30-minute full-bar soak now survives with
+  the renderer flat (~133 MB, `recoveryCount 0`, zero invalidations).
+- **Orderbook coverage decay: fixed.** The 20-second re-verification loop burst all tracked markets at
+  once and drew Kalshi 429s, lapsing markets past the 90 s provenance TTL until the tracked set decayed
+  below 25. Re-verification is now rate-paced (`pacedDispatch`) and the book-fetch rate-limit backoff is
+  bounded below the TTL.
+- **Readiness continuous-hold reconnect tolerance: added.** A single self-healed transport reconnect
+  (bounded, must re-qualify within a grace window; a second episode or a non-recovery still hard-fails)
+  no longer breaks the hold. This is orderbook-transport accounting, not a relaxation of the heartbeat
+  watchdog.
+
+A full 30-minute soak completes cleanly with zero stalls, invalidations, or reconnect faults. The
+remaining step is a passing soak at the full 25-market bar; validation continues.
 
 ## Screenshots
 
