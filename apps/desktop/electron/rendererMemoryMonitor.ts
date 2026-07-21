@@ -16,6 +16,7 @@ export interface RendererMemoryPolicy {
   slopeWindowMs: number;
   slopeLimitPerHour: number;
   consecutiveSlopeSamples: number;
+  slopeMinNetGrowthFraction: number;
   baselineMultiplierLimit: number;
   heartbeatMaxAgeMs: number;
   unresponsiveMaxMs: number;
@@ -47,6 +48,7 @@ export const DEFAULT_RENDERER_MEMORY_POLICY: Readonly<RendererMemoryPolicy> = Ob
   slopeWindowMs: 30 * 60_000,
   slopeLimitPerHour: 0.02,
   consecutiveSlopeSamples: 3,
+  slopeMinNetGrowthFraction: 0.03,
   baselineMultiplierLimit: 1.5,
   heartbeatMaxAgeMs: 15_000,
   unresponsiveMaxMs: 10_000,
@@ -236,10 +238,26 @@ export class RendererMemoryMonitor {
         // consecutive-warning gate. A fast leak is still caught on a single sample
         // by the 150%-of-baseline, 384MB, and 512MB bounds above, which are
         // phase-independent and remain instantaneous.
-        if (slopePerHour > this.policy.slopeLimitPerHour) {
+        // The 2%/hr slope limit alone (~1.3MB over the 30-minute window) sits below
+        // the renderer's GC noise floor at a full market load, where the working set
+        // sawtooths across a ~13MB band and settles a couple MB above its warming-
+        // phase baseline. A flat-but-noisy renderer therefore annualizes to a
+        // spurious 3-5%/hr slope. Require a MEANINGFUL ABSOLUTE net rise alongside
+        // the slope before failing: compare the median of the window's first half
+        // against its second half (medians ignore the per-sample spikes), and only
+        // count a breach when that net growth clears slopeMinNetGrowthFraction of
+        // baseline. A genuine leak lifts the second-half median well above the first
+        // and trips both conditions; bounded oscillation has near-equal halves and
+        // trips neither. Fast leaks remain caught on a single sample by the phase-
+        // independent 150%/384/512MB bounds above.
+        const half = Math.floor(slopeWindow.length / 2);
+        const firstMedian = median(slopeWindow.slice(0, half).map((item) => item.workingSetKb));
+        const secondMedian = median(slopeWindow.slice(half).map((item) => item.workingSetKb));
+        const netGrowthFraction = (secondMedian - firstMedian) / this.baselineKb;
+        if (slopePerHour > this.policy.slopeLimitPerHour && netGrowthFraction > this.policy.slopeMinNetGrowthFraction) {
           this.consecutiveSlopeBreaches += 1;
           if (this.consecutiveSlopeBreaches >= this.policy.consecutiveSlopeSamples) {
-            reasons.push(`renderer projected slope ${(slopePerHour * 100).toFixed(2)}% of baseline per hour exceeds 2% for ${this.policy.consecutiveSlopeSamples} consecutive samples`);
+            reasons.push(`renderer projected slope ${(slopePerHour * 100).toFixed(2)}% of baseline per hour with ${(netGrowthFraction * 100).toFixed(2)}% net growth exceeds limits for ${this.policy.consecutiveSlopeSamples} consecutive samples`);
           }
         } else {
           this.consecutiveSlopeBreaches = 0;
