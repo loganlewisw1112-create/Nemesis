@@ -224,6 +224,23 @@ const ORDERBOOK_TRACKING_LIMIT = (() => {
 })();
 const ORDERBOOK_ROTATION_INTERVAL_MS = 5 * 60_000;
 const ORDERBOOK_ROTATION_BATCH_SIZE = 4;
+// A flow-driven candidate's ticker frequently is not yet one of the <=25
+// tickers the orderbook WebSocket actively tracks -- that set only rotates a
+// few tickers in every five minutes, far slower than new candidates appear.
+// Falling back to a REST orderbook snapshot for an untracked ticker can never
+// satisfy entry confirmation's exchange-origin book check: Kalshi's REST
+// snapshot carries no match-engine sequence number, only the WS delta stream
+// does (see parseOrderbook in packages/core/src/kalshi/client.ts), so
+// sourceTimestamp/sequence come back undefined and the candidate is rejected
+// before profit or persistence are ever evaluated -- regardless of the hour
+// or feed health. Give a candidate whose ticker just cleared economics a
+// short window to receive its first sequenced WS snapshot before resorting
+// to that unverifiable REST fallback.
+const PRIORITY_ORDERBOOK_WAIT_MS = 3_000;
+const PRIORITY_ORDERBOOK_POLL_MS = 200;
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // Production-provenance re-verification cadence and pacing. Every cycle refreshes
 // the (<=25) tracked orderbook markets. Firing all of them at once (the previous
@@ -298,10 +315,36 @@ const tickHistory = new Map<string, PriceTick[]>();
 const autoCloseStates = new Map<string, AutoCloseState>();
 const latestExitSignals = new Map<string, AutoCloseExitSignal>();
 const worstUnrealizedLossByPosition = new Map<string, number>();
+/**
+ * Resolves a book for entry confirmation, preferring a WS-tracked, exchange-
+ * sequenced snapshot over an unverifiable REST fallback. If the ticker is not
+ * yet in the (<=25-slot) live tracking set, add it immediately -- bounded by
+ * the same cap the periodic rotation respects -- and give it a short window
+ * to receive its first sequenced snapshot before resorting to REST. Keeps
+ * `orderbookTrackedTickers` (the module's view of tracked membership) in sync
+ * so the next periodic `refreshOrderbookTracking()` does not immediately undo
+ * this by recomputing membership without the newly-added ticker.
+ */
+async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<KalshiOrderbook> {
+  let streamed = kalshiOrderbookStream.getBook(ticker);
+  if (
+    !streamed
+    && !orderbookTrackedTickers.includes(ticker)
+    && orderbookTrackedTickers.length < ORDERBOOK_TRACKING_LIMIT
+  ) {
+    orderbookTrackedTickers = [...orderbookTrackedTickers, ticker];
+    kalshiOrderbookStream.track([ticker]);
+    const deadline = Date.now() + PRIORITY_ORDERBOOK_WAIT_MS;
+    while (!streamed && Date.now() < deadline) {
+      await delay(PRIORITY_ORDERBOOK_POLL_MS);
+      streamed = kalshiOrderbookStream.getBook(ticker);
+    }
+  }
+  return streamed ?? fetchOrderbook(ticker);
+}
 const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
   async (ticker) => {
-    const streamed = kalshiOrderbookStream.getBook(ticker);
-    const raw = streamed ?? await fetchOrderbook(ticker);
+    const raw = await fetchOrderbookWithPriorityTracking(ticker);
     const feePolicy = await kalshiFeePolicyResolver.resolve(ticker);
     const book = sanitizeExecutableBook({ ...raw, feePolicy });
     const hasAnyExecutableSurface =

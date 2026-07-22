@@ -111,7 +111,7 @@ describe('Windows package staging scripts', () => {
     expect(script).toContain('geaSampleCoverage -lt 0.99');
     expect(script).toContain('NEMESIS_RUNTIME_STATUS_PATH');
     expect(script).toContain('runtimeStatusCoverage -lt 0.99');
-    expect(script).toContain('feedReadinessCoverage -lt 0.995');
+    expect(script).toContain('feedReadinessCoverage -lt $feedCoverageFloor');
     expect(script).toContain('bridgeReadinessCoverage -lt 0.995');
     expect(script).toContain("peerRole -eq 'gea'");
     expect(script).toContain('warmupMinutes = $WarmupMinutes');
