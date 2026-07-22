@@ -327,13 +327,27 @@ const worstUnrealizedLossByPosition = new Map<string, number>();
  */
 async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<KalshiOrderbook> {
   let streamed = kalshiOrderbookStream.getBook(ticker);
-  if (
-    !streamed
-    && !orderbookTrackedTickers.includes(ticker)
-    && orderbookTrackedTickers.length < ORDERBOOK_TRACKING_LIMIT
-  ) {
-    orderbookTrackedTickers = [...orderbookTrackedTickers, ticker];
-    kalshiOrderbookStream.track([ticker]);
+  if (!streamed && !orderbookTrackedTickers.includes(ticker)) {
+    if (orderbookTrackedTickers.length < ORDERBOOK_TRACKING_LIMIT) {
+      orderbookTrackedTickers = [...orderbookTrackedTickers, ticker];
+    } else if (orderbookTrackedTickers.length > 0) {
+      // desiredOrderbookTickers() builds this list in priority order --
+      // campaign-critical tickers, then entry-eligible candidates ranked by
+      // edge, then discovery signal markets, then most-active "fill" markets
+      // added only to keep idle slots busy -- so the tracking set is full
+      // (25/25) in the overwhelmingly common case and the branch above almost
+      // never runs. The tail of the list is always the lowest-priority
+      // occupant. Evict exactly that one slot to make room for a candidate
+      // that has already cleared economics and is attempting a real entry
+      // right now; bounded to one eviction per untracked candidate, and
+      // `entryQualification.maxPendingCandidates` caps how many can be in
+      // flight at once. A pending candidate whose ticker happens to occupy
+      // the evicted slot loses its in-progress confirmation samples and
+      // restarts them -- an accepted, bounded cost against the alternative of
+      // never reaching a confirmed entry at all.
+      orderbookTrackedTickers = [...orderbookTrackedTickers.slice(0, -1), ticker];
+    }
+    kalshiOrderbookStream.replaceTracked(orderbookTrackedTickers);
     const deadline = Date.now() + PRIORITY_ORDERBOOK_WAIT_MS;
     while (!streamed && Date.now() < deadline) {
       await delay(PRIORITY_ORDERBOOK_POLL_MS);
