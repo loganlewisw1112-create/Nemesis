@@ -4,6 +4,27 @@ export const KALSHI_FEE_SCHEDULE_VERSION = '2026-07-07';
 export const KALSHI_TAKER_RATE = 0.07;
 export const KALSHI_MAKER_RATE = 0.0175;
 
+/**
+ * Fee types whose TAKER fee is the standard quadratic
+ * `multiplier * KALSHI_TAKER_RATE * contracts * P * (1 - P)`.
+ *
+ * `quadratic_with_maker_fees` differs from `quadratic` only in that makers are
+ * charged too (at KALSHI_MAKER_RATE, a quarter of the taker rate) rather than
+ * trading free; the taker formula is byte-for-byte identical. NEMESIS enters as
+ * a taker, so both compute the same fee. This stays an explicit allowlist
+ * rather than a prefix match -- an unrecognized fee type must keep falling
+ * through to UNKNOWN_KALSHI_FEE_POLICY, because guessing a fee schedule
+ * misprices every downstream profitability decision.
+ */
+const QUADRATIC_TAKER_FEE_TYPES: ReadonlySet<string> = new Set([
+  'quadratic',
+  'quadratic_with_maker_fees',
+]);
+
+export function isQuadraticTakerFeeType(feeType: string | undefined | null): boolean {
+  return feeType != null && QUADRATIC_TAKER_FEE_TYPES.has(feeType);
+}
+
 export const UNKNOWN_KALSHI_FEE_POLICY: KalshiFeePolicy = {
   known: false,
   role: 'taker',

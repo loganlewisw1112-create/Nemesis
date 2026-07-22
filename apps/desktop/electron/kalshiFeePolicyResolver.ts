@@ -1,6 +1,7 @@
 import {
   UNKNOWN_KALSHI_FEE_POLICY,
   buildKalshiFeePolicy,
+  isQuadraticTakerFeeType,
   fetchEvent,
   fetchMarket,
   fetchSeries,
@@ -53,7 +54,7 @@ export class KalshiFeePolicyResolver {
       const multiplier = Number.isFinite(waiverEndsAt) && waiverEndsAt > now
         ? 0
         : market.fee_multiplier_override ?? market.fee_multiplier ?? series.fee_multiplier;
-      if (feeType !== 'quadratic' || !Number.isFinite(multiplier)) {
+      if (!isQuadraticTakerFeeType(feeType) || !Number.isFinite(multiplier)) {
         return this.remember(ticker, {
           ...UNKNOWN_KALSHI_FEE_POLICY,
           seriesTicker,
