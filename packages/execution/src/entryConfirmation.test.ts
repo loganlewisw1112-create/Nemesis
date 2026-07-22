@@ -122,6 +122,31 @@ describe('EntryConfirmationEngine', () => {
     }).reason).toMatch(/entry book is stale/i);
   });
 
+  it('enforces the absolute bars at admission and at confirmation, not on every sample', () => {
+    // A candidate admitted on qualifying economics keeps accumulating even when
+    // an intermediate observation dips below the absolute bar, so long as the
+    // edge itself holds -- that is what edgeRetention is for.
+    const engine = new EntryConfirmationEngine({
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      minExpectedNetPnlUsd: 2.2,
+    });
+    expect(observe(engine, 0).status).toBe('pending');
+    const dip = observe(engine, 1, { impliedPrice: 0.54 });
+    expect(dip.status).toBe('pending');
+    expect(dip.reason).toMatch(/collecting persistent/i);
+
+    // But an entry is never taken on economics that fail at the confirming
+    // observation, however good the admitting sample was.
+    const strict = new EntryConfirmationEngine({
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      minSamples: 2,
+      minWindowMs: 6_000,
+      minExpectedNetPnlUsd: 2.2,
+    });
+    expect(observe(strict, 0).status).toBe('pending');
+    expect(observe(strict, 1, { impliedPrice: 0.5 }).reason).toMatch(/target net reward is below the minimum/i);
+  });
+
   it('reports tickers with evidence in flight so their books stay tracked', () => {
     const engine = new EntryConfirmationEngine();
     expect(engine.inFlightTickers()).toEqual([]);

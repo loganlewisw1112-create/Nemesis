@@ -75,6 +75,17 @@ function round(value: number, digits = 6): number {
  */
 export const MAX_PROVEN_QUIET_BOOK_AGE_MS = 10_000;
 
+/** The absolute entry-quality bars, evaluated together. Null when all pass. */
+function absoluteBarFailure(
+  metrics: EntryEconomicsEvidence,
+  config: EntryQualificationSettings,
+): string | null {
+  if (metrics.targetRewardUsd < config.minExpectedNetPnlUsd) return 'target net reward is below the minimum';
+  if (metrics.rewardRiskRatio < config.minRewardRiskRatio) return 'target reward-to-risk ratio is below the minimum';
+  if (metrics.stressedNetPnlUsd < config.minStressedNetPnlUsd) return 'one-cent stressed expected result is not profitable';
+  return null;
+}
+
 export class EntryConfirmationEngine {
   private readonly states = new Map<string, ConfirmationState>();
   private readonly usedSources = new Set<string>();
@@ -207,9 +218,20 @@ export class EntryConfirmationEngine {
       input.lastTickerExecutionAt != null
       && now - input.lastTickerExecutionAt < config.tickerCooldownMs
     ) return reject('ticker-side cooldown is active');
-    if (metrics.targetRewardUsd < config.minExpectedNetPnlUsd) return reject('target net reward is below the minimum');
-    if (metrics.rewardRiskRatio < config.minRewardRiskRatio) return reject('target reward-to-risk ratio is below the minimum');
-    if (metrics.stressedNetPnlUsd < config.minStressedNetPnlUsd) return reject('one-cent stressed expected result is not profitable');
+    // The absolute economic bars gate ENTRY; edgeRetention and spread-widening
+    // gate PERSISTENCE. Re-testing the absolute bars on every sample conflated
+    // the two and compounded them: a bar that 16% of observations clear becomes
+    // a ~0.07% bar when it must clear four times in a row. Measured over 155
+    // candidates, exactly one ever accumulated a sample. They are therefore
+    // enforced at admission (below) and again at the confirming observation
+    // (further down) -- the moment the entry is actually taken -- but not on the
+    // intermediate samples, whose job is only to prove the edge held.
+    const priorState = this.states.get(candidateId);
+    const admitting = !priorState || priorState.samples.length === 0;
+    if (admitting) {
+      const barFailure = absoluteBarFailure(metrics, config);
+      if (barFailure) return reject(barFailure);
+    }
 
     let state = this.states.get(candidateId);
     if (!state) {
@@ -259,6 +281,12 @@ export class EntryConfirmationEngine {
     if (state.samples.length < config.minSamples || windowMs < config.minWindowMs) {
       return { status: 'pending', reason: 'collecting persistent executable entry evidence', ...current };
     }
+
+    // The confirming observation is the entry itself, so the full economic bars
+    // apply here in their own right -- an entry is never taken on economics that
+    // do not currently clear them, however good the admitting sample looked.
+    const confirmingBarFailure = absoluteBarFailure(metrics, config);
+    if (confirmingBarFailure) return reject(confirmingBarFailure);
 
     const certificate: ProfitCertificate = {
       ...input.baseCertificate,
