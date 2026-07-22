@@ -325,9 +325,87 @@ const worstUnrealizedLossByPosition = new Map<string, number>();
  * so the next periodic `refreshOrderbookTracking()` does not immediately undo
  * this by recomputing membership without the newly-added ticker.
  */
+/**
+ * Off unless NEMESIS_PRIORITY_TRACK_TRACE_PATH is set. Priority tracking either
+ * works or silently doesn't, and the difference is invisible after the fact: a
+ * candidate that never gets a book looks identical whether its subscription was
+ * still warming up or the stream's own provenance store refused to admit the
+ * ticker in the first place. Records both, per attempt.
+ */
+function tracePriorityTracking(fields: Record<string, string | number | boolean>): void {
+  const tracePath = process.env.NEMESIS_PRIORITY_TRACK_TRACE_PATH;
+  if (!tracePath) return;
+  try {
+    fs.appendFileSync(tracePath, `${JSON.stringify({ at: Date.now(), ...fields })}\n`);
+  } catch {
+    // Diagnostics must never disturb the runtime.
+  }
+}
+
+/**
+ * `track`/`replaceTracked` admit a ticker only if the stream's own provenance
+ * store vouches for it, and that store is fed solely by the periodic universe
+ * sweep -- so a flow-driven candidate that discovery has not covered (or whose
+ * 90s provenance has lapsed) is refused outright. Measured: every untracked
+ * candidate sampled arrived with no record in either store, so priority
+ * tracking silently did nothing.
+ *
+ * Hydrates the one ticker from the single-market production endpoint and files
+ * the result through `recordProductionUniverse`, which is what populates both
+ * the stream's store and `productionMarketRecords`. Same verification the GEA
+ * recommendation path already performs: production environment, HTTP 200, and
+ * the source base URL the transport actually returned -- provenance is still
+ * earned from a real production response, never assumed.
+ */
+async function ensureProductionProvenance(ticker: string): Promise<boolean> {
+  if (kalshiOrderbookStream.hasProductionProvenance(ticker)) return true;
+  let responseMetadata: KalshiResponseMetadata | null = null;
+  try {
+    const hydrated = await fetchMarket(ticker, {
+      environment: 'production',
+      onResponseMetadata: (metadata) => { responseMetadata = metadata as KalshiResponseMetadata; },
+    });
+    const verified = responseMetadata as KalshiResponseMetadata | null;
+    if (!verified || verified.environment !== 'production' || verified.status !== 200) return false;
+    recordProductionUniverse([{
+      market: hydrated,
+      sourceBaseUrl: verified.sourceBaseUrl,
+      verifiedAt: verified.verifiedAt,
+    }]);
+    return kalshiOrderbookStream.hasProductionProvenance(ticker);
+  } catch {
+    // A candidate we cannot verify simply stays untracked; the REST fallback
+    // below still applies and the exchange-origin check still rejects it.
+    return false;
+  }
+}
+
 async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<KalshiOrderbook> {
   let streamed = kalshiOrderbookStream.getBook(ticker);
   if (!streamed && !orderbookTrackedTickers.includes(ticker)) {
+    const startedAt = Date.now();
+    const hadMainRecord = productionMarketRecord(ticker) != null;
+    const hadStreamProvenance = kalshiOrderbookStream.hasProductionProvenance(ticker);
+    const atCapacity = orderbookTrackedTickers.length >= ORDERBOOK_TRACKING_LIMIT;
+    // Establish provenance BEFORE touching membership. Evicting a slot for a
+    // ticker the stream will then refuse is strictly destructive: the evicted
+    // occupant loses its book (`replaceTracked` deletes books for removed
+    // tickers) and the candidate gains nothing.
+    const provenanceReady = hadStreamProvenance || await ensureProductionProvenance(ticker);
+    if (!provenanceReady) {
+      tracePriorityTracking({
+        ticker,
+        hadMainRecord,
+        hadStreamProvenance,
+        atCapacity,
+        admitted: false,
+        resolved: false,
+        waitedMs: Date.now() - startedAt,
+        trackedCount: orderbookTrackedTickers.length,
+        outcome: 'provenance-unavailable',
+      });
+      return fetchOrderbook(ticker);
+    }
     if (orderbookTrackedTickers.length < ORDERBOOK_TRACKING_LIMIT) {
       orderbookTrackedTickers = [...orderbookTrackedTickers, ticker];
     } else if (orderbookTrackedTickers.length > 0) {
@@ -348,11 +426,23 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
       orderbookTrackedTickers = [...orderbookTrackedTickers.slice(0, -1), ticker];
     }
     kalshiOrderbookStream.replaceTracked(orderbookTrackedTickers);
+    const admitted = kalshiOrderbookStream.isTracked(ticker);
     const deadline = Date.now() + PRIORITY_ORDERBOOK_WAIT_MS;
     while (!streamed && Date.now() < deadline) {
       await delay(PRIORITY_ORDERBOOK_POLL_MS);
       streamed = kalshiOrderbookStream.getBook(ticker);
     }
+    tracePriorityTracking({
+      ticker,
+      hadMainRecord,
+      hadStreamProvenance,
+      atCapacity,
+      admitted,
+      resolved: streamed != null,
+      waitedMs: Date.now() - startedAt,
+      trackedCount: orderbookTrackedTickers.length,
+      outcome: streamed != null ? 'sequenced-book' : admitted ? 'admitted-no-book' : 'refused',
+    });
   }
   return streamed ?? fetchOrderbook(ticker);
 }

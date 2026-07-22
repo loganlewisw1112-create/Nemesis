@@ -285,6 +285,20 @@ export class KalshiOrderbookStream {
     this.subscribeMissing();
   }
 
+  /**
+   * Whether this stream's own provenance store currently vouches for the ticker.
+   * `track`/`replaceTracked` silently drop anything this rejects, so a caller
+   * that adds a ticker and never sees a book needs to distinguish "subscription
+   * is still warming up" from "the ticker was never admitted at all".
+   */
+  hasProductionProvenance(ticker: string, now = Date.now()): boolean {
+    return this.marketProvenance.has(ticker, now);
+  }
+
+  isTracked(ticker: string): boolean {
+    return this.tickers.has(ticker);
+  }
+
   onBookUpdate(listener: BookUpdateListener): () => void {
     this.bookUpdateListeners.add(listener);
     return () => this.bookUpdateListeners.delete(listener);
