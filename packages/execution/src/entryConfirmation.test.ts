@@ -100,6 +100,18 @@ describe('EntryConfirmationEngine', () => {
     expect(missingPolicy.reason).toMatch(/fee policy is unknown/i);
   });
 
+  it('reports tickers with evidence in flight so their books stay tracked', () => {
+    const engine = new EntryConfirmationEngine();
+    expect(engine.inFlightTickers()).toEqual([]);
+
+    expect(observe(engine, 0).status).toBe('pending');
+    expect(engine.inFlightTickers()).toEqual([card().ticker]);
+
+    // Once the source is consumed the candidate no longer needs its book pinned.
+    engine.markSourceUsed(card().id);
+    expect(engine.inFlightTickers()).toEqual([]);
+  });
+
   it('requires six executable samples over at least 30 seconds before confirming', () => {
     const engine = new EntryConfirmationEngine();
     for (let index = 0; index < 5; index += 1) {

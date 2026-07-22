@@ -4410,6 +4410,21 @@ function isProductionLiveTicker(ticker: string | undefined, market?: KalshiMarke
   return status === 'active' || status === 'open';
 }
 
+/**
+ * Tickers whose confirmation evidence is mid-flight, across both engines.
+ * These must outrank ordinary entry-eligible cards: a candidate stops being
+ * `isEntryEligible` the moment its edge dips below the screen, which would drop
+ * it from the desired set, evict it from tracking, and delete the very book its
+ * remaining samples depend on -- discarding partial evidence that cannot be
+ * rebuilt without starting the whole window over.
+ */
+function confirmationInFlightTickers(): string[] {
+  return [...new Set([
+    ...entryConfirmationEngine.inFlightTickers(),
+    ...campaignEntryConfirmationEngine.inFlightTickers(),
+  ])];
+}
+
 function desiredOrderbookTickers(now = Date.now()): string[] {
   const marketByTicker = new Map<string, KalshiMarket>();
   for (const [ticker, record] of productionMarketRecords) {
@@ -4424,6 +4439,10 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
     seen.add(ticker);
     ordered.push(ticker);
   };
+  // Immediately after campaign-critical, and ahead of edge-ranked cards: a
+  // candidate already collecting samples has a partially-built proof that dies
+  // with its book. The production/live check still applies via add().
+  for (const ticker of confirmationInFlightTickers()) add(ticker);
   const ranked = [...theses].sort((left, right) => {
     const edge = finiteCampaignNumber(right.netEdge, 0) - finiteCampaignNumber(left.netEdge, 0);
     if (edge !== 0) return edge;
@@ -4519,7 +4538,14 @@ function refreshOrderbookTracking(now = Date.now()): void {
     return;
   }
   const desiredSet = new Set(desired);
-  const critical = campaignCriticalOrderbookTickers(now).filter((ticker) => desiredSet.has(ticker));
+  // In-flight confirmation tickers join campaign-critical as rotation-exempt:
+  // selectBoundedOrderbookTracking excludes `critical` from the replaceable set,
+  // so a five-minute rotation can no longer land mid-window and destroy a
+  // candidate's accumulated samples.
+  const critical = [
+    ...campaignCriticalOrderbookTickers(now),
+    ...confirmationInFlightTickers(),
+  ].filter((ticker) => desiredSet.has(ticker));
   const selection = selectBoundedOrderbookTracking({
     critical,
     desired,

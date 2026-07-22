@@ -75,6 +75,21 @@ export class EntryConfirmationEngine {
     return this.usedSources.has(sourceSignalId);
   }
 
+  /**
+   * Tickers with confirmation evidence already accumulating. Each additional
+   * sample requires a *new* book sequence spaced minWindowMs/(minSamples-1)
+   * apart, so a candidate needs its book to keep streaming for the whole
+   * window; if the ticker leaves the orderbook tracking set mid-flight the
+   * stream deletes its book and the partial evidence can never complete.
+   */
+  inFlightTickers(): string[] {
+    const tickers = new Set<string>();
+    for (const state of this.states.values()) {
+      if (state.samples.length > 0) tickers.add(state.ticker);
+    }
+    return [...tickers];
+  }
+
   reset(sourceSignalId?: string): void {
     if (sourceSignalId) this.states.delete(sourceSignalId);
     else this.states.clear();
