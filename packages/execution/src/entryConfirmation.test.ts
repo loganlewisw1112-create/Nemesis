@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildKalshiFeePolicy, DEFAULT_ENTRY_QUALIFICATION, type ProfitCertificate, type ThesisCard } from '@nemesis/core';
 import type { DryRunOrder } from './dryRun.js';
-import { EntryConfirmationEngine } from './entryConfirmation.js';
+import { EntryConfirmationEngine, MAX_PROVEN_QUIET_BOOK_AGE_MS } from './entryConfirmation.js';
 
 const startedAt = Date.UTC(2026, 6, 14, 12, 0, 0);
 const feePolicy = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'direct' });
@@ -98,6 +98,28 @@ describe('EntryConfirmationEngine', () => {
       bookTimestamp: startedAt, bookSequence: 1, observedAt: startedAt,
     });
     expect(missingPolicy.reason).toMatch(/fee policy is unknown/i);
+  });
+
+  it('accepts a quiet book only when continuity is proven, and never past the ceiling', () => {
+    const stale = { bookTimestamp: startedAt - 5_000, observedAt: startedAt };
+    // Unproven: the strict maxBookAgeMs bound still applies.
+    expect(new EntryConfirmationEngine().observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookSequence: 1, feePolicy, ...stale,
+    }).reason).toMatch(/entry book is stale/i);
+
+    // Proven continuity: an unchanged book from a quiet market is current.
+    expect(new EntryConfirmationEngine().observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookSequence: 1, feePolicy, bookContinuityProven: true, ...stale,
+    }).reason).not.toMatch(/entry book is stale/i);
+
+    // Proof does not extend past the hard ceiling.
+    expect(new EntryConfirmationEngine().observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookSequence: 1, feePolicy, bookContinuityProven: true,
+      bookTimestamp: startedAt - (MAX_PROVEN_QUIET_BOOK_AGE_MS + 1), observedAt: startedAt,
+    }).reason).toMatch(/entry book is stale/i);
   });
 
   it('reports tickers with evidence in flight so their books stay tracked', () => {

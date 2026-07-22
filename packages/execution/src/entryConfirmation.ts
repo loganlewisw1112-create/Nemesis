@@ -17,6 +17,14 @@ export interface EntryConfirmationObservation {
   baseCertificate: ProfitCertificate;
   bookTimestamp: number;
   bookSequence?: number;
+  /**
+   * True only when the orderbook transport can prove it has missed nothing for
+   * this book: connected, authenticated, subscribed, and free of sequence gaps.
+   * Lets an unchanged book from a quiet market count as current up to
+   * MAX_PROVEN_QUIET_BOOK_AGE_MS. Absent or false keeps the strict
+   * maxBookAgeMs bound.
+   */
+  bookContinuityProven?: boolean;
   feePolicy?: KalshiFeePolicy;
   observedAt?: number;
   sourceAlreadyUsed?: boolean;
@@ -59,6 +67,13 @@ function round(value: number, digits = 6): number {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
 }
+
+/**
+ * Ceiling for a book accepted only because the transport proved continuity.
+ * Sized below the 25s dead-connection bound so a book can never be accepted on
+ * the strength of a socket that is itself about to be declared dead.
+ */
+export const MAX_PROVEN_QUIET_BOOK_AGE_MS = 10_000;
 
 export class EntryConfirmationEngine {
   private readonly states = new Map<string, ConfirmationState>();
@@ -162,7 +177,22 @@ export class EntryConfirmationEngine {
     if (!Number.isFinite(input.bookTimestamp) || !Number.isInteger(input.bookSequence)) {
       return reject('confirmation requires an exchange-origin book timestamp and sequence');
     }
-    if (bookAgeMs > config.maxBookAgeMs) return reject('entry book is stale');
+    // A book age past maxBookAgeMs means one of two very different things: our
+    // pipeline is lagging (dangerous -- the market may have moved unseen), or
+    // the market is simply quiet (harmless -- nothing has happened). They are
+    // distinguishable: with the orderbook transport connected, authenticated,
+    // subscribed and free of sequence gaps, we can *prove* no update was missed,
+    // so an unchanged book is current rather than stale. Conflating the two
+    // discarded 17% of observations and broke the sample chain that entry
+    // confirmation depends on. The same conflation has already been corrected at
+    // four other layers of this system (feed composite, runtime health,
+    // preflight, readiness conditions); this is the fifth and last.
+    //
+    // A hard ceiling still applies, because "no gaps" cannot vouch for a book
+    // arbitrarily far in the past.
+    const quietBookProven = input.bookContinuityProven === true
+      && bookAgeMs <= MAX_PROVEN_QUIET_BOOK_AGE_MS;
+    if (bookAgeMs > config.maxBookAgeMs && !quietBookProven) return reject('entry book is stale');
     if (!isKnownKalshiFeePolicy(input.feePolicy)) return reject('account or series fee policy is unknown');
     if (!Number.isFinite(input.fill.netEdge) || input.fill.netEdge <= 0) {
       return reject('executable entry edge is not positive');

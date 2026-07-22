@@ -2749,6 +2749,7 @@ function enrollCampaignCandidate(card: ThesisCard, preview: PaperBuyResult, book
     fill,
     bookTimestamp: book.sourceTimestamp ?? Number.NaN,
     bookSequence: book.sequence,
+    bookContinuityProven: orderbookContinuityProven(card.ticker),
     feePolicy: book.feePolicy,
     observedAt: at,
     sourceAlreadyUsed: campaignEntryConfirmationEngine.hasUsedSource(card.id),
@@ -3065,6 +3066,7 @@ async function executeReservedStrictPaperBuyForCard(
     baseCertificate: preview.profitCertificate,
     bookTimestamp: book.sourceTimestamp ?? Number.NaN,
     bookSequence: book.sequence,
+    bookContinuityProven: orderbookContinuityProven(confirmationCard.ticker),
     feePolicy: book.feePolicy,
     observedAt,
     sourceAlreadyUsed: evidenceOnlyCampaign
@@ -4418,6 +4420,22 @@ function isProductionLiveTicker(ticker: string | undefined, market?: KalshiMarke
  * remaining samples depend on -- discarding partial evidence that cannot be
  * rebuilt without starting the whole window over.
  */
+/**
+ * Whether the orderbook transport can prove it has missed no update for this
+ * ticker, so an unchanged book from a quiet market counts as current. Requires
+ * the stream's own transport qualification (connected + authenticated +
+ * acknowledged + inside the dead-connection window), zero sequence gaps, and a
+ * ticker that is actually tracked and un-quarantined -- getBook returns null
+ * for quarantined tickers, so a gap on this book removes the proof.
+ */
+function orderbookContinuityProven(ticker: string): boolean {
+  const telemetry = kalshiOrderbookStream.telemetry();
+  return telemetry.transportQualificationReady
+    && telemetry.sequenceGaps === 0
+    && kalshiOrderbookStream.isTracked(ticker)
+    && kalshiOrderbookStream.getBook(ticker) != null;
+}
+
 function confirmationInFlightTickers(): string[] {
   return [...new Set([
     ...entryConfirmationEngine.inFlightTickers(),

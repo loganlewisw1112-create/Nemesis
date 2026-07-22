@@ -7,6 +7,7 @@ import {
   type ThesisCard,
 } from '@nemesis/core';
 import type { DryRunOrder } from './dryRun.js';
+import { MAX_PROVEN_QUIET_BOOK_AGE_MS } from './entryConfirmation.js';
 import { calculateEntryEconomics, type EntryEconomicsEvidence } from './tradeEconomics.js';
 
 export type CampaignScreeningReasonCode =
@@ -75,6 +76,8 @@ export interface QualifyCampaignEnrollmentInput {
   fill: DryRunOrder;
   bookTimestamp: number;
   bookSequence?: number;
+  /** See EntryConfirmationObservation.bookContinuityProven. */
+  bookContinuityProven?: boolean;
   feePolicy?: KalshiFeePolicy;
   observedAt?: number;
   sourceAlreadyUsed?: boolean;
@@ -152,7 +155,13 @@ export function qualifyCampaignEnrollment(input: QualifyCampaignEnrollmentInput)
     return screenedOut('missing_exchange_provenance', 'exchange-origin book timestamp and sequence are required');
   }
   const bookAgeMs = completedAt - input.bookTimestamp;
-  if (bookAgeMs < 0 || bookAgeMs > settings.maxBookAgeMs) {
+  // Mirrors the entry-confirmation rule: a quiet book is only accepted past
+  // maxBookAgeMs when the transport proves it missed nothing, and never past
+  // MAX_PROVEN_QUIET_BOOK_AGE_MS. Kept in lockstep so enrollment and
+  // confirmation cannot disagree about whether the same book is usable.
+  const quietBookProven = input.bookContinuityProven === true
+    && bookAgeMs <= MAX_PROVEN_QUIET_BOOK_AGE_MS;
+  if (bookAgeMs < 0 || (bookAgeMs > settings.maxBookAgeMs && !quietBookProven)) {
     return screenedOut('book_stale', 'entry book is stale');
   }
   if (!isKnownKalshiFeePolicy(input.feePolicy) || !input.fill.feePolicyKnown) {
