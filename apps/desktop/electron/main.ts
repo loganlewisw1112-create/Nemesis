@@ -71,7 +71,7 @@ import {
   type GeoMarket,
   type WorldEventsPayload,
 } from '@nemesis/core';
-import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, type ProductionUniverseRecord } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, withinSeriesAllowlist, tickerWithinSeriesAllowlist, type ProductionUniverseRecord } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -4630,6 +4630,10 @@ function refreshOrderbookTracking(now = Date.now()): void {
 }
 
 async function applyBridgeRecommendation(packet: RecommendationPacket) {
+  // GEA recommendations bypass the discovery universe, so honour the series
+  // allowlist here too: a focused run must not have off-series tickers injected
+  // into tracking or candidate flow through the bridge.
+  if (!tickerWithinSeriesAllowlist(packet.ticker)) return;
   let market = productionMarketRecord(packet.ticker)?.market;
   if (!market) {
     let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
@@ -4874,6 +4878,12 @@ const runMarketRefresh = createSingleFlight(refreshMarkets);
 const runUniverseRefresh = createSingleFlight(refreshUniverseLoop);
 
 async function buildThesesFromMarkets(markets: KalshiMarket[]) {
+  // Single choke point for the series allowlist. The discovery universe is
+  // already filtered, but candidates also arrive via the marketsCache fallback,
+  // GEA-merged recommendations, and fixtures -- all of which converge here.
+  // Filtering at this one point keeps every candidate source restricted to the
+  // configured series without threading the predicate through each producer.
+  markets = markets.filter(withinSeriesAllowlist);
   const feedRefresh = feedHub.refreshForMarkets(markets);
   const feedTimedOut = await Promise.race([
     feedRefresh.then(() => false),

@@ -45,10 +45,18 @@ const SERIES_ALLOWLIST: readonly string[] | null = (() => {
   return list.length ? list : null;
 })();
 
-function withinSeriesAllowlist(market: KalshiMarket): boolean {
+/** True when the market passes the series allowlist (or none is configured). */
+export function withinSeriesAllowlist(market: Pick<KalshiMarket, 'ticker'>): boolean {
   if (!SERIES_ALLOWLIST) return true;
   const ticker = market.ticker.toUpperCase();
   return SERIES_ALLOWLIST.some((prefix) => ticker.startsWith(prefix));
+}
+
+/** True when a raw ticker string passes the series allowlist. */
+export function tickerWithinSeriesAllowlist(ticker: string): boolean {
+  if (!SERIES_ALLOWLIST) return true;
+  const upper = ticker.toUpperCase();
+  return SERIES_ALLOWLIST.some((prefix) => upper.startsWith(prefix));
 }
 
 export interface ProductionUniverseRecord {
