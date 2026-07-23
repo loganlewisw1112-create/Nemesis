@@ -242,7 +242,24 @@ export class EntryConfirmationEngine {
       this.states.delete(candidateId);
       return reject('source signal identity changed during confirmation');
     }
-    const minSpacingMs = Math.max(1, Math.ceil(config.minWindowMs / Math.max(1, config.minSamples - 1)));
+    // Anti-burst spacing only: it exists so four reads of the same instant
+    // cannot pass for four samples. The actual persistence guarantees are
+    // enforced independently below -- minSamples AND minWindowMs must both hold
+    // before a candidate confirms -- so this bound does not need to carry the
+    // window itself.
+    //
+    // Tiling it exactly across the window (minWindowMs / (minSamples - 1))
+    // computed to 5000ms against an observation cadence whose measured median
+    // is exactly 5.0s, leaving zero slack: roughly every other observation fell
+    // a few milliseconds short and was silently dropped, while the source
+    // signal expired at maxSourceAgeMs. Across 155 candidates exactly one ever
+    // accumulated a sample, and it stalled at 3 of 4. Halving the requirement
+    // keeps samples meaningfully spread while giving the natural cadence room
+    // to land; the 15s window and the 4-sample count are unchanged.
+    const minSpacingMs = Math.max(
+      1,
+      Math.floor(Math.ceil(config.minWindowMs / Math.max(1, config.minSamples - 1)) / 2),
+    );
     const last = state.samples.at(-1);
     const duplicateSequence = state.samples.some((sample) => sample.bookSequence === input.bookSequence);
     if ((!last || now - last.at >= minSpacingMs) && !duplicateSequence) {

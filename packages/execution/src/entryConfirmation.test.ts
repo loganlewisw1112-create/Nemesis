@@ -122,6 +122,62 @@ describe('EntryConfirmationEngine', () => {
     }).reason).toMatch(/entry book is stale/i);
   });
 
+  it('accumulates samples at an observation cadence near the tiling interval', () => {
+    // Production settings: the old spacing rule tiled exactly across the window
+    // (15000 / 3 = 5000ms) against a poll cadence whose measured median was
+    // exactly 5.0s. An observation arriving a few ms early was dropped, so a
+    // candidate could sit at one sample until its source expired.
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const cadenceMs = 4_990;
+    const step = (index: number) => {
+      const observedAt = startedAt + index * cadenceMs;
+      return engine.observe({
+        card: card({ updatedAt: observedAt }),
+        fill: fill(),
+        baseCertificate: certificate(),
+        bookTimestamp: observedAt,
+        bookSequence: index + 1,
+        feePolicy,
+        observedAt,
+      });
+    };
+
+    expect(step(0).samples).toBe(1);
+    // Under the old bound each of these was silently discarded.
+    expect(step(1).samples).toBe(2);
+    expect(step(2).samples).toBe(3);
+
+    // The window guarantee is untouched: four samples spanning 14_970ms is
+    // still short of minWindowMs, so it stays pending rather than confirming.
+    const fourth = step(3);
+    expect(fourth.samples).toBe(4);
+    expect(fourth.status).toBe('pending');
+    expect(fourth.windowMs).toBeLessThan(15_000);
+
+    const fifth = step(4);
+    expect(fifth.status).toBe('ready');
+    expect(fifth.windowMs).toBeGreaterThanOrEqual(15_000);
+  });
+
+  it('still rejects burst samples taken from the same instant', () => {
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const burst = (index: number) => engine.observe({
+      card: card({ updatedAt: startedAt }),
+      fill: fill(),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      bookSequence: index + 1,
+      feePolicy,
+      observedAt: startedAt + index * 10,
+    });
+    expect(burst(0).samples).toBe(1);
+    // 10ms apart is far below the anti-burst bound, so these do not count.
+    expect(burst(1).samples).toBe(1);
+    expect(burst(2).samples).toBe(1);
+  });
+
   it('enforces the absolute bars at admission and at confirmation, not on every sample', () => {
     // A candidate admitted on qualifying economics keeps accumulating even when
     // an intermediate observation dips below the absolute bar, so long as the
