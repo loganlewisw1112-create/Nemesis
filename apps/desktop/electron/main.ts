@@ -382,8 +382,20 @@ async function ensureProductionProvenance(ticker: string): Promise<boolean> {
 
 async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<KalshiOrderbook> {
   let streamed = kalshiOrderbookStream.getBook(ticker);
-  if (!streamed && !orderbookTrackedTickers.includes(ticker)) {
+  // Trigger on the absence of a usable book, not on membership. A ticker can sit
+  // in orderbookTrackedTickers and still return null from getBook, because
+  // getBook also requires unlapsed provenance in the stream's own store -- and
+  // that store is refreshed only by the periodic universe sweep, on a TTL
+  // shorter than the sweep interval. Gating this remedy on "not currently
+  // tracked" meant the tracked-but-bookless case, which is the common one, fell
+  // straight through to the REST fallback: measured at 56% of all rejections
+  // (15 stale-book plus 9 exchange-origin of 43), both of which are the same
+  // null book wearing two different reasons -- no sequence fails exchange
+  // origin, and no book also forces bookContinuityProven false, which reverts
+  // the freshness bound to its strict form.
+  if (!streamed) {
     const startedAt = Date.now();
+    const alreadyTracked = orderbookTrackedTickers.includes(ticker);
     const hadMainRecord = productionMarketRecord(ticker) != null;
     const hadStreamProvenance = kalshiOrderbookStream.hasProductionProvenance(ticker);
     const atCapacity = orderbookTrackedTickers.length >= ORDERBOOK_TRACKING_LIMIT;
@@ -406,7 +418,13 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
       });
       return fetchOrderbook(ticker);
     }
-    if (orderbookTrackedTickers.length < ORDERBOOK_TRACKING_LIMIT) {
+    if (alreadyTracked) {
+      // Nothing to admit: the ticker is already in the desired set and the
+      // membership must not be disturbed. The book was missing because the
+      // stream's provenance for it had lapsed, which ensureProductionProvenance
+      // has now refreshed -- re-applying membership below readmits it, and the
+      // book it already holds becomes visible again.
+    } else if (orderbookTrackedTickers.length < ORDERBOOK_TRACKING_LIMIT) {
       orderbookTrackedTickers = [...orderbookTrackedTickers, ticker];
     } else if (orderbookTrackedTickers.length > 0) {
       // desiredOrderbookTickers() builds this list in priority order --
@@ -427,6 +445,9 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
     }
     kalshiOrderbookStream.replaceTracked(orderbookTrackedTickers);
     const admitted = kalshiOrderbookStream.isTracked(ticker);
+    // A lapsed-provenance book is restored the instant provenance is refreshed,
+    // with no new packet required, so check before paying the wait.
+    streamed = kalshiOrderbookStream.getBook(ticker);
     const deadline = Date.now() + PRIORITY_ORDERBOOK_WAIT_MS;
     while (!streamed && Date.now() < deadline) {
       await delay(PRIORITY_ORDERBOOK_POLL_MS);
@@ -441,6 +462,7 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
       resolved: streamed != null,
       waitedMs: Date.now() - startedAt,
       trackedCount: orderbookTrackedTickers.length,
+      alreadyTracked,
       outcome: streamed != null ? 'sequenced-book' : admitted ? 'admitted-no-book' : 'refused',
     });
   }
