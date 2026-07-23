@@ -29,6 +29,28 @@ const REST_DEPTH_FALLBACK_PER_CYCLE = 8;
 const MAX_UNIVERSE_PAGES = 50;
 const MIN_EXECUTABLE_UNIVERSE = 25;
 
+/**
+ * Optional operator lever: restrict the discovered universe to markets whose
+ * ticker begins with one of these series prefixes (comma-separated, e.g.
+ * "KXINXHUD,KXNASDAQ100HUD,KXBTCD"). Lets the whole pipeline be pointed at a
+ * chosen instrument set -- e.g. continuously-liquid financial-index or
+ * crypto-daily markets whose pace suits the persistence-confirmation model --
+ * without code changes. Unset means no restriction (the historical behaviour).
+ * Read once at module load; case-insensitive.
+ */
+const SERIES_ALLOWLIST: readonly string[] | null = (() => {
+  const raw = process.env.NEMESIS_SERIES_ALLOWLIST?.trim();
+  if (!raw) return null;
+  const list = raw.split(',').map((entry) => entry.trim().toUpperCase()).filter(Boolean);
+  return list.length ? list : null;
+})();
+
+function withinSeriesAllowlist(market: KalshiMarket): boolean {
+  if (!SERIES_ALLOWLIST) return true;
+  const ticker = market.ticker.toUpperCase();
+  return SERIES_ALLOWLIST.some((prefix) => ticker.startsWith(prefix));
+}
+
 export interface ProductionUniverseRecord {
   market: KalshiMarket;
   sourceBaseUrl: string;
@@ -176,10 +198,11 @@ export class DiscoveryOrchestrator {
           signal,
           onResponseMetadata: (metadata) => { responseMetadata = metadata; },
         });
-        merged.push(...res.markets);
+        const pageMarkets = res.markets.filter(withinSeriesAllowlist);
+        merged.push(...pageMarkets);
         const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
         if (verifiedResponse?.environment === 'production' && verifiedResponse.status === 200) {
-          for (const market of res.markets) {
+          for (const market of pageMarkets) {
             productionByTicker.set(market.ticker, {
               market: { ...market },
               sourceBaseUrl: verifiedResponse.sourceBaseUrl,
