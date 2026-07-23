@@ -380,6 +380,17 @@ async function ensureProductionProvenance(ticker: string): Promise<boolean> {
   }
 }
 
+/**
+ * A streamed book is only useful for entry confirmation if it carries the
+ * exchange provenance that check requires. getBook can return a book whose
+ * sequence/sourceTimestamp are still undefined -- a snapshot received with no
+ * sequenced delta yet -- and such a book is truthy, so testing the object alone
+ * skipped the remedy and then failed downstream on exchange origin anyway.
+ */
+function hasExchangeProvenance(book: KalshiOrderbook | null): boolean {
+  return book != null && Number.isFinite(book.sourceTimestamp) && Number.isInteger(book.sequence);
+}
+
 async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<KalshiOrderbook> {
   let streamed = kalshiOrderbookStream.getBook(ticker);
   // Trigger on the absence of a usable book, not on membership. A ticker can sit
@@ -393,7 +404,7 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
   // null book wearing two different reasons -- no sequence fails exchange
   // origin, and no book also forces bookContinuityProven false, which reverts
   // the freshness bound to its strict form.
-  if (!streamed) {
+  if (!hasExchangeProvenance(streamed)) {
     const startedAt = Date.now();
     const alreadyTracked = orderbookTrackedTickers.includes(ticker);
     const hadMainRecord = productionMarketRecord(ticker) != null;
@@ -449,7 +460,7 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
     // with no new packet required, so check before paying the wait.
     streamed = kalshiOrderbookStream.getBook(ticker);
     const deadline = Date.now() + PRIORITY_ORDERBOOK_WAIT_MS;
-    while (!streamed && Date.now() < deadline) {
+    while (!hasExchangeProvenance(streamed) && Date.now() < deadline) {
       await delay(PRIORITY_ORDERBOOK_POLL_MS);
       streamed = kalshiOrderbookStream.getBook(ticker);
     }
@@ -459,14 +470,14 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
       hadStreamProvenance,
       atCapacity,
       admitted,
-      resolved: streamed != null,
+      resolved: hasExchangeProvenance(streamed),
       waitedMs: Date.now() - startedAt,
       trackedCount: orderbookTrackedTickers.length,
       alreadyTracked,
-      outcome: streamed != null ? 'sequenced-book' : admitted ? 'admitted-no-book' : 'refused',
+      outcome: hasExchangeProvenance(streamed) ? 'sequenced-book' : admitted ? 'admitted-no-book' : 'refused',
     });
   }
-  return streamed ?? fetchOrderbook(ticker);
+  return hasExchangeProvenance(streamed) ? streamed! : fetchOrderbook(ticker);
 }
 const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
   async (ticker) => {
@@ -4451,9 +4462,20 @@ function isProductionLiveTicker(ticker: string | undefined, market?: KalshiMarke
  * for quarantined tickers, so a gap on this book removes the proof.
  */
 function orderbookContinuityProven(ticker: string): boolean {
+  // Deliberately per-ticker and current-state. An earlier version also required
+  // telemetry.sequenceGaps === 0, but that counter is lifetime-cumulative and is
+  // never reset -- not even by restart() -- so a single gap on any one ticker
+  // permanently disabled the quiet-book proof for every ticker for the life of
+  // the process, and "entry book is stale" returned as the top rejection.
+  //
+  // The global check was also redundant: every sequenceGaps increment is paired
+  // with quarantineSubscriptionAndRequestSnapshot for the affected book, and
+  // getBook returns null for a quarantined ticker (and for lapsed provenance).
+  // So a gap on THIS book already withdraws the proof through getBook, which is
+  // the guarantee that actually matters, while a gap on an unrelated ticker no
+  // longer condemns this one.
   const telemetry = kalshiOrderbookStream.telemetry();
   return telemetry.transportQualificationReady
-    && telemetry.sequenceGaps === 0
     && kalshiOrderbookStream.isTracked(ticker)
     && kalshiOrderbookStream.getBook(ticker) != null;
 }
