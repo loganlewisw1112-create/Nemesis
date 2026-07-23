@@ -60,6 +60,22 @@ const STALE_MS: Record<string, number> = {
 };
 
 const SHARED_GDELT_QUERY = 'united states economy politics';
+/**
+ * Rows fetched per trade-tape refresh. The flow-hunter candidate signal filters
+ * this shared tape by ticker, so a low-frequency instrument only surfaces if its
+ * trades land inside the window. At the default 100 rows the tape is dominated
+ * by the highest-frequency series (crypto-15m, sports), and a focused universe
+ * of slower series (financial index, crypto-daily) can get zero tape slots and
+ * therefore zero candidates. Widening the window lets those trades appear.
+ * Freshness is fetch-time based, not per-trade, so a larger window does not
+ * affect staleness; trades older than maxSourceAgeMs simply produce no valid
+ * candidate. Env-gated, clamped to Kalshi's [100, 1000]; default preserves the
+ * historical behaviour.
+ */
+const TRADE_TAPE_LIMIT: number = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_TRADE_TAPE_LIMIT ?? '', 10);
+  return Number.isFinite(raw) ? Math.min(1000, Math.max(100, raw)) : 100;
+})();
 const TRADE_BACKOFF_BASE_MS = 30_000;
 const TRADE_BACKOFF_MAX_MS = 300_000;
 const TRADE_WARNING_THROTTLE_MS = 300_000;
@@ -535,7 +551,7 @@ export class FeedHub {
     };
 
     try {
-      const res = await fetchTrades({ limit: 100, fetchFn: this.opts.fetchFn });
+      const res = await fetchTrades({ limit: TRADE_TAPE_LIMIT, fetchFn: this.opts.fetchFn });
       const fetchedAt = Date.now();
       this.trades = res.trades ?? [];
       this.tradesFetchedAt = fetchedAt;
