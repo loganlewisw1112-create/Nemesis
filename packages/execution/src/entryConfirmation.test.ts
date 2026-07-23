@@ -160,6 +160,45 @@ describe('EntryConfirmationEngine', () => {
     expect(fifth.windowMs).toBeGreaterThanOrEqual(15_000);
   });
 
+  it('accumulates persistence on a quiet book that re-ticks less often than the sample cadence', () => {
+    // Realistic slow instrument: the book re-ticks occasionally (fresh sequence)
+    // but not on every 5s sample. Between ticks the same sequence is re-observed
+    // while the book stays inside the continuity ceiling, and with continuity
+    // proven those re-observations count -- so genuine stable edge confirms
+    // instead of stalling for want of four distinct sequences.
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const obs = (observedAt: number, seq: number, bookTs: number) => engine.observe({
+      card: card({ updatedAt: observedAt }),
+      fill: fill(),
+      baseCertificate: certificate(),
+      bookTimestamp: bookTs,
+      bookSequence: seq,
+      bookContinuityProven: true,
+      feePolicy,
+      observedAt,
+    });
+    expect(obs(startedAt, 5, startedAt).samples).toBe(1);                    // fresh seq 5
+    expect(obs(startedAt + 5_000, 5, startedAt).samples).toBe(2);            // same seq, age 5s, proven
+    expect(obs(startedAt + 8_000, 6, startedAt + 8_000).samples).toBe(3);    // book re-ticks: fresh seq 6
+    const fourth = obs(startedAt + 15_000, 6, startedAt + 8_000);            // same seq 6, age 7s, proven
+    expect(fourth.samples).toBe(4);
+    expect(fourth.windowMs).toBe(15_000);
+    expect(fourth.status).toBe('ready');
+
+    // Without continuity proof, a repeated sequence at a stale age is rejected,
+    // so the same market cannot pad its sample count.
+    const strict = new EntryConfirmationEngine(settings);
+    expect(strict.observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, bookSequence: 5, feePolicy, observedAt: startedAt,
+    }).samples).toBe(1);
+    expect(strict.observe({
+      card: card({ updatedAt: startedAt + 5_000 }), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, bookSequence: 5, feePolicy, observedAt: startedAt + 5_000,
+    }).reason).toMatch(/entry book is stale/i);
+  });
+
   it('still rejects burst samples taken from the same instant', () => {
     const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
     const engine = new EntryConfirmationEngine(settings);

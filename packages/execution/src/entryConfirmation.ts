@@ -261,8 +261,23 @@ export class EntryConfirmationEngine {
       Math.floor(Math.ceil(config.minWindowMs / Math.max(1, config.minSamples - 1)) / 2),
     );
     const last = state.samples.at(-1);
-    const duplicateSequence = state.samples.some((sample) => sample.bookSequence === input.bookSequence);
-    if ((!last || now - last.at >= minSpacingMs) && !duplicateSequence) {
+    const spaced = !last || now - last.at >= minSpacingMs;
+    const freshSequence = !state.samples.some((sample) => sample.bookSequence === input.bookSequence);
+    // A persistence sample proves the edge held across time on a live book. A
+    // fresh exchange sequence always qualifies. But requiring a *new* sequence
+    // for every sample fits only high-frequency markets: a slow, quiet
+    // instrument (index up/down, crypto-daily) can carry genuine, stable edge
+    // while its book ticks only once or twice in the window, so it could never
+    // reach the sample count and would never trade -- the mirror of the
+    // fast-market edge-decay failure. When the transport proves the book is
+    // still live and gap-free (bookContinuityProven), an unchanged book
+    // re-observed after the spacing interval is itself evidence the edge
+    // persisted, so it counts. Book verification is untouched: the
+    // exchange-origin timestamp+sequence is still required above, and
+    // bookContinuityProven already demands a tracked, un-quarantined, unlapsed
+    // book on a qualification-ready transport -- a dead feed cannot fake it.
+    const admitSample = spaced && (freshSequence || input.bookContinuityProven === true);
+    if (admitSample) {
       state.samples.push({
         at: now,
         netEdge: input.fill.netEdge,
