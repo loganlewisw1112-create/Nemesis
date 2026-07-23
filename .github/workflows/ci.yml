@@ -99,10 +99,19 @@ jobs:
 
       - name: Upload CI evidence
         if: always()
+        # The evidence bundle carries the packaged installers, so each run stores
+        # ~675MB and the account artifact quota fills after a handful of runs.
+        # Once full, CreateArtifact fails and reds the badge on a build whose
+        # every real gate -- build, typecheck, unit, e2e, packaging, signature
+        # verification -- passed. Evidence storage is diagnostic, not a gate, so
+        # it must not decide whether the build is green; retention caps the
+        # accumulation that causes the failure in the first place.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: nemesis-ci-${{ github.run_id }}
           if-no-files-found: warn
+          retention-days: 7
           path: |
             ci-artifacts/**
             apps/desktop/release/**
