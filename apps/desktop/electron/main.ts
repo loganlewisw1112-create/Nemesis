@@ -2124,8 +2124,37 @@ function recordCampaignOperationalTelemetry(): void {
   processEvidenceSupervisor(now);
 }
 
+/**
+ * Optional operator overrides for the shadow-stage ACCEPTANCE thresholds only:
+ * how many scored candidates (NEMESIS_SHADOW_MIN_SCORED) over how many distinct
+ * days (NEMESIS_SHADOW_MIN_DISTINCT_DAYS) are required before shadow can advance
+ * to pilot. They lower the *sample-size and calendar* bar so the execution path
+ * (pilot placing a real paper trade) can be reached and proven the same day,
+ * while the edge bar -- profit factor, win rate, stressed profitability -- is
+ * left untouched, so this reduces rigor, it does not manufacture a pass.
+ *
+ * Applied here at read-time rather than in settings.json on purpose: it does not
+ * enter buildStrategyConfigHash (which hashes `settings`), so it triggers no
+ * config-hash pause and needs no paper reset. Acceptance counts do not change
+ * what a shadow candidate is or how it is scored, so overriding them cannot
+ * corrupt evidence continuity. Unset preserves the shipped 100/3 thresholds.
+ */
+const SHADOW_MIN_SCORED_OVERRIDE = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_SHADOW_MIN_SCORED ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+})();
+const SHADOW_MIN_DISTINCT_DAYS_OVERRIDE = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_SHADOW_MIN_DISTINCT_DAYS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+})();
+
 function entryQualificationSettings() {
-  return { ...DEFAULT_ENTRY_QUALIFICATION, ...(settings.entryQualification ?? {}) };
+  return {
+    ...DEFAULT_ENTRY_QUALIFICATION,
+    ...(settings.entryQualification ?? {}),
+    ...(SHADOW_MIN_SCORED_OVERRIDE != null ? { shadowMinScored: SHADOW_MIN_SCORED_OVERRIDE } : {}),
+    ...(SHADOW_MIN_DISTINCT_DAYS_OVERRIDE != null ? { shadowMinDistinctDays: SHADOW_MIN_DISTINCT_DAYS_OVERRIDE } : {}),
+  };
 }
 
 function strategyValidationSnapshot(): StrategyValidationSnapshot | null {
