@@ -1,0 +1,26 @@
+---
+description: NEMESIS git hygiene from Claude Code — no AI attribution; push once green (this project only).
+alwaysApply: true
+---
+
+# NEMESIS git hygiene
+
+## No AI attribution
+
+Never add `Co-Authored-By: Claude`, `Co-Authored-By: Anthropic`, "Generated with Claude Code",
+or any AI attribution to commits, PRs, or docs in this repo. Strip if a harness re-adds them.
+Before push: `git log` range must not contain those trailers.
+
+## Push once green (overrides default "ask before push" for this project only)
+
+When the user has asked for the work and verification is green:
+
+1. `npx tsc` / desktop typecheck clean
+2. Full vitest green (expect 550+ tests)
+3. Build succeeds
+
+…then **commit and push** to the feature branch without asking "should I push?".
+Still: never commit secrets; review `git status`; never force-push `main`; prefer
+`agent/nemesis-seven-hour-campaign` for NEMESIS work.
+
+A red CI badge from **artifact storage quota** on upload steps is not automatically a code failure.

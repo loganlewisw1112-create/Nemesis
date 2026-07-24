@@ -1,0 +1,50 @@
+---
+description: Auto-select NEMESIS skills/MCPs/connectors from the green-paper tooling map without waiting for the user to request them.
+alwaysApply: true
+---
+
+# NEMESIS tooling — discretionary instant use
+
+Do **not** wait for the user to ask for tool/skill/MCP calls on this project. Pick the best asset for the moment from the map below and use it proactively.
+
+Canonical inventory: workspace canvas `tooling-for-green-paper.canvas.tsx` (and the 2026-07-23 tooling report that produced it).
+
+## Venue fact
+
+NEMESIS trades **Kalshi** event contracts (paper-first). **Not** Kraken/crypto-spot execution.
+
+## Must use when the moment matches
+
+| Moment | Use |
+|--------|-----|
+| Any code/ops/relaunch/paper diagnosis | `.cursor/skills/nemesis-ops/SKILL.md` |
+| Zero/few paper trades; funnel stalls | `.cursor/skills/diagnose-qualification-funnel/SKILL.md` |
+| Post-overnight / go-no-go | `nemesis/docs/HANDOFF-NEXT-SESSION.md` + post-cutoff filters only |
+| About to claim green / fixed / passing | `verification-before-completion` |
+| Trade path / books / feeds | In-repo `@nemesis/connectors` (Kalshi WS/REST/book) — never relax exchange-origin |
+
+## Use when relevant
+
+- After first certified trades / release audit → `audit-nemesis`
+- Invalid run or unexplained regression → `systematic-debugging`
+- Crypto allowlist / Crypto Lead → Binance connector (signal only)
+- GEA visibility → bridge + brain-core (already wired)
+
+## Later only
+
+- Subtext → UI proof screenshots **after** trades exist
+- parallel-web-search → no-go pivot / external research
+- shadcn / browser MCP → polish or web only (Electron ≠ URL)
+
+## Never for green-paper path
+
+- Kraken CLI MCP / Kraken recipes (wrong venue)
+- Appwrite (local AppData JSON is source of truth)
+- Higgsfield (irrelevant)
+- Lowering profit / exchange-origin bars to manufacture green P&L
+
+## Hard habits
+
+1. Filter validation logs strictly **after** relaunch cutoff before judging a fix.
+2. Prefer AppData JSONL ground truth over guessing UI state.
+3. User does not need to request these tools — invoke at discretion.

@@ -1,0 +1,20 @@
+---
+description: NEMESIS session-start and live-fix pacing (Claude Code parity). Always apply.
+alwaysApply: true
+---
+
+# NEMESIS session flow
+
+On every new chat in this workspace:
+
+1. Treat [AGENTS.md](../../AGENTS.md) + `.cursor/memory/MEMORY.md` as the brain — not account-local memory.
+2. Read `nemesis/docs/HANDOFF-NEXT-SESSION.md` before starting new plumbing.
+3. Load `.cursor/skills/nemesis-ops/SKILL.md` for any code/ops/relaunch/paper work.
+4. If paper trades ≈ 0 → `.cursor/skills/diagnose-qualification-funnel/SKILL.md` before touching bars.
+
+## Live-system pacing
+
+- One theory → verify (tsc/vitest/build) → relaunch → **post-cutoff** observation → then decide.
+- Never judge a fix from mixed pre/post-relaunch JSONL.
+- After 2–3 unsuccessful rounds, stop and checkpoint with the user (options + evidence).
+- Grep where settings are *read* before asserting what `demoMode` / toggles do; no invented UI.
