@@ -33,6 +33,7 @@ import {
   rankTheses,
   detectNoTradeRegimes,
   shouldShutdownSession,
+  sessionShutdownFreezesTheses,
   computeNetEdge,
   DEFAULT_SHUTDOWN_COUNTERS,
   recordInvalidation,
@@ -924,6 +925,9 @@ function recordDryRunInvalidation() {
 
 function recordDryRunAbnormalExecution() {
   if (PRODUCTION_OBSERVATION_MODE) return;
+  // Paper/shadow screening rejects must not accumulate session-shutdown counters.
+  // Live unlock still sees blocking paper_abort rows via blockingSafetyEventCount.
+  if (!settings.liveEnabled) return;
   recordAbnormalExecution(ensureShutdownCounters());
   saveSessionStats();
 }
@@ -3939,7 +3943,10 @@ function computeRegimeState(spread: number, depthUsd: number, freshnessMs: numbe
     shutdownEvidenceRecorded = true;
     recordQualificationSafety('shutdown_event', 'session shutdown counters triggered');
   }
-  return { ...regime, reviewOnly: regime.reviewOnly || shutdown };
+  return {
+    ...regime,
+    reviewOnly: regime.reviewOnly || sessionShutdownFreezesTheses(shutdown, settings.liveEnabled),
+  };
 }
 
 function finalizeThesis(card: ThesisCard): ThesisCard {

@@ -128,3 +128,17 @@ export function shouldShutdownSession(input: ShutdownCounters): boolean {
     input.apiDegradedMinutes >= 10
   );
 }
+
+/**
+ * Session shutdown must hard-stop live theses. Paper/shadow must keep flowing:
+ * a few paper `invalid_price` / synthetic-liquidity aborts otherwise latch
+ * reviewOnly for the rest of the calendar day (and every relaunch), freezing
+ * entry_eligible at 0 with a dead confirmation path. Live unlock still sees
+ * shutdownTriggered + blockingSafetyEventCount independently.
+ */
+export function sessionShutdownFreezesTheses(
+  shutdownTriggered: boolean,
+  liveEnabled: boolean,
+): boolean {
+  return shutdownTriggered && liveEnabled;
+}

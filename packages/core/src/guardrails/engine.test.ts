@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SHUTDOWN_COUNTERS,
+  sessionShutdownFreezesTheses,
   shouldShutdownSession,
 } from './engine.js';
 
@@ -50,5 +51,14 @@ describe('shouldShutdownSession', () => {
         apiDegradedMinutes: 10,
       }),
     ).toBe(true);
+  });
+});
+
+describe('sessionShutdownFreezesTheses', () => {
+  it('freezes theses only when live is enabled and shutdown is tripped', () => {
+    expect(sessionShutdownFreezesTheses(true, true)).toBe(true);
+    expect(sessionShutdownFreezesTheses(true, false)).toBe(false);
+    expect(sessionShutdownFreezesTheses(false, true)).toBe(false);
+    expect(sessionShutdownFreezesTheses(false, false)).toBe(false);
   });
 });
