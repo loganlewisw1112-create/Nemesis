@@ -674,9 +674,14 @@ function refreshBridgeConnectivity(now = Date.now()): void {
   const stream = kalshiOrderbookStream.telemetry();
   const tradeFeed = feedHub.getTradeFeedState();
   bridgeStatus.tradeTapeFreshnessMs = tradeFeed.tapeAgeMs;
-  bridgeStatus.orderbookObservationFreshnessMs = stream.lastMessageAt == null
+  // Prefer application ingest / sequenced delta age — protocol ping must not
+  // make a dead orderbook look fresh.
+  const orderbookTrafficAt = stream.lastApplicationMessageAt
+    ?? stream.lastSequencedDeltaAt
+    ?? stream.lastMessageAt;
+  bridgeStatus.orderbookObservationFreshnessMs = orderbookTrafficAt == null
     ? null
-    : Math.max(0, now - stream.lastMessageAt);
+    : Math.max(0, now - orderbookTrafficAt);
   bridgeStatus.exchangeDeltaFreshnessMs = stream.lastExchangeTimestamp == null
     ? null
     : Math.max(0, now - stream.lastExchangeTimestamp);
@@ -690,6 +695,19 @@ function refreshBridgeConnectivity(now = Date.now()): void {
   bridgeStatus.trafficFreshnessMs = bridgeStatus.lastInboundAt == null || bridgeStatus.lastOutboundAt == null
     ? null
     : Math.max(now - bridgeStatus.lastInboundAt, now - bridgeStatus.lastOutboundAt);
+}
+
+/** External OB watchdog: recovers if stream heartbeat stalls on a zombie socket. */
+function maybeRecoverStaleOrderbookStream(now = Date.now()): void {
+  const before = kalshiOrderbookStream.telemetry(now);
+  if (!kalshiOrderbookStream.recoverIfDataPlaneSilent(now)) return;
+  const after = kalshiOrderbookStream.telemetry(now);
+  console.warn(
+    `[nemesis] orderbook data-plane silence watchdog fired `
+    + `(tracked=${before.trackedTickers}, appAgeMs=${before.lastApplicationMessageAt == null ? 'null' : now - before.lastApplicationMessageAt}, `
+    + `deltaAgeMs=${before.lastSequencedDeltaAt == null ? 'null' : now - before.lastSequencedDeltaAt}, `
+    + `reconnects ${before.reconnects}→${after.reconnects}, trigger=${after.lastCloseTrigger ?? 'local_data_plane_silence'})`,
+  );
 }
 
 function currentProcessTelemetry(now = Date.now()): Record<string, unknown> {
@@ -6363,6 +6381,7 @@ app.whenReady().then(async () => {
     void runThroughputCertification('entry-confirmation-tick');
     void evaluateCampaignConfirmations();
     void evaluateCampaignDiagnostics();
+    maybeRecoverStaleOrderbookStream();
     broadcastToGea({ type: 'bridge:ping', payload: {} });
     recordCampaignOperationalTelemetry();
     broadcast('connectors:update', registry.getAll());

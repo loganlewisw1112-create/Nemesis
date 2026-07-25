@@ -255,11 +255,12 @@ describe('KalshiOrderbookStream', () => {
     });
   });
 
-  it('terminates an authenticated half-open socket after ping-pong traffic expires', async () => {
+  it('forces reconnect when ping-pong traffic expires (does not rely on close alone)', async () => {
     vi.useFakeTimers();
     const startedAt = 1_700_000_100_000;
     vi.setSystemTime(startedAt);
     const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    Object.assign(stream as unknown as Record<string, unknown>, { started: true });
     const socket = {
       readyState: WebSocket.OPEN,
       ping: vi.fn(),
@@ -271,22 +272,102 @@ describe('KalshiOrderbookStream', () => {
       authenticated: true,
       generation: 4,
       lastMessageAt: startedAt,
+      lastApplicationMessageAt: startedAt,
       lastPongAt: startedAt,
       lastSequencedDeltaAt: startedAt,
+      connectedAt: startedAt,
     });
     (stream as unknown as { startHeartbeat(socket: WebSocket, generation: number): void })
       .startHeartbeat(socket, 4);
 
     await vi.advanceTimersByTimeAsync(20_000);
     expect(socket.ping).toHaveBeenCalledTimes(2);
-    expect(socket.terminate).not.toHaveBeenCalled();
-    Object.assign(stream as unknown as Record<string, unknown>, { lastMessageAt: startedAt + 20_000 });
+    expect(socket.close).not.toHaveBeenCalled();
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      lastMessageAt: startedAt + 20_000,
+      lastApplicationMessageAt: startedAt + 20_000,
+    });
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(socket.terminate).toHaveBeenCalledTimes(1);
-    expect(stream.telemetry(startedAt + 30_000).qualificationReady).toBe(false);
+    expect(socket.close).toHaveBeenCalledTimes(1);
+    expect(stream.telemetry(startedAt + 30_000)).toMatchObject({
+      reconnects: 1,
+      lastCloseTrigger: 'local_pong_expired',
+      connected: false,
+    });
     stream.stop();
   });
 
+  it('forces reconnect when pongs stay fresh but orderbook application traffic freezes', async () => {
+    vi.useFakeTimers();
+    const startedAt = 1_700_000_200_000;
+    vi.setSystemTime(startedAt);
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    Object.assign(stream as unknown as Record<string, unknown>, { started: true });
+    const socket = {
+      readyState: WebSocket.OPEN,
+      ping: vi.fn(),
+      terminate: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+    const tickers = new Set(['KXINXHUD-TEST']);
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket,
+      authenticated: true,
+      generation: 7,
+      tickers,
+      lastMessageAt: startedAt,
+      lastApplicationMessageAt: startedAt,
+      lastPongAt: startedAt,
+      connectedAt: startedAt,
+    });
+    (stream as unknown as { startHeartbeat(socket: WebSocket, generation: number): void })
+      .startHeartbeat(socket, 7);
+
+    // Keep pongs fresh (zombie control plane) while application clock stays frozen.
+    // Silence uses strict > DATA_PLANE_SILENCE_MS (90s), so the 10th 10s heartbeat (100s) recovers.
+    for (let step = 0; step < 10; step += 1) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      if (step < 9) {
+        expect(socket.close).not.toHaveBeenCalled();
+      }
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        lastPongAt: startedAt + ((step + 1) * 10_000),
+        // Protocol ping must not reset the application silence clock.
+        lastMessageAt: startedAt + ((step + 1) * 10_000),
+      });
+    }
+    expect(socket.close).toHaveBeenCalledTimes(1);
+    expect(stream.telemetry(startedAt + 100_000)).toMatchObject({
+      reconnects: 1,
+      lastCloseTrigger: 'local_data_plane_silence',
+    });
+    stream.stop();
+  });
+
+  it('desktop recoverIfDataPlaneSilent forces reconnect without waiting for heartbeat', () => {
+    const startedAt = 1_700_000_300_000;
+    const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+    const socket = {
+      readyState: WebSocket.OPEN,
+      ping: vi.fn(),
+      terminate: vi.fn(),
+      close: vi.fn(),
+    } as unknown as WebSocket;
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      started: true,
+      socket,
+      authenticated: true,
+      generation: 3,
+      tickers: new Set(['KXBTCD-TEST']),
+      lastApplicationMessageAt: startedAt - 120_000,
+      connectedAt: startedAt - 120_000,
+      lastPongAt: startedAt,
+    });
+    expect(stream.recoverIfDataPlaneSilent(startedAt)).toBe(true);
+    expect(socket.close).toHaveBeenCalledTimes(1);
+    expect(stream.telemetry(startedAt).lastCloseTrigger).toBe('local_data_plane_silence');
+    stream.stop();
+  });
   it('bounds live orderbooks to one 25-ticker subscription and updates that subscription in place', () => {
     const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
     const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() };

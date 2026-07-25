@@ -24,6 +24,17 @@ import {
 
 const PING_INTERVAL_MS = 10_000;
 const DEAD_CONNECTION_MS = 25_000;
+// Pong-only / protocol-ping liveness can keep a half-open socket alive while
+// orderbook application traffic has stopped (overnight soak 2026-07-23:
+// lastMessageAt froze ~14h while client pings still earned pongs; Jul 25
+// paper run: observation freshness climbed >3h with socketConnected true).
+// When markets are tracked, require recent *application* ingest on a looser
+// bound than DEAD_CONNECTION so quiet books do not thrash every 25s, but a
+// multi-minute data-plane freeze still forces reconnect + resubscribe.
+// Recovery must schedule reconnect itself — terminate()+close alone has left
+// zombie OPEN sockets without a reconnect on Windows Electron builds.
+export const ORDERBOOK_DATA_PLANE_SILENCE_MS = 90_000;
+const DATA_PLANE_SILENCE_MS = ORDERBOOK_DATA_PLANE_SILENCE_MS;
 const DEFAULT_MAX_TRACKED_TICKERS = 25;
 // Bounded freshness proves the stream is live, not that every second trades:
 // a book with sequence continuity, a live pong, and an unchanged state is
@@ -48,6 +59,8 @@ export interface KalshiOrderbookStreamTelemetry extends KalshiSocketHealthV2 {
   verifiedTrackedTickers: number;
   membershipAcknowledged: boolean;
   lastSequencedDeltaAt: number | null;
+  /** Last JSON application frame (subscribe/snapshot/delta/ok). Not protocol ping/pong. */
+  lastApplicationMessageAt: number | null;
   lastCloseAt: number | null;
   lastCloseCode: number | null;
   lastCloseReason: string | null;
@@ -189,6 +202,7 @@ export class KalshiOrderbookStream {
   private authenticated = false;
   private connectedAt: number | null = null;
   private lastMessageAt: number | null = null;
+  private lastApplicationMessageAt: number | null = null;
   private lastPongAt: number | null = null;
   private lastSequencedDeltaAt: number | null = null;
   private lastExchangeTimestamp: number | null = null;
@@ -239,6 +253,24 @@ export class KalshiOrderbookStream {
     this.acknowledgedTrackingRevision = null;
     this.closeCurrentSocket();
     if (this.started) this.connect();
+  }
+
+  /**
+   * Belt-and-suspenders for desktop: if the heartbeat timer stalls or
+   * terminate()+close fails to reconnect, the main-process health tick can
+   * still force recovery when tracked markets have gone application-silent.
+   */
+  recoverIfDataPlaneSilent(now = Date.now()): boolean {
+    if (!this.started || this.socket?.readyState !== WebSocket.OPEN) return false;
+    if (this.tickers.size === 0) return false;
+    const dataReferenceAt = this.lastApplicationMessageAt ?? this.connectedAt;
+    if (dataReferenceAt != null && now - dataReferenceAt <= DATA_PLANE_SILENCE_MS) return false;
+    this.forceLocalReconnect(
+      this.generation,
+      createKalshiTransportFailure('timeout', 'order-book websocket data-plane silence'),
+      'local_data_plane_silence',
+    );
+    return true;
   }
 
   stop(): void {
@@ -404,6 +436,7 @@ export class KalshiOrderbookStream {
       generation: this.generation,
       lastPongAt: this.lastPongAt,
       lastMessageAt: this.lastMessageAt,
+      lastApplicationMessageAt: this.lastApplicationMessageAt,
       lastSequencedDeltaAt: this.lastSequencedDeltaAt,
       lastExchangeTimestamp: this.lastExchangeTimestamp,
       lastCloseAt: this.lastCloseAt,
@@ -522,6 +555,7 @@ export class KalshiOrderbookStream {
       for (const ticker of this.tickers) this.quarantined.add(ticker);
       this.connectedAt = Date.now();
       this.lastMessageAt = this.connectedAt;
+      this.lastApplicationMessageAt = this.connectedAt;
       this.lastPongAt = null;
       this.startHeartbeat(socket, generation);
       this.recordHealth();
@@ -531,6 +565,8 @@ export class KalshiOrderbookStream {
       if (this.isCurrent(socket, generation)) this.ingest(String(raw), generation);
     });
     socket.on('ping', () => {
+      // Protocol ping proves the control plane only — do NOT treat it as
+      // orderbook application traffic (that masked multi-hour OB freezes).
       if (!this.isCurrent(socket, generation)) return;
       this.lastMessageAt = Date.now();
       this.recordHealth();
@@ -643,7 +679,9 @@ export class KalshiOrderbookStream {
   /** Ingests one official WebSocket packet; public to support deterministic replay tests. */
   ingest(raw: string, generation = this.generation): void {
     if (generation !== this.generation) return;
-    this.lastMessageAt = Date.now();
+    const receivedAt = Date.now();
+    this.lastMessageAt = receivedAt;
+    this.lastApplicationMessageAt = receivedAt;
     try {
       const packet = JSON.parse(raw) as Record<string, unknown>;
       const type = String(packet.type ?? '');
@@ -929,13 +967,73 @@ export class KalshiOrderbookStream {
       const now = Date.now();
       const pongReferenceAt = this.lastPongAt ?? this.connectedAt;
       if (pongReferenceAt == null || now - pongReferenceAt > DEAD_CONNECTION_MS) {
-        this.registry.recordWarn('kalshi-orderbook-ws', 'order-book websocket pong expired');
-        this.setPendingFailure(generation, createKalshiTransportFailure('timeout', 'order-book websocket pong expired'), 'local_pong_expired');
-        socket.terminate();
+        this.forceLocalReconnect(
+          generation,
+          createKalshiTransportFailure('timeout', 'order-book websocket pong expired'),
+          'local_pong_expired',
+        );
         return;
+      }
+      // Data-plane silence while membership is non-empty: pongs / protocol
+      // pings alone are not proof that orderbook_delta traffic still flows.
+      if (this.tickers.size > 0) {
+        const dataReferenceAt = this.lastApplicationMessageAt ?? this.connectedAt;
+        if (dataReferenceAt == null || now - dataReferenceAt > DATA_PLANE_SILENCE_MS) {
+          this.forceLocalReconnect(
+            generation,
+            createKalshiTransportFailure('timeout', 'order-book websocket data-plane silence'),
+            'local_data_plane_silence',
+          );
+          return;
+        }
       }
       socket.ping();
     }, PING_INTERVAL_MS);
+  }
+
+  /**
+   * Local watchdog kill: tear down the socket and *always* schedule reconnect
+   * when started. Do not rely on the WebSocket `close` event — terminate/close
+   * alone has left zombie OPEN sockets without reconnect on Electron/Windows.
+   */
+  private forceLocalReconnect(generation: number, failure: KalshiTransportFailure, trigger: string): void {
+    if (generation !== this.generation) return;
+    this.lastCloseAt = Date.now();
+    this.lastCloseTrigger = trigger;
+    this.lastCloseReason = failure.detail;
+    this.lastCloseCode = null;
+    this.pendingCloseTrigger = null;
+    this.pendingTransportFailure = null;
+    // Best-effort controller accounting; local recovery still reconnects if the
+    // controller rejects a stale/missing attempt id (unit tests / races).
+    const decision = this.transportController.recordFailure(generation, failure);
+    this.closeCurrentSocket();
+    this.recordHealth();
+    if (!this.started) return;
+    this.reconnects += 1;
+    const waitMs = decision.retry && decision.delayMs != null ? decision.delayMs : 0;
+    this.registry.recordWarn(
+      'kalshi-orderbook-ws',
+      `order-book websocket ${trigger}; forcing reconnect+resubscribe in ${waitMs}ms (reconnects=${this.reconnects})`,
+    );
+    this.registry.recordTelemetry('kalshi-orderbook-ws', {
+      status: 'warn',
+      lastError: `order-book stream ${trigger}; reconnect scheduled`,
+      reconnects: this.reconnects,
+      transportConnected: false,
+      authenticated: false,
+      qualificationReady: false,
+      lastCloseAt: this.lastCloseAt,
+      lastCloseCode: this.lastCloseCode,
+      lastCloseReason: this.lastCloseReason,
+      lastCloseTrigger: this.lastCloseTrigger,
+      lastMessageAt: this.lastApplicationMessageAt,
+    });
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, waitMs);
   }
 
   private recordHealth(): void {
