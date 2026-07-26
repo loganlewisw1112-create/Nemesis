@@ -12,3 +12,6 @@ WINDOWS PACKAGE/
 .DS_Store
 .env
 .env.local
+.nemesis-*-cutoff.txt
+overnight-logs/
+vitest-out.txt

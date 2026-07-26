@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildKalshiFeePolicy, kalshiFeeForOrder, type KalshiOrderbook } from '@nemesis/core';
-import { dryRunFill } from './dryRun.js';
+import { dryRunFill, isSupportedQualificationFill } from './dryRun.js';
 
 const policy = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'direct' });
 
@@ -46,5 +46,24 @@ describe('fixed-point dry-run execution', () => {
     const result = dryRunFill({ ...book(), feePolicy: undefined }, 'yes', 1, 0.6, 0.1);
     expect(result.aborted).toBe(false);
     expect(result.feePolicyKnown).toBe(false);
+  });
+
+  it('accepts supported per-level fills when the average price has extra decimals', () => {
+    const result = dryRunFill(book(), 'yes', 2, 0.6, 0.1);
+    expect(result.fillPrice).toBeCloseTo(0.405);
+    expect(isSupportedQualificationFill({
+      ...result,
+      fillPrice: 0.40555,
+      fillLevels: [
+        { price: 0.4, quantity: 1, cost: 0.4 },
+        { price: 0.4111, quantity: 1, cost: 0.4111 },
+      ],
+    })).toBe(true);
+    expect(isSupportedQualificationFill({
+      ...result,
+      fillPrice: 0.40555,
+      filled: 1.005,
+      fillLevels: [{ price: 0.4, quantity: 1.005, cost: 0.402 }],
+    })).toBe(false);
   });
 });

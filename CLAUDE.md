@@ -1,10 +1,9 @@
 # Claude Code — NEMESIS
 
-Follow **[AGENTS.md](./AGENTS.md)** as the source of truth.
+Claude Code uses **its own** memory and skills:
 
-Repo-local memory (portable across accounts/machines): `.cursor/memory/`
-Repo-local skills: `.cursor/skills/`
+- Memory: `~/.claude/projects/.../memory/` (parent-slug history + KRYPT index — see `nemesis-memory-location`)
+- Skills: `.claude/skills/` (e.g. `nemesis-ops`)
 
-If the Cursor workspace is the parent `KRYPT/` folder, the same files also live at
-`KRYPT/.cursor/` and `KRYPT/AGENTS.md` for always-on rules in that workspace.
-Legacy `~/.claude/projects/*/memory/` is backup only on the original machine.
+Cursor maintains a **parallel** pack under `.cursor/` — independent, not a replacement.
+Do not overwrite Claude memory/skills from Cursor (or the reverse).

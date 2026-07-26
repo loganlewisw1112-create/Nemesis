@@ -7,6 +7,7 @@ export const CLOSE_FOLLOW_UP_MS = 15 * 60 * 1_000;
 
 export type QualificationFunnelStage =
   | 'raw_candidates'
+  | 'entry_blocked'
   | 'duplicates_removed'
   | 'entry_eligible'
   | 'books_fetched'
@@ -124,6 +125,7 @@ interface ActivePositionEvidence {
 
 const FUNNEL_STAGES: QualificationFunnelStage[] = [
   'raw_candidates',
+  'entry_blocked',
   'duplicates_removed',
   'entry_eligible',
   'books_fetched',

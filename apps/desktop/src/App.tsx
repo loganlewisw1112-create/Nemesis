@@ -35,7 +35,8 @@ import type {
 } from '@nemesis/core';
 import { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
 import type { FeedHubTradeFeedState } from '@nemesis/connectors';
-import type { PaperQualificationSnapshot, StrategyValidationSnapshot } from '@nemesis/execution';
+import type { PaperQualificationSnapshot } from '@nemesis/execution/paperQualification';
+import type { StrategyValidationSnapshot } from '@nemesis/execution/strategyValidation';
 
 interface PilotValidationSnapshot {
   completedPositionCount: number;
@@ -655,26 +656,43 @@ export default function App() {
           {tab === 'paper' && paper && (
             <>
               <h1 style={{ fontSize: 18, marginBottom: 12 }}>Paper Command Desk</h1>
-              {paper.strategyValidation && (
+              {paper.strategyValidation && (() => {
+                const sv = paper.strategyValidation!;
+                const minScored = sv.shadowMinScored ?? 100;
+                const minDays = sv.shadowMinDistinctDays ?? 3;
+                const countOk = sv.shadowCountPassed
+                  ?? (sv.shadowCandidateCount >= minScored
+                    && sv.shadowDistinctDayCount >= minDays
+                    && !sv.paused
+                    && !sv.integrityError);
+                const qualityOk = sv.shadowQualityPassed ?? sv.shadowPassed;
+                const daysMatter = minDays > 1;
+                const daysPart = daysMatter ? ` · days ${sv.shadowDistinctDayCount}/${minDays}` : '';
+                const pf = Number.isFinite(sv.shadowProfitFactor) ? sv.shadowProfitFactor.toFixed(2) : '∞';
+                const countLabel = countOk ? 'count PASS' : 'count short';
+                const qualityLabel = qualityOk
+                  ? 'quality PASS'
+                  : `quality FAIL (net $${sv.shadowNetPnlUsd.toFixed(2)})`;
+                return (
                 <div style={{ padding: 12, marginBottom: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
                     <div>
                       <div style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase' }}>
-                        Validation stage: {paper.strategyValidation.stage}
+                        Validation stage: {sv.stage}
                       </div>
                       <div style={{ marginTop: 5, fontSize: 11, color: 'var(--text-muted)' }}>
-                        Shadow {paper.strategyValidation.shadowCandidateCount}/100 · days {paper.strategyValidation.shadowDistinctDayCount}/3 · PF {Number.isFinite(paper.strategyValidation.shadowProfitFactor) ? paper.strategyValidation.shadowProfitFactor.toFixed(2) : '∞'} · wins {(paper.strategyValidation.shadowWinRate * 100).toFixed(1)}%
+                        {`Shadow ${sv.shadowCandidateCount}/${minScored}${daysPart} · ${countLabel} · ${qualityLabel} · PF ${pf} · wins ${(sv.shadowWinRate * 100).toFixed(1)}%`}
                       </div>
                       {paper.pilotValidation && (
                         <div style={{ marginTop: 3, fontSize: 11, color: 'var(--text-muted)' }}>
                           Pilot {paper.pilotValidation.completedPositionCount}/20 · net ${paper.pilotValidation.realizedPnlUsd.toFixed(2)} · PF {Number.isFinite(paper.pilotValidation.profitFactor) ? paper.pilotValidation.profitFactor.toFixed(2) : '∞'} · loss budget ${paper.pilotValidation.lossBudgetRemainingUsd.toFixed(2)}
                         </div>
                       )}
-                      {paper.strategyValidation.paused && (
-                        <div style={{ marginTop: 5, fontSize: 11, color: 'var(--danger)' }}>Paused: {paper.strategyValidation.pauseReason}</div>
+                      {sv.paused && (
+                        <div style={{ marginTop: 5, fontSize: 11, color: 'var(--danger)' }}>Paused: {sv.pauseReason}</div>
                       )}
                     </div>
-                    {paper.strategyValidation.stage === 'shadow' && paper.strategyValidation.shadowPassed && (
+                    {sv.stage === 'shadow' && qualityOk && (
                       <button type="button" style={chipStyle(false)} onClick={async () => {
                         const confirmation = window.prompt('Type ADVANCE_TO_PILOT to start the capped paper pilot.');
                         if (!confirmation) return;
@@ -683,7 +701,7 @@ export default function App() {
                         await loadPaper();
                       }}>Advance to pilot</button>
                     )}
-                    {paper.strategyValidation.stage === 'pilot' && paper.pilotValidation?.passed && (
+                    {sv.stage === 'pilot' && paper.pilotValidation?.passed && (
                       <button type="button" style={chipStyle(false)} onClick={async () => {
                         const confirmation = window.prompt('Type ADVANCE_TO_QUALIFICATION to continue into full qualification.');
                         if (!confirmation) return;
@@ -694,7 +712,8 @@ export default function App() {
                     )}
                   </div>
                 </div>
-              )}
+                );
+              })()}
               <PaperDeskPanel
                 portfolio={paper.portfolio}
                 marks={paper.marks}

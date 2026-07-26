@@ -214,7 +214,8 @@ describe('Windows package staging scripts', () => {
     expect(main).toContain('orderbook_tracking_set_below_25');
     expect(main).toContain('orderbook.trackedTickers === ORDERBOOK_TRACKING_LIMIT');
     expect(main).toContain('trackingReady: orderbook.trackingReady');
-    expect(main).toContain('current: orderbookTrackedTickers.filter((ticker) => desiredSet.has(ticker))');
+    expect(main).toContain('current: orderbookTrackedTickers.filter((ticker) => {');
+    expect(main).toContain('return hasExchangeProvenance(kalshiOrderbookStream.getBook(ticker))');
     expect(stream).toContain('const trackingReady = this.tickers.size === this.maxTrackedTickers');
     expect(stream).toContain('&& trackingReady');
   });

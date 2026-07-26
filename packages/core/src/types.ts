@@ -231,7 +231,7 @@ export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
   shadowMinProfitFactor: 1.25,
   shadowMinWinRate: 0.55,
   shadowMinStressedProfitFactor: 1.1,
-  pilotMaxEntryRiskUsd: 10,
+  pilotMaxEntryRiskUsd: 50,
   pilotLossBudgetUsd: 20,
   pilotMinCompleted: 20,
   pilotMinProfitFactor: 1.25,
@@ -404,6 +404,12 @@ export interface CryptoThesisContext {
   confidence: number;
   sampleCount: number;
   windowMs: number;
+  timeToExpirySec?: number;
+  sigmaT?: number;
+  observedSigmaT?: number;
+  floorSigmaT?: number;
+  annualVolFloor?: number;
+  volatilityScale?: number;
 }
 
 export interface JournalEntry {

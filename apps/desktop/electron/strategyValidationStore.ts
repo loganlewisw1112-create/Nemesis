@@ -77,6 +77,12 @@ export class StrategyValidationStore {
   snapshot(settings: EntryQualificationSettings): StrategyValidationSnapshot {
     const snapshot = this.tracker.snapshot(settings);
     if (!this.persistenceError) return snapshot;
-    return { ...snapshot, integrityError: this.persistenceError, shadowPassed: false };
+    return {
+      ...snapshot,
+      integrityError: this.persistenceError,
+      shadowCountPassed: false,
+      shadowQualityPassed: false,
+      shadowPassed: false,
+    };
   }
 }

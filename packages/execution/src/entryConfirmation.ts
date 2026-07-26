@@ -1,13 +1,13 @@
 import {
   DEFAULT_ENTRY_QUALIFICATION,
   isKnownKalshiFeePolicy,
-  isSupportedQualificationFeeOrder,
   type EntryQualificationSettings,
   type KalshiFeePolicy,
   type ProfitCertificate,
   type ThesisCard,
 } from '@nemesis/core';
-import type { DryRunOrder } from './dryRun.js';
+import { campaignEconomicIdentity } from './economicIdentity.js';
+import { isSupportedQualificationFill, type DryRunOrder } from './dryRun.js';
 import { calculateEntryEconomics, type EntryEconomicsEvidence } from './tradeEconomics.js';
 
 export interface EntryConfirmationObservation {
@@ -41,6 +41,7 @@ export interface ConfirmationSample {
 
 interface ConfirmationState {
   sourceSignalId: string;
+  economicIdentity: string;
   ticker: string;
   side: 'yes' | 'no';
   samples: ConfirmationSample[];
@@ -70,10 +71,14 @@ function round(value: number, digits = 6): number {
 
 /**
  * Ceiling for a book accepted only because the transport proved continuity.
- * Sized below the 25s dead-connection bound so a book can never be accepted on
- * the strength of a socket that is itself about to be declared dead.
+ * Must cover a full confirmation window (production paper settings use
+ * minWindowMs=15s / minSamples=4): a completely quiet book that never emits a
+ * new sequence still needs its final sample at t≈minWindowMs, so a 10s ceiling
+ * made sample 4 structurally unreachable and stalled chains at 3. Keep this
+ * below the 25s dead-connection bound so continuity cannot vouch for a socket
+ * that is itself about to be declared dead.
  */
-export const MAX_PROVEN_QUIET_BOOK_AGE_MS = 10_000;
+export const MAX_PROVEN_QUIET_BOOK_AGE_MS = 20_000;
 
 /** The absolute entry-quality bars, evaluated together. Null when all pass. */
 function absoluteBarFailure(
@@ -88,13 +93,32 @@ function absoluteBarFailure(
 
 export class EntryConfirmationEngine {
   private readonly states = new Map<string, ConfirmationState>();
+  /** Consumed source signal ids and economic identities (post-trade / shadow claim). */
   private readonly usedSources = new Set<string>();
+  /** Maps a sourceSignalId to the state key it last belonged to. */
+  private readonly sourceToStateKey = new Map<string, string>();
 
   constructor(private readonly settings: EntryQualificationSettings = DEFAULT_ENTRY_QUALIFICATION) {}
 
   markSourceUsed(sourceSignalId: string): void {
     this.usedSources.add(sourceSignalId);
-    this.states.delete(sourceSignalId);
+    const keysToClear = new Set<string>();
+    const mappedKey = this.sourceToStateKey.get(sourceSignalId);
+    if (mappedKey) keysToClear.add(mappedKey);
+    if (this.states.has(sourceSignalId)) keysToClear.add(sourceSignalId);
+    for (const [key, state] of this.states) {
+      if (state.sourceSignalId === sourceSignalId || state.economicIdentity === sourceSignalId) {
+        keysToClear.add(key);
+      }
+    }
+    for (const key of keysToClear) {
+      const state = this.states.get(key);
+      if (state) {
+        this.usedSources.add(state.economicIdentity);
+        this.usedSources.add(state.sourceSignalId);
+      }
+      this.states.delete(key);
+    }
   }
 
   hasUsedSource(sourceSignalId: string): boolean {
@@ -117,8 +141,15 @@ export class EntryConfirmationEngine {
   }
 
   reset(sourceSignalId?: string): void {
-    if (sourceSignalId) this.states.delete(sourceSignalId);
-    else this.states.clear();
+    if (sourceSignalId) {
+      const mappedKey = this.sourceToStateKey.get(sourceSignalId);
+      if (mappedKey) this.states.delete(mappedKey);
+      this.states.delete(sourceSignalId);
+      this.sourceToStateKey.delete(sourceSignalId);
+      return;
+    }
+    this.states.clear();
+    this.sourceToStateKey.clear();
   }
 
   restoreCandidateState(input: {
@@ -134,17 +165,29 @@ export class EntryConfirmationEngine {
         && Number.isFinite(sample.bookTimestamp)
         && Number.isInteger(sample.bookSequence))
       .sort((a, b) => a.at - b.at);
+    const economicIdentity = campaignEconomicIdentity({
+      ticker: input.ticker,
+      side: input.side,
+      playbook: 'flow-hunter',
+      sourceMove: 'flow-driven',
+    });
+    if (this.usedSources.has(economicIdentity)) return;
     this.states.set(input.candidateId, {
       sourceSignalId: input.sourceSignalId,
+      economicIdentity,
       ticker: input.ticker,
       side: input.side,
       samples,
     });
+    this.sourceToStateKey.set(input.sourceSignalId, input.candidateId);
   }
 
   observe(input: EntryConfirmationObservation): EntryConfirmationResult {
     const now = input.observedAt ?? Date.now();
-    const candidateId = input.candidateId ?? input.card.id;
+    const economicIdentity = campaignEconomicIdentity(input.card);
+    // Prefer an explicit campaign candidate id when present; otherwise key on the
+    // stable economic identity so re-issued flow card.ids continue one chain.
+    const candidateId = input.candidateId ?? economicIdentity;
     const config = this.settings;
     const metrics = calculateEntryEconomics({
       entryPrice: input.fill.fillPrice,
@@ -181,7 +224,11 @@ export class EntryConfirmationEngine {
       };
     }
     if (input.card.sourceMove !== 'flow-driven') return reject('automatic entry requires a flow-driven source');
-    if (this.usedSources.has(input.card.id) || input.sourceAlreadyUsed) return reject('source signal already used');
+    if (
+      this.usedSources.has(input.card.id)
+      || this.usedSources.has(economicIdentity)
+      || input.sourceAlreadyUsed
+    ) return reject('source signal already used');
     const sourceAgeMs = Math.max(0, now - input.card.createdAt);
     if (sourceAgeMs > config.maxSourceAgeMs) return reject('source signal is stale');
     const bookAgeMs = Math.max(0, now - input.bookTimestamp);
@@ -208,7 +255,7 @@ export class EntryConfirmationEngine {
     if (!Number.isFinite(input.fill.netEdge) || input.fill.netEdge <= 0) {
       return reject('executable entry edge is not positive');
     }
-    if (!isSupportedQualificationFeeOrder(input.fill.fillPrice, input.fill.filled)) {
+    if (!isSupportedQualificationFill(input.fill)) {
       return reject('qualification fee model requires a four-decimal price and two-decimal quantity');
     }
     if (!Number.isFinite(input.card.impliedPrice) || metrics.targetExitPrice <= input.fill.fillPrice) {
@@ -235,13 +282,26 @@ export class EntryConfirmationEngine {
 
     let state = this.states.get(candidateId);
     if (!state) {
-      state = { sourceSignalId: input.card.id, ticker: input.card.ticker, side: input.card.side, samples: [] };
+      state = {
+        sourceSignalId: input.card.id,
+        economicIdentity,
+        ticker: input.card.ticker,
+        side: input.card.side,
+        samples: [],
+      };
       this.states.set(candidateId, state);
     }
-    if (state.ticker !== input.card.ticker || state.side !== input.card.side || state.sourceSignalId !== input.card.id) {
+    // Ticker/side/playbook/sourceMove are encoded in economicIdentity. A new
+    // card.id for the same identity is a re-issued GEA signal — continue the
+    // chain and adopt the latest id. A true identity change rejects.
+    if (state.economicIdentity !== economicIdentity
+      || state.ticker !== input.card.ticker
+      || state.side !== input.card.side) {
       this.states.delete(candidateId);
       return reject('source signal identity changed during confirmation');
     }
+    state.sourceSignalId = input.card.id;
+    this.sourceToStateKey.set(input.card.id, candidateId);
     // Anti-burst spacing only: it exists so four reads of the same instant
     // cannot pass for four samples. The actual persistence guarantees are
     // enforced independently below -- minSamples AND minWindowMs must both hold

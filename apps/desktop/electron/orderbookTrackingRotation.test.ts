@@ -1,5 +1,9 @@
+import {
+  mergeAllowlistForceFillDesired,
+  selectBoundedOrderbookTracking,
+  shouldHoldEmptyDesiredOrderbook,
+} from './orderbookTrackingRotation.js';
 import { describe, expect, it } from 'vitest';
-import { selectBoundedOrderbookTracking } from './orderbookTrackingRotation.js';
 
 const base = {
   critical: [] as string[],
@@ -12,6 +16,41 @@ const base = {
   rotationIntervalMs: 300_000,
   rotationBatchSize: 2,
 };
+
+describe('shouldHoldEmptyDesiredOrderbook', () => {
+  it('holds only when both local list and stream still have membership', () => {
+    expect(shouldHoldEmptyDesiredOrderbook({ localTrackedCount: 3, streamTrackedCount: 2 })).toBe(true);
+    expect(shouldHoldEmptyDesiredOrderbook({ localTrackedCount: 3, streamTrackedCount: 0 })).toBe(false);
+    expect(shouldHoldEmptyDesiredOrderbook({ localTrackedCount: 0, streamTrackedCount: 0 })).toBe(false);
+    expect(shouldHoldEmptyDesiredOrderbook({ localTrackedCount: 0, streamTrackedCount: 2 })).toBe(false);
+  });
+});
+
+describe('mergeAllowlistForceFillDesired', () => {
+  it('is a no-op when series allowlist is not configured', () => {
+    expect(mergeAllowlistForceFillDesired({
+      seriesAllowlistConfigured: false,
+      desired: ['A'],
+      allowlistedExecutableTickers: ['B', 'C'],
+    })).toEqual(['A']);
+  });
+
+  it('appends missing allowlisted executables without padding off-series or duplicates', () => {
+    expect(mergeAllowlistForceFillDesired({
+      seriesAllowlistConfigured: true,
+      desired: ['KXBTCD-1'],
+      allowlistedExecutableTickers: ['KXBTCD-1', 'KXETHD-2', 'KXBTC15M-3'],
+    })).toEqual(['KXBTCD-1', 'KXETHD-2', 'KXBTC15M-3']);
+  });
+
+  it('can populate an empty desired set from a thin allowlist universe (N ≪ 25)', () => {
+    expect(mergeAllowlistForceFillDesired({
+      seriesAllowlistConfigured: true,
+      desired: [],
+      allowlistedExecutableTickers: ['KXBTCD-1', 'KXINXHUD-2'],
+    })).toEqual(['KXBTCD-1', 'KXINXHUD-2']);
+  });
+});
 
 describe('selectBoundedOrderbookTracking', () => {
   it('fills once and remains sticky before the controlled rotation interval', () => {

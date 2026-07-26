@@ -19,8 +19,9 @@ export interface BinanceQuote {
   windowMs: number;
 }
 
-function roundBps(value: number): number {
-  return Math.round(value * 10) / 10;
+function roundBps(value: number, decimals = 1): number {
+  const scale = 10 ** decimals;
+  return Math.round(value * scale) / scale;
 }
 
 function rollingVolatilityBps(samples: BinanceSample[]): number {
@@ -54,7 +55,7 @@ export function deriveBinanceQuote(
     lagMs,
     fetchedAt,
     momentumBps: roundBps(momentumBps),
-    volatilityBps: roundBps(rollingVolatilityBps(windowed)),
+    volatilityBps: roundBps(rollingVolatilityBps(windowed), 4),
     sampleCount: windowed.length,
     windowMs,
   };

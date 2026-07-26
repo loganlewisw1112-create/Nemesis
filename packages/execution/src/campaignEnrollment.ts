@@ -1,12 +1,12 @@
 import {
   DEFAULT_ENTRY_QUALIFICATION,
   isKnownKalshiFeePolicy,
-  isSupportedQualificationFeeOrder,
   type EntryQualificationSettings,
   type KalshiFeePolicy,
   type ThesisCard,
 } from '@nemesis/core';
-import type { DryRunOrder } from './dryRun.js';
+import { isSupportedQualificationFill, type DryRunOrder } from './dryRun.js';
+import { campaignEconomicIdentity } from './economicIdentity.js';
 import { MAX_PROVEN_QUIET_BOOK_AGE_MS } from './entryConfirmation.js';
 import { calculateEntryEconomics, type EntryEconomicsEvidence } from './tradeEconomics.js';
 
@@ -89,20 +89,7 @@ export interface QualifyCampaignEnrollmentInput {
   settings?: EntryQualificationSettings;
 }
 
-function normalizeIdentityPart(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, '-');
-}
-
-/** Stable source/economic identity. Presentation text such as signalReason is intentionally excluded. */
-export function campaignEconomicIdentity(card: ThesisCard): string {
-  return [
-    normalizeIdentityPart(card.ticker),
-    card.side,
-    normalizeIdentityPart(card.playbook),
-    normalizeIdentityPart(card.sourceMove ?? 'unknown'),
-    normalizeIdentityPart(card.id),
-  ].join('|');
-}
+export { campaignEconomicIdentity } from './economicIdentity.js';
 
 /**
  * Pure, fail-closed campaign enrollment decision. It never creates confirmation
@@ -170,7 +157,7 @@ export function qualifyCampaignEnrollment(input: QualifyCampaignEnrollmentInput)
   if (input.fill.aborted || input.fill.filled <= 0 || input.fill.filled !== input.fill.contracts) {
     return screenedOut('incomplete_fill', input.fill.abortReason ?? 'a complete executable fill is required');
   }
-  if (!isSupportedQualificationFeeOrder(input.fill.fillPrice, input.fill.filled)) {
+  if (!isSupportedQualificationFill(input.fill)) {
     return screenedOut('unsupported_fixed_point_order', 'qualification requires a four-decimal price and two-decimal quantity');
   }
   if (!Number.isFinite(input.fill.netEdge) || input.fill.netEdge <= 0) {

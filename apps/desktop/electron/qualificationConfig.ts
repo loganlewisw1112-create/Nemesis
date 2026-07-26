@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { DiscoverySettings, GuardrailSettings } from '@nemesis/core';
+import { DEFAULT_ENTRY_QUALIFICATION, type DiscoverySettings, type GuardrailSettings } from '@nemesis/core';
 
 export const PAPER_STRATEGY_ENGINE_VERSION = 3;
 
@@ -28,6 +28,18 @@ export function buildStrategyConfigHash(
     'humanQuizPassed',
     'backtestPassed',
   ]) delete qualificationSettings[key];
+  // Shadow sample-size / calendar acceptance only — same rationale as
+  // NEMESIS_SHADOW_MIN_* env overrides in main.ts: changing them must not
+  // pause evidence continuity. Pin to shipped defaults so the hash stays
+  // identical to historical ledgers that recorded 100/3.
+  const entryQualification = qualificationSettings.entryQualification;
+  if (entryQualification && typeof entryQualification === 'object') {
+    qualificationSettings.entryQualification = {
+      ...(entryQualification as Record<string, unknown>),
+      shadowMinScored: DEFAULT_ENTRY_QUALIFICATION.shadowMinScored,
+      shadowMinDistinctDays: DEFAULT_ENTRY_QUALIFICATION.shadowMinDistinctDays,
+    };
+  }
   return createHash('sha256')
     .update(stableJson({
       strategyEngineVersion: PAPER_STRATEGY_ENGINE_VERSION,

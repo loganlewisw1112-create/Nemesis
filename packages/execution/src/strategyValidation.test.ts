@@ -103,6 +103,8 @@ describe('StrategyValidationTracker', () => {
       shadowNetPnlUsd: 80,
       shadowStressedProfitFactor: 3,
       shadowDistinctDayCount: 3,
+      shadowCountPassed: true,
+      shadowQualityPassed: true,
       shadowPassed: true,
     });
     expect(StrategyValidationTracker.replay(tracker.allEvents()).snapshot(DEFAULT_ENTRY_QUALIFICATION)).toEqual(snapshot);
@@ -137,5 +139,36 @@ describe('StrategyValidationTracker', () => {
     expect(() => tracker.changeStage('pilot', 'ADVANCE_TO_PILOT')).toThrow(/cannot advance/i);
     tracker.pause('settings changed');
     expect(tracker.snapshot(DEFAULT_ENTRY_QUALIFICATION)).toMatchObject({ paused: true, shadowPassed: false });
+  });
+
+  it('requires 50 scored shadows across two calendar days before count passes', () => {
+    const acceptance = {
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      shadowMinScored: 50,
+      shadowMinDistinctDays: 2,
+    };
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 2, start, 'count-run');
+    for (let index = 0; index < 49; index += 1) {
+      const at = start + (index % 2) * day + index * 1_000;
+      const row = candidate(index, at);
+      tracker.startShadowCandidate(row);
+      // Mostly losers: count clears, quality does not.
+      const win = index < 2;
+      tracker.scoreShadowCandidate(row.id, win ? 2 : -1, win ? 1 : -0.5, 'follow-up complete', at + 2_000);
+    }
+    expect(tracker.snapshot(acceptance).shadowCountPassed).toBe(false);
+
+    const finalAt = start + day + 50_000;
+    const finalRow = candidate(49, finalAt);
+    tracker.startShadowCandidate(finalRow);
+    tracker.scoreShadowCandidate(finalRow.id, -1, -0.5, 'follow-up complete', finalAt + 2_000);
+
+    const snapshot = tracker.snapshot(acceptance);
+    expect(snapshot.shadowCandidateCount).toBe(50);
+    expect(snapshot.shadowDistinctDayCount).toBe(2);
+    expect(snapshot.shadowCountPassed).toBe(true);
+    expect(snapshot.shadowQualityPassed).toBe(false);
+    expect(snapshot.shadowPassed).toBe(false);
+    expect(snapshot.shadowNetPnlUsd).toBeLessThan(0);
   });
 });

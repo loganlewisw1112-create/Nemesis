@@ -17,6 +17,44 @@ export interface OrderbookTrackingRotationResult {
   rotated: boolean;
 }
 
+/**
+ * Empty-desired HOLD was added so a temporary provenance TTL lapse would not
+ * unsubscribe a live book mid-hold. Under a thin series allowlist the stream
+ * can already be empty (selectVerified dropped everyone) while main still
+ * lists stale names — HOLD then self-latches because reverify cannot heal an
+ * empty stream membership. Only hold when both sides still show membership.
+ */
+export function shouldHoldEmptyDesiredOrderbook(input: {
+  localTrackedCount: number;
+  streamTrackedCount: number;
+}): boolean {
+  return input.localTrackedCount > 0 && input.streamTrackedCount > 0;
+}
+
+/**
+ * When a series allowlist is configured, force-fill the desired track set with
+ * every currently open executable on-series ticker from discovery (N may be
+ * ≪ the WS limit). Preserves existing desired priority order, then appends any
+ * missing allowlisted executables. Never pads with off-series names.
+ */
+export function mergeAllowlistForceFillDesired(input: {
+  seriesAllowlistConfigured: boolean;
+  desired: readonly string[];
+  allowlistedExecutableTickers: readonly string[];
+}): string[] {
+  if (!input.seriesAllowlistConfigured) return [...input.desired];
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (ticker: string | undefined) => {
+    if (!ticker || seen.has(ticker)) return;
+    seen.add(ticker);
+    ordered.push(ticker);
+  };
+  for (const ticker of input.desired) add(ticker);
+  for (const ticker of input.allowlistedExecutableTickers) add(ticker);
+  return ordered;
+}
+
 /** Keeps live books sticky while allowing campaign-critical tickers in immediately. */
 export function selectBoundedOrderbookTracking(
   input: OrderbookTrackingRotationInput,

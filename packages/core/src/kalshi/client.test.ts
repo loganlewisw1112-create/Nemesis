@@ -39,4 +39,16 @@ describe('Kalshi REST response provenance', () => {
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+
+  it('passes series_ticker when seriesTicker is set', async () => {
+    const fetchFn = vi.fn().mockResolvedValue(new Response(JSON.stringify({ markets: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    await fetchMarkets({ limit: 25, status: 'open', seriesTicker: 'KXBTCD', fetchFn });
+    expect(fetchFn).toHaveBeenCalled();
+    const url = String(fetchFn.mock.calls[0]?.[0] ?? '');
+    expect(url).toContain('series_ticker=KXBTCD');
+    expect(url).toContain('status=open');
+  });
 });

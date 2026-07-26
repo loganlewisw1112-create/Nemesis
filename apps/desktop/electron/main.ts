@@ -72,7 +72,7 @@ import {
   type GeoMarket,
   type WorldEventsPayload,
 } from '@nemesis/core';
-import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, withinSeriesAllowlist, tickerWithinSeriesAllowlist, type ProductionUniverseRecord } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, withinSeriesAllowlist, tickerWithinSeriesAllowlist, seriesAllowlistConfigured, seriesDenylistConfigured, type ProductionUniverseRecord } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -133,6 +133,7 @@ import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
 import { PaperQualificationStore } from './paperQualificationStore.js';
 import { StrategyValidationStore } from './strategyValidationStore.js';
 import { SevenHourCampaignStore } from './sevenHourCampaignStore.js';
+import { requalifyThesisCard } from './thesisRequalification.js';
 import {
   CampaignBookTriggerScheduler,
   campaignBookUpdateWork,
@@ -157,7 +158,11 @@ import { EvidenceRunSupervisor } from './evidenceRunSupervisor.js';
 import { VersionedStateStream } from './stateStreamCoalescer.js';
 import { RuntimeStatusExporter, runtimeStatusPathFromEnvironment } from './runtimeStatusExport.js';
 import { RendererHeartbeatMonitor } from './rendererHeartbeatMonitor.js';
-import { selectBoundedOrderbookTracking } from './orderbookTrackingRotation.js';
+import {
+  mergeAllowlistForceFillDesired,
+  selectBoundedOrderbookTracking,
+  shouldHoldEmptyDesiredOrderbook,
+} from './orderbookTrackingRotation.js';
 import { assessProductionObservation, productionObservationStateHash } from './productionObservation.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
@@ -2730,6 +2735,13 @@ function opportunityKey(card: Pick<ThesisCard, 'ticker' | 'side'>): string {
   return `${card.ticker}:${card.side}`;
 }
 
+function entryBlockedDiagnosticReason(card: ThesisCard, baseReason: string): string {
+  const gates = [...new Set(card.invalidations)]
+    .filter((gate) => gate.trim().length > 0)
+    .slice(0, 5);
+  return gates.length > 0 ? `${baseReason}; gates=${gates.join(',')}` : baseReason;
+}
+
 function findCampaignCandidate(card: ThesisCard): CampaignCandidateRecord | null {
   const snapshot = campaignSnapshot();
   if (!snapshot || snapshot.manifest.status !== 'active') return null;
@@ -2898,6 +2910,31 @@ async function executeReservedStrictPaperBuyForCard(
 ): Promise<PaperBuyResult> {
   const activeCampaign = source === 'throughput' ? campaignSnapshot() : null;
   const evidenceOnlyCampaign = isEvidenceOnlyCampaignExecution(source, activeCampaign);
+  // Hard choke: when NEMESIS_SERIES_ALLOWLIST / DENYLIST is set, never confirm/buy
+  // off-series cards (sports contamination previously burned confirmation capacity).
+  if ((seriesAllowlistConfigured() || seriesDenylistConfigured()) && !tickerWithinSeriesAllowlist(card.ticker)) {
+    const reason = seriesDenylistConfigured() && !seriesAllowlistConfigured()
+      ? `ticker ${card.ticker} is blocked by NEMESIS_SERIES_DENYLIST`
+      : `ticker ${card.ticker} is outside NEMESIS_SERIES_ALLOWLIST`;
+    recordPaperBlock({
+      thesisId: card.id,
+      ticker: card.ticker,
+      detail: reason,
+      code: 'series_allowlist_block',
+      severity: 'info',
+      blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
+    });
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: reason,
+      error: reason,
+      abortCode: 'series_allowlist_block',
+      queueState: 'blocked_final',
+      wouldMutate: false,
+    };
+  }
   const mutationLock = campaignMutationLockReason();
   if (mutationLock && !evidenceOnlyCampaign) {
     return { ok: false, aborted: true, abortReason: mutationLock, error: mutationLock, abortCode: 'campaign_mutation_lock', queueState: 'blocked_final', wouldMutate: false };
@@ -3084,7 +3121,20 @@ async function executeReservedStrictPaperBuyForCard(
     }
     const maxPilotContracts = Math.max(1, Math.floor(entryConfig.pilotMaxEntryRiskUsd / (rawAsk + kalshiFeeForOrder(rawAsk, 1))));
     const desiredContracts = contracts ?? resolveContractCount(card, paperDesk.snapshot(), settings);
-    effectiveContracts = Math.max(1, Math.min(maxPilotContracts, desiredContracts));
+    // Size up toward the absolute $ minExpectedNetPnlUsd bar when the per-contract
+    // edge can clear it inside the pilot risk / maxPosition caps. Leaving size at
+    // a thin Kelly slice left KXBTCD at ~$0.63 target reward with R:R already ≥2 —
+    // an honest edge rejected only for undersizing, not for failing the bar.
+    let sizedContracts = Math.max(1, Math.min(maxPilotContracts, desiredContracts));
+    const unitPreview = previewPaperBuy(paperDesk.snapshot(), card, book, settings, 1);
+    const unitReward = unitPreview.profitCertificate?.targetRewardUsd;
+    if (Number.isFinite(unitReward) && (unitReward as number) > 0) {
+      const needForBar = Math.ceil(entryConfig.minExpectedNetPnlUsd / (unitReward as number));
+      if (needForBar > sizedContracts && needForBar <= maxPilotContracts) {
+        sizedContracts = needForBar;
+      }
+    }
+    effectiveContracts = sizedContracts;
   }
 
   const beforeTradeCount = paperDesk.snapshot().trades.length;
@@ -3620,16 +3670,20 @@ async function evaluateStrategyValidationFollowUps(): Promise<void> {
         const edgeGone = observations.length >= 3 && observations.every((observation) => observation.netEdge <= 0);
         const targetRewardUsd = candidate.targetRewardUsd ?? candidate.expectedRewardUsd;
         const hitTarget = Number.isFinite(targetRewardUsd) && executableNetPnlUsd >= targetRewardUsd!;
-        const hitLoss = executableNetPnlUsd <= -candidate.plannedLossUsd;
         const due = now >= candidate.dueAt;
-        if (hitTarget || hitLoss || edgeGone || due) {
+        // Do not early-stop shadow on planned-loss MTM. Entry→immediate exit always
+        // burns spread+fees ≈ plannedLoss (11/11 measured), so a loss stop before the
+        // follow-up horizon guarantees shadowPassed can never clear. Score winners on
+        // target, abandon on sustained edge-gone after the confirmation window, and
+        // otherwise wait for the 15-minute due deadline.
+        const heldMs = Math.max(0, now - candidate.startedAt);
+        const edgeStopArmed = heldMs >= entryQualificationSettings().minWindowMs;
+        if (hitTarget || due || (edgeStopArmed && edgeGone)) {
           const closeReason = hitTarget
             ? 'shadow target reached'
-            : hitLoss
-              ? 'shadow planned-loss limit reached'
-              : edgeGone
-                ? 'shadow edge gone for three executable observations'
-                : 'shadow 15-minute follow-up complete';
+            : due
+              ? 'shadow 15-minute follow-up complete'
+              : 'shadow edge gone for three executable observations';
           recordStrategyValidation((tracker) => tracker.scoreShadowCandidate(
             candidate.id,
             executableNetPnlUsd,
@@ -3988,7 +4042,7 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
     changed = true;
     const marketPrice = t.side === 'yes' ? yesPrice : 1 - yesPrice;
     const edge = computeNetEdge(t.impliedPrice, marketPrice, spread);
-    return {
+    return finalizeThesis(requalifyThesisCard({
       ...t,
       marketPrice,
       spread,
@@ -3997,7 +4051,10 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
       feeEstimate: edge.feeCost,
       updatedAt: Date.now(),
       edgeHistory: [...t.edgeHistory.slice(-19), edge.netEdge],
-    };
+    }, {
+      reviewOnly,
+      demoMode: settings.demoMode,
+    }));
   };
   theses = theses.map(updateCard);
   geaTheses = geaTheses.map(updateCard);
@@ -4017,6 +4074,9 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
     scheduleMarketStatePublish();
     void evaluateAutoClosePositions('quote');
     schedulePaperUpdate();
+    if (theses.some((t) => t.ticker === ticker && isEntryEligible(t))) {
+      void runThroughputCertification('quote', new Set([ticker]));
+    }
   }
 }
 
@@ -4071,18 +4131,54 @@ async function runThroughputCertification(trigger: string, tickerFilter?: Readon
     const existingCampaignIdentities = throughputCampaign?.manifest.status === 'active'
       ? new Set(throughputCampaign.candidates.map((candidate) => candidate.economicIdentity))
       : null;
+    const scopedTheses = theses.filter((card) => tickerWithinSeriesAllowlist(card.ticker));
     const rawCandidates = tickerFilter
-      ? theses.filter((card) => tickerFilter.has(card.ticker))
-      : theses;
+      ? scopedTheses.filter((card) => tickerFilter.has(card.ticker))
+      : scopedTheses;
     const formalQualificationEligible = throughputCampaign?.manifest.status !== 'active';
     if (formalQualificationEligible) {
       recordQualification((tracker) => tracker.recordFunnel('raw_candidates', rawCandidates.length));
     }
+    const entryBlockReasons = new Map<string, number>();
+    const countEntryBlock = (reason: string) => {
+      entryBlockReasons.set(reason, (entryBlockReasons.get(reason) ?? 0) + 1);
+    };
+    const seriesAllowlistActive = seriesAllowlistConfigured();
     const rankedCandidates = rawCandidates
-      .filter((card) => isEntryEligible(card)
-        && hasRealExecutableDepth(card)
-        && !openKeys.has(opportunityKey(card))
-        && !existingCampaignIdentities?.has(candidateEconomicIdentity(card)))
+      .filter((card) => {
+        const eligibilityBlock = entryEligibilityBlockReason(card);
+        if (eligibilityBlock) {
+          countEntryBlock(`entry eligibility: ${entryBlockedDiagnosticReason(card, eligibilityBlock)}`);
+          return false;
+        }
+        // Under a series allowlist, depth labels only appear after a tracked book
+        // exists — and the track set is fed by entry-eligible work. Requiring
+        // hasRealExecutableDepth here deadlocks: raw allowlisted theses stay at
+        // entry_eligible=0 forever while books stay empty. Priority-track + the
+        // strict book gate still earn a sequenced book before any fill.
+        const economicIdentity = candidateEconomicIdentity(card);
+        if (
+          entryConfirmationEngine.hasUsedSource(card.id)
+          || entryConfirmationEngine.hasUsedSource(economicIdentity)
+          || strategyValidationStore?.tracker.hasUsedSource(card.id)
+        ) {
+          countEntryBlock('entry source already used');
+          return false;
+        }
+        if (!seriesAllowlistActive && !hasRealExecutableDepth(card)) {
+          countEntryBlock('missing executable depth');
+          return false;
+        }
+        if (openKeys.has(opportunityKey(card))) {
+          countEntryBlock('position already open');
+          return false;
+        }
+        if (existingCampaignIdentities?.has(economicIdentity)) {
+          countEntryBlock('campaign economic identity already enrolled');
+          return false;
+        }
+        return true;
+      })
       .sort((a, b) => {
         const edgeDelta = b.netEdge - a.netEdge;
         if (edgeDelta !== 0) return edgeDelta;
@@ -4090,6 +4186,11 @@ async function runThroughputCertification(trigger: string, tickerFilter?: Readon
       });
     if (formalQualificationEligible) {
       recordQualification((tracker) => tracker.recordFunnel('entry_eligible', rankedCandidates.length));
+      for (const [reason, count] of [...entryBlockReasons.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)) {
+        recordQualification((tracker) => tracker.recordFunnel('entry_blocked', count, reason));
+      }
     }
     const deduplicatedCandidates = dedupeByExecutionKey(rankedCandidates, opportunityKey);
     const duplicateCount = rankedCandidates.length - deduplicatedCandidates.length;
@@ -4393,7 +4494,12 @@ function mergeGeaMarkets(markets: KalshiMarket[]): KalshiMarket[] {
 
 function replaceGeaTheses(base: ThesisCard[]): ThesisCard[] {
   const withoutGea = base.filter((card) => !card.id.startsWith('gea-'));
-  return rankThesesForUi([...geaTheses.map(applyDepthToCard), ...withoutGea]);
+  // Drop off-allowlist GEA cards so a focused series run cannot keep sports
+  // recommendations in the live thesis set after the env allowlist is applied.
+  const scopedGea = geaTheses
+    .filter((card) => tickerWithinSeriesAllowlist(card.ticker))
+    .map(applyDepthToCard);
+  return rankThesesForUi([...scopedGea, ...withoutGea]);
 }
 
 function publishMarketState(extra: Record<string, unknown> = {}) {
@@ -4566,7 +4672,11 @@ function desiredOrderbookTickers(now = Date.now()): string[] {
       - finiteCampaignNumber(right.freshnessMs, Number.MAX_SAFE_INTEGER);
   });
   for (const card of ranked) {
-    if (isEntryEligible(card) && hasRealExecutableDepth(card)) add(card.ticker);
+    // Same allowlist chicken-egg as the funnel: without a book there is no tier
+    // depth label, so require only entry eligibility when focusing a series.
+    if (isEntryEligible(card) && (seriesAllowlistConfigured() || hasRealExecutableDepth(card))) {
+      add(card.ticker);
+    }
   }
   // Eligible signal markets are the second priority after campaign-critical
   // tickers, regardless of whether discovery has already verified depth.
@@ -4637,20 +4747,83 @@ function refreshTickerTracking(now = Date.now()): void {
 }
 
 function refreshOrderbookTracking(now = Date.now()): void {
-  const desired = desiredOrderbookTickers(now);
+  // Allowlist mode: keep provenance warm for every open executable on-series
+  // market so desiredOrderbookTickers cannot stick empty while discovery still
+  // has inventory. Do not wait for a full empty-desired cycle / 5-minute refresh.
+  if (seriesAllowlistConfigured()) {
+    const seeded = discovery.getProductionUniverseRecords()
+      .filter((record) => {
+        if (!tickerWithinSeriesAllowlist(record.market.ticker)) return false;
+        const status = record.market.status.toLowerCase();
+        return status === 'active' || status === 'open';
+      })
+      .map((record) => ({ ...record, verifiedAt: now }));
+    if (seeded.length > 0) recordProductionUniverse(seeded);
+  }
+  let desired = desiredOrderbookTickers(now);
+  // Focused allowlist runs often have only a handful of executable markets.
+  // Their production provenance TTLs can lapse together between universe
+  // refreshes, emptying desired and (via selectVerified) the stream. Re-file
+  // discovery's last on-series production proofs with a fresh verifiedAt so
+  // those markets can re-enter desired without waiting for a 5-minute cycle.
+  if (desired.length === 0 && seriesAllowlistConfigured()) {
+    const seeded = discovery.getProductionUniverseRecords()
+      .filter((record) => tickerWithinSeriesAllowlist(record.market.ticker))
+      .map((record) => ({ ...record, verifiedAt: now }));
+    if (seeded.length > 0) {
+      recordProductionUniverse(seeded);
+      desired = desiredOrderbookTickers(now);
+    }
+  }
+  // Force-fill: while allowlisted, subscribe every currently open executable
+  // on-series market (N may be ≪ 25). Pull from discovery universe plus any
+  // live production/cache/thesis tickers already known to main — GEA can surface
+  // a candidate before discovery.universe is warm, and volume_24h=0 listings
+  // used to leave universe empty so only priority-track admitted 1 ticker.
+  // Never pad off-series.
+  if (seriesAllowlistConfigured()) {
+    const openAllowlisted: string[] = [];
+    const seenAllowlisted = new Set<string>();
+    const consider = (ticker: string | undefined, market?: KalshiMarket) => {
+      if (!ticker || seenAllowlisted.has(ticker)) return;
+      if (!tickerWithinSeriesAllowlist(ticker)) return;
+      const resolved = market ?? productionMarketRecord(ticker, now)?.market;
+      if (!isProductionLiveTicker(ticker, resolved)) return;
+      seenAllowlisted.add(ticker);
+      openAllowlisted.push(ticker);
+    };
+    for (const market of discovery.getUniverse()) consider(market.ticker, market);
+    for (const market of marketsCache) consider(market.ticker, market);
+    for (const [ticker, record] of productionMarketRecords) {
+      if (productionMarketRecord(ticker, now)) consider(ticker, record.market);
+    }
+    for (const card of theses) consider(card.ticker);
+    desired = mergeAllowlistForceFillDesired({
+      seriesAllowlistConfigured: true,
+      desired,
+      allowlistedExecutableTickers: openAllowlisted,
+    });
+  }
   // An empty desired set means discovery produced nothing this cycle, not that
   // we should unsubscribe everything. Production provenance expires after 30s
   // while the universe only refreshes every 5 minutes, so every record can lapse
   // at once and starve the set; applying that as a membership update collapsed
-  // tracking to zero markets 17 seconds short of a completed hold. It also
-  // self-latches, because the re-verify loop only refreshes the tickers already
-  // in this set -- at zero there is nothing left to re-verify. Hold the current
-  // membership and let the next cycle recover. A genuinely stale set still fails
-  // readiness through the verified-count conditions, which are checked directly.
+  // tracking to zero markets 17 seconds short of a completed hold. Hold only
+  // while BOTH main and stream still show membership. If the stream is already
+  // empty, HOLD self-latches (reverify cannot heal zero stream tickers) — clear
+  // and kick a universe refresh instead.
   if (desired.length === 0) {
-    if (orderbookTrackedTickers.length > 0) return;
+    const streamTracked = kalshiOrderbookStream.telemetry(now).trackedTickers;
+    if (shouldHoldEmptyDesiredOrderbook({
+      localTrackedCount: orderbookTrackedTickers.length,
+      streamTrackedCount: streamTracked,
+    })) {
+      return;
+    }
+    orderbookTrackedTickers = [];
     kalshiOrderbookStream.replaceTracked([]);
     refreshTickerTracking(now);
+    if (seriesAllowlistConfigured()) void runUniverseRefresh();
     return;
   }
   const desiredSet = new Set(desired);
@@ -4665,10 +4838,14 @@ function refreshOrderbookTracking(now = Date.now()): void {
   const selection = selectBoundedOrderbookTracking({
     critical,
     desired,
-    // Never carry a ticker forward unless the latest production/live universe
-    // still validates it. A partial refresh must fail readiness, not preserve
-    // a closed or stale market in the 25-slot set.
-    current: orderbookTrackedTickers.filter((ticker) => desiredSet.has(ticker)),
+    // Prefer stickiness only for tickers that still have an exchange-sequenced
+    // book. Under allowlist force-fill the 25 slots filled with quoted-but-quiet
+    // names that never received a delta; priority-track then reported
+    // admitted-no-book forever while exchangeDelta aged to minutes.
+    current: orderbookTrackedTickers.filter((ticker) => {
+      if (!desiredSet.has(ticker)) return false;
+      return hasExchangeProvenance(kalshiOrderbookStream.getBook(ticker));
+    }),
     now,
     lastRotationAt: orderbookLastRotationAt,
     cursor: orderbookRotationCursor,
@@ -4724,7 +4901,7 @@ async function applyBridgeRecommendation(packet: RecommendationPacket) {
   geaTheses = upsertRecommendationThesis(geaTheses, packet, market).map(applyDepthToCard);
   theses = replaceGeaTheses(theses);
   opportunityQueue.discover(geaTheses.filter((c) => isEntryEligible(c)
-    && hasRealExecutableDepth(c)));
+    && (seriesAllowlistConfigured() || hasRealExecutableDepth(c))));
   refreshOrderbookTracking();
   // GEA can deliver bursts of recommendations. Coalesce the expensive
   // market/world snapshot work so the renderer receives one bounded update
@@ -4753,17 +4930,30 @@ function withoutExecutableDepth(card: ThesisCard): ThesisCard {
 
 function applyDepthToCard(card: ThesisCard): ThesisCard {
   const d = discovery.getDepth(card.ticker);
-  if (!d) return withoutExecutableDepth(card);
-  if (Date.now() - d.verifiedAt > LIQUIDITY_PREFILTER_MAX_AGE_MS) return withoutExecutableDepth(card);
+  if (!d) return finalizeThesis(requalifyThesisCard(withoutExecutableDepth(card), {
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
+  if (Date.now() - d.verifiedAt > LIQUIDITY_PREFILTER_MAX_AGE_MS) return finalizeThesis(requalifyThesisCard(withoutExecutableDepth(card), {
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
   const sideResult = card.side === 'yes' ? d.yes : d.no;
-  if (!sideResult?.executableTier) return withoutExecutableDepth(card);
-  return {
+  if (!sideResult?.executableTier) return finalizeThesis(requalifyThesisCard(withoutExecutableDepth(card), {
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
+  return finalizeThesis(requalifyThesisCard({
     ...card,
     executableTier: sideResult.executableTier,
     fillableUsd: sideResult.fillableUsd,
     slippagePp: sideResult.slippagePp,
     depthLevels: sideResult.depthLevels,
-  };
+  }, {
+    depthUsd: Math.max(card.depthUsd, sideResult.fillableUsd),
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
 }
 
 function rankThesesForUi(cards: ThesisCard[]): ThesisCard[] {
@@ -4992,7 +5182,8 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
         spread,
         depthUsd,
         lagMs: cx.lagMs,
-        kalshiImpliedSpot: cx.kalshiImpliedSpot,
+        binanceQuote: cx.binanceQuote,
+        closeTime: m.close_time,
       }));
     } else if (isMacroMarket(m)) {
       const macro = feedHub.macroInputFor(m);
@@ -5086,7 +5277,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
   }
   theses = replaceGeaTheses(built);
   opportunityQueue.discover(theses.filter((c) => isEntryEligible(c)
-    && hasRealExecutableDepth(c)));
+    && (seriesAllowlistConfigured() || hasRealExecutableDepth(c))));
   refreshOrderbookTracking();
 
   for (const c of theses) {
@@ -5464,6 +5655,45 @@ function invalidateLiveCertificate(reason: string) {
   settings = { ...settings, liveUnlockCertificate: undefined, liveStage: 'paper', liveEnabled: false, autoLiveEnabled: false, demoMode: true, dryRun: true };
   auditLog.append({ action: 'gate_block', detail: `live certificate invalidated: ${reason}`, ok: false });
 }
+function advanceStrategyStageRequest(
+  stage: StrategyValidationStage,
+  confirmation: string,
+): { ok: boolean; error?: string; strategyValidation?: StrategyValidationSnapshot | null; pilotValidation?: ReturnType<typeof pilotValidationSnapshot> } {
+  const mutationLock = campaignMutationLockReason();
+  if (mutationLock) return { ok: false, error: mutationLock };
+  try {
+    if (!strategyValidationStore) throw new Error('strategy validation store is unavailable');
+    const current = strategyValidationSnapshot();
+    if (!current || current.integrityError || current.paused) throw new Error('strategy validation evidence is not eligible for advancement');
+    if (paperDesk.snapshot().positions.length > 0) throw new Error('close all paper positions before advancing the stage');
+    if (stage === 'pilot') {
+      if (current.stage !== 'shadow') throw new Error('only a shadow run can advance to pilot');
+      if (!current.shadowPassed) {
+        throw new Error('shadow count, calendar, and quality thresholds have not passed');
+      }
+      if (confirmation !== 'ADVANCE_TO_PILOT') {
+        throw new Error('confirmation must equal ADVANCE_TO_PILOT');
+      }
+    } else if (stage === 'qualification') {
+      if (current.stage !== 'pilot') throw new Error('only a pilot run can advance to qualification');
+      if (!pilotValidationSnapshot().passed) throw new Error('pilot thresholds have not passed');
+      if (confirmation !== 'ADVANCE_TO_QUALIFICATION') {
+        throw new Error('confirmation must equal ADVANCE_TO_QUALIFICATION');
+      }
+    } else {
+      throw new Error('shadow is created only by archive and reset');
+    }
+    const ledgerConfirmation = stage === 'pilot' ? 'ADVANCE_TO_PILOT' : confirmation;
+    strategyValidationStore.record((tracker) => tracker.changeStage(stage, ledgerConfirmation));
+    const strategyValidation = strategyValidationSnapshot();
+    const pilotValidation = pilotValidationSnapshot();
+    broadcastPaperUpdate(true);
+    return { ok: true, strategyValidation, pilotValidation };
+  } catch (error) {
+    return { ok: false, error: describeError(error) };
+  }
+}
+
 function setupIpc() {
   ipcMain.on('renderer:heartbeat', (event, payload: { painted?: boolean; at?: number; sequence?: number } | undefined) => {
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
@@ -5914,32 +6144,8 @@ function setupIpc() {
     };
   });
 
-  ipcMain.handle('nemesis:advanceStrategyStage', (_e, stage: StrategyValidationStage, confirmation: string) => {
-    const mutationLock = campaignMutationLockReason();
-    if (mutationLock) return { ok: false, error: mutationLock };
-    try {
-      if (!strategyValidationStore) throw new Error('strategy validation store is unavailable');
-      const current = strategyValidationSnapshot();
-      if (!current || current.integrityError || current.paused) throw new Error('strategy validation evidence is not eligible for advancement');
-      if (paperDesk.snapshot().positions.length > 0) throw new Error('close all paper positions before advancing the stage');
-      if (stage === 'pilot') {
-        if (current.stage !== 'shadow') throw new Error('only a shadow run can advance to pilot');
-        if (!current.shadowPassed) throw new Error('shadow thresholds have not passed');
-      } else if (stage === 'qualification') {
-        if (current.stage !== 'pilot') throw new Error('only a pilot run can advance to qualification');
-        if (!pilotValidationSnapshot().passed) throw new Error('pilot thresholds have not passed');
-      } else {
-        throw new Error('shadow is created only by archive and reset');
-      }
-      strategyValidationStore.record((tracker) => tracker.changeStage(stage, confirmation));
-      const strategyValidation = strategyValidationSnapshot();
-      const pilotValidation = pilotValidationSnapshot();
-      broadcastPaperUpdate(true);
-      return { ok: true, strategyValidation, pilotValidation };
-    } catch (error) {
-      return { ok: false, error: describeError(error) };
-    }
-  });
+  ipcMain.handle('nemesis:advanceStrategyStage', (_e, stage: StrategyValidationStage, confirmation: string) =>
+    advanceStrategyStageRequest(stage, confirmation));
 
   ipcMain.handle('nemesis:resetPaper', (_e, confirmation: string) => {
     const mutationLock = campaignMutationLockReason();
@@ -6313,7 +6519,7 @@ app.whenReady().then(async () => {
       const work = campaignBookUpdateWork(book.ticker, theses.filter((card) =>
         card.ticker === book.ticker
         && isEntryEligible(card)
-        && hasRealExecutableDepth(card)), campaign, completedAt);
+        && (seriesAllowlistConfigured() || hasRealExecutableDepth(card))), campaign, completedAt);
       if (!readiness.ready) {
         if (work.diagnostic) {
           const outcome: 'missing_provenance' | 'stale_book' | 'fee_unknown' = /fee/i.test(readiness.reason)

@@ -1,6 +1,7 @@
 import {
   kalshiFeeForFills,
   kalshiFeeForOrder,
+  isSupportedQualificationFeeOrder,
   walkBookFill,
   type BookFillLevel,
   type KalshiOrderbook,
@@ -42,6 +43,14 @@ function feeForWalk(book: KalshiOrderbook, fills: BookFillLevel[]) {
     fees: fills.reduce((sum, fill) => sum + kalshiFeeForOrder(fill.price, fill.quantity), 0),
     feePolicyKnown: false,
   };
+}
+
+export function isSupportedQualificationFill(fill: Pick<DryRunOrder, 'fillPrice' | 'filled' | 'fillLevels'>): boolean {
+  if (isSupportedQualificationFeeOrder(fill.fillPrice, fill.filled)) return true;
+  if (fill.fillLevels.length === 0) return false;
+  const levelQuantity = fill.fillLevels.reduce((sum, level) => sum + level.quantity, 0);
+  if (Math.abs(levelQuantity - fill.filled) > 1e-8) return false;
+  return fill.fillLevels.every((level) => isSupportedQualificationFeeOrder(level.price, level.quantity));
 }
 
 function emptyResult(

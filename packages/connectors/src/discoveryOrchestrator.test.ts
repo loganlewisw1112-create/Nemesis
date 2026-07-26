@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { DiscoveryOrchestrator } from './discoveryOrchestrator.js';
 import { ConnectorRegistry } from './registry.js';
 import type { KalshiMarket, KalshiOrderbook } from '@nemesis/core';
@@ -254,5 +254,132 @@ describe('DiscoveryOrchestrator fixture fallback', () => {
     await discovery.runDepthPass();
     expect(fetchOrderbookMock).not.toHaveBeenCalled();
     expect(discovery.getDepth(ninthTicker)).toBeDefined();
+  });
+});
+
+describe('series allowlist env', () => {
+  const original = process.env.NEMESIS_SERIES_ALLOWLIST;
+  const originalDeny = process.env.NEMESIS_SERIES_DENYLIST;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.NEMESIS_SERIES_ALLOWLIST;
+    else process.env.NEMESIS_SERIES_ALLOWLIST = original;
+    if (originalDeny === undefined) delete process.env.NEMESIS_SERIES_DENYLIST;
+    else process.env.NEMESIS_SERIES_DENYLIST = originalDeny;
+  });
+
+  it('reads NEMESIS_SERIES_ALLOWLIST dynamically (not frozen at module load)', async () => {
+    const {
+      tickerWithinSeriesAllowlist,
+      seriesAllowlistConfigured,
+    } = await import('./discoveryOrchestrator.js');
+
+    delete process.env.NEMESIS_SERIES_ALLOWLIST;
+    expect(seriesAllowlistConfigured()).toBe(false);
+    expect(tickerWithinSeriesAllowlist('KXMLBGAME-1')).toBe(true);
+
+    process.env.NEMESIS_SERIES_ALLOWLIST = 'KXINXHUD,KXBTCD';
+    expect(seriesAllowlistConfigured()).toBe(true);
+    expect(tickerWithinSeriesAllowlist('KXBTCD-26JUL2412-T63999.99')).toBe(true);
+    expect(tickerWithinSeriesAllowlist('KXMLBGAME-1')).toBe(false);
+    expect(tickerWithinSeriesAllowlist('KXINXHUD-1')).toBe(true);
+  });
+
+  it('honors NEMESIS_SERIES_DENYLIST even without an allowlist', async () => {
+    const {
+      tickerWithinSeriesAllowlist,
+      seriesDenylistConfigured,
+    } = await import('./discoveryOrchestrator.js');
+
+    delete process.env.NEMESIS_SERIES_ALLOWLIST;
+    process.env.NEMESIS_SERIES_DENYLIST = 'KXETHD';
+    expect(seriesDenylistConfigured()).toBe(true);
+    expect(tickerWithinSeriesAllowlist('KXETHD-26JUL2512-T1859.99')).toBe(false);
+    expect(tickerWithinSeriesAllowlist('KXBTCD-26JUL2512-T64099.99')).toBe(true);
+  });
+
+  it('keeps zero-volume quoted allowlisted markets so force-fill has inventory', async () => {
+    process.env.NEMESIS_SERIES_ALLOWLIST = 'KXBTCD,KXETHD';
+    fetchMarketsMock.mockImplementation(async (options: { seriesTicker?: string }) => {
+      const all = [
+        {
+          ticker: 'KXBTCD-26JUL2421-T64099.99',
+          title: 'BTC daily',
+          status: 'open',
+          yes_bid_dollars: '0.4000',
+          yes_ask_dollars: '0.4100',
+          volume: 0,
+          volume_24h: 0,
+        },
+        {
+          ticker: 'KXETHD-26JUL2421-T2499.99',
+          title: 'ETH daily',
+          status: 'open',
+          yes_bid_dollars: '0.5500',
+          yes_ask_dollars: '0.5600',
+          volume: 0,
+          volume_24h: 0,
+        },
+        {
+          ticker: 'KXMLBGAME-1',
+          title: 'Sports (must not enter allowlisted universe)',
+          status: 'open',
+          yes_bid_dollars: '0.5000',
+          yes_ask_dollars: '0.5100',
+          volume: 9_000,
+          volume_24h: 4_000,
+        },
+      ];
+      const series = options.seriesTicker?.toUpperCase();
+      return {
+        markets: series
+          ? all.filter((market) => market.ticker.toUpperCase().startsWith(series))
+          : all,
+      };
+    });
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    await discovery.refreshUniverse();
+    expect(discovery.getUniverse().map((market) => market.ticker).sort()).toEqual([
+      'KXBTCD-26JUL2421-T64099.99',
+      'KXETHD-26JUL2421-T2499.99',
+    ]);
+    expect(fetchMarketsMock).toHaveBeenCalledWith(expect.objectContaining({ seriesTicker: 'KXBTCD' }));
+    expect(fetchMarketsMock).toHaveBeenCalledWith(expect.objectContaining({ seriesTicker: 'KXETHD' }));
+  });
+
+  it('queries each allowlist series directly instead of paging the global open book', async () => {
+    process.env.NEMESIS_SERIES_ALLOWLIST = 'KXINXHUD,KXBTCD';
+    fetchMarketsMock.mockReset();
+    fetchMarketsMock.mockImplementation(async (options: { seriesTicker?: string }) => ({
+      markets: options.seriesTicker === 'KXBTCD'
+        ? [{
+            ticker: 'KXBTCD-26JUL2421-T64099.99',
+            title: 'BTC daily',
+            status: 'open',
+            yes_bid_dollars: '0.4000',
+            yes_ask_dollars: '0.4100',
+            volume: 0,
+            volume_24h: 0,
+          }]
+        : options.seriesTicker === 'KXINXHUD'
+          ? [{
+              ticker: 'KXINXHUD-26JUL2418-B7000',
+              title: 'INX HUD',
+              status: 'open',
+              yes_bid_dollars: '0.4800',
+              yes_ask_dollars: '0.4900',
+              volume: 0,
+              volume_24h: 0,
+            }]
+          : [],
+    }));
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    await discovery.refreshUniverse();
+    expect(discovery.getUniverse().map((market) => market.ticker).sort()).toEqual([
+      'KXBTCD-26JUL2421-T64099.99',
+      'KXINXHUD-26JUL2418-B7000',
+    ]);
+    const seriesArgs = fetchMarketsMock.mock.calls.map((call) => call[0]?.seriesTicker).sort();
+    expect(seriesArgs).toEqual(['KXBTCD', 'KXINXHUD']);
   });
 });

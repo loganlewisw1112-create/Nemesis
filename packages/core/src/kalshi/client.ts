@@ -64,6 +64,8 @@ export interface FetchOptions {
   limit?: number;
   status?: string;
   cursor?: string;
+  /** When set, Kalshi returns only markets in this series (avoids paging past sports to find crypto/HUD). */
+  seriesTicker?: string;
   authHeaders?: Record<string, string>;
   signal?: AbortSignal;
   onResponseMetadata?: (metadata: KalshiResponseMetadata) => void;
@@ -616,6 +618,7 @@ export async function fetchMarkets(opts: FetchOptions = {}): Promise<KalshiMarke
   params.set('limit', String(opts.limit ?? 50));
   if (opts.status) params.set('status', opts.status);
   if (opts.cursor) params.set('cursor', opts.cursor);
+  if (opts.seriesTicker) params.set('series_ticker', opts.seriesTicker);
   const raw = await kalshiFetch<KalshiMarketsResponse>(`/markets?${params}`, opts);
   return {
     ...raw,

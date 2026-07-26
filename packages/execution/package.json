@@ -6,7 +6,9 @@
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./pnlEngine": "./src/pnlEngine.ts"
+    "./paperQualification": "./src/paperQualification.ts",
+    "./pnlEngine": "./src/pnlEngine.ts",
+    "./strategyValidation": "./src/strategyValidation.ts"
   },
   "dependencies": {
     "@nemesis/core": "*",

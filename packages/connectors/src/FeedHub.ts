@@ -680,18 +680,22 @@ export class FeedHub {
     };
   }
 
-  cryptoInputFor(market: KalshiMarket, marketPrice: number) {
+  cryptoInputFor(market: KalshiMarket, _marketPrice: number) {
     const symbol = parseCryptoSymbol(market.title, market.ticker);
     const live = this.binance.getQuote(symbol);
     const snap = this.crypto.get(symbol);
-    const strike = parseBtcStrike(market.title);
+    const strike = parseBtcStrike(market.title, market.ticker);
     const binanceQuote = live ?? this.snapshotToBinanceQuote(symbol, snap);
     return {
       symbol,
       spotPrice: binanceQuote?.price ?? strike,
       strike,
       lagMs: binanceQuote?.lagMs ?? 0,
-      kalshiImpliedSpot: marketPrice * strike,
+      // Do NOT invent a Kalshi spot as marketPrice*strike. For binary
+      // above/below contracts that product is a probability×strike mash that
+      // almost always "disagrees" with Binance and permanently marks
+      // crypto-lead theses uncertain (source-conflict) — which zeroed
+      // entry_eligible on the KXBTCD/KXETHD allowlist soak.
       binanceQuote,
     };
   }

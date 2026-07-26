@@ -99,6 +99,15 @@ export interface StrategyValidationSnapshot {
   shadowStressedProfitFactor: number;
   shadowLargestWinShare: number;
   shadowDistinctDayCount: number;
+  /** Effective acceptance bar used for shadowPassed (includes env/settings overrides). */
+  shadowMinScored: number;
+  /** Effective distinct-day bar; 1 means same-day is enough (days do not block). */
+  shadowMinDistinctDays: number;
+  /** Count + distinct-day sample size met (quality may still fail). */
+  shadowCountPassed: boolean;
+  /** Edge quality bars met (PF / win rate / net / stressed / concentration). */
+  shadowQualityPassed: boolean;
+  /** Full shadow gate: count + quality + not paused + no integrity error. */
   shadowPassed: boolean;
   paused: boolean;
   pauseReason?: string;
@@ -396,16 +405,17 @@ export class StrategyValidationTracker {
     const winRate = rows.length > 0 ? rows.filter((value) => value > 0).length / rows.length : 0;
     const largestWinShare = grossProfit > 0 ? largestWin / grossProfit : 0;
     const pauseEvent = this.events.filter((event): event is Extract<StrategyValidationEvent, { type: 'validation_paused' }> => event.type === 'validation_paused').at(-1);
-    const shadowPassed = rows.length >= settings.shadowMinScored
-      && distinctDays >= settings.shadowMinDistinctDays
-      && netPnl > 0
+    const eligible = !pauseEvent && !this.integrityError;
+    const shadowCountPassed = eligible
+      && rows.length >= settings.shadowMinScored
+      && distinctDays >= settings.shadowMinDistinctDays;
+    const shadowQualityPassed = netPnl > 0
       && profitFactor >= settings.shadowMinProfitFactor
       && winRate >= settings.shadowMinWinRate
       && stressedNetPnl > 0
       && stressedProfitFactor >= settings.shadowMinStressedProfitFactor
-      && largestWinShare <= 0.2
-      && !pauseEvent
-      && !this.integrityError;
+      && largestWinShare <= 0.2;
+    const shadowPassed = shadowCountPassed && shadowQualityPassed;
 
     return {
       schemaVersion: this.schemaVersion,
@@ -426,6 +436,10 @@ export class StrategyValidationTracker {
       shadowStressedProfitFactor: round(stressedProfitFactor),
       shadowLargestWinShare: round(largestWinShare),
       shadowDistinctDayCount: distinctDays,
+      shadowMinScored: settings.shadowMinScored,
+      shadowMinDistinctDays: settings.shadowMinDistinctDays,
+      shadowCountPassed,
+      shadowQualityPassed,
       shadowPassed,
       paused: Boolean(pauseEvent),
       pauseReason: pauseEvent?.reason,

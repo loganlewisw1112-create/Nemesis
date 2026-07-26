@@ -221,9 +221,13 @@ describe('campaign schema-v2 screening and lifecycle', () => {
     const v2Snapshot = v2.snapshot();
     expect(v2Snapshot.candidates).toEqual([]);
     expect(v2Snapshot.diagnostics).toEqual([]);
-    expect(v2Snapshot.screenedOut).toHaveLength(3);
-    expect(v2Snapshot.screenedOut?.map((screening) => screening.reasonCode))
-      .toEqual(Array(3).fill('target_reward_below_minimum'));
+    // Three historical enrollments collapse to unique economic identities
+    // (ticker|side|playbook|sourceMove) — re-issued card.ids no longer fork rows.
+    const screenedOccurrences = v2Snapshot.screenedOut?.reduce((sum, row) => sum + row.occurrences, 0) ?? 0;
+    expect(screenedOccurrences).toBe(3);
+    expect(v2Snapshot.screenedOut?.length).toBeGreaterThanOrEqual(1);
+    expect(v2Snapshot.screenedOut?.length).toBeLessThanOrEqual(3);
+    expect(v2Snapshot.screenedOut?.every((screening) => screening.reasonCode === 'target_reward_below_minimum')).toBe(true);
   });
 
   it('replays the three r9 economic candidates as screened out with no lifecycle or diagnostic', () => {
@@ -266,15 +270,13 @@ describe('campaign schema-v2 screening and lifecycle', () => {
       expect(decision).toMatchObject({ status: 'screened_out', reasonCode: 'target_reward_below_minimum' });
       if (decision.status === 'screened_out') tracker.recordScreenedOut({ card: candidate, decision });
     });
-    expect(tracker.snapshot()).toMatchObject({
-      candidates: [],
-      diagnostics: [],
-      screenedOut: [
-        { reasonCode: 'target_reward_below_minimum' },
-        { reasonCode: 'target_reward_below_minimum' },
-        { reasonCode: 'target_reward_below_minimum' },
-      ],
-    });
+    const snapshot = tracker.snapshot();
+    expect(snapshot.candidates).toEqual([]);
+    expect(snapshot.diagnostics).toEqual([]);
+    // Two share ticker/side (MAS no); third is distinct — 2 identity rows, 3 occurrences.
+    expect(snapshot.screenedOut).toHaveLength(2);
+    expect(snapshot.screenedOut.reduce((sum, row) => sum + row.occurrences, 0)).toBe(3);
+    expect(snapshot.screenedOut.every((row) => row.reasonCode === 'target_reward_below_minimum')).toBe(true);
   });
 
   it('screens economic failures without enrolling or scheduling diagnostics and deduplicates evidence', () => {
@@ -301,6 +303,9 @@ describe('campaign schema-v2 screening and lifecycle', () => {
     expect(snapshot.diagnostics).toHaveLength(0);
     expect(snapshot.screenedOut).toMatchObject([{ occurrences: 2, reasonCode: 'target_reward_below_minimum' }]);
     expect(candidateEconomicIdentity(candidate)).toBe(candidateEconomicIdentity({ ...candidate, signalReason: 'totally different' }));
+    // Re-issued flow signals get a new card.id; economic identity must stay stable
+    // so confirmation and campaign enrollment accumulate rather than reset.
+    expect(candidateEconomicIdentity(candidate)).toBe(candidateEconomicIdentity({ ...candidate, id: 'totally-different-signal-id' }));
   });
 
   it('atomically enrolls one confirming candidate with its first exchange sample and one diagnostic', async () => {

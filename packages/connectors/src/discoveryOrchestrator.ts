@@ -36,27 +36,62 @@ const MIN_EXECUTABLE_UNIVERSE = 25;
  * chosen instrument set -- e.g. continuously-liquid financial-index or
  * crypto-daily markets whose pace suits the persistence-confirmation model --
  * without code changes. Unset means no restriction (the historical behaviour).
- * Read once at module load; case-insensitive.
+ * Read from env on every check (not module-load freeze) so a correctly launched
+ * Electron process is never stuck with a null allowlist after a bad Start-Process
+ * env handoff — and so tests can set the env mid-suite.
  */
-const SERIES_ALLOWLIST: readonly string[] | null = (() => {
+function seriesAllowlistPrefixes(): readonly string[] | null {
   const raw = process.env.NEMESIS_SERIES_ALLOWLIST?.trim();
   if (!raw) return null;
   const list = raw.split(',').map((entry) => entry.trim().toUpperCase()).filter(Boolean);
   return list.length ? list : null;
-})();
-
-/** True when the market passes the series allowlist (or none is configured). */
-export function withinSeriesAllowlist(market: Pick<KalshiMarket, 'ticker'>): boolean {
-  if (!SERIES_ALLOWLIST) return true;
-  const ticker = market.ticker.toUpperCase();
-  return SERIES_ALLOWLIST.some((prefix) => ticker.startsWith(prefix));
 }
 
-/** True when a raw ticker string passes the series allowlist. */
-export function tickerWithinSeriesAllowlist(ticker: string): boolean {
-  if (!SERIES_ALLOWLIST) return true;
+/**
+ * Optional operator cut-list: reject tickers whose prefix matches
+ * NEMESIS_SERIES_DENYLIST (comma-separated). Applied even when no allowlist is
+ * set, so a single losing series (e.g. KXETHD) can be removed without rewriting
+ * the whole allowlist. Read dynamically like the allowlist.
+ */
+function seriesDenylistPrefixes(): readonly string[] {
+  const raw = process.env.NEMESIS_SERIES_DENYLIST?.trim();
+  if (!raw) return [];
+  return raw.split(',').map((entry) => entry.trim().toUpperCase()).filter(Boolean);
+}
+
+function tickerDeniedBySeries(ticker: string): boolean {
+  const denylist = seriesDenylistPrefixes();
+  if (denylist.length === 0) return false;
   const upper = ticker.toUpperCase();
-  return SERIES_ALLOWLIST.some((prefix) => upper.startsWith(prefix));
+  return denylist.some((prefix) => upper.startsWith(prefix));
+}
+
+/** True when a series allowlist env is configured (any non-empty prefix list). */
+export function seriesAllowlistConfigured(): boolean {
+  return seriesAllowlistPrefixes() != null;
+}
+
+/** True when a series denylist env is configured. */
+export function seriesDenylistConfigured(): boolean {
+  return seriesDenylistPrefixes().length > 0;
+}
+
+/** True when the market passes the series allowlist (or none is configured) and is not denylisted. */
+export function withinSeriesAllowlist(market: Pick<KalshiMarket, 'ticker'>): boolean {
+  if (tickerDeniedBySeries(market.ticker)) return false;
+  const allowlist = seriesAllowlistPrefixes();
+  if (!allowlist) return true;
+  const ticker = market.ticker.toUpperCase();
+  return allowlist.some((prefix) => ticker.startsWith(prefix));
+}
+
+/** True when a raw ticker string passes the series allowlist and is not denylisted. */
+export function tickerWithinSeriesAllowlist(ticker: string): boolean {
+  if (tickerDeniedBySeries(ticker)) return false;
+  const allowlist = seriesAllowlistPrefixes();
+  if (!allowlist) return true;
+  const upper = ticker.toUpperCase();
+  return allowlist.some((prefix) => upper.startsWith(prefix));
 }
 
 export interface ProductionUniverseRecord {
@@ -194,47 +229,101 @@ export class DiscoveryOrchestrator {
     const start = Date.now();
     const merged: KalshiMarket[] = [];
     const productionByTicker = new Map<string, ProductionUniverseRecord>();
-    let cursor: string | undefined;
     let pages = 0;
+    const allowlist = seriesAllowlistPrefixes();
     try {
-      do {
-        let responseMetadata: KalshiResponseMetadata | null = null;
-        const res = await fetchMarkets({
-          limit: this.settings.universePageSize,
-          status: 'open',
-          cursor,
-          signal,
-          onResponseMetadata: (metadata) => { responseMetadata = metadata; },
-        });
-        const pageMarkets = res.markets.filter(withinSeriesAllowlist);
+      const ingestPage = (
+        pageMarkets: KalshiMarket[],
+        responseMetadata: KalshiResponseMetadata | null,
+      ) => {
         merged.push(...pageMarkets);
-        const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
-        if (verifiedResponse?.environment === 'production' && verifiedResponse.status === 200) {
+        if (responseMetadata?.environment === 'production' && responseMetadata.status === 200) {
           for (const market of pageMarkets) {
             productionByTicker.set(market.ticker, {
               market: { ...market },
-              sourceBaseUrl: verifiedResponse.sourceBaseUrl,
-              verifiedAt: verifiedResponse.verifiedAt,
+              sourceBaseUrl: responseMetadata.sourceBaseUrl,
+              verifiedAt: responseMetadata.verifiedAt,
             });
           }
         }
-        cursor = res.cursor;
-        pages += 1;
-        // Record success on the first successful page so kalshi-rest exits
-        // "idle" within ~1-2 s of startup rather than waiting for all pages.
-        if (pages === 1) {
-          this.registry.recordSuccess('kalshi-rest', Date.now() - start);
+      };
+
+      if (allowlist) {
+        // Prefix allowlists are a handful of series. Client-side filtering of the
+        // global /markets stream pages past sports/parlays and often never reaches
+        // KXBTCD/HUD within MAX_UNIVERSE_PAGES — leaving force-fill with zero
+        // inventory and an empty track set. Query each series directly.
+        for (const seriesTicker of allowlist) {
+          let cursor: string | undefined;
+          let seriesPages = 0;
+          do {
+            let responseMetadata: KalshiResponseMetadata | null = null;
+            const res = await fetchMarkets({
+              limit: this.settings.universePageSize,
+              status: 'open',
+              cursor,
+              seriesTicker,
+              signal,
+              onResponseMetadata: (metadata) => { responseMetadata = metadata; },
+            });
+            ingestPage(res.markets.filter(withinSeriesAllowlist), responseMetadata);
+            cursor = res.cursor;
+            seriesPages += 1;
+            pages += 1;
+            if (pages === 1) {
+              this.registry.recordSuccess('kalshi-rest', Date.now() - start);
+            }
+            if (!cursor || seriesPages >= MAX_UNIVERSE_PAGES) break;
+          } while (true);
         }
-        const executableCount = selectExecutableMarkets(merged).length;
-        // Kalshi may return long runs of newly-created, zero-volume
-        // combination markets before liquid live markets. Keep paging until
-        // the exact orderbook readiness minimum is available; do not let a
-        // shallow page cap manufacture an empty live universe.
-        if (!cursor || executableCount >= Math.min(this.settings.maxTrackedTickers, MIN_EXECUTABLE_UNIVERSE)) break;
-      } while (pages < MAX_UNIVERSE_PAGES);
+      } else {
+        let cursor: string | undefined;
+        do {
+          let responseMetadata: KalshiResponseMetadata | null = null;
+          const res = await fetchMarkets({
+            limit: this.settings.universePageSize,
+            status: 'open',
+            cursor,
+            signal,
+            onResponseMetadata: (metadata) => { responseMetadata = metadata; },
+          });
+          ingestPage(res.markets, responseMetadata);
+          cursor = res.cursor;
+          pages += 1;
+          // Record success on the first successful page so kalshi-rest exits
+          // "idle" within ~1-2 s of startup rather than waiting for all pages.
+          if (pages === 1) {
+            this.registry.recordSuccess('kalshi-rest', Date.now() - start);
+          }
+          const executableCount = selectExecutableMarkets(merged).length;
+          // Kalshi may return long runs of newly-created, zero-volume
+          // combination markets before liquid live markets. Keep paging until
+          // the exact orderbook readiness minimum is available; do not let a
+          // shallow page cap manufacture an empty live universe.
+          if (!cursor || executableCount >= Math.min(this.settings.maxTrackedTickers, MIN_EXECUTABLE_UNIVERSE)) break;
+        } while (pages < MAX_UNIVERSE_PAGES);
+      }
 
       this.registry.recordSuccess('kalshi-rest', Date.now() - start);
-      this.universe = selectExecutableMarkets(merged).slice(0, this.settings.maxTrackedTickers);
+      // Focused series allowlists are often thin overnight and Kalshi's markets
+      // listing leaves volume_24h at 0 for most rows. selectExecutableMarkets
+      // then returns [] (liquidityScore>0 gate), so force-fill had nothing to
+      // subscribe and track sets stuck at 1 via priority-track only. Under an
+      // allowlist, keep every open market that still shows an executable quote;
+      // volume ranking remains the default for the unfocused universe.
+      this.universe = (allowlist
+        ? merged
+          .filter((market) => {
+            const status = market.status.toLowerCase();
+            return (status === 'active' || status === 'open') && hasExecutableMarketQuote(market);
+          })
+          .sort((left, right) => {
+            const volumeDelta = marketLiquidityScore(right) - marketLiquidityScore(left);
+            if (volumeDelta !== 0) return volumeDelta;
+            return left.ticker.localeCompare(right.ticker);
+          })
+        : selectExecutableMarkets(merged)
+      ).slice(0, this.settings.maxTrackedTickers);
       this.productionUniverseRecords = this.universe
         .map((market) => productionByTicker.get(market.ticker))
         .filter((record): record is ProductionUniverseRecord => record != null);
