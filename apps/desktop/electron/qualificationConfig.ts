@@ -28,10 +28,10 @@ export function buildStrategyConfigHash(
     'humanQuizPassed',
     'backtestPassed',
   ]) delete qualificationSettings[key];
-  // Shadow sample-size / calendar acceptance only — same rationale as
+  // Shadow sample-size / calendar/time acceptance only — same rationale as
   // NEMESIS_SHADOW_MIN_* env overrides in main.ts: changing them must not
-  // pause evidence continuity. Pin to shipped defaults so the hash stays
-  // identical to historical ledgers that recorded 100/3.
+  // pause evidence continuity. Pin existing historical bars to shipped defaults,
+  // and omit newer acceptance-only fields that older ledgers never hashed.
   const entryQualification = qualificationSettings.entryQualification;
   if (entryQualification && typeof entryQualification === 'object') {
     qualificationSettings.entryQualification = {
@@ -39,6 +39,7 @@ export function buildStrategyConfigHash(
       shadowMinScored: DEFAULT_ENTRY_QUALIFICATION.shadowMinScored,
       shadowMinDistinctDays: DEFAULT_ENTRY_QUALIFICATION.shadowMinDistinctDays,
     };
+    delete (qualificationSettings.entryQualification as Record<string, unknown>).shadowMinObservationMs;
   }
   return createHash('sha256')
     .update(stableJson({

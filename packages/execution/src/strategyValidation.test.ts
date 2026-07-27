@@ -103,6 +103,7 @@ describe('StrategyValidationTracker', () => {
       shadowNetPnlUsd: 80,
       shadowStressedProfitFactor: 3,
       shadowDistinctDayCount: 3,
+      shadowObservationWindowMs: expect.any(Number),
       shadowCountPassed: true,
       shadowQualityPassed: true,
       shadowPassed: true,
@@ -141,15 +142,16 @@ describe('StrategyValidationTracker', () => {
     expect(tracker.snapshot(DEFAULT_ENTRY_QUALIFICATION)).toMatchObject({ paused: true, shadowPassed: false });
   });
 
-  it('requires 50 scored shadows across two calendar days before count passes', () => {
+  it('requires 50 scored shadows across the minimum observation window before count passes', () => {
     const acceptance = {
       ...DEFAULT_ENTRY_QUALIFICATION,
       shadowMinScored: 50,
-      shadowMinDistinctDays: 2,
+      shadowMinDistinctDays: 1,
+      shadowMinObservationMs: 24 * 60 * 60_000,
     };
     const tracker = StrategyValidationTracker.create('shadow', 'config-a', 2, start, 'count-run');
     for (let index = 0; index < 49; index += 1) {
-      const at = start + (index % 2) * day + index * 1_000;
+      const at = start + index * 1_000;
       const row = candidate(index, at);
       tracker.startShadowCandidate(row);
       // Mostly losers: count clears, quality does not.
@@ -158,14 +160,23 @@ describe('StrategyValidationTracker', () => {
     }
     expect(tracker.snapshot(acceptance).shadowCountPassed).toBe(false);
 
-    const finalAt = start + day + 50_000;
-    const finalRow = candidate(49, finalAt);
+    const earlyRow = candidate(49, start + 50_000);
+    tracker.startShadowCandidate(earlyRow);
+    tracker.scoreShadowCandidate(earlyRow.id, -1, -0.5, 'follow-up complete', start + 52_000);
+    expect(tracker.snapshot(acceptance)).toMatchObject({
+      shadowCandidateCount: 50,
+      shadowCountPassed: false,
+    });
+
+    const finalAt = start + 24 * 60 * 60_000;
+    const finalRow = candidate(50, finalAt);
     tracker.startShadowCandidate(finalRow);
     tracker.scoreShadowCandidate(finalRow.id, -1, -0.5, 'follow-up complete', finalAt + 2_000);
 
     const snapshot = tracker.snapshot(acceptance);
-    expect(snapshot.shadowCandidateCount).toBe(50);
-    expect(snapshot.shadowDistinctDayCount).toBe(2);
+    expect(snapshot.shadowCandidateCount).toBe(51);
+    expect(snapshot.shadowObservationWindowMs).toBeGreaterThanOrEqual(24 * 60 * 60_000);
+    expect(snapshot.shadowMinObservationMs).toBe(24 * 60 * 60_000);
     expect(snapshot.shadowCountPassed).toBe(true);
     expect(snapshot.shadowQualityPassed).toBe(false);
     expect(snapshot.shadowPassed).toBe(false);

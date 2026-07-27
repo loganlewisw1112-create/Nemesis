@@ -3,11 +3,20 @@ import { WebSocket } from 'ws';
 import { getKalshiEndpointPolicy, resetKalshiProductionRetryCoordinatorForTests } from '@nemesis/core';
 import { ConnectorRegistry } from './registry.js';
 import { DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS } from './productionMarketProvenance.js';
-import { KalshiOrderbookStream, type OrderbookTrackingStateV2 } from './kalshiOrderbookStream.js';
 import {
+  KalshiOrderbookStream,
+  ORDERBOOK_CONNECT_DEADLINE_MS,
+  ORDERBOOK_DATA_PLANE_SILENCE_MS,
+  ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS,
+  ORDERBOOK_SUPERVISOR_MAX_BACKOFF_MS,
+  type OrderbookTrackingStateV2,
+} from './kalshiOrderbookStream.js';
+import {
+  classifyKalshiWebSocketError,
   createKalshiTransportFailure,
   type KalshiProductionConnectionController,
   type KalshiSocketHealthV2,
+  type KalshiTransportFailure,
 } from './kalshiTransportController.js';
 
 const productionRestBase = getKalshiEndpointPolicy('production').restBaseUrls[0]!;
@@ -18,6 +27,37 @@ function verifyTickers(stream: KalshiOrderbookStream, tickers: string[], verifie
     title: ticker,
     status: 'active',
   })), productionRestBase, verifiedAt);
+}
+
+function fakeSocket(readyState: number) {
+  return { readyState, close: vi.fn(), ping: vi.fn(), send: vi.fn() };
+}
+
+function controllerOf(stream: KalshiOrderbookStream): KalshiProductionConnectionController {
+  return (stream as unknown as { transportController: KalshiProductionConnectionController }).transportController;
+}
+
+/**
+ * Reuses the existing fake-socket seam for `connect()`: the stub installs a
+ * CONNECTING socket exactly as the real WebSocket constructor would, so the
+ * supervisor's invariant sees the same post-attempt state it sees in production
+ * without opening a real socket.
+ */
+function stubConnect(stream: KalshiOrderbookStream) {
+  const sockets: Array<ReturnType<typeof fakeSocket>> = [];
+  const spy = vi.spyOn(stream as unknown as { connect(): void }, 'connect').mockImplementation(() => {
+    const socket = fakeSocket(WebSocket.CONNECTING);
+    sockets.push(socket);
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket,
+      connectAttemptStartedAt: Date.now(),
+    });
+  });
+  return { spy, sockets };
+}
+
+function killSocket(stream: KalshiOrderbookStream): void {
+  Object.assign(stream as unknown as Record<string, unknown>, { socket: null, connectAttemptStartedAt: null });
 }
 
 describe('KalshiOrderbookStream', () => {
@@ -717,6 +757,381 @@ describe('KalshiOrderbookStream', () => {
     expect(JSON.parse(String(socket.send.mock.calls[0]![0]))).toMatchObject({
       cmd: 'update_subscription',
       params: { sids: [12], market_tickers: ['KXCONTROL'], action: 'get_snapshot' },
+    });
+  });
+
+  // Regression suite for the 2026-07-26 outage: the orderbook socket died at
+  // T+13m40s and never re-opened for 7.9h because every teardown path could end
+  // without arming a reconnect. Recovery is now owned from outside the socket.
+  describe('data-plane supervision', () => {
+    it('A: recovers a socket that a non-retryable (sticky) close left with nothing armed', () => {
+      vi.useFakeTimers();
+      const closedAt = 1_700_010_000_000;
+      vi.setSystemTime(closedAt);
+      const registry = new ConnectorRegistry();
+      const warn = vi.spyOn(registry, 'recordWarn');
+      const stream = new KalshiOrderbookStream(registry, () => ({ authorization: 'test' }));
+      const attempt = controllerOf(stream).beginAttempt()!;
+      const socket = fakeSocket(WebSocket.OPEN);
+      verifyTickers(stream, ['KXBTCD-TEST'], closedAt);
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        socket,
+        authenticated: true,
+        generation: attempt.generation,
+        tickers: new Set(['KXBTCD-TEST']),
+        connectedAt: closedAt,
+        lastApplicationMessageAt: closedAt,
+      });
+      const { spy } = stubConnect(stream);
+
+      // 1008 + "invalid credentials" classifies as sticky `authentication`, so
+      // recordFailure returns noRetry() — the exact absorbing dead end.
+      (stream as unknown as { handleSocketClose(s: WebSocket, g: number, c: number, r: Buffer): void })
+        .handleSocketClose(socket as unknown as WebSocket, attempt.generation, 1008, Buffer.from('invalid credentials'));
+
+      expect(stream.socketState()).toBe('none');
+      expect(stream.telemetry(closedAt)).toMatchObject({
+        reconnectScheduled: false,
+        connectInFlight: false,
+        socketState: 'none',
+      });
+      expect(spy).not.toHaveBeenCalled();
+      expect(stream.isTracked('KXBTCD-TEST')).toBe(true);
+
+      const recovered = stream.superviseDataPlane(closedAt + 1);
+      expect(recovered.action).toBe('reconnect-dead-socket');
+      // Sticky classes go straight to the cap and keep retrying, never latch off.
+      expect(recovered.nextAttemptInMs).toBe(ORDERBOOK_SUPERVISOR_MAX_BACKOFF_MS);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(stream.socketState()).toBe('connecting');
+      expect(stream.telemetry(closedAt + 1)).toMatchObject({
+        connectInFlight: true,
+        supervisorEscalations: 1,
+        lastSupervisionAction: 'reconnect-dead-socket',
+        lastSupervisionAt: closedAt + 1,
+      });
+      expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-orderbook-ws' && /sticky authentication/.test(detail)))
+        .toBe(true);
+
+      // Backoff is respected between attempts; the connect stays in flight.
+      expect(stream.superviseDataPlane(closedAt + 2)).toMatchObject({ action: 'none', reason: 'connect in flight' });
+      expect(spy).toHaveBeenCalledTimes(1);
+      stream.stop();
+    });
+
+    it('B: recovers after restartAfterFailure leaves a non-retryable handshake dead end', () => {
+      vi.useFakeTimers();
+      const at = 1_700_011_000_000;
+      vi.setSystemTime(at);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const attempt = controllerOf(stream).beginAttempt()!;
+      const socket = fakeSocket(WebSocket.CONNECTING);
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        socket,
+        generation: attempt.generation,
+        connectAttemptStartedAt: at,
+      });
+      const { spy } = stubConnect(stream);
+
+      // HTTP 404 maps to the unmapped `unknown` class: retryable === false.
+      const failure = classifyKalshiWebSocketError({ statusCode: 404, message: 'unexpected server response: 404' });
+      expect(failure).toMatchObject({ classification: 'unknown', retryable: false });
+      (stream as unknown as { restartAfterFailure(g: number, f: KalshiTransportFailure): void })
+        .restartAfterFailure(attempt.generation, failure);
+
+      expect(stream.socketState()).toBe('none');
+      expect(stream.telemetry(at).reconnectScheduled).toBe(false);
+      expect(spy).not.toHaveBeenCalled();
+
+      expect(stream.superviseDataPlane(at + 1)).toMatchObject({
+        action: 'reconnect-dead-socket',
+        nextAttemptInMs: ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS,
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(stream.socketState()).toBe('connecting');
+      stream.stop();
+    });
+
+    it('C: keeps the 3158ef9 guard — an OPEN but application-silent socket still reconnects and resubscribes', async () => {
+      vi.useFakeTimers();
+      const startedAt = 1_700_012_000_000;
+      vi.setSystemTime(startedAt);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const socket = fakeSocket(WebSocket.OPEN);
+      const tracked = ['KXBTCD-A', 'KXBTCD-B'];
+      verifyTickers(stream, tracked, startedAt);
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        socket,
+        authenticated: true,
+        generation: 3,
+        tickers: new Set(tracked),
+        subscribed: new Set(tracked),
+        connectedAt: startedAt - ORDERBOOK_DATA_PLANE_SILENCE_MS - 1_000,
+        lastApplicationMessageAt: startedAt - ORDERBOOK_DATA_PLANE_SILENCE_MS - 1_000,
+        lastPongAt: startedAt,
+      });
+      const { spy } = stubConnect(stream);
+
+      const result = stream.superviseDataPlane(startedAt);
+      expect(result.action).toBe('reconnect-silent');
+      expect(socket.close).toHaveBeenCalledTimes(1);
+      expect(stream.telemetry(startedAt)).toMatchObject({
+        lastCloseTrigger: 'local_data_plane_silence',
+        reconnectScheduled: true,
+        // Membership was torn down, so the reconnect must resubscribe it.
+        serverTrackedTickers: 0,
+      });
+      await vi.advanceTimersByTimeAsync(Math.max(result.nextAttemptInMs ?? 0, 1));
+      expect(spy).toHaveBeenCalledTimes(1);
+      stream.stop();
+    });
+
+    it('D: does not thrash a live socket that is still receiving application frames', () => {
+      vi.useFakeTimers();
+      const at = 1_700_013_000_000;
+      vi.setSystemTime(at);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const socket = fakeSocket(WebSocket.OPEN);
+      const tracked = ['KXBTCD-LOUD', 'KXBTCD-QUIET'];
+      verifyTickers(stream, tracked, at);
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        socket,
+        authenticated: true,
+        generation: 5,
+        tickers: new Set(tracked),
+        subscribed: new Set(tracked),
+        connectedAt: at - 60_000,
+        lastApplicationMessageAt: at - 1_000,
+        lastPongAt: at,
+      });
+      (stream as unknown as { startHeartbeat(socket: WebSocket, generation: number): void })
+        .startHeartbeat(socket as unknown as WebSocket, 5);
+      const { spy } = stubConnect(stream);
+
+      expect(stream.superviseDataPlane(at)).toEqual({ action: 'none', reason: null, nextAttemptInMs: null });
+      // One tracked book is quiet — that is a market property, not a feed fault.
+      expect(stream.bookState('KXBTCD-QUIET', at).state).toBe('subscribed-awaiting-snapshot');
+      expect(spy).not.toHaveBeenCalled();
+      expect(socket.close).not.toHaveBeenCalled();
+      expect(stream.telemetry(at)).toMatchObject({ supervisorEscalations: 0, lastSupervisionAction: null });
+      stream.stop();
+    });
+
+    it('E: reports every per-ticker book lifecycle state, including a superseded-revision delta', () => {
+      vi.useFakeTimers();
+      const at = 1_700_014_000_000;
+      vi.setSystemTime(at);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => null);
+      const snapshot = (seq: number) => JSON.stringify({
+        type: 'orderbook_snapshot', seq,
+        msg: { market_ticker: 'KXSTATE', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+      });
+      const delta = (seq: number) => JSON.stringify({
+        type: 'orderbook_delta', seq,
+        msg: { market_ticker: 'KXSTATE', price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: at },
+      });
+
+      expect(stream.bookState('KXSTATE', at)).toEqual({ state: 'untracked', sequencedAgeMs: null, snapshotAgeMs: null });
+
+      // Membership without a live provenance proof is exactly what a 90s TTL
+      // lapse looks like from getBook's side.
+      Object.assign(stream as unknown as Record<string, unknown>, { tickers: new Set(['KXSTATE']) });
+      expect(stream.bookState('KXSTATE', at).state).toBe('tracked-no-provenance');
+
+      verifyTickers(stream, ['KXSTATE'], at);
+      expect(stream.bookState('KXSTATE', at)).toEqual({
+        state: 'subscribed-awaiting-snapshot',
+        sequencedAgeMs: null,
+        snapshotAgeMs: null,
+      });
+
+      stream.ingest(snapshot(1));
+      expect(stream.bookState('KXSTATE', at)).toEqual({
+        state: 'snapshot-quarantined',
+        sequencedAgeMs: null,
+        snapshotAgeMs: 0,
+      });
+
+      stream.ingest(delta(2));
+      expect(stream.bookState('KXSTATE', at)).toEqual({
+        state: 'sequenced',
+        sequencedAgeMs: 0,
+        snapshotAgeMs: 0,
+      });
+
+      // A delta whose snapshot belongs to a superseded tracking revision must
+      // NOT un-quarantine: recovery restores delivery, never lowers evidence.
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        generation: 1,
+        trackingRevision: 4,
+        acknowledgedTrackingRevision: 4,
+        subscribed: new Set(['KXSTATE']),
+      });
+      stream.ingest(snapshot(3), 1);
+      expect(stream.bookState('KXSTATE', at).state).toBe('snapshot-quarantined');
+      Object.assign(stream as unknown as Record<string, unknown>, { trackingRevision: 5 });
+      stream.ingest(delta(4), 1);
+      expect(stream.bookState('KXSTATE', at).state).toBe('snapshot-quarantined');
+      expect(stream.getBook('KXSTATE', at)).toBeNull();
+    });
+
+    it('F: reaps a socket stuck in CONNECTING past the connect deadline', () => {
+      vi.useFakeTimers();
+      const at = 1_700_015_000_000;
+      vi.setSystemTime(at);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const socket = fakeSocket(WebSocket.CONNECTING);
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        socket,
+        generation: 2,
+        connectAttemptStartedAt: at - ORDERBOOK_CONNECT_DEADLINE_MS,
+      });
+      const { spy, sockets } = stubConnect(stream);
+
+      expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'none', reason: 'connect in flight' });
+      expect(spy).not.toHaveBeenCalled();
+
+      const reaped = stream.superviseDataPlane(at + 1);
+      expect(reaped).toMatchObject({
+        action: 'reconnect-connect-timeout',
+        nextAttemptInMs: ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS,
+      });
+      expect(socket.close).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(sockets).toHaveLength(1);
+      expect(stream.socketState()).toBe('connecting');
+      stream.stop();
+    });
+
+    it('escalates to a bounded full stream restart after three failed supervised attempts', () => {
+      vi.useFakeTimers();
+      const at = 1_700_016_000_000;
+      vi.setSystemTime(at);
+      const registry = new ConnectorRegistry();
+      const warn = vi.spyOn(registry, 'recordWarn');
+      const stream = new KalshiOrderbookStream(registry, () => ({ authorization: 'test' }));
+      Object.assign(stream as unknown as Record<string, unknown>, { started: true, socket: null });
+      const { spy } = stubConnect(stream);
+
+      const actions: string[] = [];
+      let now = at;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const result = stream.superviseDataPlane(now);
+        actions.push(result.action);
+        now += result.nextAttemptInMs ?? 0;
+        killSocket(stream);
+      }
+      expect(actions).toEqual([
+        'reconnect-dead-socket',
+        'reconnect-dead-socket',
+        'reconnect-dead-socket',
+        'stream-restarted',
+      ]);
+      expect(spy).toHaveBeenCalledTimes(4);
+      expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-orderbook-ws' && /full stream restart/.test(detail)))
+        .toBe(true);
+      expect(stream.telemetry(now)).toMatchObject({
+        supervisorEscalations: 4,
+        lastSupervisionAction: 'stream-restarted',
+      });
+
+      // A real application frame proves the data plane came back: the ladder and
+      // the backoff both reset to base.
+      verifyTickers(stream, ['KXSTATE'], now);
+      Object.assign(stream as unknown as Record<string, unknown>, { socket: fakeSocket(WebSocket.OPEN), generation: 9 });
+      stream.ingest(JSON.stringify({
+        type: 'orderbook_snapshot', seq: 1,
+        msg: { market_ticker: 'KXSTATE', yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [] },
+      }), 9);
+      killSocket(stream);
+      expect(stream.superviseDataPlane(now)).toMatchObject({
+        action: 'reconnect-dead-socket',
+        nextAttemptInMs: ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS,
+      });
+      stream.stop();
+    });
+
+    it('leaves an intentionally stopped stream stopped', () => {
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const { spy } = stubConnect(stream);
+      expect(stream.superviseDataPlane(1_700_017_000_000)).toEqual({ action: 'none', reason: null, nextAttemptInMs: null });
+      expect(spy).not.toHaveBeenCalled();
+      expect(stream.socketState()).toBe('none');
+    });
+
+    it('restarts a missing heartbeat interval on an otherwise healthy open socket', () => {
+      vi.useFakeTimers();
+      const at = 1_700_018_000_000;
+      vi.setSystemTime(at);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const socket = fakeSocket(WebSocket.OPEN);
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        socket,
+        authenticated: true,
+        generation: 6,
+        connectedAt: at,
+        lastApplicationMessageAt: at,
+        lastPongAt: at,
+      });
+      expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'heartbeat-restarted' });
+      expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'none' });
+      vi.advanceTimersByTime(10_000);
+      expect(socket.ping).toHaveBeenCalledTimes(1);
+      stream.stop();
+    });
+
+    it('warns on the tripwire when a supervised attempt cannot even open a socket', () => {
+      vi.useFakeTimers();
+      const at = 1_700_019_000_000;
+      vi.setSystemTime(at);
+      const registry = new ConnectorRegistry();
+      const warn = vi.spyOn(registry, 'recordWarn');
+      // No credentials: connect() bails before constructing a socket, so after
+      // supervision nothing is open, connecting, or scheduled.
+      const stream = new KalshiOrderbookStream(registry, () => null);
+      Object.assign(stream as unknown as Record<string, unknown>, { started: true });
+
+      expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'reconnect-dead-socket' });
+      expect(stream.socketState()).toBe('none');
+      expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-orderbook-ws' && /invariant violated/.test(detail)))
+        .toBe(true);
+      // Reported once per supervised attempt, so it can never spam the ledger.
+      const warnsAfterFirst = warn.mock.calls.length;
+      expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'none', reason: 'supervisor backoff pending' });
+      expect(warn.mock.calls).toHaveLength(warnsAfterFirst);
+      // The supervisor still keeps retrying rather than latching off.
+      expect(stream.superviseDataPlane(at + ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS))
+        .toMatchObject({ action: 'reconnect-dead-socket' });
+      stream.stop();
+    });
+
+    it('returns invariant-violation when a socket vanishes with nothing armed to bring it back', () => {
+      vi.useFakeTimers();
+      const at = 1_700_020_000_000;
+      vi.setSystemTime(at);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      Object.assign(stream as unknown as Record<string, unknown>, { started: true, socket: null });
+      stubConnect(stream);
+
+      expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'reconnect-dead-socket' });
+      // The attempt is in flight, so the invariant holds.
+      expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'none', reason: 'connect in flight' });
+
+      // Socket disappears mid-backoff with no timer armed: the tripwire state.
+      killSocket(stream);
+      const violation = stream.superviseDataPlane(at + 2);
+      expect(violation.action).toBe('invariant-violation');
+      expect(violation.reason).toContain('no reconnect scheduled');
+      expect(violation.nextAttemptInMs).toBe(ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS - 2);
+      expect(stream.superviseDataPlane(at + 3)).toMatchObject({ action: 'none' });
+      stream.stop();
     });
   });
 });

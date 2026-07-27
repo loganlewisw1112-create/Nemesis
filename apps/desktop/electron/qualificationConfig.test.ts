@@ -40,6 +40,7 @@ describe('buildStrategyConfigHash', () => {
         ...DEFAULT_GUARDRAILS.entryQualification!,
         shadowMinScored: 25,
         shadowMinDistinctDays: 1,
+        shadowMinObservationMs: 24 * 60 * 60_000,
       },
     }, discovery)).toBe(base);
   });

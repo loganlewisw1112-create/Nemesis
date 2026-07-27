@@ -660,14 +660,19 @@ export default function App() {
                 const sv = paper.strategyValidation!;
                 const minScored = sv.shadowMinScored ?? 100;
                 const minDays = sv.shadowMinDistinctDays ?? 3;
+                const minObservationMs = sv.shadowMinObservationMs ?? 0;
                 const countOk = sv.shadowCountPassed
                   ?? (sv.shadowCandidateCount >= minScored
                     && sv.shadowDistinctDayCount >= minDays
+                    && (sv.shadowObservationWindowMs ?? 0) >= minObservationMs
                     && !sv.paused
                     && !sv.integrityError);
                 const qualityOk = sv.shadowQualityPassed ?? sv.shadowPassed;
                 const daysMatter = minDays > 1;
                 const daysPart = daysMatter ? ` · days ${sv.shadowDistinctDayCount}/${minDays}` : '';
+                const observationPart = minObservationMs > 0
+                  ? ` · age ${((sv.shadowObservationWindowMs ?? 0) / 86_400_000).toFixed(1)}/${(minObservationMs / 86_400_000).toFixed(1)}d`
+                  : '';
                 const pf = Number.isFinite(sv.shadowProfitFactor) ? sv.shadowProfitFactor.toFixed(2) : '∞';
                 const countLabel = countOk ? 'count PASS' : 'count short';
                 const qualityLabel = qualityOk
@@ -681,7 +686,7 @@ export default function App() {
                         Validation stage: {sv.stage}
                       </div>
                       <div style={{ marginTop: 5, fontSize: 11, color: 'var(--text-muted)' }}>
-                        {`Shadow ${sv.shadowCandidateCount}/${minScored}${daysPart} · ${countLabel} · ${qualityLabel} · PF ${pf} · wins ${(sv.shadowWinRate * 100).toFixed(1)}%`}
+                        {`Shadow ${sv.shadowCandidateCount}/${minScored}${daysPart}${observationPart} · ${countLabel} · ${qualityLabel} · PF ${pf} · wins ${(sv.shadowWinRate * 100).toFixed(1)}%`}
                       </div>
                       {paper.pilotValidation && (
                         <div style={{ marginTop: 3, fontSize: 11, color: 'var(--text-muted)' }}>

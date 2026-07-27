@@ -69,6 +69,12 @@ export interface BridgeStatus {
   lastPongAt: number | null;
   lastSequenceIn: number | null;
   lastSequenceOut: number | null;
+  /**
+   * Bridge-socket counters (desktop<->GEA). NOT the Kalshi orderbook stream.
+   * A 2026-07-27 run was read as "the orderbook never reconnected" from these
+   * three zeros; the orderbook stream's own counters are the `orderbook*`
+   * fields below.
+   */
   reconnects: number;
   disconnects: number;
   failovers: number;
@@ -86,6 +92,16 @@ export interface BridgeStatus {
   tradeTapeFreshnessMs?: number | null;
   orderbookObservationFreshnessMs?: number | null;
   exchangeDeltaFreshnessMs?: number | null;
+  /** Kalshi orderbook stream state — socket health here is not book health. */
+  orderbookSocketState?: 'none' | 'connecting' | 'open' | 'closing' | 'closed' | null;
+  orderbookStreamReconnects?: number | null;
+  orderbookTrackedTickers?: number | null;
+  orderbookQualifiedTickers?: number | null;
+  orderbookSupervisorEscalations?: number | null;
+  /** Latched when candidates cannot obtain a sequenced book; rejections emitted while true are not economic evidence. */
+  dataPlaneDegraded?: boolean;
+  dataPlaneDegradedMs?: number | null;
+  candidateSequencedBookFraction?: number | null;
   geaPid?: number | null;
   geaWorkingSetMb?: number | null;
   geaProcessSampledAt?: number | null;

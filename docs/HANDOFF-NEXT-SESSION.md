@@ -4,10 +4,10 @@
 
 This section supersedes the older July 24 instructions below.
 
-- The focused shadow campaign is now **50 scored observations across two distinct
-  calendar days**. `scripts/launch-paper-allowlist.ps1` exports
+- The focused shadow campaign is now **50 scored observations across 1 elapsed
+  day**. `scripts/launch-paper-allowlist.ps1` exports
   `NEMESIS_SHADOW_MIN_SCORED=50` and
-  `NEMESIS_SHADOW_MIN_DISTINCT_DAYS=2`.
+  `NEMESIS_SHADOW_MIN_OBSERVATION_DAYS=1`.
 - Count is never enough by itself. Net P&L, profit factor, win rate, stressed
   P&L/PF, largest-win concentration, ledger integrity, and exchange-origin book
   checks remain mandatory.
@@ -23,11 +23,11 @@ This section supersedes the older July 24 instructions below.
   reason to weaken the acceptance bars.
 - The source tree was built and verified without stopping the running desk.
   A later controlled relaunch is required before the live UI/runtime uses the
-  committed 50/2 gate and no-bypass build.
+  committed 50/1-day gate and no-bypass build.
 
 **Next runtime action:** controlled relaunch with
 `scripts/launch-paper-allowlist.ps1`, record a new cutoff, verify the UI reports
-50 samples / 2 days and exposes no force button, then judge only post-cutoff
+50 samples / 1 day and exposes no force button, then judge only post-cutoff
 events. Do not reset the paper portfolio or strategy ledger from automation.
 
 **Read this first.** Do **not** start new plumbing overnight. The app was left running for a

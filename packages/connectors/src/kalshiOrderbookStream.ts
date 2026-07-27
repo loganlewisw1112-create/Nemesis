@@ -35,7 +35,26 @@ const DEAD_CONNECTION_MS = 25_000;
 // zombie OPEN sockets without a reconnect on Windows Electron builds.
 export const ORDERBOOK_DATA_PLANE_SILENCE_MS = 90_000;
 const DATA_PLANE_SILENCE_MS = ORDERBOOK_DATA_PLANE_SILENCE_MS;
+// A socket stuck in CONNECTING never fires `open` or `close`, so nothing inside
+// the socket can time it out. The supervisor owns that deadline from outside.
+export const ORDERBOOK_CONNECT_DEADLINE_MS = 20_000;
+// Supervisor backoff is deliberately independent of the transport controller's
+// retry decision: the 2026-07-26 outage was caused by the controller returning
+// noRetry() forever, so an owner that trusts that decision cannot recover.
+export const ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS = 5_000;
+export const ORDERBOOK_SUPERVISOR_MAX_BACKOFF_MS = 60_000;
+// Consecutive supervised attempts that never reached open + first application
+// frame before the supervisor tears the whole stream down and rebuilds it.
+export const ORDERBOOK_SUPERVISOR_MAX_ESCALATIONS = 3;
 const DEFAULT_MAX_TRACKED_TICKERS = 25;
+// Credentials can be repaired at runtime; a permanently dead feed is strictly
+// worse than a slow retry loop, so sticky classes back off to the cap and keep
+// retrying with a durable warn instead of latching the stream off.
+const SUPERVISOR_STICKY_FAILURE_CLASSES = new Set<KalshiTransportFailureClass>([
+  'authentication',
+  'authorization',
+  'configuration',
+]);
 // Bounded freshness proves the stream is live, not that every second trades:
 // a book with sequence continuity, a live pong, and an unchanged state is
 // still current. One second disqualified the whole feed whenever no tracked
@@ -43,6 +62,49 @@ const DEFAULT_MAX_TRACKED_TICKERS = 25;
 const MAX_QUALIFICATION_EXCHANGE_AGE_MS = DEAD_CONNECTION_MS;
 const MAX_EXCHANGE_FUTURE_SKEW_MS = 5_000;
 const MIN_MILLISECOND_TIMESTAMP = 1_000_000_000_000;
+
+/** Read-only projection of `WebSocket.readyState`; `none` means no socket object at all. */
+export type OrderbookSocketState = 'none' | 'connecting' | 'open' | 'closing' | 'closed';
+
+/**
+ * Per-ticker book lifecycle. "Tracked" was one word for four different states,
+ * which is why an 8h dead socket read as a provenance-shaped symptom.
+ */
+export type OrderbookBookState =
+  /** Not in this stream's tracked set. */
+  | 'untracked'
+  /** Tracked, but this stream's provenance store no longer vouches for it. */
+  | 'tracked-no-provenance'
+  /** Tracked and provenanced, but no book object has arrived yet. */
+  | 'subscribed-awaiting-snapshot'
+  /** A snapshot exists but no qualifying sequenced delta under the current tracking revision. */
+  | 'snapshot-quarantined'
+  /** `getBook()` yields a book with a finite exchange timestamp and an integer sequence. */
+  | 'sequenced';
+
+export interface OrderbookBookStateSnapshot {
+  state: OrderbookBookState;
+  /** now - book.sequencedDeltaAt; null when no sequenced delta has ever landed. */
+  sequencedAgeMs: number | null;
+  /** now - book.receivedAt; null when no book object exists. */
+  snapshotAgeMs: number | null;
+}
+
+export type OrderbookSupervisionAction =
+  | 'none'
+  | 'reconnect-silent'
+  | 'reconnect-dead-socket'
+  | 'reconnect-connect-timeout'
+  | 'heartbeat-restarted'
+  | 'stream-restarted'
+  | 'invariant-violation';
+
+export interface OrderbookSupervisionResult {
+  action: OrderbookSupervisionAction;
+  reason: string | null;
+  /** Milliseconds until the supervisor will next attempt recovery, when one is pending. */
+  nextAttemptInMs: number | null;
+}
 
 export interface KalshiOrderbookStreamTelemetry extends KalshiSocketHealthV2 {
   trackedTickers: number;
@@ -68,6 +130,13 @@ export interface KalshiOrderbookStreamTelemetry extends KalshiSocketHealthV2 {
   subscriptionUpdates: number;
   subscriptionUpdateQueueDepth: number;
   subscriptionUpdateInFlight: boolean;
+  socketState: OrderbookSocketState;
+  /** A reconnect timer is armed. With socketState !== 'open' this is what proves recovery is owned. */
+  reconnectScheduled: boolean;
+  connectInFlight: boolean;
+  supervisorEscalations: number;
+  lastSupervisionAction: string | null;
+  lastSupervisionAt: number | null;
 }
 
 /**
@@ -216,6 +285,15 @@ export class KalshiOrderbookStream {
   private readonly subscriptionUpdateQueue: SubscriptionUpdateCommand[] = [];
   private pendingSubscriptionUpdate: PendingSubscriptionUpdate | null = null;
   private initialSubscriptionCommand: InitialSubscriptionCommand | null = null;
+  private connectAttemptStartedAt: number | null = null;
+  private supervisorBackoffMs = ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS;
+  private supervisorNextAttemptAt: number | null = null;
+  private supervisedAttemptPending = false;
+  private supervisedAttemptFailures = 0;
+  private supervisorEscalations = 0;
+  private supervisionInvariantReported = false;
+  private lastSupervisionAction: string | null = null;
+  private lastSupervisionAt: number | null = null;
   private trackingRevision = 0;
   private acknowledgedTrackingRevision: number | null = null;
   private readonly bookUpdateListeners = new Set<BookUpdateListener>();
@@ -256,27 +334,115 @@ export class KalshiOrderbookStream {
   }
 
   /**
-   * Belt-and-suspenders for desktop: if the heartbeat timer stalls or
-   * terminate()+close fails to reconnect, the main-process health tick can
-   * still force recovery when tracked markets have gone application-silent.
+   * Back-compat wrapper for the desktop health tick. True iff supervision
+   * actually attempted a new connection this call.
    */
   recoverIfDataPlaneSilent(now = Date.now()): boolean {
-    if (!this.started || this.socket?.readyState !== WebSocket.OPEN) return false;
-    if (this.tickers.size === 0) return false;
-    const dataReferenceAt = this.lastApplicationMessageAt ?? this.connectedAt;
-    if (dataReferenceAt != null && now - dataReferenceAt <= DATA_PLANE_SILENCE_MS) return false;
-    this.forceLocalReconnect(
-      this.generation,
-      createKalshiTransportFailure('timeout', 'order-book websocket data-plane silence'),
-      'local_data_plane_silence',
-    );
-    return true;
+    const { action } = this.superviseDataPlane(now);
+    return action === 'reconnect-silent'
+      || action === 'reconnect-dead-socket'
+      || action === 'reconnect-connect-timeout'
+      || action === 'stream-restarted';
+  }
+
+  socketState(): OrderbookSocketState {
+    const socket = this.socket;
+    if (!socket) return 'none';
+    if (socket.readyState === WebSocket.CONNECTING) return 'connecting';
+    if (socket.readyState === WebSocket.OPEN) return 'open';
+    if (socket.readyState === WebSocket.CLOSING) return 'closing';
+    return 'closed';
+  }
+
+  /**
+   * Where one ticker actually is in the book lifecycle. Deliberately derived
+   * from `getBook`, so `sequenced` can never mean anything weaker than the
+   * exchange-origin evidence `getBook` already enforces.
+   */
+  bookState(ticker: string, now = Date.now()): OrderbookBookStateSnapshot {
+    const book = this.books.get(ticker);
+    const snapshotAgeMs = book ? now - book.receivedAt : null;
+    const sequencedAgeMs = book?.sequencedDeltaAt != null ? now - book.sequencedDeltaAt : null;
+    const at = (state: OrderbookBookState): OrderbookBookStateSnapshot => ({ state, sequencedAgeMs, snapshotAgeMs });
+    if (!this.tickers.has(ticker)) return at('untracked');
+    if (!this.marketProvenance.has(ticker, now)) return at('tracked-no-provenance');
+    if (!book) return at('subscribed-awaiting-snapshot');
+    const delivered = this.getBook(ticker, now);
+    const sequenced = delivered != null
+      && delivered.sourceTimestamp != null
+      && Number.isFinite(delivered.sourceTimestamp)
+      && Number.isInteger(delivered.sequence);
+    return at(sequenced ? 'sequenced' : 'snapshot-quarantined');
+  }
+
+  /**
+   * The stream's own outside owner. Everything inside the socket dies with the
+   * socket, so recovery has to be driven from here: on 2026-07-26 a sticky
+   * close left `socket === null`, the heartbeat cleared, and no reconnect timer
+   * armed — an absorbing dead state that ran for 7.9h.
+   */
+  superviseDataPlane(now = Date.now()): OrderbookSupervisionResult {
+    if (!this.started) return { action: 'none', reason: null, nextAttemptInMs: null };
+    const state = this.socketState();
+
+    // 1. OPEN but application-silent with live membership: pre-existing 3158ef9
+    //    behavior, unchanged.
+    if (state === 'open' && this.tickers.size > 0) {
+      const dataReferenceAt = this.lastApplicationMessageAt ?? this.connectedAt;
+      if (dataReferenceAt == null || now - dataReferenceAt > DATA_PLANE_SILENCE_MS) {
+        const reason = `application silence for ${dataReferenceAt == null ? 'unknown' : now - dataReferenceAt}ms on an open socket`;
+        const escalate = this.noteSupervisedAttempt();
+        this.scheduleSupervisorBackoff(now);
+        if (escalate) return this.restartStreamAfterEscalation(now, reason);
+        const waitMs = this.forceLocalReconnect(
+          this.generation,
+          createKalshiTransportFailure('timeout', 'order-book websocket data-plane silence'),
+          'local_data_plane_silence',
+        );
+        return this.checkSupervisionInvariant(now, this.finishSupervision(now, 'reconnect-silent', reason, waitMs));
+      }
+    }
+
+    // 2. OPEN with no heartbeat handle: closeCurrentSocket clears the interval,
+    //    so a stale-generation race can leave an OPEN socket unpinged forever.
+    if (state === 'open' && this.heartbeatTimer == null && this.socket) {
+      this.registry.recordWarn('kalshi-orderbook-ws', 'order-book heartbeat interval missing on an open socket; restarting it');
+      this.startHeartbeat(this.socket, this.generation);
+      return this.finishSupervision(now, 'heartbeat-restarted', 'open socket had no heartbeat interval', null);
+    }
+
+    // 3. Stuck in CONNECTING: no `open`, no `close`, nothing else can time it out.
+    if (state === 'connecting') {
+      const startedAt = this.connectAttemptStartedAt;
+      if (startedAt == null || now - startedAt <= ORDERBOOK_CONNECT_DEADLINE_MS) {
+        return { action: 'none', reason: 'connect in flight', nextAttemptInMs: null };
+      }
+      const reason = `connect attempt exceeded ${ORDERBOOK_CONNECT_DEADLINE_MS}ms`;
+      return this.attemptSupervisedConnect(now, 'reconnect-connect-timeout', reason, true);
+    }
+
+    // 4. No live socket and nobody armed to bring one back. Membership is
+    //    deliberately not required: an empty tracked set still needs a socket.
+    if (state !== 'open' && this.reconnectTimer == null) {
+      const dueAt = this.supervisorNextAttemptAt;
+      if (dueAt != null && now < dueAt) {
+        return this.checkSupervisionInvariant(now, {
+          action: 'none',
+          reason: 'supervisor backoff pending',
+          nextAttemptInMs: dueAt - now,
+        });
+      }
+      return this.attemptSupervisedConnect(now, 'reconnect-dead-socket', `socket state ${state} with no reconnect armed`, false);
+    }
+
+    return this.checkSupervisionInvariant(now, { action: 'none', reason: null, nextAttemptInMs: null });
   }
 
   stop(): void {
     this.started = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.resetSupervisorBackoff();
     this.closeCurrentSocket();
   }
 
@@ -360,7 +526,8 @@ export class KalshiOrderbookStream {
   }
 
   telemetry(now = Date.now()): KalshiOrderbookStreamTelemetry {
-    const connected = this.socket?.readyState === WebSocket.OPEN;
+    const socketState = this.socketState();
+    const connected = socketState === 'open';
     const verifiedTrackedTickers = [...this.tickers]
       .filter((ticker) => this.marketProvenance.has(ticker, now)).length;
     const qualifiedTickers = [...this.books.values()].filter((book) => {
@@ -446,6 +613,12 @@ export class KalshiOrderbookStream {
       subscriptionUpdates: this.subscriptionUpdates,
       subscriptionUpdateQueueDepth: this.subscriptionUpdateQueue.length,
       subscriptionUpdateInFlight: this.initialSubscriptionCommand != null || this.pendingSubscriptionUpdate != null,
+      socketState,
+      reconnectScheduled: this.reconnectTimer != null,
+      connectInFlight: socketState === 'connecting',
+      supervisorEscalations: this.supervisorEscalations,
+      lastSupervisionAction: this.lastSupervisionAction,
+      lastSupervisionAt: this.lastSupervisionAt,
       endpointUrl: this.currentEndpointUrl(),
       activeEndpoint: transport.activeEndpoint,
       failedEndpoint: transport.failedEndpoint,
@@ -535,8 +708,12 @@ export class KalshiOrderbookStream {
     this.generation = generation;
     const socket = new WebSocket(endpointUrl, { headers });
     this.socket = socket;
+    // Owned by the supervisor: a socket that never leaves CONNECTING fires
+    // neither `open` nor `close`, so only an external deadline can reap it.
+    this.connectAttemptStartedAt = Date.now();
     socket.on('open', () => {
       if (!this.isCurrent(socket, generation)) return;
+      this.connectAttemptStartedAt = null;
       this.authenticated = true;
       this.subscribed.clear();
       this.books.clear();
@@ -592,48 +769,57 @@ export class KalshiOrderbookStream {
         message: `websocket handshake returned HTTP ${response.statusCode}`,
       }));
     });
-    socket.on('close', (code, reason) => {
-      if (!this.isCurrent(socket, generation)) return;
-      this.lastCloseAt = Date.now();
-      this.lastCloseCode = code;
-      this.lastCloseTrigger = this.pendingCloseTrigger ?? 'remote_close_without_reason';
-      const rawReason = reason.toString('utf8') || null;
-      const failure = this.pendingTransportFailure?.generation === generation
-        ? this.pendingTransportFailure.failure
-        : classifyKalshiWebSocketClose(code, rawReason, !this.started);
-      this.lastCloseReason = failure.closeReason ?? (rawReason ? failure.detail : this.lastCloseTrigger);
-      const retry = this.transportController.recordFailure(generation, failure);
-      const transportTelemetry = this.transportController.telemetry();
-      this.pendingCloseTrigger = null;
-      this.pendingTransportFailure = null;
-      this.socket = null;
-      this.authenticated = false;
-      this.connectedAt = null;
-      this.clearHeartbeatTimer();
-      this.subscribed.clear();
-      this.subscriptionUpdateQueue.length = 0;
-      this.pendingSubscriptionUpdate = null;
-      if (!this.started || !retry.retry) return;
-      this.reconnects += 1;
-      this.registry.recordTelemetry('kalshi-orderbook-ws', {
-        status: 'warn',
-        lastError: 'order-book stream disconnected; reconnect scheduled',
-        reconnects: this.reconnects,
-        transportConnected: false,
-        authenticated: false,
-        qualificationReady: false,
-        endpointUrl: transportTelemetry.failedEndpoint,
-        lastCloseAt: this.lastCloseAt,
-        lastCloseCode: this.lastCloseCode,
-        lastCloseReason: this.lastCloseReason,
-        lastCloseTrigger: this.lastCloseTrigger,
-      });
-      const waitMs = retry.delayMs ?? 0;
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null;
-        this.connect();
-      }, waitMs);
+    socket.on('close', (code, reason) => this.handleSocketClose(socket, generation, code, reason));
+  }
+
+  /**
+   * Extracted from the `close` listener so recovery tests can drive the real
+   * close path (including its non-retryable dead end) without a live socket.
+   */
+  private handleSocketClose(socket: WebSocket, generation: number, code: number, reason: Buffer): void {
+    if (!this.isCurrent(socket, generation)) return;
+    this.lastCloseAt = Date.now();
+    this.lastCloseCode = code;
+    this.lastCloseTrigger = this.pendingCloseTrigger ?? 'remote_close_without_reason';
+    const rawReason = reason.toString('utf8') || null;
+    const failure = this.pendingTransportFailure?.generation === generation
+      ? this.pendingTransportFailure.failure
+      : classifyKalshiWebSocketClose(code, rawReason, !this.started);
+    this.lastCloseReason = failure.closeReason ?? (rawReason ? failure.detail : this.lastCloseTrigger);
+    const retry = this.transportController.recordFailure(generation, failure);
+    const transportTelemetry = this.transportController.telemetry();
+    this.pendingCloseTrigger = null;
+    this.pendingTransportFailure = null;
+    this.socket = null;
+    this.connectAttemptStartedAt = null;
+    this.authenticated = false;
+    this.connectedAt = null;
+    this.clearHeartbeatTimer();
+    this.subscribed.clear();
+    this.subscriptionUpdateQueue.length = 0;
+    this.pendingSubscriptionUpdate = null;
+    // A non-retryable decision here used to be terminal. It is now merely
+    // "unscheduled": superviseDataPlane owns recovery from this state.
+    if (!this.started || !retry.retry) return;
+    this.reconnects += 1;
+    this.registry.recordTelemetry('kalshi-orderbook-ws', {
+      status: 'warn',
+      lastError: 'order-book stream disconnected; reconnect scheduled',
+      reconnects: this.reconnects,
+      transportConnected: false,
+      authenticated: false,
+      qualificationReady: false,
+      endpointUrl: transportTelemetry.failedEndpoint,
+      lastCloseAt: this.lastCloseAt,
+      lastCloseCode: this.lastCloseCode,
+      lastCloseReason: this.lastCloseReason,
+      lastCloseTrigger: this.lastCloseTrigger,
     });
+    const waitMs = retry.delayMs ?? 0;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, waitMs);
   }
 
   private subscribeMissing(): void {
@@ -682,6 +868,9 @@ export class KalshiOrderbookStream {
     const receivedAt = Date.now();
     this.lastMessageAt = receivedAt;
     this.lastApplicationMessageAt = receivedAt;
+    // An application frame is the only proof a supervised attempt actually
+    // restored the data plane; `open` alone has produced silent zombies.
+    this.resetSupervisorBackoff();
     try {
       const packet = JSON.parse(raw) as Record<string, unknown>;
       const type = String(packet.type ?? '');
@@ -996,8 +1185,8 @@ export class KalshiOrderbookStream {
    * when started. Do not rely on the WebSocket `close` event — terminate/close
    * alone has left zombie OPEN sockets without reconnect on Electron/Windows.
    */
-  private forceLocalReconnect(generation: number, failure: KalshiTransportFailure, trigger: string): void {
-    if (generation !== this.generation) return;
+  private forceLocalReconnect(generation: number, failure: KalshiTransportFailure, trigger: string): number | null {
+    if (generation !== this.generation) return null;
     this.lastCloseAt = Date.now();
     this.lastCloseTrigger = trigger;
     this.lastCloseReason = failure.detail;
@@ -1009,7 +1198,7 @@ export class KalshiOrderbookStream {
     const decision = this.transportController.recordFailure(generation, failure);
     this.closeCurrentSocket();
     this.recordHealth();
-    if (!this.started) return;
+    if (!this.started) return null;
     this.reconnects += 1;
     const waitMs = decision.retry && decision.delayMs != null ? decision.delayMs : 0;
     this.registry.recordWarn(
@@ -1034,6 +1223,131 @@ export class KalshiOrderbookStream {
       this.reconnectTimer = null;
       this.connect();
     }, waitMs);
+    return waitMs;
+  }
+
+  /**
+   * Counts one supervised recovery attempt. Returns true when the previous
+   * attempts never reached open + first application frame often enough that a
+   * full stream rebuild is warranted.
+   */
+  private noteSupervisedAttempt(): boolean {
+    if (this.supervisedAttemptPending) this.supervisedAttemptFailures += 1;
+    this.supervisedAttemptPending = true;
+    this.supervisionInvariantReported = false;
+    return this.supervisedAttemptFailures >= ORDERBOOK_SUPERVISOR_MAX_ESCALATIONS;
+  }
+
+  /** Arms the supervisor's own backoff. Returns the delay until the next attempt. */
+  private scheduleSupervisorBackoff(now: number): number {
+    const failureClass = this.transportController.telemetry().failureClass;
+    if (failureClass != null && SUPERVISOR_STICKY_FAILURE_CLASSES.has(failureClass)) {
+      this.supervisorBackoffMs = ORDERBOOK_SUPERVISOR_MAX_BACKOFF_MS;
+      this.registry.recordWarn(
+        'kalshi-orderbook-ws',
+        `order-book websocket sticky ${failureClass} failure; capping supervised retry at ${ORDERBOOK_SUPERVISOR_MAX_BACKOFF_MS}ms and continuing to retry`,
+      );
+    }
+    const backoffMs = this.supervisorBackoffMs;
+    this.supervisorNextAttemptAt = now + backoffMs;
+    this.supervisorBackoffMs = Math.min(ORDERBOOK_SUPERVISOR_MAX_BACKOFF_MS, backoffMs * 2);
+    return backoffMs;
+  }
+
+  private resetSupervisorBackoff(): void {
+    this.supervisorBackoffMs = ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS;
+    this.supervisorNextAttemptAt = null;
+    this.supervisedAttemptPending = false;
+    this.supervisedAttemptFailures = 0;
+    this.supervisionInvariantReported = false;
+  }
+
+  private attemptSupervisedConnect(
+    now: number,
+    action: OrderbookSupervisionAction,
+    reason: string,
+    tearDownFirst: boolean,
+  ): OrderbookSupervisionResult {
+    const escalate = this.noteSupervisedAttempt();
+    const backoffMs = this.scheduleSupervisorBackoff(now);
+    if (tearDownFirst) {
+      this.closeCurrentSocket();
+      this.recordHealth();
+    }
+    if (escalate) return this.restartStreamAfterEscalation(now, reason);
+    this.registry.recordWarn(
+      'kalshi-orderbook-ws',
+      `order-book data-plane supervisor reconnecting (${action}): ${reason}; next supervised attempt in ${backoffMs}ms`,
+    );
+    this.connect();
+    return this.checkSupervisionInvariant(now, this.finishSupervision(now, action, reason, backoffMs));
+  }
+
+  /**
+   * Bounded last resort: rebuild the stream from scratch (stop() then start()
+   * semantics) when repeated supervised reconnects never produced a frame.
+   */
+  private restartStreamAfterEscalation(now: number, reason: string): OrderbookSupervisionResult {
+    this.supervisedAttemptFailures = 0;
+    this.registry.recordWarn(
+      'kalshi-orderbook-ws',
+      `order-book data-plane supervisor escalating to a full stream restart after ${ORDERBOOK_SUPERVISOR_MAX_ESCALATIONS} failed supervised attempts: ${reason}`,
+    );
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.sequenceBySubscription.clear();
+    this.tickersBySubscription.clear();
+    this.subscriptionIdByKey.clear();
+    this.pendingSnapshotRepair.clear();
+    this.snapshotRequestRevisionBySubscription.clear();
+    this.subscriptionUpdateQueue.length = 0;
+    this.pendingSubscriptionUpdate = null;
+    this.initialSubscriptionCommand = null;
+    this.acknowledgedTrackingRevision = null;
+    this.pendingCloseTrigger = null;
+    this.pendingTransportFailure = null;
+    this.lastSequencedDeltaAt = null;
+    // Fail closed: every book must re-prove sequence continuity after a rebuild.
+    for (const ticker of this.tickers) {
+      this.books.delete(ticker);
+      this.quarantined.add(ticker);
+    }
+    this.closeCurrentSocket();
+    this.recordHealth();
+    this.connect();
+    const nextAttemptInMs = this.supervisorNextAttemptAt == null ? null : this.supervisorNextAttemptAt - now;
+    return this.checkSupervisionInvariant(now, this.finishSupervision(now, 'stream-restarted', reason, nextAttemptInMs));
+  }
+
+  /**
+   * Tripwire for the next variant of the 2026-07-26 bug: a started stream that
+   * is not open, has no reconnect armed and no connect in flight has nobody who
+   * can revive it. Reported once per supervised attempt so it cannot spam.
+   */
+  private checkSupervisionInvariant(now: number, result: OrderbookSupervisionResult): OrderbookSupervisionResult {
+    if (!this.started) return result;
+    const state = this.socketState();
+    if (state === 'open' || state === 'connecting' || this.reconnectTimer != null) return result;
+    if (this.supervisionInvariantReported) return result;
+    this.supervisionInvariantReported = true;
+    const reason = `started stream has socketState=${state} with no reconnect scheduled and no connect in flight`;
+    this.registry.recordWarn('kalshi-orderbook-ws', `order-book data-plane invariant violated: ${reason}`);
+    if (result.action !== 'none') return result;
+    return this.finishSupervision(now, 'invariant-violation', reason, result.nextAttemptInMs);
+  }
+
+  private finishSupervision(
+    now: number,
+    action: OrderbookSupervisionAction,
+    reason: string | null,
+    nextAttemptInMs: number | null,
+  ): OrderbookSupervisionResult {
+    if (action !== 'none') {
+      this.supervisorEscalations += 1;
+      this.lastSupervisionAction = action;
+      this.lastSupervisionAt = now;
+    }
+    return { action, reason, nextAttemptInMs };
   }
 
   private recordHealth(): void {
@@ -1081,6 +1395,7 @@ export class KalshiOrderbookStream {
     this.clearHeartbeatTimer();
     const socket = this.socket;
     this.socket = null;
+    this.connectAttemptStartedAt = null;
     this.authenticated = false;
     this.connectedAt = null;
     this.subscribed.clear();

@@ -164,6 +164,13 @@ import {
   shouldHoldEmptyDesiredOrderbook,
 } from './orderbookTrackingRotation.js';
 import { assessProductionObservation, productionObservationStateHash } from './productionObservation.js';
+import { createTraceWriter } from './orderbookTrace.js';
+import {
+  DataPlaneDegradationLatch,
+  computeCandidateSequencedBookHealth,
+  DEFAULT_SEQUENCED_BOOK_THRESHOLD_MS,
+  type CandidateBookSample,
+} from './dataPlaneHealth.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -179,6 +186,9 @@ const EQUITY_HISTORY_PATH = path.join(DATA_DIR, 'equity-history.json');
 const SESSION_STATS_PATH = path.join(DATA_DIR, 'session-stats.json');
 const PAPER_ORDERS_PATH = path.join(DATA_DIR, 'paper-orders.json');
 const AUDIT_PATH = path.join(DATA_DIR, 'audit-log.json');
+// The in-memory audit log is capped; without this archive the oldest entries
+// vanish silently (a 2026-07-27 run lost its last 2.6h to the cap).
+const AUDIT_ARCHIVE_PATH = path.join(DATA_DIR, 'audit-log-archive.jsonl');
 const DISCOVERY_SETTINGS_PATH = path.join(DATA_DIR, 'discovery-settings.json');
 const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
 const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json');
@@ -311,7 +321,16 @@ const paperDesk = new PaperDesk(DEFAULT_PAPER_CASH);
 const paperBuyExecutionCoordinator = new PaperExecutionCoordinator();
 const paperOrderBook = new PaperOrderBook();
 let productionObservationBaselineHash: string | null = null;
-const auditLog = new AuditLog();
+const auditLog = new AuditLog({
+  onEvict: (evicted) => {
+    try {
+      ensureDataDir();
+      fs.appendFileSync(AUDIT_ARCHIVE_PATH, `${evicted.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+    } catch {
+      // Archival must never disturb the runtime; the cap still applies.
+    }
+  },
+});
 const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
 const opportunityQueue = new OpportunityThroughputQueue(DEFAULT_OPPORTUNITY_THROUGHPUT);
 let entryConfirmationEngine = new EntryConfirmationEngine(DEFAULT_ENTRY_QUALIFICATION);
@@ -347,6 +366,28 @@ function tracePriorityTracking(fields: Record<string, string | number | boolean>
     // Diagnostics must never disturb the runtime.
   }
 }
+
+/**
+ * Orderbook stream state, sampled on the health tick. The 2026-07-27 run went
+ * 7.9h with a dead socket while every persisted ledger described either the
+ * desktop<->GEA bridge or the funnel's downstream symptoms; the stream's own
+ * socket/membership/quarantine state was recoverable only from a console. This
+ * writer is the durable record. Deduped, so a healthy 8h run costs kilobytes.
+ */
+const orderbookTrace = createTraceWriter('NEMESIS_ORDERBOOK_TRACE_PATH');
+/**
+ * Connector warnings, verbatim. `registry.recordWarn('kalshi-orderbook-ws', ...)`
+ * strings would have identified that outage in five minutes; they went nowhere.
+ * Never deduped -- a repeated warning is itself the signal.
+ */
+const connectorWarnTrace = createTraceWriter('NEMESIS_CONNECTOR_WARN_TRACE_PATH', { dedupeWindowMs: 0 });
+/**
+ * Latches when candidates cannot obtain a sequenced exchange book. Confirmation
+ * rejections emitted while latched describe missing data, not absent edge, and
+ * are tagged so no verdict can read "no data" as "no edge" again.
+ */
+const dataPlaneLatch = new DataPlaneDegradationLatch();
+let dataPlaneDegradedSnapshot = dataPlaneLatch.snapshot(Date.now());
 
 /**
  * `track`/`replaceTracked` admit a ticker only if the stream's own provenance
@@ -470,17 +511,43 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
       await delay(PRIORITY_ORDERBOOK_POLL_MS);
       streamed = kalshiOrderbookStream.getBook(ticker);
     }
+    const resolved = hasExchangeProvenance(streamed);
+    const finalBookState = kalshiOrderbookStream.bookState(ticker);
+    const streamTelemetry = kalshiOrderbookStream.telemetry();
     tracePriorityTracking({
       ticker,
       hadMainRecord,
       hadStreamProvenance,
       atCapacity,
       admitted,
-      resolved: hasExchangeProvenance(streamed),
+      resolved,
       waitedMs: Date.now() - startedAt,
       trackedCount: orderbookTrackedTickers.length,
       alreadyTracked,
-      outcome: hasExchangeProvenance(streamed) ? 'sequenced-book' : admitted ? 'admitted-no-book' : 'refused',
+      // `admitted-no-book` collapsed four different failures into one bucket,
+      // which is why an 8h dead socket read as a provenance-shaped symptom.
+      // Split them; `sequenced-book`/`provenance-unavailable`/`refused` keep
+      // their meaning so historical traces stay comparable.
+      outcome: resolved
+        ? 'sequenced-book'
+        : !admitted
+          ? 'refused'
+          : streamTelemetry.socketState !== 'open'
+            ? 'admitted-socket-dead'
+            : finalBookState.state === 'tracked-no-provenance'
+              ? 'admitted-provenance-lapsed'
+              : finalBookState.state === 'subscribed-awaiting-snapshot'
+                ? 'admitted-awaiting-snapshot'
+                : finalBookState.state === 'snapshot-quarantined'
+                  ? 'admitted-quarantined'
+                  : 'admitted-no-delta',
+      bookState: finalBookState.state,
+      socketState: streamTelemetry.socketState,
+      snapshotAgeMs: finalBookState.snapshotAgeMs ?? -1,
+      sequencedAgeMs: finalBookState.sequencedAgeMs ?? -1,
+      streamSequencedDeltaAgeMs: streamTelemetry.lastSequencedDeltaAt == null
+        ? -1
+        : Date.now() - streamTelemetry.lastSequencedDeltaAt,
     });
   }
   return hasExchangeProvenance(streamed) ? streamed! : fetchOrderbook(ticker);
@@ -690,6 +757,15 @@ function refreshBridgeConnectivity(now = Date.now()): void {
   bridgeStatus.exchangeDeltaFreshnessMs = stream.lastExchangeTimestamp == null
     ? null
     : Math.max(0, now - stream.lastExchangeTimestamp);
+  // Orderbook-stream state, distinct from the bridge counters above: a healthy
+  // bridge says nothing about whether Kalshi books are arriving.
+  bridgeStatus.orderbookSocketState = stream.socketState;
+  bridgeStatus.orderbookStreamReconnects = stream.reconnects;
+  bridgeStatus.orderbookTrackedTickers = stream.trackedTickers;
+  bridgeStatus.orderbookQualifiedTickers = stream.qualifiedTickers;
+  bridgeStatus.orderbookSupervisorEscalations = stream.supervisorEscalations;
+  bridgeStatus.dataPlaneDegraded = dataPlaneDegradedSnapshot.degraded;
+  bridgeStatus.dataPlaneDegradedMs = dataPlaneDegradedSnapshot.totalDegradedMs;
   bridgeStatus.tapeFreshnessMs = bridgeStatus.tradeTapeFreshnessMs;
   const inboundRecent = bridgeStatus.lastInboundAt != null && now - bridgeStatus.lastInboundAt <= BRIDGE_TRAFFIC_TTL_MS;
   const outboundRecent = bridgeStatus.lastOutboundAt != null && now - bridgeStatus.lastOutboundAt <= BRIDGE_TRAFFIC_TTL_MS;
@@ -702,17 +778,108 @@ function refreshBridgeConnectivity(now = Date.now()): void {
     : Math.max(now - bridgeStatus.lastInboundAt, now - bridgeStatus.lastOutboundAt);
 }
 
-/** External OB watchdog: recovers if stream heartbeat stalls on a zombie socket. */
-function maybeRecoverStaleOrderbookStream(now = Date.now()): void {
+/**
+ * Tickers whose book actually matters right now: anything mid-confirmation plus
+ * campaign-critical names. Health is judged on these, not on the whole tracked
+ * set -- 24 quiet fill markets must not mask the one candidate that is starving.
+ */
+function candidateBookSamples(now = Date.now()): CandidateBookSample[] {
+  const tickers = new Set<string>([
+    ...confirmationInFlightTickers(),
+    ...campaignCriticalOrderbookTickers(now),
+  ]);
+  return [...tickers].map((ticker) => {
+    const state = kalshiOrderbookStream.bookState(ticker, now);
+    return { ticker, state: state.state, sequencedAgeMs: state.sequencedAgeMs };
+  });
+}
+
+/**
+ * Supervises the orderbook data plane on every health tick and records what it
+ * saw. Replaces the previous watchdog, which could only act on a socket that
+ * was still OPEN -- the 2026-07-27 outage left no socket at all, so nothing
+ * fired for 7.9h. Also drives the degraded latch that tags rejections made
+ * while no candidate could obtain a sequenced book.
+ */
+function superviseOrderbookDataPlane(now = Date.now()): void {
   const before = kalshiOrderbookStream.telemetry(now);
-  if (!kalshiOrderbookStream.recoverIfDataPlaneSilent(now)) return;
+  const supervision = kalshiOrderbookStream.superviseDataPlane(now);
   const after = kalshiOrderbookStream.telemetry(now);
-  console.warn(
-    `[nemesis] orderbook data-plane silence watchdog fired `
-    + `(tracked=${before.trackedTickers}, appAgeMs=${before.lastApplicationMessageAt == null ? 'null' : now - before.lastApplicationMessageAt}, `
-    + `deltaAgeMs=${before.lastSequencedDeltaAt == null ? 'null' : now - before.lastSequencedDeltaAt}, `
-    + `reconnects ${before.reconnects}→${after.reconnects}, trigger=${after.lastCloseTrigger ?? 'local_data_plane_silence'})`,
-  );
+  const samples = candidateBookSamples(now);
+  const health = computeCandidateSequencedBookHealth(samples, {
+    thresholdMs: DEFAULT_SEQUENCED_BOOK_THRESHOLD_MS,
+  });
+  const observation = dataPlaneLatch.observe({
+    at: now,
+    health,
+    streamSequencedAgeMs: after.lastSequencedDeltaAt == null ? null : Math.max(0, now - after.lastSequencedDeltaAt),
+  });
+  dataPlaneDegradedSnapshot = observation;
+  bridgeStatus.candidateSequencedBookFraction = health.candidateCount === 0 ? null : health.fractionSequencedWithin;
+  orderbookTrace.record({
+    at: now,
+    socketState: after.socketState,
+    reconnectScheduled: after.reconnectScheduled,
+    connectInFlight: after.connectInFlight,
+    connected: after.connected,
+    authenticated: after.authenticated,
+    generation: after.generation,
+    reconnects: after.reconnects,
+    supervisorEscalations: after.supervisorEscalations,
+    supervisionAction: supervision.action,
+    supervisionReason: supervision.reason,
+    nextAttemptInMs: supervision.nextAttemptInMs,
+    trackedTickers: after.trackedTickers,
+    verifiedTrackedTickers: after.verifiedTrackedTickers,
+    serverTrackedTickers: after.serverTrackedTickers,
+    qualifiedTickers: after.qualifiedTickers,
+    quarantinedTickers: after.quarantinedTickers,
+    booksWithExchangeTime: after.booksWithExchangeTime,
+    membershipAcknowledged: after.membershipAcknowledged,
+    trackingRevision: after.trackingRevision,
+    acknowledgedTrackingRevision: after.acknowledgedTrackingRevision,
+    subscriptionUpdateQueueDepth: after.subscriptionUpdateQueueDepth,
+    subscriptionUpdateInFlight: after.subscriptionUpdateInFlight,
+    sequenceGaps: after.sequenceGaps,
+    sequenceRegressions: after.sequenceRegressions,
+    applicationSilenceMs: after.lastApplicationMessageAt == null ? null : Math.max(0, now - after.lastApplicationMessageAt),
+    sequencedDeltaAgeMs: after.lastSequencedDeltaAt == null ? null : Math.max(0, now - after.lastSequencedDeltaAt),
+    exchangeTimestampAgeMs: after.lastExchangeTimestamp == null ? null : Math.max(0, now - after.lastExchangeTimestamp),
+    lastCloseAt: after.lastCloseAt,
+    lastCloseCode: after.lastCloseCode,
+    lastCloseReason: after.lastCloseReason,
+    lastCloseTrigger: after.lastCloseTrigger,
+    failureClass: after.failureClass,
+    errorCode: after.errorCode,
+    httpStatus: after.httpStatus,
+    nextRetryAt: after.nextRetryAt,
+    activeEndpoint: after.activeEndpoint,
+    failedEndpoint: after.failedEndpoint,
+    switchReason: after.switchReason,
+    candidateCount: health.candidateCount,
+    candidateSequencedWithin: health.sequencedWithinCount,
+    candidateFractionSequenced: health.fractionSequencedWithin,
+    candidateMaxSequencedAgeMs: health.maxSequencedAgeMs,
+    dataPlaneDegraded: observation.degraded,
+    dataPlaneDegradedMs: observation.totalDegradedMs,
+    dataPlaneUnhealthyReason: observation.unhealthyReason,
+  });
+  if (supervision.action !== 'none') {
+    const message = `[nemesis] orderbook supervisor ${supervision.action}`
+      + ` (reason=${supervision.reason ?? 'unspecified'}, socket=${before.socketState}→${after.socketState},`
+      + ` tracked=${before.trackedTickers}, appAgeMs=${before.lastApplicationMessageAt == null ? 'null' : now - before.lastApplicationMessageAt},`
+      + ` deltaAgeMs=${before.lastSequencedDeltaAt == null ? 'null' : now - before.lastSequencedDeltaAt},`
+      + ` reconnects ${before.reconnects}→${after.reconnects}, retryInMs=${supervision.nextAttemptInMs ?? 'n/a'})`;
+    console.warn(message);
+    connectorWarnTrace.record({ at: now, connector: 'kalshi-orderbook-ws', source: 'supervisor', message });
+  }
+  if (observation.changed) {
+    const message = observation.degraded
+      ? `[nemesis] data plane DEGRADED (${observation.unhealthyReason ?? 'unknown'}); confirmation rejections from here are not economic evidence`
+      : `[nemesis] data plane recovered after ${Math.round(observation.totalDegradedMs / 1000)}s degraded`;
+    console.warn(message);
+    connectorWarnTrace.record({ at: now, connector: 'kalshi-orderbook-ws', source: 'data-plane-latch', message });
+  }
 }
 
 function currentProcessTelemetry(now = Date.now()): Record<string, unknown> {
@@ -2153,9 +2320,10 @@ function recordCampaignOperationalTelemetry(): void {
 
 /**
  * Optional operator overrides for the shadow-stage ACCEPTANCE thresholds only:
- * how many scored candidates (NEMESIS_SHADOW_MIN_SCORED) over how many distinct
- * days (NEMESIS_SHADOW_MIN_DISTINCT_DAYS) are required before shadow can advance
- * to pilot. They lower the *sample-size and calendar* bar so the execution path
+ * how many scored candidates (NEMESIS_SHADOW_MIN_SCORED), how many distinct
+ * days (NEMESIS_SHADOW_MIN_DISTINCT_DAYS), and how much elapsed observation time
+ * (NEMESIS_SHADOW_MIN_OBSERVATION_DAYS / _HOURS / _MS) are required before shadow
+ * can advance to pilot. They lower the *sample-size and calendar/time* bar so the execution path
  * (pilot placing a real paper trade) can be reached and proven the same day,
  * while the edge bar -- profit factor, win rate, stressed profitability -- is
  * left untouched, so this reduces rigor, it does not manufacture a pass.
@@ -2174,6 +2342,15 @@ const SHADOW_MIN_DISTINCT_DAYS_OVERRIDE = (() => {
   const raw = Number.parseInt(process.env.NEMESIS_SHADOW_MIN_DISTINCT_DAYS ?? '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : null;
 })();
+const SHADOW_MIN_OBSERVATION_MS_OVERRIDE = (() => {
+  const ms = Number.parseInt(process.env.NEMESIS_SHADOW_MIN_OBSERVATION_MS ?? '', 10);
+  if (Number.isFinite(ms) && ms > 0) return ms;
+  const hours = Number.parseFloat(process.env.NEMESIS_SHADOW_MIN_OBSERVATION_HOURS ?? '');
+  if (Number.isFinite(hours) && hours > 0) return Math.round(hours * 60 * 60_000);
+  const days = Number.parseFloat(process.env.NEMESIS_SHADOW_MIN_OBSERVATION_DAYS ?? '');
+  if (Number.isFinite(days) && days > 0) return Math.round(days * 24 * 60 * 60_000);
+  return null;
+})();
 
 function entryQualificationSettings() {
   return {
@@ -2181,6 +2358,7 @@ function entryQualificationSettings() {
     ...(settings.entryQualification ?? {}),
     ...(SHADOW_MIN_SCORED_OVERRIDE != null ? { shadowMinScored: SHADOW_MIN_SCORED_OVERRIDE } : {}),
     ...(SHADOW_MIN_DISTINCT_DAYS_OVERRIDE != null ? { shadowMinDistinctDays: SHADOW_MIN_DISTINCT_DAYS_OVERRIDE } : {}),
+    ...(SHADOW_MIN_OBSERVATION_MS_OVERRIDE != null ? { shadowMinObservationMs: SHADOW_MIN_OBSERVATION_MS_OVERRIDE } : {}),
   };
 }
 
@@ -3256,6 +3434,9 @@ async function executeReservedStrictPaperBuyForCard(
     rewardRiskRatio: confirmation.rewardRiskRatio,
     stressedNetPnlUsd: confirmation.stressedNetPnlUsd,
     economics: confirmation.economics,
+    // Tag, never suppress: a rejection recorded while the data plane is latched
+    // degraded is evidence about the feed, not about the strategy's edge.
+    dataPlaneDegraded: dataPlaneDegradedSnapshot.degraded,
   }));
   if (!confirmationRecorded) {
     const reason = 'entry confirmation evidence could not be persisted';
@@ -4010,10 +4191,23 @@ function computeRegimeState(spread: number, depthUsd: number, freshnessMs: numbe
     strategyDrawdown: sessionStatsData.dailyPnl < -settings.dailyLossCapUsd * 0.5,
   });
   activeRegimes = regime.active;
-  const shutdown = shouldShutdownSession(getShutdownCounters());
+  const shutdownCounters = getShutdownCounters();
+  const shutdown = shouldShutdownSession(shutdownCounters);
   if (shutdown && !shutdownEvidenceRecorded) {
     shutdownEvidenceRecorded = true;
-    recordQualificationSafety('shutdown_event', 'session shutdown counters triggered');
+    // Attribute the trip. The bare "session shutdown counters triggered" string
+    // read as an unexplained runtime risk marker in the 2026-07-27 report when
+    // the actual cause was 152 API-degraded minutes downstream of a dead
+    // orderbook socket. It freezes live theses only; paper/shadow keep flowing.
+    recordQualificationSafety(
+      'shutdown_event',
+      'session shutdown counters triggered (live theses frozen; paper/shadow unaffected): '
+      + `invalidations=${shutdownCounters.consecutiveInvalidations}/5, `
+      + `abnormalExecutions=${shutdownCounters.abnormalExecutions}/3, `
+      + `manualOverrides=${shutdownCounters.manualOverrides}/3, `
+      + `apiDegradedMinutes=${shutdownCounters.apiDegradedMinutes}/10, `
+      + `dataPlaneDegraded=${dataPlaneDegradedSnapshot.degraded}`,
+    );
   }
   return {
     ...regime,
@@ -6587,7 +6781,7 @@ app.whenReady().then(async () => {
     void runThroughputCertification('entry-confirmation-tick');
     void evaluateCampaignConfirmations();
     void evaluateCampaignDiagnostics();
-    maybeRecoverStaleOrderbookStream();
+    superviseOrderbookDataPlane();
     broadcastToGea({ type: 'bridge:ping', payload: {} });
     recordCampaignOperationalTelemetry();
     broadcast('connectors:update', registry.getAll());

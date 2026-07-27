@@ -189,6 +189,7 @@ export interface EntryQualificationSettings {
   shadowFollowUpMs: number;
   shadowMinScored: number;
   shadowMinDistinctDays: number;
+  shadowMinObservationMs: number;
   shadowMinProfitFactor: number;
   shadowMinWinRate: number;
   shadowMinStressedProfitFactor: number;
@@ -228,6 +229,7 @@ export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
   shadowFollowUpMs: 15 * 60_000,
   shadowMinScored: 100,
   shadowMinDistinctDays: 3,
+  shadowMinObservationMs: 0,
   shadowMinProfitFactor: 1.25,
   shadowMinWinRate: 0.55,
   shadowMinStressedProfitFactor: 1.1,

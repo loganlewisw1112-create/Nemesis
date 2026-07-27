@@ -61,6 +61,12 @@ export type StrategyValidationEvent = ValidationEventBase & (
     rewardRiskRatio: number;
     stressedNetPnlUsd: number;
     economics?: EntryEconomicsEvidence;
+    /**
+     * True when this observation was made while the orderbook data plane was
+     * latched degraded. Such rejections describe missing data, not absent edge,
+     * and must be excluded from any economic verdict.
+     */
+    dataPlaneDegraded?: boolean;
   }
   | {
     type: 'shadow_candidate_observed';
@@ -99,11 +105,14 @@ export interface StrategyValidationSnapshot {
   shadowStressedProfitFactor: number;
   shadowLargestWinShare: number;
   shadowDistinctDayCount: number;
+  shadowObservationWindowMs: number;
   /** Effective acceptance bar used for shadowPassed (includes env/settings overrides). */
   shadowMinScored: number;
   /** Effective distinct-day bar; 1 means same-day is enough (days do not block). */
   shadowMinDistinctDays: number;
-  /** Count + distinct-day sample size met (quality may still fail). */
+  /** Effective elapsed observation bar; 0 means elapsed age does not block. */
+  shadowMinObservationMs: number;
+  /** Count + elapsed/calendared sample-size bars met (quality may still fail). */
   shadowCountPassed: boolean;
   /** Edge quality bars met (PF / win rate / net / stressed / concentration). */
   shadowQualityPassed: boolean;
@@ -293,6 +302,7 @@ export class StrategyValidationTracker {
     rewardRiskRatio: number;
     stressedNetPnlUsd: number;
     economics: EntryEconomicsEvidence;
+    dataPlaneDegraded?: boolean;
     at?: number;
   }): StrategyValidationEvent {
     const { at, ...rest } = input;
@@ -392,12 +402,16 @@ export class StrategyValidationTracker {
     const scores = this.events.filter((event): event is Extract<StrategyValidationEvent, { type: 'shadow_candidate_scored' }> => event.type === 'shadow_candidate_scored');
     const rows = scores.map((score) => score.netPnlUsd);
     const stressed = scores.map((score) => score.stressedNetPnlUsd);
+    const scoreTimes = scores.map((score) => score.at);
     const grossProfit = rows.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
     const grossLoss = Math.abs(rows.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
     const stressedProfit = stressed.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
     const stressedLoss = Math.abs(stressed.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
     const largestWin = rows.filter((value) => value > 0).reduce((largest, value) => Math.max(largest, value), 0);
     const distinctDays = new Set(scores.map((score) => localDay(score.at))).size;
+    const shadowObservationWindowMs = scoreTimes.length > 0
+      ? Math.max(...scoreTimes) - Math.min(...scoreTimes)
+      : 0;
     const profitFactor = ratio(grossProfit, grossLoss);
     const stressedProfitFactor = ratio(stressedProfit, stressedLoss);
     const netPnl = rows.reduce((sum, value) => sum + value, 0);
@@ -408,7 +422,8 @@ export class StrategyValidationTracker {
     const eligible = !pauseEvent && !this.integrityError;
     const shadowCountPassed = eligible
       && rows.length >= settings.shadowMinScored
-      && distinctDays >= settings.shadowMinDistinctDays;
+      && distinctDays >= settings.shadowMinDistinctDays
+      && shadowObservationWindowMs >= settings.shadowMinObservationMs;
     const shadowQualityPassed = netPnl > 0
       && profitFactor >= settings.shadowMinProfitFactor
       && winRate >= settings.shadowMinWinRate
@@ -436,8 +451,10 @@ export class StrategyValidationTracker {
       shadowStressedProfitFactor: round(stressedProfitFactor),
       shadowLargestWinShare: round(largestWinShare),
       shadowDistinctDayCount: distinctDays,
+      shadowObservationWindowMs,
       shadowMinScored: settings.shadowMinScored,
       shadowMinDistinctDays: settings.shadowMinDistinctDays,
+      shadowMinObservationMs: settings.shadowMinObservationMs,
       shadowCountPassed,
       shadowQualityPassed,
       shadowPassed,
