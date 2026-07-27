@@ -112,31 +112,31 @@ Once any of those fires: `closeCurrentSocket()` (`:1080-1092`) nulls `this.socke
 
 **Modify:** `apps/desktop/electron/main.ts` (next to `maybeRecoverStaleOrderbookStream`), `packages/connectors/src/kalshiOrderbookStream.ts` (one new read-only accessor).
 
-- [ ] **Step 1** — Add `socketState(): 'none' | 'connecting' | 'open' | 'closing' | 'closed'` to the stream (read-only projection of `this.socket?.readyState`), plus `reconnectScheduled: boolean` (`this.reconnectTimer != null`) on the telemetry object. These two fields alone discriminate every hypothesis in §0.4.
-- [ ] **Step 2** — On the same health tick that calls `maybeRecoverStaleOrderbookStream()` (`main.ts:6601`), append one JSON line to `NEMESIS_ORDERBOOK_TRACE_PATH` (env-gated, same pattern as `NEMESIS_PRIORITY_TRACK_TRACE_PATH`, `main.ts:341-348`) with: `at`, `socketState`, `reconnectScheduled`, `started`, `connected`, `authenticated`, `generation`, `reconnects`, `trackedTickers`, `verifiedTrackedTickers`, `serverTrackedTickers`, `qualifiedTickers`, `quarantinedTickers`, `booksWithExchangeTime`, `membershipAcknowledged`, `trackingRevision`, `acknowledgedTrackingRevision`, `subscriptionUpdateQueueDepth`, `subscriptionUpdateInFlight`, `sequenceGaps`, `sequenceRegressions`, `lastApplicationMessageAt`, `lastSequencedDeltaAt`, `lastExchangeTimestamp`, `lastCloseAt`, `lastCloseCode`, `lastCloseReason`, `lastCloseTrigger`, `failureClass`, `errorCode`, `httpStatus`, `nextRetryAt`, `activeEndpoint`, `failedEndpoint`, `switchReason`, `failureCounters`.
+- [x] **Step 1** — Add `socketState(): 'none' | 'connecting' | 'open' | 'closing' | 'closed'` to the stream (read-only projection of `this.socket?.readyState`), plus `reconnectScheduled: boolean` (`this.reconnectTimer != null`) on the telemetry object. These two fields alone discriminate every hypothesis in §0.4.
+- [x] **Step 2** — On the same health tick that calls `maybeRecoverStaleOrderbookStream()` (`main.ts:6601`), append one JSON line to `NEMESIS_ORDERBOOK_TRACE_PATH` (env-gated, same pattern as `NEMESIS_PRIORITY_TRACK_TRACE_PATH`, `main.ts:341-348`) with: `at`, `socketState`, `reconnectScheduled`, `started`, `connected`, `authenticated`, `generation`, `reconnects`, `trackedTickers`, `verifiedTrackedTickers`, `serverTrackedTickers`, `qualifiedTickers`, `quarantinedTickers`, `booksWithExchangeTime`, `membershipAcknowledged`, `trackingRevision`, `acknowledgedTrackingRevision`, `subscriptionUpdateQueueDepth`, `subscriptionUpdateInFlight`, `sequenceGaps`, `sequenceRegressions`, `lastApplicationMessageAt`, `lastSequencedDeltaAt`, `lastExchangeTimestamp`, `lastCloseAt`, `lastCloseCode`, `lastCloseReason`, `lastCloseTrigger`, `failureClass`, `errorCode`, `httpStatus`, `nextRetryAt`, `activeEndpoint`, `failedEndpoint`, `switchReason`, `failureCounters`.
   Every one of these already exists on `telemetry()` except the two from Step 1 — this is serialization, not new measurement.
-- [ ] **Step 3** — Sample cap: write at most one line per health tick and skip a write when nothing but `at` changed *and* the last write was under 30s ago, so an 8h run costs kilobytes, not gigabytes.
-- [ ] **Step 4** — Unit test: given a stubbed stream telemetry, the writer emits one line with all required keys and honors the dedupe window.
+- [x] **Step 3** — Sample cap: write at most one line per health tick and skip a write when nothing but `at` changed *and* the last write was under 30s ago, so an 8h run costs kilobytes, not gigabytes.
+- [x] **Step 4** — Unit test: given a stubbed stream telemetry, the writer emits one line with all required keys and honors the dedupe window.
 
 ### Task 0.2 — Make connector warnings durable
 
 **Modify:** `apps/desktop/electron/main.ts` (connector registry wiring).
 
 - [ ] **Step 1** — Mirror every `recordWarn`/`recordTelemetry` for `kalshi-orderbook-ws`, `kalshi-ws`, `kalshi-rest` into the Task 0.1 ledger (or a sibling `connector-warns.jsonl`) with `at`, `connector`, `message`. The strings that would have solved this run in five minutes — `"order-book websocket data-plane silence; forcing reconnect+resubscribe in Nms"`, `"order-book websocket pong expired"` — currently exist only in a console nobody was reading at 20:45 PDT.
-- [ ] **Step 2** — Same for the `console.warn` inside `maybeRecoverStaleOrderbookStream` (`main.ts:710-715`).
+- [x] **Step 2** — Same for the `console.warn` inside `maybeRecoverStaleOrderbookStream` (`main.ts:710-715`).
 
 ### Task 0.3 — Stop the bridge ledger from being misleading
 
 **Modify:** `packages/bridge-contracts/src/bridge.ts`, `apps/desktop/electron/main.ts:678-703`.
 
-- [ ] **Step 1** — Add `orderbookStreamReconnects`, `orderbookTrackedTickers`, `orderbookQualifiedTickers`, `orderbookSocketState` to `BridgeStatus`, populated in `refreshBridgeConnectivity` from `kalshiOrderbookStream.telemetry()`.
-- [ ] **Step 2** — Rename nothing; the existing `reconnects`/`disconnects`/`failovers` stay as bridge counters. Add a one-line comment at their declaration (`main.ts:661-675`) stating they are bridge-socket counters, so the next reader does not repeat the §0.3 misreading.
+- [x] **Step 1** — Add `orderbookStreamReconnects`, `orderbookTrackedTickers`, `orderbookQualifiedTickers`, `orderbookSocketState` to `BridgeStatus`, populated in `refreshBridgeConnectivity` from `kalshiOrderbookStream.telemetry()`.
+- [x] **Step 2** — Rename nothing; the existing `reconnects`/`disconnects`/`failovers` stay as bridge counters. Add a one-line comment at their declaration (`main.ts:661-675`) stating they are bridge-socket counters, so the next reader does not repeat the §0.3 misreading.
 
 ### Task 0.4 — Fix the audit-log truncation
 
 **Modify:** wherever `audit-log.json` is capped/persisted.
 
-- [ ] **Step 1** — The 5,000-entry cap silently discarded the last 2.6h of an 8h run. Either roll to `audit-log.jsonl` (append-only, same shape) or archive-and-rotate on cap with the rotation recorded. Keep the `t` field name; do not break existing readers.
+- [x] **Step 1** — The 5,000-entry cap silently discarded the last 2.6h of an 8h run. Either roll to `audit-log.jsonl` (append-only, same shape) or archive-and-rotate on cap with the rotation recorded. Keep the `t` field name; do not break existing readers.
 - [ ] **Step 2** — Note in `docs/` that audit entries key on `t`, not `at`.
 
 **Phase 0 gate:** `npx vitest run` green, `tsc --noEmit` green on `apps/desktop`, `npm run build` green. A 10-minute local launch produces a non-empty orderbook trace whose `socketState` reads `open`. No behavior change to tracking, confirmation, or execution.
@@ -151,32 +151,32 @@ Once any of those fires: `closeCurrentSocket()` (`:1080-1092`) nulls `this.socke
 
 **Modify:** `packages/connectors/src/kalshiOrderbookStream.test.ts`.
 
-- [ ] **Step 1** — Test A (`socket never re-opens after non-retryable close`): start a stream, track tickers, drive a close whose classification is sticky (e.g. `authentication`) or unmapped so `recordFailure` returns `noRetry()`. Assert today's behavior — `socketState === 'none'`, `reconnectScheduled === false`, and `recoverIfDataPlaneSilent()` returns `false` forever. **This test must fail after the fix**, so write it as the desired post-fix assertion: after `SUPERVISOR_INTERVAL`, the stream has attempted a new connection.
-- [ ] **Step 2** — Test B (`restartAfterFailure dead end`): drive `unexpected-response` with a non-retryable HTTP status; assert recovery is eventually attempted.
-- [ ] **Step 3** — Test C (`OPEN but silent` regression guard): the existing `3158ef9` behavior must still hold — 90s of application silence on an OPEN socket with non-empty membership forces reconnect+resubscribe.
-- [ ] **Step 4** — Test D (`no false thrash`): a quiet-but-alive book (snapshots/deltas arriving for *some* tracked tickers) must not trigger recovery.
+- [x] **Step 1** — Test A (`socket never re-opens after non-retryable close`): start a stream, track tickers, drive a close whose classification is sticky (e.g. `authentication`) or unmapped so `recordFailure` returns `noRetry()`. Assert today's behavior — `socketState === 'none'`, `reconnectScheduled === false`, and `recoverIfDataPlaneSilent()` returns `false` forever. **This test must fail after the fix**, so write it as the desired post-fix assertion: after `SUPERVISOR_INTERVAL`, the stream has attempted a new connection.
+- [x] **Step 2** — Test B (`restartAfterFailure dead end`): drive `unexpected-response` with a non-retryable HTTP status; assert recovery is eventually attempted.
+- [x] **Step 3** — Test C (`OPEN but silent` regression guard): the existing `3158ef9` behavior must still hold — 90s of application silence on an OPEN socket with non-empty membership forces reconnect+resubscribe.
+- [x] **Step 4** — Test D (`no false thrash`): a quiet-but-alive book (snapshots/deltas arriving for *some* tracked tickers) must not trigger recovery.
 
 ### Task 1.2 — Supervised reconnect (replace the OPEN-only guard)
 
 **Modify:** `packages/connectors/src/kalshiOrderbookStream.ts`.
 
-- [ ] **Step 1** — Generalize `recoverIfDataPlaneSilent` into `superviseDataPlane(now)` with explicit cases:
+- [x] **Step 1** — Generalize `recoverIfDataPlaneSilent` into `superviseDataPlane(now)` with explicit cases:
   - `!this.started` → no-op (correct: an intentionally stopped stream stays stopped).
   - socket `OPEN` + membership non-empty + application silence > `ORDERBOOK_DATA_PLANE_SILENCE_MS` (90s) → `forceLocalReconnect` (today's behavior, unchanged).
   - socket **not** `OPEN` (`none`/`closing`/`closed`) **and** `reconnectTimer == null` → **schedule a connect attempt** on the supervisor's own backoff. This is the case that ran the whole 8-hour run into the ground and is currently unreachable by any recovery code.
   - socket `CONNECTING` for longer than a connect deadline (propose 20s) → treat as failed attempt, close and re-schedule.
   - membership empty → still supervise the socket (do not require `tickers.size > 0` for *connection* liveness; only the silence check needs membership).
-- [ ] **Step 2** — Supervisor backoff: independent of the transport controller's decision, bounded exponential (propose 5s → 2× → cap 60s), reset on a successful `open` + first application frame. A sticky `authentication`/`authorization` failure should back off to the cap and keep retrying **while surfacing a loud, durable warn** — never silently give up. Rationale: credentials can be rotated/repaired at runtime; a permanently dead feed is strictly worse than a slow retry loop, and there is no real-money risk in a paper run.
-- [ ] **Step 3** — Never lose the timer: assert (in code, via the supervisor) the invariant `started && socketState !== 'open' ⇒ reconnectScheduled || connectInFlight`. Emit a warn if it is ever observed false — that warn is the tripwire for the next unknown variant of this bug.
-- [ ] **Step 4** — Heartbeat self-heal: if the socket is `OPEN` but the heartbeat interval handle is null, restart it. (`closeCurrentSocket` clears it; a stale-generation race could otherwise leave an OPEN socket unpinged.)
+- [x] **Step 2** — Supervisor backoff: independent of the transport controller's decision, bounded exponential (propose 5s → 2× → cap 60s), reset on a successful `open` + first application frame. A sticky `authentication`/`authorization` failure should back off to the cap and keep retrying **while surfacing a loud, durable warn** — never silently give up. Rationale: credentials can be rotated/repaired at runtime; a permanently dead feed is strictly worse than a slow retry loop, and there is no real-money risk in a paper run.
+- [x] **Step 3** — Never lose the timer: assert (in code, via the supervisor) the invariant `started && socketState !== 'open' ⇒ reconnectScheduled || connectInFlight`. Emit a warn if it is ever observed false — that warn is the tripwire for the next unknown variant of this bug.
+- [x] **Step 4** — Heartbeat self-heal: if the socket is `OPEN` but the heartbeat interval handle is null, restart it. (`closeCurrentSocket` clears it; a stale-generation race could otherwise leave an OPEN socket unpinged.)
 
 ### Task 1.3 — Main-process escalation ladder
 
 **Modify:** `apps/desktop/electron/main.ts:706-716` (`maybeRecoverStaleOrderbookStream`).
 
-- [ ] **Step 1** — Call `superviseDataPlane` on the existing health tick, and escalate on consecutive failures: `resubscribe` → `reconnect` → `endpoint failover` → `stop() + start()` full stream restart. Each step bounded, counted, and written to the Phase 0 ledger with the reason.
-- [ ] **Step 2** — Hard rule: never escalate silently. Every escalation writes one durable line.
-- [ ] **Step 3** — Keep the existing `console.warn` and add the same content to the ledger.
+- [x] **Step 1** — Call `superviseDataPlane` on the existing health tick, and escalate on consecutive failures: `resubscribe` → `reconnect` → `endpoint failover` → `stop() + start()` full stream restart. Each step bounded, counted, and written to the Phase 0 ledger with the reason.
+- [x] **Step 2** — Hard rule: never escalate silently. Every escalation writes one durable line.
+- [x] **Step 3** — Keep the existing `console.warn` and add the same content to the ledger.
 
 **Phase 1 gate:** Tests A–D green; full `npx vitest run` green (expect 555+ tests); `tsc --noEmit`; `npm run build`. Then a **fault-injection soak**: run 30+ minutes locally and forcibly kill the orderbook socket at least twice (e.g. drive a sticky failure through the stream's test seam); the trace must show `socketState` returning to `open` and `lastSequencedDeltaAt` advancing within one backoff cycle each time.
 
@@ -190,15 +190,15 @@ Once any of those fires: `closeCurrentSocket()` (`:1080-1092`) nulls `this.socke
 
 **Modify:** `packages/connectors/src/kalshiOrderbookStream.ts` (new read-only accessor), consumed in `main.ts`.
 
-- [ ] **Step 1** — `bookState(ticker)` returning one of: `untracked` · `tracked-no-provenance` · `subscribed-awaiting-snapshot` · `snapshot-quarantined` (snapshot received, no qualifying delta yet — see `applySnapshot` :839-841, which deliberately quarantines until a sequenced delta proves advance) · `sequenced` — plus `sequencedAgeMs` and `snapshotAgeMs`.
-- [ ] **Step 2** — Unit tests for each transition, including the `deltaTrackingRevision !== trackingRevision` case (a delta that arrives against a superseded membership revision does **not** un-quarantine — `applyDelta` :899-906).
+- [x] **Step 1** — `bookState(ticker)` returning one of: `untracked` · `tracked-no-provenance` · `subscribed-awaiting-snapshot` · `snapshot-quarantined` (snapshot received, no qualifying delta yet — see `applySnapshot` :839-841, which deliberately quarantines until a sequenced delta proves advance) · `sequenced` — plus `sequencedAgeMs` and `snapshotAgeMs`.
+- [x] **Step 2** — Unit tests for each transition, including the `deltaTrackingRevision !== trackingRevision` case (a delta that arrives against a superseded membership revision does **not** un-quarantine — `applyDelta` :899-906).
 
 ### Task 2.2 — Refine the priority-track trace outcomes
 
 **Modify:** `apps/desktop/electron/main.ts:473-484`.
 
-- [ ] **Step 1** — Replace the single `admitted-no-book` outcome with the Task 2.1 state at the moment the wait expires: `admitted-socket-dead`, `admitted-awaiting-snapshot`, `admitted-quarantined`, `admitted-no-delta`. Keep `sequenced-book`, `provenance-unavailable`, `refused` unchanged so historical traces stay comparable.
-- [ ] **Step 2** — Add `socketState` and `lastSequencedDeltaAgeMs` to every trace line. Had these existed, this run's diagnosis would have taken minutes.
+- [x] **Step 1** — Replace the single `admitted-no-book` outcome with the Task 2.1 state at the moment the wait expires: `admitted-socket-dead`, `admitted-awaiting-snapshot`, `admitted-quarantined`, `admitted-no-delta`. Keep `sequenced-book`, `provenance-unavailable`, `refused` unchanged so historical traces stay comparable.
+- [x] **Step 2** — Add `socketState` and `lastSequencedDeltaAgeMs` to every trace line. Had these existed, this run's diagnosis would have taken minutes.
 
 ### Task 2.3 — Measure `markTrackingChanged` blast radius (measure, then decide)
 
@@ -220,15 +220,15 @@ Once any of those fires: `closeCurrentSocket()` (`:1080-1092`) nulls `this.socke
 
 **Modify:** `apps/desktop/electron/main.ts`, `packages/execution/src/entryConfirmation.ts` (accessor use only — the gate itself is untouched).
 
-- [ ] **Step 1** — Define `candidateSequencedBookHealth`: over the tickers with confirmation in flight (`EntryConfirmationEngine.inFlightTickers()` already exists) plus campaign-critical tickers, report `count`, `maxSequencedAgeMs`, `fractionSequencedWithin(N)`. Propose `N = 30s`.
+- [x] **Step 1** — Define `candidateSequencedBookHealth`: over the tickers with confirmation in flight (`EntryConfirmationEngine.inFlightTickers()` already exists) plus campaign-critical tickers, report `count`, `maxSequencedAgeMs`, `fractionSequencedWithin(N)`. Propose `N = 30s`.
 - [ ] **Step 2** — Expose on the bridge status, session stats, and the renderer.
 
 ### Task 3.2 — Degraded-run latch
 
-- [ ] **Step 1** — When `fractionSequencedWithin(30s) == 0` across all in-flight candidates for more than a grace window (propose 3 consecutive minutes), latch `dataPlaneDegraded = true`: keep the pipeline running, keep logging, but **tag every confirmation rejection emitted while latched** with `dataPlaneDegraded: true`.
-- [ ] **Step 2** — The report/verdict generator must exclude `dataPlaneDegraded` rejections from any economic conclusion and must state the degraded minutes prominently. This is the guardrail that makes "no edge" and "no data" impossible to confuse — the exact confusion this run produced.
-- [ ] **Step 3** — Unlatch only on a sustained recovery (propose: 2 consecutive minutes with at least one candidate sequenced inside 30s).
-- [ ] **Step 4** — Tests: latch on, latch off, tagging applied, verdict generator excludes tagged rows.
+- [x] **Step 1** — When `fractionSequencedWithin(30s) == 0` across all in-flight candidates for more than a grace window (propose 3 consecutive minutes), latch `dataPlaneDegraded = true`: keep the pipeline running, keep logging, but **tag every confirmation rejection emitted while latched** with `dataPlaneDegraded: true`.
+- [x] **Step 2** — The report/verdict generator must exclude `dataPlaneDegraded` rejections from any economic conclusion and must state the degraded minutes prominently. This is the guardrail that makes "no edge" and "no data" impossible to confuse — the exact confusion this run produced.
+- [x] **Step 3** — Unlatch only on a sustained recovery (propose: 2 consecutive minutes with at least one candidate sequenced inside 30s).
+- [x] **Step 4** — Tests: latch on, latch off, tagging applied, verdict generator excludes tagged rows.
 
 **Phase 3 gate:** replaying this run's conditions (dead socket at T+13m) against the new latch produces a run marked degraded from ~T+16m onward, with 0 rejections counted as economic evidence.
 
@@ -242,8 +242,8 @@ Only after Phases 0–3 are committed, green, and built.
 
 - [ ] Confirm zero `KRYPT*nemesis*` electron processes (`Get-CimInstance Win32_Process`), per the launch script's own refusal check.
 - [ ] Confirm `settings.json`: `dryRun=true`, `liveEnabled=false`, `autoLiveEnabled=false`, `demoMode=false`, `killSwitchActive=false`, profit bars unchanged.
-- [ ] Confirm `dist-electron/main.js` contains the new supervisor symbol (string-search the built bundle — the Jul 24 plan learned this lesson: never debug a theory against a stale build).
-- [ ] Add `NEMESIS_ORDERBOOK_TRACE_PATH` to `scripts/launch-paper-allowlist.ps1` alongside the existing priority-track trace, and point the log dir at `overnight-logs/<run-date>/`.
+- [x] Confirm `dist-electron/main.js` contains the new supervisor symbol (string-search the built bundle — the Jul 24 plan learned this lesson: never debug a theory against a stale build).
+- [x] Add `NEMESIS_ORDERBOOK_TRACE_PATH` to `scripts/launch-paper-allowlist.ps1` alongside the existing priority-track trace, and point the log dir at `overnight-logs/<run-date>/`.
 - [ ] Write a fresh `.nemesis-relaunch-cutoff.txt`; all analysis filters on it.
 
 ### Task 4.2 — Staged verification (abort criteria are hard)
@@ -276,7 +276,7 @@ Only after Phases 0–3 are committed, green, and built.
 
 ### Task 6.1 — The 101-minute late stop
 
-- [ ] Requested `03:00:00 PDT`, actual `04:41:25 PDT`. Replace the heartbeat-dependent stop with a scheduled, self-verifying stop: a timer that (a) fires independently of the agent loop, (b) verifies zero matching electron processes afterward, and (c) writes a stop receipt with requested vs actual. A stop that can drift 100 minutes cannot bound an unattended run.
+- [x] Requested `03:00:00 PDT`, actual `04:41:25 PDT`. Replace the heartbeat-dependent stop with a scheduled, self-verifying stop: a timer that (a) fires independently of the agent loop, (b) verifies zero matching electron processes afterward, and (c) writes a stop receipt with requested vs actual. A stop that can drift 100 minutes cannot bound an unattended run.
 
 ### Task 6.2 — Aborts and degraded minutes
 
@@ -285,7 +285,7 @@ Only after Phases 0–3 are committed, green, and built.
 
 ### Task 6.3 — The shutdown safety block
 
-- [ ] `2026-07-27T11:40:07.291Z`, `safety_block`, code `shutdown_event`, detail `session shutdown counters triggered` (`main.ts:4027`). It did not mutate portfolio state. Confirm it is purely a shutdown-path artifact — cross-check against `042ae70` ("Keep paper eligibility alive when session shutdown counters trip") — and if so, downgrade its severity so it stops reading as a runtime risk marker on every clean stop.
+- [x] `2026-07-27T11:40:07.291Z`, `safety_block`, code `shutdown_event`, detail `session shutdown counters triggered` (`main.ts:4027`). It did not mutate portfolio state. Confirm it is purely a shutdown-path artifact — cross-check against `042ae70` ("Keep paper eligibility alive when session shutdown counters trip") — and if so, downgrade its severity so it stops reading as a runtime risk marker on every clean stop.
 
 ---
 
@@ -318,3 +318,55 @@ Only after Phases 0–3 are committed, green, and built.
 ```
 
 Push each phase once typecheck + tests + build are green; do not park green commits waiting on the next phase.
+
+---
+
+## Execution log — 2026-07-27 (Phases 0–3 + Phase 6 code, committed `6f8a424`, pushed)
+
+Phases 0, 1, 2 (except the measurement-gated 2.3), 3 and the code half of Phase 6 are
+implemented. **655/655 tests, typecheck, build and the isolated CI boot smoke are green.**
+Phases 4 and 5 are runtime protocol and have not been executed — no app was launched.
+
+### Landed
+
+| Task | Where | Note |
+|------|-------|------|
+| 0.1 stream telemetry ledger | `orderbookTrace.ts` (new, 13 tests), `main.ts superviseOrderbookDataPlane` | `NEMESIS_ORDERBOOK_TRACE_PATH`; dedupe writes on state change or 30s, so a state transition is never dropped but an 8h healthy run stays in kilobytes |
+| 0.1 discriminating fields | `kalshiOrderbookStream.socketState()`, telemetry `reconnectScheduled` / `connectInFlight` / `supervisorEscalations` / `lastSupervisionAction` | these alone separate every §0.4 hypothesis |
+| 0.2 durable warnings | `NEMESIS_CONNECTOR_WARN_TRACE_PATH`, never deduped | **partial**: supervisor actions and latch transitions are mirrored; a general `registry.recordWarn` tap for `kalshi-ws`/`kalshi-rest` is not wired |
+| 0.3 bridge ledger | `bridge.ts`, `refreshBridgeConnectivity` | added `orderbookSocketState`, `orderbookStreamReconnects`, `orderbookTrackedTickers`, `orderbookQualifiedTickers`, `orderbookSupervisorEscalations`, `dataPlaneDegraded(Ms)`, `candidateSequencedBookFraction`; bridge counters kept and commented as bridge-socket counters |
+| 0.4 audit truncation | `auditLog.ts` (+10 tests), `main.ts` | overflow archived to `audit-log-archive.jsonl`; `new AuditLog()` still caps at 5000 exactly; `load()` now enforces the cap too (that was the silent-loss path) |
+| 1.1–1.2 supervisor | `kalshiOrderbookStream.superviseDataPlane()` (+11 tests) | recovers from dead socket / stuck CONNECTING (20s deadline) / cleared heartbeat / 90s application silence; own backoff 5s→×2→60s cap, independent of the controller's `noRetry()`; sticky auth failures retry at the cap with a durable warn; invariant tripwire returns `invariant-violation` |
+| 1.3 escalation ladder | stream-internal, driven from the health tick | 3 consecutive failed attempts → full stream restart, counted, every escalation writes a line. Ladder lives in the stream rather than main so the invariant cannot be bypassed by a caller |
+| 2.1 book lifecycle | `bookState(ticker)` → 5 states + `sequencedAgeMs`/`snapshotAgeMs` | derived from `getBook()`, so it cannot be weaker than the evidence rule; a delta against a superseded `trackingRevision` correctly reads `snapshot-quarantined` |
+| 2.2 trace outcomes | `main.ts fetchOrderbookWithPriorityTracking` | `admitted-no-book` split into `admitted-socket-dead` / `-provenance-lapsed` / `-awaiting-snapshot` / `-quarantined` / `-no-delta`; `sequenced-book` / `provenance-unavailable` / `refused` unchanged; every line now carries `socketState` and delta ages |
+| 3.1–3.2 fail-closed latch | `dataPlaneHealth.ts` (new, pure, 29 tests) | latch on after 3 min continuously unhealthy, off after 2 min healthy; zero-candidate windows judged on stream-level sequenced-delta age so an idle window still latches; **replay test: this run's shape latches at T+16.5m and never recovers, 96.6% of the run degraded** |
+| 3.2 tagging | `strategyValidation.ts`, `main.ts` | `entry_confirmation_observed` carries `dataPlaneDegraded`. Tagged, never suppressed |
+| 3.2 verdict guard | `scripts/analyze-dataplane-run.cjs` (new) | splits `taggedDegraded` from `economicallyValid` and scores the run against explicit gates; reproduces the post-mortem numbers exactly (4,843 / 139 / 3 priority outcomes; 4,472 confirmations; 4,136 exchange-origin; ready 4; maxSamples 6) |
+| 6.1 deterministic stop | `scripts/stop-nemesis-at.ps1` (new) | `-At`/`-AfterMinutes`, drift receipt, grace then `-Force`, exit 2 if anything survives, matches only `KRYPT*nemesis*` electron |
+| 6.3 shutdown block | `main.ts` | not a severity field (safety-block events carry none) — the detail string now attributes the trip: each counter against its bound plus `dataPlaneDegraded`. This run tripped on `apiDegradedMinutes=152/10`, itself downstream of the dead socket |
+| 4.1 preflight, automated | `scripts/launch-paper-allowlist.ps1` | refuses to launch on a stale bundle (markers `NEMESIS_ORDERBOOK_TRACE_PATH`, `superviseDataPlane`, `admitted-socket-dead`, `data plane DEGRADED` — string literals and class members, which esbuild preserves; plain function names get renamed and would false-alarm), dates its own log dir, exports both new trace paths |
+
+### Deliberately not done
+
+- **Task 2.3 (`markTrackingChanged` blast radius)** — gated on measurement by its own terms. The
+  ledger now records `trackingRevision` / `acknowledgedTrackingRevision` per tick, so the churn
+  rate and time-to-`sequenced` distribution are computable from the first repair run. No code
+  touched.
+- **Task 3.1 Step 2 (session stats + renderer)** — the metric is on `BridgeStatus` only.
+- **Task 0.4 Step 2 (`docs/` note on the `t` key)** — captured as a doc comment on `AuditEntry.t`.
+- **Task 6.2 (abort classification)** — needs a run under the new tagging to be worth doing;
+  classifying the old 778 against an untagged ledger would re-import the confusion this plan exists
+  to end.
+- **Phases 4 and 5** — require launching an unattended paper run. Operator's call on timing.
+
+### Next action (operator)
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/launch-paper-allowlist.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stop-nemesis-at.ps1 -AfterMinutes 300
+node scripts/analyze-dataplane-run.cjs   # at T+15, T+60, and after the stop
+```
+
+The analyzer exits non-zero while any data-plane gate fails, which is the Phase 4 abort criterion
+in executable form. A failed gate means the run is a diagnostic, not evidence about edge.
