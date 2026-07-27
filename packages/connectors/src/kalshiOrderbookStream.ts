@@ -459,12 +459,15 @@ export class KalshiOrderbookStream {
   }
 
   track(tickers: string[], now = Date.now()): void {
-    const before = this.tickers.size;
+    const added: string[] = [];
     for (const ticker of this.marketProvenance.selectVerified(tickers, this.maxTrackedTickers, now)) {
       if (this.tickers.has(ticker) || this.tickers.size >= this.maxTrackedTickers) continue;
       this.tickers.add(ticker);
+      added.push(ticker);
     }
-    if (this.tickers.size !== before) this.markTrackingChanged();
+    // Only the admitted tickers had their subscription disturbed; the retained
+    // ones keep their books and their existing quarantine state.
+    if (added.length > 0) this.markTrackingChanged(added);
     this.subscribeMissing();
   }
 
@@ -473,13 +476,16 @@ export class KalshiOrderbookStream {
     const desired = new Set(this.marketProvenance.selectVerified(tickers, this.maxTrackedTickers, now));
     if (desired.size === this.tickers.size && [...desired].every((ticker) => this.tickers.has(ticker))) return;
     const removed = [...this.tickers].filter((ticker) => !desired.has(ticker));
+    const added = [...desired].filter((ticker) => !this.tickers.has(ticker));
     this.tickers.clear();
     for (const ticker of desired) this.tickers.add(ticker);
     for (const ticker of removed) {
       this.books.delete(ticker);
       this.quarantined.delete(ticker);
     }
-    this.markTrackingChanged();
+    // Removed tickers are already dropped above; only the additions disturb a
+    // still-tracked subscription member.
+    this.markTrackingChanged(added);
     this.subscribeMissing();
   }
 
@@ -711,33 +717,7 @@ export class KalshiOrderbookStream {
     // Owned by the supervisor: a socket that never leaves CONNECTING fires
     // neither `open` nor `close`, so only an external deadline can reap it.
     this.connectAttemptStartedAt = Date.now();
-    socket.on('open', () => {
-      if (!this.isCurrent(socket, generation)) return;
-      this.connectAttemptStartedAt = null;
-      this.authenticated = true;
-      this.subscribed.clear();
-      this.books.clear();
-      this.sequenceBySubscription.clear();
-      this.tickersBySubscription.clear();
-      this.subscriptionIdByKey.clear();
-      this.pendingSnapshotRepair.clear();
-      this.snapshotRequestRevisionBySubscription.clear();
-      this.subscriptionUpdateQueue.length = 0;
-      this.pendingSubscriptionUpdate = null;
-      this.initialSubscriptionCommand = null;
-      this.acknowledgedTrackingRevision = null;
-      this.pendingCloseTrigger = null;
-      this.pendingTransportFailure = null;
-      this.lastSequencedDeltaAt = null;
-      for (const ticker of this.tickers) this.quarantined.add(ticker);
-      this.connectedAt = Date.now();
-      this.lastMessageAt = this.connectedAt;
-      this.lastApplicationMessageAt = this.connectedAt;
-      this.lastPongAt = null;
-      this.startHeartbeat(socket, generation);
-      this.recordHealth();
-      this.subscribeMissing();
-    });
+    socket.on('open', () => this.handleSocketOpen(socket, generation));
     socket.on('message', (raw) => {
       if (this.isCurrent(socket, generation)) this.ingest(String(raw), generation);
     });
@@ -770,6 +750,41 @@ export class KalshiOrderbookStream {
       }));
     });
     socket.on('close', (code, reason) => this.handleSocketClose(socket, generation, code, reason));
+  }
+
+  /**
+   * Extracted from the `open` listener (same rationale as `handleSocketClose`)
+   * so reconnect tests can drive the real re-quarantine path without a live
+   * socket. Every book is dropped and every tracked ticker re-quarantined here,
+   * which is what makes membership carry-forward safe: a reconnect always wins
+   * over any revision an earlier acknowledgement stamped.
+   */
+  private handleSocketOpen(socket: WebSocket, generation: number): void {
+    if (!this.isCurrent(socket, generation)) return;
+    this.connectAttemptStartedAt = null;
+    this.authenticated = true;
+    this.subscribed.clear();
+    this.books.clear();
+    this.sequenceBySubscription.clear();
+    this.tickersBySubscription.clear();
+    this.subscriptionIdByKey.clear();
+    this.pendingSnapshotRepair.clear();
+    this.snapshotRequestRevisionBySubscription.clear();
+    this.subscriptionUpdateQueue.length = 0;
+    this.pendingSubscriptionUpdate = null;
+    this.initialSubscriptionCommand = null;
+    this.acknowledgedTrackingRevision = null;
+    this.pendingCloseTrigger = null;
+    this.pendingTransportFailure = null;
+    this.lastSequencedDeltaAt = null;
+    for (const ticker of this.tickers) this.quarantined.add(ticker);
+    this.connectedAt = Date.now();
+    this.lastMessageAt = this.connectedAt;
+    this.lastApplicationMessageAt = this.connectedAt;
+    this.lastPongAt = null;
+    this.startHeartbeat(socket, generation);
+    this.recordHealth();
+    this.subscribeMissing();
   }
 
   /**
@@ -1069,11 +1084,26 @@ export class KalshiOrderbookStream {
     }
   }
 
-  private markTrackingChanged(): void {
+  /**
+   * Bumps the immutable membership revision and invalidates the books that the
+   * change actually disturbed.
+   *
+   * `disturbed` scopes deletion + quarantine to those tickers; retained tickers
+   * keep their book object and their existing quarantine state untouched.
+   * Omitting it keeps the historical whole-universe behavior, which is the safe
+   * default for reset/reconnect paths.
+   *
+   * Measured on the 2026-07-27 paper run (1.73h, 443 open samples): the
+   * whole-universe wipe churned `trackingRevision` at 3.0/min and left a median
+   * 25 of 25 tickers quarantined for the 16.7% of samples where membership was
+   * unacknowledged. 453 priority-track attempts produced 313 revisions, so each
+   * admission wiped every book and starved the next candidate.
+   */
+  private markTrackingChanged(disturbed?: Iterable<string>): void {
     this.trackingRevision += 1;
     this.acknowledgedTrackingRevision = null;
     this.snapshotRequestRevisionBySubscription.clear();
-    for (const ticker of this.tickers) {
+    for (const ticker of disturbed ?? this.tickers) {
       this.books.delete(ticker);
       this.quarantined.add(ticker);
     }
@@ -1107,13 +1137,43 @@ export class KalshiOrderbookStream {
     this.acknowledgedTrackingRevision = this.trackingRevision;
     if (this.snapshotRequestRevisionBySubscription.get(subscription) === this.trackingRevision) return;
     this.snapshotRequestRevisionBySubscription.set(subscription, this.trackingRevision);
-    const affected = [...this.tickers].sort();
-    this.pendingSnapshotRepair.set(subscription, new Set(affected));
-    for (const ticker of affected) {
+    // Partition rather than wipe. Reaching this line proves the subscription's
+    // sequence stream stayed continuous across the membership update: a break at
+    // the update acknowledgement takes the `subscription_update_ack_sequence_gap`
+    // branch in `ingest` and closes the socket, and any reconnect bumps the
+    // generation and re-quarantines every ticker in the `open` handler. A
+    // retained ticker's book is built from that same unbroken sequence stream,
+    // so it has provably missed nothing and needs no snapshot round-trip.
+    //
+    // Carry-forward is deliberately revision-agnostic (snapshot revision equal
+    // to delta revision, not equal to the current one) so a book survives
+    // several membership changes landing before one acknowledgement.
+    const repair: string[] = [];
+    for (const ticker of [...this.tickers].sort()) {
+      const book = this.books.get(ticker);
+      const provenUnderSomeEpoch = book != null
+        && !this.quarantined.has(ticker)
+        && book.snapshotTrackingRevision != null
+        && book.snapshotTrackingRevision === book.deltaTrackingRevision;
+      if (provenUnderSomeEpoch) {
+        // Fully proven under an undisturbed epoch: re-stamp onto the new
+        // revision, keep the book, leave it un-quarantined, no repair snapshot.
+        book.snapshotTrackingRevision = this.trackingRevision;
+        book.deltaTrackingRevision = this.trackingRevision;
+        continue;
+      }
       this.books.delete(ticker);
       this.quarantined.add(ticker);
+      repair.push(ticker);
     }
-    this.enqueueSubscriptionUpdate({ sid, marketTickers: affected, action: 'get_snapshot' });
+    if (repair.length === 0) {
+      // Nothing outstanding for this subscription; never enqueue an empty
+      // get_snapshot, and never leave a stale repair set blocking gap repair.
+      this.pendingSnapshotRepair.delete(subscription);
+      return;
+    }
+    this.pendingSnapshotRepair.set(subscription, new Set(repair));
+    this.enqueueSubscriptionUpdate({ sid, marketTickers: repair, action: 'get_snapshot' });
   }
 
   private isValidExchangeTimestamp(timestamp: number, now: number): boolean {

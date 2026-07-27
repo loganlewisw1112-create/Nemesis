@@ -204,9 +204,9 @@ Once any of those fires: `closeCurrentSocket()` (`:1080-1092`) nulls `this.socke
 
 `markTrackingChanged()` (`:884-891`) deletes **every** tracked book and quarantines **every** ticker on **any** membership change. `fetchOrderbookWithPriorityTracking` calls `replaceTracked` per untracked candidate, on top of the 5-minute rotation and the allowlist force-fill path.
 
-- [ ] **Step 1** — From the Phase 0 ledger, compute membership-change rate (`trackingRevision` deltas per minute) and the distribution of time-to-`sequenced` after each change. **Do not change this code before that measurement exists.**
-- [ ] **Step 2** — Only if churn is shown to be starving re-qualification: scope invalidation to tickers whose subscription membership actually changed, keeping the fail-closed property (a ticker whose subscription was disturbed must still re-prove sequence continuity before its book is trusted). Add a test that a *retained* ticker keeps its sequenced book across an unrelated add/remove, and that a *disturbed* ticker does not.
-- [ ] **Step 3** — Companion measurement: how often provenance lapses (90s TTL) against the 20s paced reverify and 5-minute universe refresh, for tickers that are tracked but not candidates. A lapse silently drops a ticker from `selectVerified` inside `replaceTracked`.
+- [x] **Step 1** — From the Phase 0 ledger, compute membership-change rate (`trackingRevision` deltas per minute) and the distribution of time-to-`sequenced` after each change. **Do not change this code before that measurement exists.**
+- [x] **Step 2** — Only if churn is shown to be starving re-qualification: scope invalidation to tickers whose subscription membership actually changed, keeping the fail-closed property (a ticker whose subscription was disturbed must still re-prove sequence continuity before its book is trusted). Add a test that a *retained* ticker keeps its sequenced book across an unrelated add/remove, and that a *disturbed* ticker does not.
+- [x] **Step 3** — Companion measurement: how often provenance lapses (90s TTL) against the 20s paced reverify and 5-minute universe refresh, for tickers that are tracked but not candidates. A lapse silently drops a ticker from `selectVerified` inside `replaceTracked`.
 
 **Phase 2 gate:** a 30-minute run's trace can answer, per candidate, *which* stage it died at, without reading source.
 
@@ -347,12 +347,52 @@ Phases 4 and 5 are runtime protocol and have not been executed — no app was la
 | 6.3 shutdown block | `main.ts` | not a severity field (safety-block events carry none) — the detail string now attributes the trip: each counter against its bound plus `dataPlaneDegraded`. This run tripped on `apiDegradedMinutes=152/10`, itself downstream of the dead socket |
 | 4.1 preflight, automated | `scripts/launch-paper-allowlist.ps1` | refuses to launch on a stale bundle (markers `NEMESIS_ORDERBOOK_TRACE_PATH`, `superviseDataPlane`, `admitted-socket-dead`, `data plane DEGRADED` — string literals and class members, which esbuild preserves; plain function names get renamed and would false-alarm), dates its own log dir, exports both new trace paths |
 
-### Deliberately not done
+### Task 2.3 — measurement taken 2026-07-27 on the live repair run (1.73h, 443 open samples)
 
-- **Task 2.3 (`markTrackingChanged` blast radius)** — gated on measurement by its own terms. The
-  ledger now records `trackingRevision` / `acknowledgedTrackingRevision` per tick, so the churn
-  rate and time-to-`sequenced` distribution are computable from the first repair run. No code
-  touched.
+The gate on this task was "do not change this code before that measurement exists." It exists now,
+and it says the churn is real, self-inflicted, and the dominant remaining constraint.
+
+**Step 1 — membership churn.** `trackingRevision` advances **3.0/min** — a membership change every
+20 seconds. 453 priority-track attempts produced 313 revisions, so priority-track admission is the
+dominant source: each admission calls `replaceTracked`, which wipes every book.
+
+**Step 3 — companion measurement, provenance lapse ruled out.** Only **3.4%** of open samples show
+`verifiedTrackedTickers < trackedTickers` (median verified 25/25). The 90s TTL against the 20s
+paced reverify is keeping up. This is *not* a provenance problem.
+
+**What the churn costs, measured:**
+
+| state | share of open samples | median quarantined |
+|---|---|---|
+| membership unacknowledged | 16.7% | **25 of 25** (the whole universe dark) |
+| membership acknowledged | 83.3% | 4 |
+
+- 75.4% of open samples have at least one quarantined ticker; median qualified 17/25.
+- Zero sequence gaps, zero regressions across the whole run — the exchange stream is clean, so
+  every one of these invalidations was self-inflicted.
+
+**The feedback loop, confirmed numerically.** `refreshOrderbookTracking` computes stickiness as
+`current: orderbookTrackedTickers.filter(t => hasExchangeProvenance(getBook(t)))` — a ticker with
+no sequenced book loses its slot. So: a wipe deletes all books → all tickers lose stickiness → the
+next refresh recomputes a different membership → another wipe.
+
+| after a sample with… | avg revisions to next sample | mean candidate fraction sequenced |
+|---|---|---|
+| ≥13 tickers quarantined | **0.97** | **0.071** |
+| <13 tickers quarantined | 0.62 | 0.612 |
+
+Churn is 56% higher coming out of a heavy-quarantine state, and candidate book health is **8.6×
+worse** inside it. That is the mechanism behind the one failing Phase 4 gate
+(`candidate books sequenced >90%` → 21.3%).
+
+**Step 2 — fix implemented** (scoped invalidation + revision carry-forward at the acknowledgement
+point). A book that was proven under a prior epoch (snapshot **and** sequenced delta, un-quarantined)
+survives a membership change that did not disturb its own subscription, and re-qualifies at the
+acknowledgement without a snapshot round-trip. Books mid-update stay unqualified — fail-closed is
+unchanged; only the recovery cost changes. Disturbed and unproven tickers are invalidated and
+snapshot-repaired exactly as before.
+
+### Deliberately not done
 - **Task 3.1 Step 2 (session stats + renderer)** — the metric is on `BridgeStatus` only.
 - **Task 0.4 Step 2 (`docs/` note on the `t` key)** — captured as a doc comment on `AuditEntry.t`.
 - **Task 6.2 (abort classification)** — needs a run under the new tagging to be worth doing;

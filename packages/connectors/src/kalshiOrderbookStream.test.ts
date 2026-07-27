@@ -1134,4 +1134,357 @@ describe('KalshiOrderbookStream', () => {
       stream.stop();
     });
   });
+
+  // Task 2.3 Step 2. Measured on the 2026-07-27 paper run: `trackingRevision`
+  // churned 3.0/min and the whole-universe invalidation left a median 25 of 25
+  // tickers quarantined while a membership change was unacknowledged, so every
+  // admission starved the next candidate. Invalidation is now scoped to the
+  // tickers a change actually disturbed, and a fully proven book is carried
+  // across the acknowledgement instead of needing a snapshot round-trip.
+  describe('membership-change invalidation scope', () => {
+    const SID = 7;
+
+    type FakeOpenSocket = {
+      readyState: number;
+      send: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      ping: ReturnType<typeof vi.fn>;
+    };
+
+    interface SentCommand {
+      id: number;
+      cmd: string;
+      params?: { sids?: number[]; market_tickers?: string[]; action?: string; channels?: string[] };
+    }
+
+    function lastCommand(socket: FakeOpenSocket, action: string): SentCommand {
+      const matches = socket.send.mock.calls
+        .map((call) => JSON.parse(String(call[0])) as SentCommand)
+        .filter((command) => command.params?.action === action);
+      const last = matches[matches.length - 1];
+      if (!last) throw new Error(`no ${action} command was sent`);
+      return last;
+    }
+
+    function snapshotFrame(ticker: string, seq: number): string {
+      return JSON.stringify({
+        type: 'orderbook_snapshot', sid: SID, seq,
+        msg: { market_ticker: ticker, yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [['0.6000', '8.00']] },
+      });
+    }
+
+    function deltaFrame(ticker: string, seq: number, tsMs: number): string {
+      return JSON.stringify({
+        type: 'orderbook_delta', sid: SID, seq,
+        msg: { market_ticker: ticker, price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: tsMs },
+      });
+    }
+
+    function okFrame(id: number, seq: number, marketTickers: string[]): string {
+      return JSON.stringify({ id, type: 'ok', sid: SID, seq, msg: { market_tickers: marketTickers } });
+    }
+
+    /**
+     * Opens a stream on the file's existing fake-socket seam, tracks `tickers`,
+     * and drives the real subscribe → `subscribed` → acknowledge handshake, so
+     * every test below starts from a genuinely acknowledged membership.
+     */
+    function openTrackedStream(tickers: string[], at: number) {
+      const registry = new ConnectorRegistry();
+      const stream = new KalshiOrderbookStream(registry, () => ({ authorization: 'test' }));
+      const socket: FakeOpenSocket = {
+        readyState: WebSocket.OPEN,
+        send: vi.fn(),
+        close: vi.fn(),
+        ping: vi.fn(),
+      };
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        socket,
+        authenticated: true,
+        generation: 1,
+        started: true,
+        lastPongAt: at,
+      });
+      verifyTickers(stream, tickers, at);
+      stream.track(tickers, at);
+      const subscribe = JSON.parse(String(socket.send.mock.calls[0]![0])) as SentCommand;
+      stream.ingest(JSON.stringify({ id: subscribe.id, type: 'subscribed', msg: { sid: SID } }), 1);
+      let seq = 0;
+      return { registry, stream, socket, nextSeq: () => (seq += 1) };
+    }
+
+    /** Proves a book end to end: snapshot, then a sequenced exchange delta. */
+    function proveBook(
+      stream: KalshiOrderbookStream,
+      ticker: string,
+      at: number,
+      nextSeq: () => number,
+    ): void {
+      stream.ingest(snapshotFrame(ticker, nextSeq()), 1);
+      stream.ingest(deltaFrame(ticker, nextSeq(), at), 1);
+    }
+
+    it('1: carries a proven retained book across an unrelated add with no new snapshot', () => {
+      vi.useFakeTimers();
+      const at = 1_700_030_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, nextSeq } = openTrackedStream(['KX-KEEP'], at);
+      proveBook(stream, 'KX-KEEP', at, nextSeq);
+      expect(stream.telemetry(at)).toMatchObject({ qualifiedTickers: 1, trackingRevision: 1 });
+      const snapshotsBefore = socket.send.mock.calls.length;
+
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.track(['KX-NEW'], at);
+
+      // In flight: fail-closed by design — a stale revision is not qualified —
+      // but the book itself survives the window.
+      expect(stream.telemetry(at)).toMatchObject({ qualifiedTickers: 0, membershipAcknowledged: false });
+      expect(stream.getBook('KX-KEEP', at)).toMatchObject({ sequence: 2, sourceTimestamp: at });
+      expect(stream.bookState('KX-KEEP', at).state).toBe('sequenced');
+
+      const add = lastCommand(socket, 'add_markets');
+      expect(add.params?.market_tickers).toEqual(['KX-NEW']);
+      stream.ingest(okFrame(add.id, nextSeq(), ['KX-NEW']), 1);
+
+      // Re-qualified at the acknowledgement itself, with no orderbook_snapshot
+      // delivered in between.
+      expect(stream.telemetry(at)).toMatchObject({
+        membershipAcknowledged: true,
+        trackingRevision: 2,
+        acknowledgedTrackingRevision: 2,
+        qualifiedTickers: 1,
+      });
+      expect(stream.getBook('KX-KEEP', at)).toMatchObject({ sequence: 2, sourceTimestamp: at });
+      expect(lastCommand(socket, 'get_snapshot').params?.market_tickers).toEqual(['KX-NEW']);
+      expect(socket.send.mock.calls.length).toBe(snapshotsBefore + 2);
+      stream.stop();
+    });
+
+    it('2: carries a proven retained book across a replaceTracked that removes a different ticker', () => {
+      vi.useFakeTimers();
+      const at = 1_700_031_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, nextSeq } = openTrackedStream(['KX-KEEP', 'KX-GONE'], at);
+      proveBook(stream, 'KX-KEEP', at, nextSeq);
+      proveBook(stream, 'KX-GONE', at, nextSeq);
+      expect(stream.telemetry(at).qualifiedTickers).toBe(2);
+
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.replaceTracked(['KX-KEEP', 'KX-NEW'], at);
+      expect(stream.getBook('KX-GONE', at)).toBeNull();
+      expect(stream.getBook('KX-KEEP', at)).toMatchObject({ sequence: 2 });
+
+      const remove = lastCommand(socket, 'delete_markets');
+      expect(remove.params?.market_tickers).toEqual(['KX-GONE']);
+      stream.ingest(okFrame(remove.id, nextSeq(), ['KX-GONE']), 1);
+      const add = lastCommand(socket, 'add_markets');
+      expect(add.params?.market_tickers).toEqual(['KX-NEW']);
+      stream.ingest(okFrame(add.id, nextSeq(), ['KX-NEW']), 1);
+
+      expect(stream.telemetry(at)).toMatchObject({ membershipAcknowledged: true, qualifiedTickers: 1 });
+      expect(stream.getBook('KX-KEEP', at)).toMatchObject({ sequence: 2, sourceTimestamp: at });
+      expect(lastCommand(socket, 'get_snapshot').params?.market_tickers).toEqual(['KX-NEW']);
+      stream.stop();
+    });
+
+    it('3: a newly added ticker stays unqualified until its own snapshot and sequenced delta', () => {
+      vi.useFakeTimers();
+      const at = 1_700_032_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, nextSeq } = openTrackedStream(['KX-KEEP'], at);
+      proveBook(stream, 'KX-KEEP', at, nextSeq);
+
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.track(['KX-NEW'], at);
+      stream.ingest(okFrame(lastCommand(socket, 'add_markets').id, nextSeq(), ['KX-NEW']), 1);
+
+      expect(stream.bookState('KX-NEW', at).state).toBe('subscribed-awaiting-snapshot');
+      expect(stream.getBook('KX-NEW', at)).toBeNull();
+      expect(stream.telemetry(at).qualifiedTickers).toBe(1);
+
+      stream.ingest(snapshotFrame('KX-NEW', nextSeq()), 1);
+      expect(stream.bookState('KX-NEW', at).state).toBe('snapshot-quarantined');
+      expect(stream.getBook('KX-NEW', at)).toBeNull();
+      expect(stream.telemetry(at).qualifiedTickers).toBe(1);
+
+      stream.ingest(deltaFrame('KX-NEW', nextSeq(), at), 1);
+      expect(stream.bookState('KX-NEW', at).state).toBe('sequenced');
+      expect(stream.telemetry(at).qualifiedTickers).toBe(2);
+      stream.stop();
+    });
+
+    it('4: a retained ticker that was already quarantined stays quarantined and is repaired', () => {
+      vi.useFakeTimers();
+      const at = 1_700_033_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, nextSeq } = openTrackedStream(['KX-KEEP'], at);
+      proveBook(stream, 'KX-KEEP', at, nextSeq);
+
+      // A delta carrying a second-based (invalid) exchange timestamp quarantines
+      // the ticker without deleting its book — a genuine pre-change quarantine.
+      stream.ingest(deltaFrame('KX-KEEP', nextSeq(), 1_700_033_000), 1);
+      expect(stream.getBook('KX-KEEP', at)).toBeNull();
+      expect(stream.telemetry(at)).toMatchObject({ quarantinedTickers: 1, qualifiedTickers: 0 });
+
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.track(['KX-NEW'], at);
+      stream.ingest(okFrame(lastCommand(socket, 'add_markets').id, nextSeq(), ['KX-NEW']), 1);
+
+      expect(lastCommand(socket, 'get_snapshot').params?.market_tickers).toEqual(['KX-KEEP', 'KX-NEW']);
+      expect(stream.getBook('KX-KEEP', at)).toBeNull();
+      expect(stream.bookState('KX-KEEP', at).state).toBe('subscribed-awaiting-snapshot');
+      expect(stream.telemetry(at)).toMatchObject({ quarantinedTickers: 2, qualifiedTickers: 0 });
+      stream.stop();
+    });
+
+    it('5: a snapshot-only book never carries forward, even if it is not quarantined', () => {
+      vi.useFakeTimers();
+      const at = 1_700_034_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, nextSeq } = openTrackedStream(['KX-SNAPONLY'], at);
+      stream.ingest(snapshotFrame('KX-SNAPONLY', nextSeq()), 1);
+
+      // Strip the quarantine flag so the ONLY remaining disqualifier is the
+      // missing delta proof (deltaTrackingRevision is undefined).
+      const quarantined = (stream as unknown as { quarantined: Set<string> }).quarantined;
+      quarantined.delete('KX-SNAPONLY');
+      expect(stream.telemetry(at).quarantinedTickers).toBe(0);
+
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.track(['KX-NEW'], at);
+      stream.ingest(okFrame(lastCommand(socket, 'add_markets').id, nextSeq(), ['KX-NEW']), 1);
+
+      expect(lastCommand(socket, 'get_snapshot').params?.market_tickers).toEqual(['KX-NEW', 'KX-SNAPONLY']);
+      expect(stream.getBook('KX-SNAPONLY', at)).toBeNull();
+      expect(stream.bookState('KX-SNAPONLY', at).state).toBe('subscribed-awaiting-snapshot');
+      expect(stream.telemetry(at).qualifiedTickers).toBe(0);
+      stream.stop();
+    });
+
+    it('6: a sequence break at the update acknowledgement still fails closed', () => {
+      vi.useFakeTimers();
+      const at = 1_700_035_000_000;
+      vi.setSystemTime(at);
+      const { registry, stream, socket, nextSeq } = openTrackedStream(['KX-KEEP'], at);
+      const warn = vi.spyOn(registry, 'recordWarn');
+      proveBook(stream, 'KX-KEEP', at, nextSeq);
+
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.track(['KX-NEW'], at);
+      const snapshotRequestsBefore = socket.send.mock.calls.length;
+
+      // Skip a sequence number on the acknowledgement itself.
+      const gapped = nextSeq() + 1;
+      stream.ingest(okFrame(lastCommand(socket, 'add_markets').id, gapped, ['KX-NEW']), 1);
+
+      expect(socket.close).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls.some(([id, detail]) =>
+        id === 'kalshi-orderbook-ws' && /broke sequence continuity/.test(detail))).toBe(true);
+      expect(stream.telemetry(at)).toMatchObject({
+        acknowledgedTrackingRevision: null,
+        membershipAcknowledged: false,
+        qualifiedTickers: 0,
+      });
+      // Nothing was carried forward and no repair was enqueued on a broken stream.
+      expect(socket.send.mock.calls.length).toBe(snapshotRequestsBefore);
+      stream.stop();
+    });
+
+    it('7: a reconnect re-quarantines everything, carried-forward books included', () => {
+      vi.useFakeTimers();
+      const at = 1_700_036_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, nextSeq } = openTrackedStream(['KX-KEEP'], at);
+      proveBook(stream, 'KX-KEEP', at, nextSeq);
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.track(['KX-NEW'], at);
+      stream.ingest(okFrame(lastCommand(socket, 'add_markets').id, nextSeq(), ['KX-NEW']), 1);
+      expect(stream.telemetry(at).qualifiedTickers).toBe(1);
+
+      const reconnected: FakeOpenSocket = {
+        readyState: WebSocket.OPEN,
+        send: vi.fn(),
+        close: vi.fn(),
+        ping: vi.fn(),
+      };
+      Object.assign(stream as unknown as Record<string, unknown>, { socket: reconnected, generation: 2 });
+      (stream as unknown as { handleSocketOpen(s: WebSocket, g: number): void })
+        .handleSocketOpen(reconnected as unknown as WebSocket, 2);
+
+      expect(stream.getBook('KX-KEEP', at)).toBeNull();
+      expect(stream.telemetry(at)).toMatchObject({
+        qualifiedTickers: 0,
+        quarantinedTickers: 2,
+        acknowledgedTrackingRevision: null,
+        membershipAcknowledged: false,
+        serverTrackedTickers: 0,
+      });
+      // The reconnect resubscribes from scratch, so nothing can be carried
+      // across a generation boundary.
+      expect(JSON.parse(String(reconnected.send.mock.calls[0]![0]))).toMatchObject({ cmd: 'subscribe' });
+      stream.stop();
+      expect(socket.close).not.toHaveBeenCalled();
+    });
+
+    it('8: the repair set is exactly the disturbed and unproven tickers, not the universe', () => {
+      vi.useFakeTimers();
+      const at = 1_700_037_000_000;
+      vi.setSystemTime(at);
+      const tracked = ['KX-P1', 'KX-P2', 'KX-P3', 'KX-UNPROVEN'];
+      const { stream, socket, nextSeq } = openTrackedStream(tracked, at);
+      for (const ticker of ['KX-P1', 'KX-P2', 'KX-P3']) proveBook(stream, ticker, at, nextSeq);
+      stream.ingest(snapshotFrame('KX-UNPROVEN', nextSeq()), 1);
+      expect(stream.telemetry(at).qualifiedTickers).toBe(3);
+
+      verifyTickers(stream, ['KX-NEW'], at);
+      stream.track(['KX-NEW'], at);
+      stream.ingest(okFrame(lastCommand(socket, 'add_markets').id, nextSeq(), ['KX-NEW']), 1);
+
+      expect(lastCommand(socket, 'get_snapshot').params?.market_tickers).toEqual(['KX-NEW', 'KX-UNPROVEN']);
+      expect(stream.telemetry(at)).toMatchObject({ qualifiedTickers: 3, quarantinedTickers: 2 });
+      for (const ticker of ['KX-P1', 'KX-P2', 'KX-P3']) {
+        expect(stream.getBook(ticker, at)).toMatchObject({ sequence: expect.any(Number) });
+      }
+      stream.stop();
+    });
+
+    it('9: five sequential membership changes leave a continuously retained book qualified', () => {
+      vi.useFakeTimers();
+      const at = 1_700_038_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, nextSeq } = openTrackedStream(['KX-KEEP'], at);
+      proveBook(stream, 'KX-KEEP', at, nextSeq);
+      const provenSequence = stream.getBook('KX-KEEP', at)!.sequence;
+
+      for (let change = 0; change < 5; change += 1) {
+        const ticker = `KX-CHURN-${change}`;
+        verifyTickers(stream, [ticker], at);
+        stream.track([ticker], at);
+
+        // Mid-update the book is intentionally not qualified, but under the old
+        // whole-universe wipe it would have been deleted outright and gone dark
+        // for a full snapshot round-trip after every single change.
+        expect(stream.telemetry(at).qualifiedTickers).toBe(0);
+        expect(stream.getBook('KX-KEEP', at)).toMatchObject({ sequence: provenSequence });
+
+        stream.ingest(okFrame(lastCommand(socket, 'add_markets').id, nextSeq(), [ticker]), 1);
+
+        expect(stream.telemetry(at)).toMatchObject({
+          membershipAcknowledged: true,
+          qualifiedTickers: 1,
+          trackingRevision: change + 2,
+          acknowledgedTrackingRevision: change + 2,
+        });
+        expect(stream.getBook('KX-KEEP', at)).toMatchObject({ sequence: provenSequence, sourceTimestamp: at });
+        // The churn tickers are never proven, so they stay in the repair set;
+        // the proven retained ticker is never in it. Under the whole-universe
+        // wipe every repair set was all 25 tickers, every 20 seconds.
+        expect(lastCommand(socket, 'get_snapshot').params?.market_tickers)
+          .toEqual(Array.from({ length: change + 1 }, (_, index) => `KX-CHURN-${index}`));
+      }
+
+      expect(stream.telemetry(at)).toMatchObject({ trackedTickers: 6, trackingRevision: 6 });
+      stream.stop();
+    });
+  });
 });
