@@ -805,6 +805,14 @@ function superviseOrderbookDataPlane(now = Date.now()): void {
   const before = kalshiOrderbookStream.telemetry(now);
   const supervision = kalshiOrderbookStream.superviseDataPlane(now);
   const after = kalshiOrderbookStream.telemetry(now);
+  // Advisory ordering only: after any invalidation the stream repairs these
+  // tickers first. Kalshi ran 44 reconnects/hour in the final hour of the
+  // 2026-07-27 run, and each one legitimately drops every book -- we cannot
+  // stop that, only recover the tickers that matter before the other 20.
+  kalshiOrderbookStream.setRepairPriority([
+    ...confirmationInFlightTickers(),
+    ...campaignCriticalOrderbookTickers(now),
+  ]);
   const samples = candidateBookSamples(now);
   const health = computeCandidateSequencedBookHealth(samples, {
     thresholdMs: DEFAULT_SEQUENCED_BOOK_THRESHOLD_MS,
@@ -3492,6 +3500,11 @@ async function executeReservedStrictPaperBuyForCard(
       playbook: card.playbook,
       startedAt: Date.now(),
       dueAt: Date.now() + entryConfig.shadowFollowUpMs,
+      // An entry taken while the data plane was latched degraded is a bad entry
+      // however cleanly it exits. Recorded, then excluded from the acceptance
+      // tallies -- the shadow ledger is what the gate reads, so this is where
+      // "no data" would otherwise be laundered into "no edge".
+      dataPlaneDegraded: dataPlaneDegradedSnapshot.degraded,
       contracts: preview.fill!.filled,
       entryPrice: preview.fill!.fillPrice,
       entryFeesUsd: preview.fill!.fees,
@@ -3871,6 +3884,10 @@ async function evaluateStrategyValidationFollowUps(): Promise<void> {
             stressedNetPnlUsd,
             closeReason,
             now,
+            // A mark taken during a degraded window is an untrustworthy mark,
+            // just as an entry taken during one is a bad entry. Either end
+            // contaminates the row and excludes it from the acceptance tallies.
+            dataPlaneDegradedSnapshot.degraded,
           ));
         }
       } catch {
@@ -5239,11 +5256,30 @@ async function refreshProductionMarketProvenance(ticker: string): Promise<void> 
 }
 
 async function reverifyTrackedProductionMarkets(): Promise<void> {
-  if (settings.demoMode || orderbookTrackedTickers.length === 0) return;
+  if (settings.demoMode) return;
+  // Confirmation-in-flight tickers lead, and are covered even when they are not
+  // in the tracked set. `desiredOrderbookTickers` admits a ticker only through
+  // `isProductionLiveTicker`, which reads `productionMarketRecord(ticker, now)`
+  // -- an *unlapsed* record. So a candidate mid-confirmation whose 90s
+  // provenance TTL expires silently falls out of the desired set, loses its
+  // slot, and then fails hydration again on the entry hot path, where
+  // `ensureProductionProvenance` gets exactly one un-retried REST attempt.
+  //
+  // Measured on the 2026-07-27 repair run: `provenance-unavailable` was the top
+  // priority-track outcome at 31.4%, and candidate book health sat at 0.27 even
+  // in a window where the socket was 100% open, churn was 0.52/min and 21 of 25
+  // tickers held qualifying books. That is a coverage failure, not a delivery
+  // failure -- the candidates were on tickers the tracked set did not hold.
+  //
+  // Reusing this paced loop keeps the extra hydration under the same rate-limit
+  // discipline that fixed the R10 orderbook-decay bug; bursting these would
+  // re-earn the 429s that started that whole investigation.
   const tickers = [...new Set([
+    ...confirmationInFlightTickers(),
     ...campaignCriticalOrderbookTickers(),
     ...orderbookTrackedTickers,
-  ])].slice(0, ORDERBOOK_TRACKING_LIMIT);
+  ])].slice(0, ORDERBOOK_TRACKING_LIMIT + entryQualificationSettings().maxPendingCandidates);
+  if (tickers.length === 0) return;
   // Spread the refreshes across the interval rather than bursting them, so the
   // aggregate request rate stays under Kalshi's limit and every market is
   // re-verified inside its 90s provenance TTL. See REVERIFY_* constants.

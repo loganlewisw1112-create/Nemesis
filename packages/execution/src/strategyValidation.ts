@@ -5,6 +5,23 @@ import type { EntryEconomicsEvidence } from './tradeEconomics.js';
 export const STRATEGY_VALIDATION_SCHEMA_VERSION = 2;
 const SUPPORTED_STRATEGY_VALIDATION_SCHEMAS = new Set([1, STRATEGY_VALIDATION_SCHEMA_VERSION]);
 
+/**
+ * Maximum share of scored shadows that may be excluded as data-plane
+ * contaminated before the sample stops being a test of the strategy at all.
+ *
+ * Contamination is *not* random with respect to outcome: a degraded data plane
+ * produces bad entries, and bad entries produce losses, so the excluded
+ * population is systematically loss-heavy. Below this bound, dropping a few
+ * degraded rows is noise reduction. Above it, the exclusion is doing so much of
+ * the work that the surviving rows flatter the strategy by construction — the
+ * honest reading is that the run is a diagnostic, not evidence about edge, the
+ * same standard the run-level data-plane gates already apply.
+ *
+ * This is a validity bound on the sample, not an acceptance threshold: it can
+ * only ever hold the gate closed, never open it.
+ */
+export const SHADOW_MAX_CONTAMINATED_SHARE = 0.2;
+
 export interface ShadowCandidateEvidence {
   id: string;
   sourceSignalId: string;
@@ -26,6 +43,15 @@ export interface ShadowCandidateEvidence {
   stressedTargetNetPnlUsd?: number;
   /** @deprecated Schema-1 compatibility alias. */
   stressedExpectedNetPnlUsd?: number;
+  /**
+   * True when the orderbook data plane was latched degraded at the moment this
+   * candidate was entered. An entry made on a book that could not prove itself
+   * is a bad entry regardless of how cleanly it later exits, so the scored row
+   * is excluded from every acceptance tally. Additive and optional: absent
+   * means false, and historical ledgers written before this field replay
+   * byte-identically.
+   */
+  dataPlaneDegraded?: boolean;
 }
 
 interface ValidationEventBase {
@@ -81,6 +107,12 @@ export type StrategyValidationEvent = ValidationEventBase & (
     netPnlUsd: number;
     stressedNetPnlUsd: number;
     closeReason: string;
+    /**
+     * True when the orderbook data plane was latched degraded at the moment of
+     * scoring. The exit mark is then untrustworthy, so the row is excluded from
+     * every acceptance tally. Absent means false.
+     */
+    dataPlaneDegraded?: boolean;
   }
   | { type: 'validation_stage_changed'; stage: StrategyValidationStage; confirmation: string }
   | { type: 'validation_paused'; reason: string }
@@ -94,7 +126,35 @@ export interface StrategyValidationSnapshot {
   strategyEngineVersion: number;
   lastSequence: number;
   integrityError?: string;
+  /**
+   * Scored shadows counted by the acceptance gate. Clean population only:
+   * rows whose entry and scoring were both recorded outside a degraded
+   * data-plane window.
+   */
   shadowCandidateCount: number;
+  /**
+   * Scored shadows excluded from every acceptance tally because the data plane
+   * was latched degraded at entry, at scoring, or both. Recorded and reported,
+   * never suppressed — but never evidence about edge.
+   */
+  shadowContaminatedCount: number;
+  /**
+   * Net P&L of the excluded population. Visibility only: this value is not an
+   * input to any gate and must never be merged into shadowNetPnlUsd.
+   */
+  shadowContaminatedNetPnlUsd: number;
+  /**
+   * contaminated / (clean + contaminated) over scored shadows; 0 when nothing
+   * has been scored. Measures how much of the verdict is being carried by the
+   * exclusion itself.
+   */
+  shadowContaminatedShare: number;
+  /**
+   * True when shadowContaminatedShare exceeds SHADOW_MAX_CONTAMINATED_SHARE, so
+   * the sample is not a valid test of the strategy and the gate is held closed.
+   * Surfaced explicitly so the reason never has to be inferred from arithmetic.
+   */
+  shadowContaminationBlocked: boolean;
   shadowPendingCount: number;
   shadowWinRate: number;
   shadowGrossProfitUsd: number;
@@ -164,6 +224,12 @@ export class StrategyValidationTracker {
   private readonly events: StrategyValidationEvent[] = [];
   private readonly pending = new Map<string, ShadowCandidateEvidence>();
   private readonly usedSources = new Set<string>();
+  /**
+   * Candidate ids whose entry was recorded while the data plane was degraded.
+   * Kept beyond scoring (unlike `pending`) so the scored row can still be
+   * attributed to a contaminated entry. Rebuilt identically on replay.
+   */
+  private readonly degradedStarts = new Set<string>();
   private integrityError?: string;
   private stage: StrategyValidationStage;
 
@@ -263,6 +329,7 @@ export class StrategyValidationTracker {
     if (event.type === 'shadow_candidate_started') {
       this.pending.set(event.candidate.id, { ...event.candidate });
       this.usedSources.add(event.candidate.sourceSignalId);
+      if (event.candidate.dataPlaneDegraded === true) this.degradedStarts.add(event.candidate.id);
     } else if (event.type === 'shadow_candidate_scored') {
       this.pending.delete(event.candidateId);
     } else if (event.type === 'validation_stage_changed') {
@@ -277,13 +344,17 @@ export class StrategyValidationTracker {
     if (!Number.isFinite(targetRewardUsd)) throw new Error('shadow candidate target reward is missing');
     const stressedTargetNetPnlUsd = candidate.stressedTargetNetPnlUsd ?? candidate.stressedExpectedNetPnlUsd;
     if (!Number.isFinite(stressedTargetNetPnlUsd)) throw new Error('shadow candidate stressed target result is missing');
-    const normalized = {
+    const normalized: ShadowCandidateEvidence = {
       ...candidate,
       targetRewardUsd: targetRewardUsd!,
       expectedRewardUsd: targetRewardUsd!,
       stressedTargetNetPnlUsd: stressedTargetNetPnlUsd!,
       stressedExpectedNetPnlUsd: stressedTargetNetPnlUsd!,
     };
+    // Canonical form: the flag is written only when true, so a clean candidate
+    // hashes exactly as it did before this field existed.
+    if (candidate.dataPlaneDegraded === true) normalized.dataPlaneDegraded = true;
+    else delete normalized.dataPlaneDegraded;
     return this.add('shadow_candidate_started', { candidate: normalized }, candidate.startedAt);
   }
 
@@ -335,6 +406,7 @@ export class StrategyValidationTracker {
     stressedNetPnlUsd: number,
     closeReason: string,
     at = Date.now(),
+    dataPlaneDegraded = false,
   ): StrategyValidationEvent {
     if (!this.pending.has(candidateId)) throw new Error('shadow candidate is not pending');
     return this.add('shadow_candidate_scored', {
@@ -342,6 +414,8 @@ export class StrategyValidationTracker {
       netPnlUsd: round(netPnlUsd),
       stressedNetPnlUsd: round(stressedNetPnlUsd),
       closeReason,
+      // Written only when true, so a clean score hashes as it did before.
+      ...(dataPlaneDegraded === true ? { dataPlaneDegraded: true } : {}),
     }, at);
   }
 
@@ -398,8 +472,23 @@ export class StrategyValidationTracker {
     return this.integrityError;
   }
 
+  /**
+   * A scored shadow is contaminated when the data plane was latched degraded at
+   * entry OR at scoring. Absent flags mean false, so ledgers written before the
+   * flag existed are entirely clean.
+   */
+  private isContaminated(score: Extract<StrategyValidationEvent, { type: 'shadow_candidate_scored' }>): boolean {
+    return score.dataPlaneDegraded === true || this.degradedStarts.has(score.candidateId);
+  }
+
   snapshot(settings: EntryQualificationSettings): StrategyValidationSnapshot {
-    const scores = this.events.filter((event): event is Extract<StrategyValidationEvent, { type: 'shadow_candidate_scored' }> => event.type === 'shadow_candidate_scored');
+    const allScores = this.events.filter((event): event is Extract<StrategyValidationEvent, { type: 'shadow_candidate_scored' }> => event.type === 'shadow_candidate_scored');
+    // A scored shadow is contaminated when *either* end touched a degraded
+    // window: a bad entry is bad however cleanly it exits, and a mark taken on
+    // an unproven book is not a mark. Contaminated rows stay in the ledger and
+    // are reported below, but no acceptance tally may read them.
+    const contaminated = allScores.filter((score) => this.isContaminated(score));
+    const scores = allScores.filter((score) => !this.isContaminated(score));
     const rows = scores.map((score) => score.netPnlUsd);
     const stressed = scores.map((score) => score.stressedNetPnlUsd);
     const scoreTimes = scores.map((score) => score.at);
@@ -420,7 +509,16 @@ export class StrategyValidationTracker {
     const largestWinShare = grossProfit > 0 ? largestWin / grossProfit : 0;
     const pauseEvent = this.events.filter((event): event is Extract<StrategyValidationEvent, { type: 'validation_paused' }> => event.type === 'validation_paused').at(-1);
     const eligible = !pauseEvent && !this.integrityError;
+    // Validity bound on the sample, evaluated on the unrounded share. Because
+    // contamination correlates with losses, a heavily contaminated ledger would
+    // otherwise report a flattering clean subset; treat it as "not a test"
+    // rather than as a quality failure, so shadowQualityPassed below keeps
+    // telling the operator the truth about the clean rows.
+    const scoredTotal = rows.length + contaminated.length;
+    const contaminatedShare = scoredTotal > 0 ? contaminated.length / scoredTotal : 0;
+    const shadowContaminationBlocked = contaminatedShare > SHADOW_MAX_CONTAMINATED_SHARE;
     const shadowCountPassed = eligible
+      && !shadowContaminationBlocked
       && rows.length >= settings.shadowMinScored
       && distinctDays >= settings.shadowMinDistinctDays
       && shadowObservationWindowMs >= settings.shadowMinObservationMs;
@@ -441,6 +539,10 @@ export class StrategyValidationTracker {
       lastSequence: this.lastSequence(),
       integrityError: this.integrityError,
       shadowCandidateCount: rows.length,
+      shadowContaminatedCount: contaminated.length,
+      shadowContaminatedNetPnlUsd: round(contaminated.reduce((sum, score) => sum + score.netPnlUsd, 0)),
+      shadowContaminatedShare: round(contaminatedShare),
+      shadowContaminationBlocked,
       shadowPendingCount: this.pending.size,
       shadowWinRate: round(winRate),
       shadowGrossProfitUsd: round(grossProfit),

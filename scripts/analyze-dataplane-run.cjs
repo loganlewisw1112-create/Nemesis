@@ -127,6 +127,75 @@ const warns = readJsonl(connectorWarnPath, cutoffMs);
 const bridge = readJsonl(appDataLedger('bridge-telemetry.jsonl'), cutoffMs);
 const validation = readJsonl(appDataLedger('paper-strategy-validation-events.jsonl'), cutoffMs);
 
+// Shadow contamination: an entry taken while the data plane was latched
+// degraded is a bad entry however cleanly it exits, and a mark taken during a
+// degraded window is an untrustworthy mark. Read the WHOLE ledger, not just the
+// post-cutoff slice -- the shadow gate accumulates across relaunches.
+const wholeValidation = readJsonl(appDataLedger('paper-strategy-validation-events.jsonl'), null);
+const shadowStarts = new Map();
+for (const event of wholeValidation) {
+  if (event.type === 'shadow_candidate_started' && event.candidate) {
+    shadowStarts.set(event.candidate.id, event.candidate.dataPlaneDegraded === true);
+  }
+}
+// Retroactive classification. The dataPlaneDegraded flag only exists going
+// forward, so shadows scored before it shipped read as clean even when they
+// were entered on a dead book. The orderbook trace is the authority on WHEN the
+// data plane was degraded, so join against it: inside a degraded interval is
+// contaminated, inside trace coverage but outside those intervals is clean, and
+// outside coverage entirely is unclassified — never silently counted as clean.
+const allTrace = readJsonl(orderbookTracePath, null);
+const degradedIntervals = [];
+let intervalStart = null;
+let previousAt = null;
+for (const row of allTrace) {
+  if (row.dataPlaneDegraded === true && intervalStart == null) intervalStart = row.at;
+  if (row.dataPlaneDegraded !== true && intervalStart != null) {
+    degradedIntervals.push([intervalStart, previousAt ?? row.at]);
+    intervalStart = null;
+  }
+  previousAt = row.at;
+}
+if (intervalStart != null && previousAt != null) degradedIntervals.push([intervalStart, previousAt]);
+const traceFrom = allTrace.length > 0 ? allTrace[0].at : null;
+const traceTo = allTrace.length > 0 ? allTrace[allTrace.length - 1].at : null;
+const withinDegraded = (at) => degradedIntervals.some(([from, to]) => at >= from && at <= to);
+const covered = (at) => traceFrom != null && at >= traceFrom && at <= traceTo;
+
+const startAtById = new Map();
+for (const event of wholeValidation) {
+  if (event.type === 'shadow_candidate_started' && event.candidate) {
+    startAtById.set(event.candidate.id, event.candidate.startedAt ?? event.at);
+  }
+}
+const shadowScored = wholeValidation.filter((e) => e.type === 'shadow_candidate_scored');
+const shadowRows = shadowScored.map((event) => {
+  const startedAt = startAtById.get(event.candidateId) ?? null;
+  const flagged = shadowStarts.get(event.candidateId) === true || event.dataPlaneDegraded === true;
+  const retro = (startedAt != null && withinDegraded(startedAt)) || withinDegraded(event.at);
+  const knowable = (startedAt == null || covered(startedAt)) && covered(event.at);
+  return {
+    netPnlUsd: event.netPnlUsd ?? 0,
+    contaminated: flagged || retro,
+    // Unclassified only when nothing marked it AND the trace cannot speak to it.
+    unclassified: !flagged && !retro && !knowable,
+    retro: !flagged && retro,
+  };
+});
+const cleanShadows = shadowRows.filter((row) => !row.contaminated && !row.unclassified);
+const dirtyShadows = shadowRows.filter((row) => row.contaminated);
+const unknownShadows = shadowRows.filter((row) => row.unclassified);
+const shadowStat = (rows) => {
+  const wins = rows.filter((row) => row.netPnlUsd > 0);
+  const net = rows.reduce((sum, row) => sum + row.netPnlUsd, 0);
+  return {
+    scored: rows.length,
+    wins: wins.length,
+    winRate: rows.length === 0 ? 0 : wins.length / rows.length,
+    netPnlUsd: net,
+  };
+};
+
 const confirmations = validation.filter((e) => e.type === 'entry_confirmation_observed');
 const degradedConfirmations = confirmations.filter((e) => e.dataPlaneDegraded === true);
 const cleanConfirmations = confirmations.filter((e) => e.dataPlaneDegraded !== true);
@@ -278,6 +347,22 @@ if (args.includes('--json')) {
   line('max samples reached', report.confirmations.maxSamples);
   for (const [reason, count] of report.confirmations.topReasonsClean) {
     line(`  ${String(reason).slice(0, 34)}`, count);
+  }
+
+  console.log('\nSHADOW LEDGER (whole ledger — the gate accumulates across relaunches)');
+  const clean = shadowStat(cleanShadows);
+  const dirty = shadowStat(dirtyShadows);
+  const unknown = shadowStat(unknownShadows);
+  const classified = clean.scored + dirty.scored;
+  line('scored total', shadowRows.length);
+  line('clean (counts toward the gate)', `${clean.scored} · wins ${clean.wins} (${(clean.winRate * 100).toFixed(0)}%) · net $${clean.netPnlUsd.toFixed(2)}`);
+  line('contaminated (excluded)', `${dirty.scored} · wins ${dirty.wins} · net $${dirty.netPnlUsd.toFixed(2)}`
+    + `${shadowRows.filter((r) => r.retro).length > 0 ? ` (${shadowRows.filter((r) => r.retro).length} classified retroactively from the trace)` : ''}`);
+  line('unclassified (no trace cover)', `${unknown.scored} · net $${unknown.netPnlUsd.toFixed(2)}`);
+  line('contaminated share', classified === 0 ? 'n/a' : pct(dirty.scored, classified));
+  if (classified > 0 && dirty.scored / classified > 0.2) {
+    console.log('  NOTE: contamination over 20% — the clean subset is not a valid test of the strategy,');
+    console.log('        because degraded books produce bad entries, so exclusions are loss-biased.');
   }
 
   console.log('\nGATES');

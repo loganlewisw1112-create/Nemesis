@@ -400,6 +400,103 @@ snapshot-repaired exactly as before.
   to end.
 - **Phases 4 and 5** — require launching an unattended paper run. Operator's call on timing.
 
+---
+
+## Phase 4 result — 2026-07-27, two runs, stopped 15:00:01 PDT
+
+**Run A** (09:58–12:08 PDT, 2.13h, pre-Task-2.3) and **Run B** (12:08–15:00 PDT, 2.85h, on `5b36733`).
+
+**The deterministic stop worked: 1.001s drift** (requested 15:00:00, actual 15:00:01), 9 matched,
+0 remaining, no force escalation, exit 0. Against the 101-minute drift that motivated Task 6.1.
+
+### Phase 4 gate: NOT met — 4 of 7 pass on Run B
+
+| gate | result |
+|---|---|
+| socket open at cutoff | PASS |
+| sequenced delta < 30s | PASS (1.0s) |
+| ≥1 sequenced-book outcome | PASS (94) |
+| no supervisor invariant violations | PASS (0) |
+| sequenced-book dominates | FAIL — 31.9% |
+| candidate books sequenced >90% | FAIL — 9.5% |
+| degraded under 5% | FAIL — 82.5m of 2.85h (48%) |
+
+### What was proven
+
+- **The absorbing dead state is gone.** The supervisor fired `reconnect-dead-socket` on
+  `socket state none with no reconnect armed` — the exact terminal condition that ran 7.9h
+  unnoticed on 2026-07-26 — and recovered in seconds. Across both runs: 0 invariant violations.
+- **Task 2.3 works.** Run B's clean middle hour: churn **0.52 rev/min** (vs 3.24 pre-fix), median
+  quarantined **0** (vs 7), median qualified **24/25** (vs 15), socket 100% open.
+- **The fail-closed latch earned the whole day.** Run B tagged **1,238 of 1,449** confirmations
+  `dataPlaneDegraded`; only 211 stand as economic evidence. Without it this run would have
+  reported ~1,449 strategy rejections, ~85% of which were feed artifacts.
+
+### What was learned that the plan did not anticipate
+
+1. **Churn was never the whole story.** In Run B's flawless middle hour — socket 100% open, zero
+   quarantine, 21 of 25 tickers holding qualifying books — candidate book health was still only
+   **0.274**. The candidates were on tickers the tracked set did not hold. The binding constraint
+   is now **coverage**, not delivery.
+   - Root cause found: `desiredOrderbookTickers` admits a ticker only via `isProductionLiveTicker`,
+     which reads an *unlapsed* production record. A candidate mid-confirmation whose 90s TTL
+     expires falls out of the desired set, loses its slot, and then fails hydration again on the
+     entry hot path where `ensureProductionProvenance` gets one un-retried REST attempt.
+     `reverifyTrackedProductionMarkets` covered only *tracked* tickers, never in-flight candidates.
+   - `provenance-unavailable` rose to the **top** priority-track outcome at 31.4% (was 9.9%).
+   - Not rate limiting: zero HTTP statuses recorded; stream failures were `timeout`/`dns`.
+2. **The degraded flag did not reach the shadow ledger.** The latch tagged
+   `entry_confirmation_observed` but not `shadow_candidate_started`/`_scored`. Six shadows scored
+   during an hour that was 83% degraded, moving the ledger −$13.44 → **−$36.69**, and were
+   indistinguishable from clean ones in the very ledger the gate reads. The firewall had a hole
+   exactly where the verdict is computed.
+3. **Kalshi socket instability is real and outside our control** — 44 reconnects/hour in Run B's
+   final hour (62 total, 4 escalations). Each legitimately drops every book. We can only make
+   recovery favour the tickers that matter.
+
+### P0 answered: the corrected model IS live
+
+`crypto-lead.ts` no longer uses the 2026-07-25 linear proxy. It computes
+`d = (ln(S/K) − 0.5σ_T²)/σ_T`, `impliedPrice = normalCdf(d)`, with σ_T from observed Binance
+volatility scaled by `√(timeToExpiry/dt)` and floored by an annualised vol floor, plus fail-closed
+invalid reasons (`crypto-sigma-unusable`, `crypto-expiry-unavailable`) that fall back to market
+price and zero edge.
+
+**So the shadow ledger is now measuring the corrected model** (49 scored, 11 wins, 22%, −$36.69) —
+which makes it consequential, and makes finding #2 urgent: that number is contaminated and cannot
+be treated as a verdict until degraded-window shadows are excluded.
+
+### Final ledger state
+
+Portfolio `$5,000`, 0 positions, **0 trades**, live hard-locked throughout. 789 aborts.
+Shadow 49 scored / 11 wins / −$36.69 (contaminated). Hash chains intact.
+
+### Follow-up work landed the same day (P0–P2)
+
+| item | where | note |
+|---|---|---|
+| **P0 — which model is being shadowed?** | `packages/pods/src/crypto-lead.ts` | **Answered: the corrected one.** See above. No code change needed. |
+| **P1 — candidate coverage** | `main.ts reverifyTrackedProductionMarkets` | Confirmation-in-flight tickers now lead the paced reverify set and are covered even when untracked, capped at `25 + maxPendingCandidates`. Reuses the existing rate-limit-safe loop rather than adding hot-path retries. |
+| **P1.5 — shadow contamination** | `strategyValidation.ts`, `main.ts` | `dataPlaneDegraded` now rides on `shadow_candidate_started` and `shadow_candidate_scored`; contaminated rows are recorded but excluded from every acceptance tally. |
+| **P1.5b — contamination-share bound** | `strategyValidation.ts` | `SHADOW_MAX_CONTAMINATED_SHARE = 0.2`. **Contamination is not random with respect to outcome** — degraded books cause bad entries, so the excluded population is loss-heavy and clean-subset tallies could otherwise flatter a bad strategy. Above the bound the gate is held closed (`shadowContaminationBlocked`), because the surviving sample is not a test. It can only hold the gate closed, never open it. |
+| **P2 — priority snapshot repair** | `kalshiOrderbookStream.setRepairPriority`, `main.ts` health tick | In-flight candidates are repaired first after any invalidation. **Correction to the original rationale:** `get_snapshot` does not hold the pending-update slot, so the queue is not pumped one command at a time here; the true claim is that Kalshi processes commands in receipt order, so the smaller priority command's snapshots are generated first. Size of the win is unmeasured and could be small. |
+| **Analyzer — retroactive classification** | `scripts/analyze-dataplane-run.cjs` | The degraded flag only exists going forward, so pre-existing shadows read as clean. The analyzer now joins scored shadows against degraded intervals derived from the orderbook trace: inside an interval ⇒ contaminated, inside trace coverage but outside ⇒ clean, outside coverage ⇒ **unclassified** (never silently counted as clean). |
+
+**First result from retroactive classification of the existing 49-shadow ledger:**
+
+| population | scored | wins | net |
+|---|---|---|---|
+| clean | 31 | 8 (26%) | **−$31.07** |
+| contaminated | 16 | 2 | −$14.94 |
+| unclassified (pre-trace) | 2 | — | +$9.32 |
+
+Contamination share **34%** — over the bound, so this ledger is not yet a valid test. But note what it
+does say: **excluding contamination does not rescue the result.** The clean subset is 26% win rate
+against a 0.55 bar, on the corrected normal-CDF model. That is not yet a verdict (31 clean vs a bar of
+50, and the 24h window is unmet), but it is no longer explicable as a data problem.
+
+683/683 tests, typecheck and build green.
+
 ### Next action (operator)
 
 ```powershell

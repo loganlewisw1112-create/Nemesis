@@ -1487,4 +1487,307 @@ describe('KalshiOrderbookStream', () => {
       stream.stop();
     });
   });
+
+  // 2026-07-27 paper run, final hour: 44 Kalshi-side reconnects/hour, each of
+  // which legitimately drops every book and re-quarantines every tracked ticker.
+  // Recovery asked for one bulk get_snapshot over all 25 with no notion of which
+  // handful had a candidate mid-confirmation; candidate book health fell to
+  // 0.220. These tests pin the repair ORDER only — no evidence rule moves.
+  describe('repair priority ordering', () => {
+    const SID = 7;
+
+    type FakeOpenSocket = {
+      readyState: number;
+      send: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      ping: ReturnType<typeof vi.fn>;
+    };
+
+    interface SentCommand {
+      id: number;
+      cmd: string;
+      params?: { sids?: number[]; market_tickers?: string[]; action?: string; channels?: string[] };
+    }
+
+    function commands(socket: FakeOpenSocket, action: string): SentCommand[] {
+      return socket.send.mock.calls
+        .map((call) => JSON.parse(String(call[0])) as SentCommand)
+        .filter((command) => command.params?.action === action);
+    }
+
+    function subscribeCommand(socket: FakeOpenSocket): SentCommand {
+      const match = socket.send.mock.calls
+        .map((call) => JSON.parse(String(call[0])) as SentCommand)
+        .find((command) => command.cmd === 'subscribe');
+      if (!match) throw new Error('no subscribe command was sent');
+      return match;
+    }
+
+    function snapshotFrame(ticker: string, seq: number): string {
+      return JSON.stringify({
+        type: 'orderbook_snapshot', sid: SID, seq,
+        msg: { market_ticker: ticker, yes_dollars_fp: [['0.4000', '10.00']], no_dollars_fp: [['0.6000', '8.00']] },
+      });
+    }
+
+    function deltaFrame(ticker: string, seq: number, tsMs: number): string {
+      return JSON.stringify({
+        type: 'orderbook_delta', sid: SID, seq,
+        msg: { market_ticker: ticker, price_dollars: '0.4100', delta_fp: '1.00', side: 'yes', ts_ms: tsMs },
+      });
+    }
+
+    function pendingRepair(stream: KalshiOrderbookStream): Map<string, Set<string>> {
+      return (stream as unknown as { pendingSnapshotRepair: Map<string, Set<string>> }).pendingSnapshotRepair;
+    }
+
+    /**
+     * Opens a stream and drives the real subscribe → `subscribed` handshake. The
+     * acknowledgement path then repairs every tracked ticker (none has a book
+     * yet), which is exactly the post-reconnect repair set this change targets.
+     */
+    function openStream(tickers: string[], at: number, priority?: string[]) {
+      const registry = new ConnectorRegistry();
+      const stream = new KalshiOrderbookStream(registry, () => ({ authorization: 'test' }));
+      const socket: FakeOpenSocket = {
+        readyState: WebSocket.OPEN,
+        send: vi.fn(),
+        close: vi.fn(),
+        ping: vi.fn(),
+      };
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        socket,
+        authenticated: true,
+        generation: 1,
+        started: true,
+        lastPongAt: at,
+      });
+      verifyTickers(stream, tickers, at);
+      if (priority) stream.setRepairPriority(priority);
+      stream.track(tickers, at);
+      let seq = 0;
+      const handshake = () => {
+        stream.ingest(JSON.stringify({
+          id: subscribeCommand(socket).id,
+          type: 'subscribed',
+          msg: { sid: SID },
+        }), 1);
+      };
+      return { registry, stream, socket, handshake, nextSeq: () => (seq += 1) };
+    }
+
+    const eight = ['KX-A', 'KX-B', 'KX-C', 'KX-D', 'KX-E', 'KX-F', 'KX-G', 'KX-H'];
+
+    it('1: with no repair priority the repair is one command in today\'s sorted order', () => {
+      vi.useFakeTimers();
+      const at = 1_700_040_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, handshake } = openStream(eight, at);
+      handshake();
+
+      const snapshots = commands(socket, 'get_snapshot');
+      expect(snapshots).toHaveLength(1);
+      expect(snapshots[0]!.params?.market_tickers).toEqual([...eight].sort());
+      // The subscribe command is untouched too.
+      expect(subscribeCommand(socket).params?.market_tickers).toEqual(eight);
+      stream.stop();
+    });
+
+    it('2: 2 of 8 prioritized produces exactly two commands, priority first', () => {
+      vi.useFakeTimers();
+      const at = 1_700_041_000_000;
+      vi.setSystemTime(at);
+      // Priority order (F before C) is deliberately not sorted order.
+      const { stream, socket, handshake } = openStream(eight, at, ['KX-F', 'KX-C']);
+      handshake();
+
+      const snapshots = commands(socket, 'get_snapshot');
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots[0]!.params?.market_tickers).toEqual(['KX-F', 'KX-C']);
+      expect(snapshots[1]!.params?.market_tickers)
+        .toEqual(['KX-A', 'KX-B', 'KX-D', 'KX-E', 'KX-G', 'KX-H']);
+      // Same tickers, same count — only the order and the command split changed.
+      expect([...snapshots.flatMap((c) => c.params?.market_tickers ?? [])].sort())
+        .toEqual([...eight].sort());
+      // Both frames are on the wire before any snapshot comes back, and the
+      // priority frame was written first.
+      const snapshotSendIndexes = socket.send.mock.calls
+        .map((call, index) => ({ index, command: JSON.parse(String(call[0])) as SentCommand }))
+        .filter(({ command }) => command.params?.action === 'get_snapshot');
+      expect(snapshotSendIndexes).toHaveLength(2);
+      expect(snapshotSendIndexes[0]!.command.params?.market_tickers).toEqual(['KX-F', 'KX-C']);
+      expect(snapshotSendIndexes[0]!.index).toBeLessThan(snapshotSendIndexes[1]!.index);
+      stream.stop();
+    });
+
+    it('3: every repair ticker prioritized collapses back to one command, in priority order', () => {
+      vi.useFakeTimers();
+      const at = 1_700_042_000_000;
+      vi.setSystemTime(at);
+      const scrambled = ['KX-H', 'KX-C', 'KX-A', 'KX-G', 'KX-B', 'KX-F', 'KX-E', 'KX-D'];
+      const { stream, socket, handshake } = openStream(eight, at, scrambled);
+      handshake();
+
+      const snapshots = commands(socket, 'get_snapshot');
+      expect(snapshots).toHaveLength(1);
+      expect(snapshots[0]!.params?.market_tickers).toEqual(scrambled);
+      stream.stop();
+    });
+
+    it('4: a priority set that intersects nothing leaves today\'s single command untouched', () => {
+      vi.useFakeTimers();
+      const at = 1_700_043_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, handshake } = openStream(eight, at, ['KX-NOT-TRACKED', 'KX-ALSO-NOT']);
+      handshake();
+
+      const snapshots = commands(socket, 'get_snapshot');
+      expect(snapshots).toHaveLength(1);
+      expect(snapshots[0]!.params?.market_tickers).toEqual([...eight].sort());
+      expect(subscribeCommand(socket).params?.market_tickers).toEqual(eight);
+      stream.stop();
+    });
+
+    it('5: pendingSnapshotRepair tracks the union and clears when both commands are answered', () => {
+      vi.useFakeTimers();
+      const at = 1_700_044_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, handshake, nextSeq } = openStream(eight, at, ['KX-F', 'KX-C']);
+      handshake();
+
+      expect(commands(socket, 'get_snapshot')).toHaveLength(2);
+      expect([...pendingRepair(stream).get(String(SID)) ?? []].sort()).toEqual([...eight].sort());
+
+      // Priority snapshots land first; the repair is still outstanding for the rest.
+      for (const ticker of ['KX-F', 'KX-C']) stream.ingest(snapshotFrame(ticker, nextSeq()), 1);
+      expect([...pendingRepair(stream).get(String(SID)) ?? []].sort())
+        .toEqual(['KX-A', 'KX-B', 'KX-D', 'KX-E', 'KX-G', 'KX-H']);
+
+      for (const ticker of ['KX-A', 'KX-B', 'KX-D', 'KX-E', 'KX-G', 'KX-H']) {
+        stream.ingest(snapshotFrame(ticker, nextSeq()), 1);
+      }
+      expect(pendingRepair(stream).has(String(SID))).toBe(false);
+
+      // Snapshot alone never qualifies anything — the evidence rule is unchanged.
+      expect(stream.telemetry(at).qualifiedTickers).toBe(0);
+      expect(stream.bookState('KX-F', at).state).toBe('snapshot-quarantined');
+      stream.ingest(deltaFrame('KX-F', nextSeq(), at), 1);
+      expect(stream.bookState('KX-F', at).state).toBe('sequenced');
+      stream.stop();
+    });
+
+    it('6: a prioritized ticker with no provenance is still never admitted', () => {
+      vi.useFakeTimers();
+      const at = 1_700_045_000_000;
+      vi.setSystemTime(at);
+      const registry = new ConnectorRegistry();
+      const stream = new KalshiOrderbookStream(registry, () => ({ authorization: 'test' }));
+      const socket: FakeOpenSocket = {
+        readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn(), ping: vi.fn(),
+      };
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        socket, authenticated: true, generation: 1, started: true, lastPongAt: at,
+      });
+      // Provenance is recorded for the tracked pair only; KX-NOPROV is prioritized
+      // but has no production REST proof.
+      verifyTickers(stream, ['KX-A', 'KX-B'], at);
+      stream.setRepairPriority(['KX-NOPROV', 'KX-B']);
+      stream.track(['KX-A', 'KX-B', 'KX-NOPROV'], at);
+
+      expect(stream.isTracked('KX-NOPROV')).toBe(false);
+      expect(stream.bookState('KX-NOPROV', at).state).toBe('untracked');
+      expect(stream.getBook('KX-NOPROV', at)).toBeNull();
+      expect(subscribeCommand(socket).params?.market_tickers).toEqual(['KX-B', 'KX-A']);
+
+      stream.ingest(JSON.stringify({ id: subscribeCommand(socket).id, type: 'subscribed', msg: { sid: SID } }), 1);
+      const snapshots = commands(socket, 'get_snapshot');
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots[0]!.params?.market_tickers).toEqual(['KX-B']);
+      expect(snapshots[1]!.params?.market_tickers).toEqual(['KX-A']);
+      expect(snapshots.flatMap((c) => c.params?.market_tickers ?? [])).not.toContain('KX-NOPROV');
+
+      // Even an unsolicited snapshot+delta for it cannot manufacture a book.
+      stream.ingest(snapshotFrame('KX-NOPROV', 1), 1);
+      stream.ingest(deltaFrame('KX-NOPROV', 2, at), 1);
+      expect(stream.getBook('KX-NOPROV', at)).toBeNull();
+      expect(stream.telemetry(at).trackedTickers).toBe(2);
+      stream.stop();
+    });
+
+    it('7: setRepairPriority dedupes, is idempotent, and an empty array clears it', () => {
+      vi.useFakeTimers();
+      const at = 1_700_046_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, handshake, nextSeq } = openStream(eight, at);
+      // Safe on every health tick: repeated calls send nothing and never touch
+      // membership or the tracking revision.
+      const sendsBefore = socket.send.mock.calls.length;
+      const revisionBefore = stream.telemetry(at).trackingRevision;
+      for (let i = 0; i < 5; i += 1) stream.setRepairPriority(['KX-F', 'KX-C', 'KX-F']);
+      stream.setRepairPriority(['KX-F', 'KX-C']);
+      expect(socket.send.mock.calls.length).toBe(sendsBefore);
+      expect(stream.telemetry(at)).toMatchObject({
+        trackingRevision: revisionBefore,
+        trackedTickers: 8,
+      });
+
+      handshake();
+      const withPriority = commands(socket, 'get_snapshot');
+      expect(withPriority).toHaveLength(2);
+      // Deduped: KX-F appears once, and the split is unaffected by the repeats.
+      expect(withPriority[0]!.params?.market_tickers).toEqual(['KX-F', 'KX-C']);
+
+      // Settle the outstanding repair so the next gap is free to enqueue.
+      for (const ticker of eight) stream.ingest(snapshotFrame(ticker, nextSeq()), 1);
+      expect(pendingRepair(stream).has(String(SID))).toBe(false);
+
+      // Clearing restores today's exact single-command behavior on the next repair.
+      stream.setRepairPriority([]);
+      (stream as unknown as { quarantineSubscriptionAndRequestSnapshot(
+        s: string, t: string | null, e: number, r: number): void })
+        .quarantineSubscriptionAndRequestSnapshot(String(SID), 'KX-A', 5, 9);
+      const afterClear = commands(socket, 'get_snapshot');
+      expect(afterClear).toHaveLength(3);
+      expect(afterClear[2]!.params?.market_tickers).toEqual([...eight].sort());
+      stream.stop();
+    });
+
+    it('8: after a reconnect the priority tickers are subscribed and repaired ahead of the rest', () => {
+      vi.useFakeTimers();
+      const at = 1_700_047_000_000;
+      vi.setSystemTime(at);
+      const { stream, socket, handshake, nextSeq } = openStream(eight, at);
+      handshake();
+      for (const ticker of eight) stream.ingest(snapshotFrame(ticker, nextSeq()), 1);
+      stream.ingest(deltaFrame('KX-A', nextSeq(), at), 1);
+      expect(stream.telemetry(at).qualifiedTickers).toBe(1);
+      // No priority set yet, so the pre-reconnect repair was one bulk command.
+      expect(commands(socket, 'get_snapshot')).toHaveLength(1);
+
+      // Entry confirmation goes in flight for two tickers, then Kalshi drops the
+      // socket — the 44/hour case. handleSocketOpen drops every book and
+      // re-quarantines every ticker; that fail-closed behavior is unchanged.
+      stream.setRepairPriority(['KX-G', 'KX-D']);
+      const reconnected: FakeOpenSocket = {
+        readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn(), ping: vi.fn(),
+      };
+      Object.assign(stream as unknown as Record<string, unknown>, { socket: reconnected, generation: 2 });
+      (stream as unknown as { handleSocketOpen(s: WebSocket, g: number): void })
+        .handleSocketOpen(reconnected as unknown as WebSocket, 2);
+
+      expect(stream.telemetry(at)).toMatchObject({ qualifiedTickers: 0, quarantinedTickers: 8 });
+      const resubscribe = subscribeCommand(reconnected);
+      expect(resubscribe.params?.market_tickers?.slice(0, 2)).toEqual(['KX-G', 'KX-D']);
+      expect([...resubscribe.params?.market_tickers ?? []].sort()).toEqual([...eight].sort());
+
+      stream.ingest(JSON.stringify({ id: resubscribe.id, type: 'subscribed', msg: { sid: SID } }), 2);
+      const snapshots = commands(reconnected, 'get_snapshot');
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots[0]!.params?.market_tickers).toEqual(['KX-G', 'KX-D']);
+      expect(snapshots[1]!.params?.market_tickers)
+        .toEqual(['KX-A', 'KX-B', 'KX-C', 'KX-E', 'KX-F', 'KX-H']);
+      expect([...pendingRepair(stream).get(String(SID)) ?? []].sort()).toEqual([...eight].sort());
+      stream.stop();
+    });
+  });
 });

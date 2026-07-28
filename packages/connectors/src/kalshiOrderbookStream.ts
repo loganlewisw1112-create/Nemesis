@@ -259,6 +259,11 @@ export class KalshiOrderbookStream {
   private readonly subscriptionIdByKey = new Map<string, number>();
   private readonly pendingSnapshotRepair = new Map<string, Set<string>>();
   private readonly snapshotRequestRevisionBySubscription = new Map<string, number>();
+  /**
+   * Advisory repair ordering only (see `setRepairPriority`). Insertion order is
+   * the caller's order and is the order priority repairs are requested in.
+   */
+  private repairPriority = new Set<string>();
   private socket: WebSocket | null = null;
   private started = false;
   private commandId = 1;
@@ -487,6 +492,90 @@ export class KalshiOrderbookStream {
     // still-tracked subscription member.
     this.markTrackingChanged(added);
     this.subscribeMissing();
+  }
+
+  /**
+   * Tickers with entry confirmation in flight; repaired first after any
+   * invalidation.
+   *
+   * Strictly advisory. Membership here grants **no** evidence, provenance or
+   * qualification advantage — it never changes which tickers are tracked,
+   * subscribed or repaired, only the ORDER in which snapshot repairs are
+   * requested and the order tickers appear in a subscribe command. An empty
+   * array clears it. Safe to call on every health tick: it has no side effects
+   * beyond replacing the stored order, and re-calling it with the same input is
+   * a no-op.
+   *
+   * Motivation (2026-07-27 paper run): the final hour saw 44 Kalshi-side
+   * reconnects, each of which legitimately drops every book and re-quarantines
+   * every ticker in `handleSocketOpen`. Recovery then asked for one bulk
+   * `get_snapshot` over the whole 25-ticker tracked set with no notion that only
+   * a handful of those had a candidate mid-confirmation. Candidate book health
+   * fell to 0.220. We cannot fix Kalshi's socket; we can make recovery favor the
+   * tickers that matter.
+   */
+  setRepairPriority(tickers: readonly string[]): void {
+    const next = new Set<string>();
+    for (const ticker of tickers) {
+      if (typeof ticker !== 'string' || ticker.length === 0) continue;
+      next.add(ticker);
+    }
+    this.repairPriority = next;
+  }
+
+  /**
+   * Splits a repair set into the priority-first half and the remainder.
+   *
+   * `priority` follows the repair-priority set's own order; `rest` preserves the
+   * caller's order (today's sorted order at every repair site), so with no
+   * priority set configured the partition is a no-op.
+   */
+  private partitionRepairPriority(repair: readonly string[]): { priority: string[]; rest: string[] } {
+    if (this.repairPriority.size === 0 || repair.length === 0) return { priority: [], rest: [...repair] };
+    const repairSet = new Set(repair);
+    const priority = [...this.repairPriority].filter((ticker) => repairSet.has(ticker));
+    if (priority.length === 0) return { priority, rest: [...repair] };
+    const prioritySet = new Set(priority);
+    return { priority, rest: repair.filter((ticker) => !prioritySet.has(ticker)) };
+  }
+
+  /**
+   * The single enqueue point for every `get_snapshot` repair.
+   *
+   * When both halves are non-empty this emits **two** `update_subscription`
+   * frames — the priority set first, then the rest — instead of one bulk
+   * command. The two frames are written to the socket in that order and Kalshi
+   * processes commands in receipt order, so the small priority request is served
+   * (and its snapshots delivered) ahead of the bulk one. Deliberately does not
+   * depend on Kalshi ordering tickers *within* a single command, which we cannot
+   * assume. When a non-snapshot update is still in flight the pair simply sits in
+   * the subscription update queue, which drains in order, so the guarantee holds
+   * either way.
+   *
+   * Callers set `pendingSnapshotRepair` to the union before calling, so the
+   * "repair complete" bookkeeping in `applySnapshot` is unaffected by the split.
+   * An empty repair set enqueues nothing (`enqueueSubscriptionUpdate` also
+   * refuses empty commands).
+   */
+  private enqueueSnapshotRepair(sid: number, repair: readonly string[]): void {
+    if (repair.length === 0) return;
+    const { priority, rest } = this.partitionRepairPriority(repair);
+    if (priority.length === 0) {
+      this.enqueueSubscriptionUpdate({ sid, marketTickers: [...repair], action: 'get_snapshot' });
+      return;
+    }
+    this.enqueueSubscriptionUpdate({ sid, marketTickers: priority, action: 'get_snapshot' });
+    if (rest.length > 0) this.enqueueSubscriptionUpdate({ sid, marketTickers: rest, action: 'get_snapshot' });
+  }
+
+  /**
+   * Permutes `tickers` so repair-priority members lead, in the priority set's own
+   * order; everything else keeps the caller's order. Purely an ordering change —
+   * the returned array always contains exactly the same tickers.
+   */
+  private orderByRepairPriority(tickers: readonly string[]): string[] {
+    const { priority, rest } = this.partitionRepairPriority(tickers);
+    return priority.length === 0 ? [...tickers] : [...priority, ...rest];
   }
 
   /**
@@ -843,7 +932,10 @@ export class KalshiOrderbookStream {
     const subscriptionEntry = [...this.subscriptionIdByKey.entries()][0];
     if (!subscriptionEntry) {
       if (this.initialSubscriptionCommand || this.tickers.size === 0) return;
-      const initial = [...this.tickers];
+      // Ordering only — same tickers, same 25-ticker bound. After a reconnect
+      // this is the first thing on the wire, so leading with the tickers that
+      // have entry confirmation in flight is the cheapest possible head start.
+      const initial = this.orderByRepairPriority([...this.tickers]);
       const id = this.commandId++;
       try {
         socket.send(JSON.stringify({
@@ -871,7 +963,10 @@ export class KalshiOrderbookStream {
     if (this.initialSubscriptionCommand || this.pendingSubscriptionUpdate || this.subscriptionUpdateQueue.length > 0) return;
     const [subscription, sid] = subscriptionEntry;
     const removed = [...this.subscribed].filter((ticker) => !this.tickers.has(ticker));
-    const added = [...this.tickers].filter((ticker) => !this.subscribed.has(ticker));
+    // Ordering only: `added` keeps exactly its membership, priority tickers lead.
+    const added = this.orderByRepairPriority(
+      [...this.tickers].filter((ticker) => !this.subscribed.has(ticker)),
+    );
     this.enqueueSubscriptionUpdate({ sid, marketTickers: removed, action: 'delete_markets' });
     this.enqueueSubscriptionUpdate({ sid, marketTickers: added, action: 'add_markets' });
     if (removed.length === 0 && added.length === 0) this.acknowledgeMembershipAndRequestSnapshots(subscription, sid);
@@ -1172,8 +1267,10 @@ export class KalshiOrderbookStream {
       this.pendingSnapshotRepair.delete(subscription);
       return;
     }
+    // Union first, then split: the split is a request-ordering concern only and
+    // must not narrow what "repair complete" waits for.
     this.pendingSnapshotRepair.set(subscription, new Set(repair));
-    this.enqueueSubscriptionUpdate({ sid, marketTickers: repair, action: 'get_snapshot' });
+    this.enqueueSnapshotRepair(sid, repair);
   }
 
   private isValidExchangeTimestamp(timestamp: number, now: number): boolean {
@@ -1202,11 +1299,7 @@ export class KalshiOrderbookStream {
     this.pendingSnapshotRepair.set(subscription, new Set(affected));
     const sid = this.subscriptionIdByKey.get(subscription);
     if (sid == null || this.socket?.readyState !== WebSocket.OPEN) return;
-    this.enqueueSubscriptionUpdate({
-      sid,
-      marketTickers: [...affected].sort(),
-      action: 'get_snapshot',
-    });
+    this.enqueueSnapshotRepair(sid, [...affected].sort());
   }
 
   private startHeartbeat(socket: WebSocket, generation: number): void {

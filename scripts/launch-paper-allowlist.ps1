@@ -39,6 +39,8 @@ $requiredMarkers = @(
   'superviseDataPlane'            # Phase 1: unconditional recovery supervisor
   'admitted-socket-dead'          # Phase 2: split priority-track outcomes
   'data plane DEGRADED'           # Phase 3: fail-closed degraded latch
+  'setRepairPriority'             # P2: candidate-first snapshot repair
+  'shadowContaminationBlocked'    # P1.5: degraded shadows excluded from the gate
 )
 foreach ($marker in $requiredMarkers) {
   if ($builtMain -notmatch [regex]::Escape($marker)) {
