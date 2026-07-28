@@ -404,8 +404,53 @@ let dataPlaneDegradedSnapshot = dataPlaneLatch.snapshot(Date.now());
  * the source base URL the transport actually returned -- provenance is still
  * earned from a real production response, never assumed.
  */
+/**
+ * Tickers whose hydration has already failed, and when to stop believing it.
+ *
+ * `verifyProductionMarket` refuses a market that is not active/open or whose
+ * `close_time` has passed (`productionMarketProvenance.ts isActiveAt`), so a
+ * settled contract can NEVER earn provenance -- yet flow kept re-issuing cards
+ * for it and every attempt paid a REST call plus the full
+ * `PRIORITY_ORDERBOOK_WAIT_MS`. Measured 2026-07-27: 69 of 149 priority-track
+ * attempts were five already-expired KXBTCD contracts (the 00:00/15:00/18:00/
+ * 23:00 UTC strikes, retried 15-17 times each) -- 46% of the funnel's priority
+ * work spent on markets that had closed hours earlier.
+ *
+ * Expired is permanent and gets a long suppression; a transport failure is not,
+ * and gets a short one so a live ticker is never blacklisted by one timeout.
+ */
+const provenanceRetryAfter = new Map<string, number>();
+const expiredProvenanceTickers = new Set<string>();
+const PROVENANCE_EXPIRED_SUPPRESSION_MS = 60 * 60_000;
+const PROVENANCE_TRANSIENT_SUPPRESSION_MS = 30_000;
+
+function suppressProvenanceRetry(ticker: string, now: number, expired: boolean): void {
+  if (expired) expiredProvenanceTickers.add(ticker);
+  provenanceRetryAfter.set(
+    ticker,
+    now + (expired ? PROVENANCE_EXPIRED_SUPPRESSION_MS : PROVENANCE_TRANSIENT_SUPPRESSION_MS),
+  );
+  // Bounded: a long-running session sees many settled contracts.
+  if (provenanceRetryAfter.size > 512) {
+    for (const [key, retryAt] of provenanceRetryAfter) {
+      if (retryAt <= now) {
+        provenanceRetryAfter.delete(key);
+        expiredProvenanceTickers.delete(key);
+      }
+    }
+  }
+}
+
+/** A market that has closed can never produce a book; it is not evidence of a sick data plane. */
+function isKnownExpiredTicker(ticker: string): boolean {
+  return expiredProvenanceTickers.has(ticker);
+}
+
 async function ensureProductionProvenance(ticker: string): Promise<boolean> {
   if (kalshiOrderbookStream.hasProductionProvenance(ticker)) return true;
+  const startedAt = Date.now();
+  const retryAfter = provenanceRetryAfter.get(ticker);
+  if (retryAfter != null && startedAt < retryAfter) return false;
   let responseMetadata: KalshiResponseMetadata | null = null;
   try {
     const hydrated = await fetchMarket(ticker, {
@@ -413,16 +458,37 @@ async function ensureProductionProvenance(ticker: string): Promise<boolean> {
       onResponseMetadata: (metadata) => { responseMetadata = metadata as KalshiResponseMetadata; },
     });
     const verified = responseMetadata as KalshiResponseMetadata | null;
-    if (!verified || verified.environment !== 'production' || verified.status !== 200) return false;
+    if (!verified || verified.environment !== 'production' || verified.status !== 200) {
+      suppressProvenanceRetry(ticker, Date.now(), false);
+      return false;
+    }
     recordProductionUniverse([{
       market: hydrated,
       sourceBaseUrl: verified.sourceBaseUrl,
       verifiedAt: verified.verifiedAt,
     }]);
-    return kalshiOrderbookStream.hasProductionProvenance(ticker);
+    const admitted = kalshiOrderbookStream.hasProductionProvenance(ticker);
+    if (admitted) {
+      provenanceRetryAfter.delete(ticker);
+      expiredProvenanceTickers.delete(ticker);
+      return true;
+    }
+    // A genuine production 200 that still earned no provenance means the market
+    // itself was refused, and the only grounds for that are status and close
+    // time. Classify so this can never again be read as a hydration failure --
+    // the same mistake `admitted-no-book` caused by collapsing four causes into
+    // one bucket.
+    const closeAt = hydrated.close_time ? Date.parse(hydrated.close_time) : Number.NaN;
+    const status = String(hydrated.status ?? '').trim().toLowerCase();
+    const expired = (Number.isFinite(closeAt) && closeAt <= Date.now())
+      || (status !== 'active' && status !== 'open');
+    suppressProvenanceRetry(ticker, Date.now(), expired);
+    return false;
   } catch {
     // A candidate we cannot verify simply stays untracked; the REST fallback
     // below still applies and the exchange-origin check still rejects it.
+    // Transport failures are transient, so this suppression is short.
+    suppressProvenanceRetry(ticker, Date.now(), false);
     return false;
   }
 }
@@ -472,7 +538,10 @@ async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<Kalsh
         resolved: false,
         waitedMs: Date.now() - startedAt,
         trackedCount: orderbookTrackedTickers.length,
-        outcome: 'provenance-unavailable',
+        // Split: a settled contract is not a sick data plane, and conflating the
+        // two put 46% of one run's priority attempts into a bucket that read as
+        // a hydration failure.
+        outcome: isKnownExpiredTicker(ticker) ? 'provenance-expired' : 'provenance-unavailable',
       });
       return fetchOrderbook(ticker);
     }
@@ -788,7 +857,12 @@ function candidateBookSamples(now = Date.now()): CandidateBookSample[] {
     ...confirmationInFlightTickers(),
     ...campaignCriticalOrderbookTickers(now),
   ]);
-  return [...tickers].map((ticker) => {
+  // A market that has closed can never produce a sequenced book, so counting it
+  // as a starving candidate latches the run degraded on corpses rather than on a
+  // sick data plane -- measured at 29% degraded while the socket was 96% open.
+  // Only *provably* settled tickers are dropped (a production 200 said so);
+  // "no provenance" on a live market stays in, because that is a real failure.
+  return [...tickers].filter((ticker) => !isKnownExpiredTicker(ticker)).map((ticker) => {
     const state = kalshiOrderbookStream.bookState(ticker, now);
     return { ticker, state: state.state, sequencedAgeMs: state.sequencedAgeMs };
   });
