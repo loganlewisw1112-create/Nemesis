@@ -1,4 +1,5 @@
 import { getKalshiEndpointPolicy, type KalshiEnvironment, type KalshiMarket } from '@nemesis/core';
+import { isTradableMarketAt } from './marketLiveness.js';
 
 /**
  * Sized against the twenty-second re-verification cycle that refreshes these
@@ -38,11 +39,8 @@ function normalizedHost(baseUrl: string): string | null {
 }
 
 function isActiveAt(market: KalshiMarket, verifiedAt: number): boolean {
-  const status = market.status.trim().toLowerCase();
-  if (status !== 'active' && status !== 'open') return false;
-  if (!market.close_time) return true;
-  const closeAt = Date.parse(market.close_time);
-  return Number.isFinite(closeAt) && closeAt > verifiedAt;
+  // Delegates so discovery and provenance can never drift apart again.
+  return isTradableMarketAt(market, verifiedAt);
 }
 
 /**

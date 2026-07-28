@@ -72,7 +72,7 @@ import {
   type GeoMarket,
   type WorldEventsPayload,
 } from '@nemesis/core';
-import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, withinSeriesAllowlist, tickerWithinSeriesAllowlist, seriesAllowlistConfigured, seriesDenylistConfigured, type ProductionUniverseRecord } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isTradableMarketAt, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, withinSeriesAllowlist, tickerWithinSeriesAllowlist, seriesAllowlistConfigured, seriesDenylistConfigured, type ProductionUniverseRecord } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -4888,8 +4888,8 @@ function isProductionLiveTicker(ticker: string | undefined, market?: KalshiMarke
   if (!ticker || /^DEMO(?:[-_]|$)/i.test(ticker)) return false;
   const verified = productionMarketRecord(ticker);
   if (!market || !verified || verified.market.ticker !== market.ticker) return false;
-  const status = verified.market.status.toLowerCase();
-  return status === 'active' || status === 'open';
+  // Shared definition: status alone let closed-but-unsettled contracts through.
+  return isTradableMarketAt(verified.market, Date.now());
 }
 
 /**

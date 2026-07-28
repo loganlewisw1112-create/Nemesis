@@ -22,6 +22,7 @@ import {
   marketLiquidityScore,
   selectExecutableMarkets,
 } from './kalshiLiquidity.js';
+import { isTradableMarketAt } from './marketLiveness.js';
 
 const UNIVERSE_STALE_MS = 5 * 60_000;
 const ORDERBOOK_TTL_MS = 12_000;
@@ -178,11 +179,14 @@ export class DiscoveryOrchestrator {
   /** Put active trade-tape markets first so the existing depth pass verifies their books. */
   prioritizeMarkets(markets: KalshiMarket[]): KalshiMarket[] {
     const seen = new Set<string>();
+    const prioritizedAt = Date.now();
     const prioritized = markets.filter((market) => {
       if (seen.has(market.ticker)) return false;
       seen.add(market.ticker);
-      const status = market.status.toLowerCase();
-      return (status === 'active' || status === 'open')
+      // Same guard as the universe build: the trade tape can still carry recent
+      // prints for a contract that has just closed, and promoting it here would
+      // reintroduce a dead ticker at the head of the tracked set.
+      return isTradableMarketAt(market, prioritizedAt)
         && marketLiquidityScore(market) > 0
         && hasExecutableMarketQuote(market);
     });
@@ -311,18 +315,21 @@ export class DiscoveryOrchestrator {
       // subscribe and track sets stuck at 1 via priority-track only. Under an
       // allowlist, keep every open market that still shows an executable quote;
       // volume ranking remains the default for the unfocused universe.
+      // One liveness guard for BOTH branches. Kalshi reports a contract as
+      // `active` after it closes and before it settles, and a status-only filter
+      // let those into the universe where they generated cards that could never
+      // earn provenance -- 100% of candidates overnight on 2026-07-28.
+      const liveAt = Date.now();
+      const live = merged.filter((market) => isTradableMarketAt(market, liveAt));
       this.universe = (allowlist
-        ? merged
-          .filter((market) => {
-            const status = market.status.toLowerCase();
-            return (status === 'active' || status === 'open') && hasExecutableMarketQuote(market);
-          })
+        ? live
+          .filter((market) => hasExecutableMarketQuote(market))
           .sort((left, right) => {
             const volumeDelta = marketLiquidityScore(right) - marketLiquidityScore(left);
             if (volumeDelta !== 0) return volumeDelta;
             return left.ticker.localeCompare(right.ticker);
           })
-        : selectExecutableMarkets(merged)
+        : selectExecutableMarkets(live)
       ).slice(0, this.settings.maxTrackedTickers);
       this.productionUniverseRecords = this.universe
         .map((market) => productionByTicker.get(market.ticker))

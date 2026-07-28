@@ -7,6 +7,7 @@ export * from './binanceStream.js';
 export * from './kalshiStream.js';
 export * from './kalshiTransportController.js';
 export * from './kalshiOrderbookStream.js';
+export * from './marketLiveness.js';
 export * from './productionMarketProvenance.js';
 export * from './kalshiTape.js';
 export * from './kalshiLiquidity.js';

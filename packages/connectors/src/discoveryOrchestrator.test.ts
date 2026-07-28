@@ -383,3 +383,81 @@ describe('series allowlist env', () => {
     expect(seriesArgs).toEqual(['KXBTCD', 'KXINXHUD']);
   });
 });
+
+describe('DiscoveryOrchestrator closed-contract exclusion', () => {
+  beforeEach(() => {
+    fetchMarketsMock.mockReset();
+    fetchOrderbookMock.mockReset();
+    fetchOrderbookMock.mockResolvedValue({ ticker: 'x', yes: [], no: [] } as unknown as KalshiOrderbook);
+    vi.useFakeTimers();
+    vi.setSystemTime(1_785_000_000_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const now = 1_785_000_000_000;
+  const quoted = {
+    yes_bid_dollars: '0.4800',
+    yes_ask_dollars: '0.4900',
+    volume: 5_000,
+    volume_24h: 5_000,
+  };
+
+  it('drops a contract Kalshi still reports as active once its close time has passed', async () => {
+    // The 2026-07-28 overnight failure: every candidate ticker was a closed
+    // contract that Kalshi still served as `active`, so a status-only filter put
+    // it in the universe where it generated cards that could never earn
+    // provenance. Entry confirmations went to zero with a healthy socket.
+    fetchMarketsMock.mockResolvedValue({
+      markets: [
+        {
+          ticker: 'KXBTCD-CLOSED',
+          title: 'Closed an hour ago',
+          status: 'active',
+          close_time: new Date(now - 60 * 60_000).toISOString(),
+          ...quoted,
+        },
+        {
+          ticker: 'KXBTCD-LIVE',
+          title: 'Closes in half an hour',
+          status: 'active',
+          close_time: new Date(now + 30 * 60_000).toISOString(),
+          ...quoted,
+        },
+      ],
+    });
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+
+    await discovery.refreshUniverse();
+
+    expect(discovery.getUniverse().map((market) => market.ticker)).toEqual(['KXBTCD-LIVE']);
+  });
+
+  it('does not promote a just-closed contract off the trade tape', async () => {
+    fetchMarketsMock.mockResolvedValue({
+      markets: [{
+        ticker: 'KXBTCD-LIVE',
+        title: 'Live',
+        status: 'active',
+        close_time: new Date(now + 30 * 60_000).toISOString(),
+        ...quoted,
+      }],
+    });
+    const discovery = new DiscoveryOrchestrator(new ConnectorRegistry());
+    await discovery.refreshUniverse();
+
+    // A contract can print trades right up to its close, so the tape keeps
+    // offering it for seconds afterwards.
+    const prioritized = discovery.prioritizeMarkets([{
+      ticker: 'KXBTCD-JUST-CLOSED',
+      title: 'Closed a minute ago',
+      status: 'active',
+      close_time: new Date(now - 60_000).toISOString(),
+      ...quoted,
+    } as unknown as KalshiMarket]);
+
+    expect(prioritized.map((market) => market.ticker)).not.toContain('KXBTCD-JUST-CLOSED');
+  });
+});
