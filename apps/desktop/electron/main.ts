@@ -478,10 +478,12 @@ async function ensureProductionProvenance(ticker: string): Promise<boolean> {
     // time. Classify so this can never again be read as a hydration failure --
     // the same mistake `admitted-no-book` caused by collapsing four causes into
     // one bucket.
+    // Only a close time in the past is permanent. A contract that exists but is
+    // not `active`/`open` yet has a FUTURE close time, and suppressing it for an
+    // hour would blacklist it across exactly the window in which it goes live --
+    // which would starve the next hour's contracts to fix the last hour's.
     const closeAt = hydrated.close_time ? Date.parse(hydrated.close_time) : Number.NaN;
-    const status = String(hydrated.status ?? '').trim().toLowerCase();
-    const expired = (Number.isFinite(closeAt) && closeAt <= Date.now())
-      || (status !== 'active' && status !== 'open');
+    const expired = Number.isFinite(closeAt) && closeAt <= Date.now();
     suppressProvenanceRetry(ticker, Date.now(), expired);
     return false;
   } catch {
