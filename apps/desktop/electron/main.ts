@@ -254,6 +254,11 @@ const ORDERBOOK_ROTATION_BATCH_SIZE = 4;
 // to that unverifiable REST fallback.
 const PRIORITY_ORDERBOOK_WAIT_MS = 3_000;
 const PRIORITY_ORDERBOOK_POLL_MS = 200;
+// Bounded, not attempt-counted, matching this file's other timeout constants.
+// A candidate whose book fetch fails right at its 15-minute due deadline gets
+// this much extra runway (roughly 60 health ticks) before being abandoned --
+// enough to rule out one transient failure, not enough to retry forever.
+const SHADOW_ABANDON_GRACE_MS = 5 * 60_000;
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -3921,7 +3926,19 @@ async function evaluateStrategyValidationFollowUps(): Promise<void> {
       try {
         const book = await bookFetchCoordinator.fetch(candidate.ticker, { allowCachedSuccess: false });
         const fill = dryRunCloseFill(book, candidate.side, candidate.contracts, candidate.entryPrice, settings.maxSlippagePp);
-        if (fill.aborted || fill.filled !== candidate.contracts || !isExecutablePrice(fill.fillPrice)) continue;
+        if (fill.aborted || fill.filled !== candidate.contracts || !isExecutablePrice(fill.fillPrice)) {
+          // A book exists but produced no executable fill (thin/frozen depth).
+          // Same permanent-pending risk as a fetch failure below if this never
+          // resolves before the abandon deadline.
+          if (now >= candidate.dueAt + SHADOW_ABANDON_GRACE_MS) {
+            recordStrategyValidation((tracker) => tracker.abandonShadowCandidate(
+              candidate.id,
+              'shadow abandoned: no executable fill before extended deadline',
+              now,
+            ));
+          }
+          continue;
+        }
         const entryCost = candidate.entryPrice * candidate.contracts + candidate.entryFeesUsd;
         const executableNetPnlUsd = fill.fillPrice * fill.filled - fill.fees - entryCost;
         const stressedPrice = Math.max(0.01, fill.fillPrice - 0.01);
@@ -3967,7 +3984,20 @@ async function evaluateStrategyValidationFollowUps(): Promise<void> {
           ));
         }
       } catch {
-        // Missing executable books remain pending and never count as scored evidence.
+        // A market that closes before the candidate can be scored would
+        // otherwise retry forever across every relaunch -- persisted state is
+        // the whole point of the shadow ledger. Measured 2026-07-29: 8
+        // candidates stuck this way, the oldest 2 days stale, 46% of one run's
+        // priority-track attempts spent retrying their dead books. Abandon only
+        // once genuinely past the extended deadline; a transient fetch failure
+        // right at `due` gets the same runway as any other candidate.
+        if (now >= candidate.dueAt + SHADOW_ABANDON_GRACE_MS) {
+          recordStrategyValidation((tracker) => tracker.abandonShadowCandidate(
+            candidate.id,
+            'shadow abandoned: no executable book before extended deadline',
+            now,
+          ));
+        }
       }
     }
   } finally {
@@ -5152,7 +5182,25 @@ async function applyBridgeRecommendation(packet: RecommendationPacket) {
   // allowlist here too: a focused run must not have off-series tickers injected
   // into tracking or candidate flow through the bridge.
   if (!tickerWithinSeriesAllowlist(packet.ticker)) return;
+  // GEA is a separate process with its own market state and no `close_time`
+  // check anywhere in its recommendation path. Measured 2026-07-29: the exact
+  // same closed contracts that were fixed out of the desktop's own discovery
+  // universe kept reappearing here, because this choke point never applied the
+  // same liveness rule -- neither to a cached `productionMarketRecord` (which
+  // can itself be a stale entry from before this contract closed) nor to a
+  // freshly hydrated one. `isTradableMarketAt` is the one definition; nothing
+  // downstream of this line may build a thesis card for a market it rejects.
   let market = productionMarketRecord(packet.ticker)?.market;
+  if (market && !isTradableMarketAt(market, Date.now())) {
+    auditLog.append({
+      action: 'gate_block',
+      ticker: packet.ticker,
+      detail: 'GEA recommendation rejected: cached record shows the market is no longer tradable',
+      ok: false,
+    });
+    saveAuditLog();
+    return;
+  }
   if (!market) {
     let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
     try {
@@ -5171,6 +5219,16 @@ async function applyBridgeRecommendation(packet: RecommendationPacket) {
       };
       recordProductionUniverse([record]);
       market = productionMarketRecord(packet.ticker)?.market;
+      if (market && !isTradableMarketAt(market, Date.now())) {
+        auditLog.append({
+          action: 'gate_block',
+          ticker: packet.ticker,
+          detail: 'GEA recommendation rejected: production response shows the market is no longer tradable',
+          ok: false,
+        });
+        saveAuditLog();
+        return;
+      }
     } catch (error) {
       auditLog.append({
         action: 'gate_block',

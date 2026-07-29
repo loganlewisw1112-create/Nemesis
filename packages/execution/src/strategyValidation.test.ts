@@ -592,3 +592,95 @@ describe('StrategyValidationTracker data-plane contamination', () => {
     expect(StrategyValidationTracker.replay(tracker.allEvents()).snapshot(acceptance)).toEqual(snapshot);
   });
 });
+
+describe('StrategyValidationTracker shadow abandonment', () => {
+  const acceptance = { ...DEFAULT_ENTRY_QUALIFICATION, shadowMinScored: 1, shadowMinDistinctDays: 1 };
+
+  it('abandons a candidate whose market closed, and it counts nowhere', () => {
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start);
+    const row = candidate(0, start);
+    tracker.startShadowCandidate(row);
+
+    tracker.abandonShadowCandidate(row.id, 'shadow abandoned: no executable book before extended deadline', start + 60_000);
+
+    const snapshot = tracker.snapshot(acceptance);
+    expect(snapshot.shadowAbandonedCount).toBe(1);
+    expect(snapshot.shadowPendingCount).toBe(0);
+    expect(snapshot.shadowCandidateCount).toBe(0);
+    expect(snapshot.shadowContaminatedCount).toBe(0);
+    expect(snapshot.shadowNetPnlUsd).toBe(0);
+    expect(snapshot.shadowWinRate).toBe(0);
+  });
+
+  it('an abandoned candidate cannot also be scored', () => {
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start);
+    const row = candidate(0, start);
+    tracker.startShadowCandidate(row);
+    tracker.abandonShadowCandidate(row.id, 'shadow abandoned: no executable book before extended deadline', start + 60_000);
+
+    expect(() => tracker.scoreShadowCandidate(row.id, 1, 1, 'follow-up complete', start + 90_000))
+      .toThrow('shadow candidate is not pending');
+  });
+
+  it('cannot abandon a candidate twice, or one already scored', () => {
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start);
+    const scored = candidate(0, start);
+    const abandoned = candidate(1, start);
+    tracker.startShadowCandidate(scored);
+    tracker.startShadowCandidate(abandoned);
+    tracker.scoreShadowCandidate(scored.id, 1, 1, 'follow-up complete', start + 500);
+    tracker.abandonShadowCandidate(abandoned.id, 'shadow abandoned: no executable book before extended deadline', start + 500);
+
+    expect(() => tracker.abandonShadowCandidate(scored.id, 'late', start + 1_000))
+      .toThrow('shadow candidate is not pending');
+    expect(() => tracker.abandonShadowCandidate(abandoned.id, 'twice', start + 1_000))
+      .toThrow('shadow candidate is not pending');
+  });
+
+  it('mixed ledger: abandoned rows are invisible to every acceptance tally, only the count reports them', () => {
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start);
+    for (let index = 0; index < 3; index += 1) {
+      const at = start + index * 1_000;
+      const row = candidate(index, at);
+      tracker.startShadowCandidate(row);
+      tracker.scoreShadowCandidate(row.id, 2, 1, 'follow-up complete', at + 500);
+    }
+    for (let index = 10; index < 18; index += 1) {
+      const at = start + index * 1_000;
+      const row = candidate(index, at);
+      tracker.startShadowCandidate(row);
+      tracker.abandonShadowCandidate(row.id, 'shadow abandoned: no executable book before extended deadline', at + 500);
+    }
+
+    const snapshot = tracker.snapshot(acceptance);
+    expect(snapshot.shadowAbandonedCount).toBe(8);
+    expect(snapshot.shadowCandidateCount).toBe(3);
+    expect(snapshot.shadowContaminatedCount).toBe(0);
+    expect(snapshot.shadowNetPnlUsd).toBe(6);
+    expect(snapshot.shadowWinRate).toBe(1);
+    // Not counted toward contamination share either -- abandonment is a
+    // different kind of exclusion (no evidence) from contamination (bad
+    // evidence), and must not inflate the denominator that bound reads.
+    expect(snapshot.shadowContaminatedShare).toBe(0);
+    expect(snapshot.shadowContaminationBlocked).toBe(false);
+  });
+
+  it('replays identically, including the abandoned count', () => {
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start);
+    const row = candidate(0, start);
+    tracker.startShadowCandidate(row);
+    tracker.abandonShadowCandidate(row.id, 'shadow abandoned: no executable book before extended deadline', start + 60_000);
+
+    const replayed = StrategyValidationTracker.replay(tracker.allEvents());
+    expect(replayed.snapshot(acceptance)).toEqual(tracker.snapshot(acceptance));
+  });
+
+  it('a pre-existing ledger with no abandonments reports zero, not undefined', () => {
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start);
+    const row = candidate(0, start);
+    tracker.startShadowCandidate(row);
+    tracker.scoreShadowCandidate(row.id, 1, 1, 'follow-up complete', start + 500);
+
+    expect(tracker.snapshot(acceptance).shadowAbandonedCount).toBe(0);
+  });
+});

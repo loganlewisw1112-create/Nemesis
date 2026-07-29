@@ -168,6 +168,7 @@ for (const event of wholeValidation) {
     startAtById.set(event.candidate.id, event.candidate.startedAt ?? event.at);
   }
 }
+const shadowAbandoned = wholeValidation.filter((e) => e.type === 'shadow_candidate_abandoned');
 const shadowScored = wholeValidation.filter((e) => e.type === 'shadow_candidate_scored');
 const shadowRows = shadowScored.map((event) => {
   const startedAt = startAtById.get(event.candidateId) ?? null;
@@ -359,6 +360,7 @@ if (args.includes('--json')) {
   line('contaminated (excluded)', `${dirty.scored} · wins ${dirty.wins} · net $${dirty.netPnlUsd.toFixed(2)}`
     + `${shadowRows.filter((r) => r.retro).length > 0 ? ` (${shadowRows.filter((r) => r.retro).length} classified retroactively from the trace)` : ''}`);
   line('unclassified (no trace cover)', `${unknown.scored} · net $${unknown.netPnlUsd.toFixed(2)}`);
+  line('abandoned (market closed, no evidence)', shadowAbandoned.length);
   line('contaminated share', classified === 0 ? 'n/a' : pct(dirty.scored, classified));
   if (classified > 0 && dirty.scored / classified > 0.2) {
     console.log('  NOTE: contamination over 20% — the clean subset is not a valid test of the strategy,');

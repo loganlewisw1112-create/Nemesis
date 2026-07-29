@@ -114,6 +114,24 @@ export type StrategyValidationEvent = ValidationEventBase & (
      */
     dataPlaneDegraded?: boolean;
   }
+  | {
+    /**
+     * Terminal state for a candidate that can never be scored, mirroring
+     * `PaperQualificationTracker`'s `close_follow_up_unscored`. Every score path
+     * requires a successful executable book fetch; if the underlying market
+     * closes before one is ever obtained, the candidate would otherwise sit in
+     * `pending` forever, retried on the health tick across every relaunch
+     * (persisted state -- this is the whole point of the shadow ledger).
+     * Measured 2026-07-29: 8 candidates stuck this way, one started 2026-07-27,
+     * still pending 2 days later, and 46% of one run's priority-track attempts
+     * were spent retrying their dead books. Carries no P&L -- there is no
+     * evidence either way -- and is excluded from every acceptance tally, never
+     * counted as a win, loss, or scored row.
+     */
+    type: 'shadow_candidate_abandoned';
+    candidateId: string;
+    reason: string;
+  }
   | { type: 'validation_stage_changed'; stage: StrategyValidationStage; confirmation: string }
   | { type: 'validation_paused'; reason: string }
 );
@@ -155,6 +173,12 @@ export interface StrategyValidationSnapshot {
    * Surfaced explicitly so the reason never has to be inferred from arithmetic.
    */
   shadowContaminationBlocked: boolean;
+  /**
+   * Candidates whose underlying market closed before an executable book was
+   * ever obtained -- can never be scored, carries no P&L, excluded from every
+   * tally. Not a symptom of the data plane; the market itself settled.
+   */
+  shadowAbandonedCount: number;
   shadowPendingCount: number;
   shadowWinRate: number;
   shadowGrossProfitUsd: number;
@@ -230,6 +254,8 @@ export class StrategyValidationTracker {
    * attributed to a contaminated entry. Rebuilt identically on replay.
    */
   private readonly degradedStarts = new Set<string>();
+  /** Candidates that reached `shadow_candidate_abandoned`. Count-only; visible in the snapshot. */
+  private abandonedCount = 0;
   private integrityError?: string;
   private stage: StrategyValidationStage;
 
@@ -332,6 +358,9 @@ export class StrategyValidationTracker {
       if (event.candidate.dataPlaneDegraded === true) this.degradedStarts.add(event.candidate.id);
     } else if (event.type === 'shadow_candidate_scored') {
       this.pending.delete(event.candidateId);
+    } else if (event.type === 'shadow_candidate_abandoned') {
+      this.pending.delete(event.candidateId);
+      this.abandonedCount += 1;
     } else if (event.type === 'validation_stage_changed') {
       this.stage = event.stage;
     }
@@ -417,6 +446,17 @@ export class StrategyValidationTracker {
       // Written only when true, so a clean score hashes as it did before.
       ...(dataPlaneDegraded === true ? { dataPlaneDegraded: true } : {}),
     }, at);
+  }
+
+  /**
+   * Closes out a candidate that can never be scored -- the underlying market
+   * closed before an executable book was ever obtained. No P&L: there is no
+   * evidence either way. Excluded from every acceptance tally, unlike a scored
+   * row, which is only excluded when contaminated.
+   */
+  abandonShadowCandidate(candidateId: string, reason: string, at = Date.now()): StrategyValidationEvent {
+    if (!this.pending.has(candidateId)) throw new Error('shadow candidate is not pending');
+    return this.add('shadow_candidate_abandoned', { candidateId, reason }, at);
   }
 
   changeStage(stage: StrategyValidationStage, confirmation: string, at = Date.now()): StrategyValidationEvent {
@@ -543,6 +583,7 @@ export class StrategyValidationTracker {
       shadowContaminatedNetPnlUsd: round(contaminated.reduce((sum, score) => sum + score.netPnlUsd, 0)),
       shadowContaminatedShare: round(contaminatedShare),
       shadowContaminationBlocked,
+      shadowAbandonedCount: this.abandonedCount,
       shadowPendingCount: this.pending.size,
       shadowWinRate: round(winRate),
       shadowGrossProfitUsd: round(grossProfit),
