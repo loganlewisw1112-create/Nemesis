@@ -171,6 +171,11 @@ import {
   DEFAULT_SEQUENCED_BOOK_THRESHOLD_MS,
   type CandidateBookSample,
 } from './dataPlaneHealth.js';
+import {
+  decideShadowFollowUp,
+  SHADOW_EDGE_GONE_OBSERVATIONS,
+  SHADOW_TARGET_HOLD_OBSERVATIONS,
+} from './shadowFollowUp.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -3945,32 +3950,38 @@ async function evaluateStrategyValidationFollowUps(): Promise<void> {
         const stressedNetPnlUsd = stressedPrice * fill.filled
           - kalshiFeeForOrder(stressedPrice, fill.filled)
           - entryCost;
-        const currentEdge = cardForTickerSide(candidate.ticker, candidate.side)?.netEdge ?? 0;
-        recordStrategyValidation((tracker) => tracker.observeShadowCandidate(
-          candidate.id,
-          executableNetPnlUsd,
-          stressedNetPnlUsd,
-          currentEdge,
-          now,
-        ));
-        const observations = strategyValidationStore.tracker.recentObservations(candidate.id, 3);
-        const edgeGone = observations.length >= 3 && observations.every((observation) => observation.netEdge <= 0);
-        const targetRewardUsd = candidate.targetRewardUsd ?? candidate.expectedRewardUsd;
-        const hitTarget = Number.isFinite(targetRewardUsd) && executableNetPnlUsd >= targetRewardUsd!;
-        const due = now >= candidate.dueAt;
         // Do not early-stop shadow on planned-loss MTM. Entry→immediate exit always
         // burns spread+fees ≈ plannedLoss (11/11 measured), so a loss stop before the
         // follow-up horizon guarantees shadowPassed can never clear. Score winners on
-        // target, abandon on sustained edge-gone after the confirmation window, and
-        // otherwise wait for the 15-minute due deadline.
-        const heldMs = Math.max(0, now - candidate.startedAt);
-        const edgeStopArmed = heldMs >= entryQualificationSettings().minWindowMs;
-        if (hitTarget || due || (edgeStopArmed && edgeGone)) {
-          const closeReason = hitTarget
-            ? 'shadow target reached'
-            : due
-              ? 'shadow 15-minute follow-up complete'
-              : 'shadow edge gone for three executable observations';
+        // a target that holds, abandon on sustained edge-gone after the confirmation
+        // window, and otherwise wait for the 15-minute due deadline. The rules live in
+        // shadowFollowUp.ts, which documents why a missing card must not read as zero
+        // edge and why the target needs persistence.
+        const currentCard = cardForTickerSide(candidate.ticker, candidate.side);
+        const decision = decideShadowFollowUp({
+          now,
+          startedAt: candidate.startedAt,
+          dueAt: candidate.dueAt,
+          targetRewardUsd: candidate.targetRewardUsd ?? candidate.expectedRewardUsd,
+          executableNetPnlUsd,
+          currentNetEdge: currentCard ? currentCard.netEdge : null,
+          priorObservations: strategyValidationStore.tracker.recentObservations(
+            candidate.id,
+            Math.max(SHADOW_EDGE_GONE_OBSERVATIONS, SHADOW_TARGET_HOLD_OBSERVATIONS),
+          ),
+          edgeStopArmMs: entryQualificationSettings().minWindowMs,
+        });
+        if (decision.observation) {
+          recordStrategyValidation((tracker) => tracker.observeShadowCandidate(
+            candidate.id,
+            executableNetPnlUsd,
+            stressedNetPnlUsd,
+            decision.observation!.netEdge,
+            now,
+          ));
+        }
+        if (decision.close) {
+          const closeReason = decision.closeReason!;
           recordStrategyValidation((tracker) => tracker.scoreShadowCandidate(
             candidate.id,
             executableNetPnlUsd,
