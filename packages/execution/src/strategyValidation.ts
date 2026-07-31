@@ -500,8 +500,17 @@ export class StrategyValidationTracker {
     return this.events.map((event) => JSON.parse(JSON.stringify(event)) as StrategyValidationEvent);
   }
 
+  // Sequences are assigned as `events.length + 1` on append and the ledger is append-only,
+  // so the events after `sequence` are always a contiguous tail. Walking back from the end
+  // and cloning only that tail keeps this O(new events). The previous
+  // `allEvents().filter(...)` deep-copied the entire ledger on every append — O(ledger) work
+  // on the per-orderbook-delta hot path, growing unbounded with run duration. That is the
+  // same shape as the clone that once starved the renderer heartbeat (see
+  // sevenHourCampaignStore.record).
   eventsAfter(sequence: number): StrategyValidationEvent[] {
-    return this.allEvents().filter((event) => event.sequence > sequence);
+    let start = this.events.length;
+    while (start > 0 && this.events[start - 1].sequence > sequence) start -= 1;
+    return this.events.slice(start).map((event) => JSON.parse(JSON.stringify(event)) as StrategyValidationEvent);
   }
 
   lastSequence(): number {
