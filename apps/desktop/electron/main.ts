@@ -71,6 +71,7 @@ import {
   type PaperOrder,
   type GeoMarket,
   type WorldEventsPayload,
+  type LadderQuote,
 } from '@nemesis/core';
 import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isTradableMarketAt, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, withinSeriesAllowlist, tickerWithinSeriesAllowlist, seriesAllowlistConfigured, seriesDenylistConfigured, type ProductionUniverseRecord } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
@@ -5532,6 +5533,23 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
     }),
   );
 
+  // Every strike quoted on one underlying at one expiry, so crypto-lead can read
+  // the market's own volatility off the ladder and refuse to signal when its
+  // model disagrees with it. Built once per refresh rather than per card: the
+  // whole slice is already in hand, and each card needs its siblings, not itself.
+  const cryptoInputs = new Map<string, ReturnType<typeof feedHub.cryptoInputFor>>();
+  const cryptoLadders = new Map<string, LadderQuote[]>();
+  for (const { m, p } of micro) {
+    if (!isCryptoMarket(m)) continue;
+    const cx = feedHub.cryptoInputFor(m, p);
+    cryptoInputs.set(m.ticker, cx);
+    if (!Number.isFinite(cx.strike) || cx.strike <= 0) continue;
+    const key = `${cx.symbol}|${m.close_time ?? ''}`;
+    const ladder = cryptoLadders.get(key);
+    if (ladder) ladder.push({ strike: cx.strike, marketPrice: p });
+    else cryptoLadders.set(key, [{ strike: cx.strike, marketPrice: p }]);
+  }
+
   for (const { m, p, spread, depthUsd } of micro) {
     if (isWeatherMarket(m)) {
       const wx = feedHub.weatherInputFor(m);
@@ -5547,7 +5565,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
         hoursToSettle: wx.hoursToSettle,
       }));
     } else if (isCryptoMarket(m)) {
-      const cx = feedHub.cryptoInputFor(m, p);
+      const cx = cryptoInputs.get(m.ticker) ?? feedHub.cryptoInputFor(m, p);
       cards.push(cryptoToThesis({
         ticker: m.ticker,
         title: m.title,
@@ -5559,6 +5577,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
         lagMs: cx.lagMs,
         binanceQuote: cx.binanceQuote,
         closeTime: m.close_time,
+        strikeLadder: cryptoLadders.get(`${cx.symbol}|${m.close_time ?? ''}`),
       }));
     } else if (isMacroMarket(m)) {
       const macro = feedHub.macroInputFor(m);

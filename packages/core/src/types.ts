@@ -407,11 +407,16 @@ export interface CryptoThesisContext {
   sampleCount: number;
   windowMs: number;
   timeToExpirySec?: number;
+  /** Total model volatility to expiry: `sigmaPerRootSec * sqrt(timeToExpirySec)`. */
   sigmaT?: number;
-  observedSigmaT?: number;
-  floorSigmaT?: number;
-  annualVolFloor?: number;
-  volatilityScale?: number;
+  /** Time-weighted spot volatility per square-root second, from the actual sample gaps. */
+  sigmaPerRootSec?: number;
+  /** Total volatility the strike ladder itself is quoting, when it fits lognormal. */
+  ladderSigmaT?: number;
+  ladderRSquared?: number;
+  ladderPoints?: number;
+  /** `sigmaT / ladderSigmaT`. Outside roughly 0.5-1.5 the card is invalidated. */
+  ladderSigmaRatio?: number;
 }
 
 export interface JournalEntry {

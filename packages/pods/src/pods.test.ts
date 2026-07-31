@@ -48,6 +48,8 @@ describe('pods', () => {
         fetchedAt: Date.now(),
         momentumBps: 0,
         volatilityBps: 10,
+        // 10 bps per sample at the 5s spacing this window implies.
+        sigmaPerRootSec: (10 / 10_000) / Math.sqrt(5),
         sampleCount: 12,
         windowMs: 55_000,
       },

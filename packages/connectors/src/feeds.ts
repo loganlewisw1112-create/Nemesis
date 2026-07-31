@@ -30,6 +30,8 @@ export interface CryptoSnapshot {
   fetchedAt: number;
   momentumBps?: number;
   volatilityBps?: number;
+  /** See `BinanceQuote.sigmaPerRootSec`. Absent on the REST-only fallback, which has no window to estimate from. */
+  sigmaPerRootSec?: number;
   sampleCount?: number;
   windowMs?: number;
 }

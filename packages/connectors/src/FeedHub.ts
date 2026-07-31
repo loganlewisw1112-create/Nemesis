@@ -355,6 +355,7 @@ export class FeedHub {
           fetchedAt: live.fetchedAt,
           momentumBps: live.momentumBps,
           volatilityBps: live.volatilityBps,
+          sigmaPerRootSec: live.sigmaPerRootSec,
           sampleCount: live.sampleCount,
           windowMs: live.windowMs,
         });
@@ -709,6 +710,10 @@ export class FeedHub {
       fetchedAt: snap.fetchedAt,
       momentumBps: snap.momentumBps ?? 0,
       volatilityBps: snap.volatilityBps ?? 0,
+      // Zero is the honest answer for a snapshot with no window behind it: the
+      // model reads it as an unusable sigma and invalidates, rather than pricing
+      // off a volatility nobody measured.
+      sigmaPerRootSec: snap.sigmaPerRootSec ?? 0,
       sampleCount: snap.sampleCount ?? 1,
       windowMs: snap.windowMs ?? 0,
     };

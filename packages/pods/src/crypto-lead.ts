@@ -5,9 +5,11 @@ import {
   qualifyThesis,
   computeNetEdge,
   detectSourceDisagreement,
+  fitLadderImpliedVol,
   kalshiFeePerContract,
   normalCdf,
   selectedSidePricing,
+  type LadderQuote,
 } from '@nemesis/core';
 
 export interface CryptoLeadInput {
@@ -23,6 +25,12 @@ export interface CryptoLeadInput {
   symbol?: string;
   binanceQuote?: BinanceQuote;
   closeTime?: string;
+  /**
+   * Every strike quoted on this underlying at this expiry, including this one.
+   * Used only to read the market's own volatility off the ladder and check the
+   * model against it. Omit it and the calibration check simply does not run.
+   */
+  strikeLadder?: readonly LadderQuote[];
 }
 
 interface CryptoScore {
@@ -34,14 +42,16 @@ interface CryptoScore {
   invalidReason?: string;
 }
 
-const VOL_SCALE = 1;
 const MIN_SIGMA_T = 0.0001;
-const SECONDS_PER_YEAR = 365 * 24 * 60 * 60;
-const DEFAULT_ANNUAL_VOL_FLOOR = 0.4;
-const ANNUAL_VOL_FLOOR_BY_SYMBOL: Record<string, number> = {
-  BTCUSDT: 0.35,
-  ETHUSDT: 0.5,
-};
+
+/**
+ * How far the model's volatility may sit from the one the market is quoting on
+ * the same ladder before the card stops being a signal. A model that disagrees
+ * with the market about volatility by more than this is not finding mispriced
+ * contracts, it is mispricing them itself.
+ */
+const MIN_LADDER_SIGMA_RATIO = 0.5;
+const MAX_LADDER_SIGMA_RATIO = 1.5;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -55,10 +65,6 @@ function round(value: number, decimals = 4): number {
 function roundBpsForModel(value: number): number {
   if (value > 0 && Math.abs(value) < 0.1) return round(value, 4);
   return round(value, 1);
-}
-
-function annualVolFloor(symbol: string): number {
-  return ANNUAL_VOL_FLOOR_BY_SYMBOL[symbol.toUpperCase()] ?? DEFAULT_ANNUAL_VOL_FLOOR;
 }
 
 function signedBps(value: number): string {
@@ -110,28 +116,41 @@ function scoreCryptoLead(input: CryptoLeadInput): CryptoScore {
   const quote = input.binanceQuote;
   const closeMs = input.closeTime ? Date.parse(input.closeTime) : Number.NaN;
   const timeToExpirySec = Number.isFinite(closeMs) ? (closeMs - Date.now()) / 1000 : Number.NaN;
-  const dtSec = context.windowMs > 0 && context.sampleCount > 1
-    ? (context.windowMs / 1000) / Math.max(1, context.sampleCount - 1)
+  // sigmaPerRootSec is already time-weighted over the actual gaps between samples
+  // (see realizedVolPerRootSec), so scaling to the horizon is a plain sqrt(t).
+  // The previous path took a per-sample dispersion and rescaled it by the *mean*
+  // sample gap, which is only valid if the samples were evenly spaced -- they are
+  // not, the window is fed by a sub-second websocket and a 5s poll at once.
+  const sigmaPerRootSec = quote?.sigmaPerRootSec ?? Number.NaN;
+  const sigmaT = Number.isFinite(sigmaPerRootSec) && sigmaPerRootSec > 0
+    && Number.isFinite(timeToExpirySec) && timeToExpirySec > 0
+    ? sigmaPerRootSec * Math.sqrt(timeToExpirySec)
     : Number.NaN;
-  const volFrac = Math.max(0, context.volatilityBps / 10_000);
-  const observedSigmaT = Number.isFinite(volFrac) && Number.isFinite(dtSec) && dtSec > 0 && Number.isFinite(timeToExpirySec) && timeToExpirySec > 0
-    ? volFrac * Math.sqrt(timeToExpirySec / dtSec) * VOL_SCALE
+
+  // The market quotes the whole strike ladder on this underlying at this expiry,
+  // and it fits lognormal at R-squared 0.997, so its own volatility is readable
+  // every snapshot at no extra cost. A model volatility far from it is not an
+  // edge, it is a broken input -- the 0.35 annual floor this replaced won 57% of
+  // the time and exceeded market-implied volatility in 34% of snapshots, which is
+  // how a 3-cent contract came to be priced at 16.5 cents.
+  const ladder = input.strikeLadder && input.strikeLadder.length > 0
+    ? fitLadderImpliedVol(context.spotPrice, input.strikeLadder)
+    : null;
+  const ladderSigmaRatio = ladder && Number.isFinite(sigmaT) && ladder.sigmaT > 0
+    ? sigmaT / ladder.sigmaT
     : Number.NaN;
-  const floorAnnualVol = annualVolFloor(context.symbol);
-  const floorSigmaT = Number.isFinite(timeToExpirySec) && timeToExpirySec > 0
-    ? floorAnnualVol * Math.sqrt(timeToExpirySec / SECONDS_PER_YEAR)
-    : Number.NaN;
-  const sigmaT = Number.isFinite(observedSigmaT) && Number.isFinite(floorSigmaT)
-    ? Math.max(observedSigmaT, floorSigmaT)
-    : Number.NaN;
+  const ladderUncalibrated = Number.isFinite(ladderSigmaRatio)
+    && (ladderSigmaRatio < MIN_LADDER_SIGMA_RATIO || ladderSigmaRatio > MAX_LADDER_SIGMA_RATIO);
+
   const modelContext = {
     ...context,
     timeToExpirySec: Number.isFinite(timeToExpirySec) ? round(timeToExpirySec, 1) : undefined,
     sigmaT: Number.isFinite(sigmaT) ? round(sigmaT, 6) : undefined,
-    observedSigmaT: Number.isFinite(observedSigmaT) ? round(observedSigmaT, 6) : undefined,
-    floorSigmaT: Number.isFinite(floorSigmaT) ? round(floorSigmaT, 6) : undefined,
-    annualVolFloor: floorAnnualVol,
-    volatilityScale: VOL_SCALE,
+    sigmaPerRootSec: Number.isFinite(sigmaPerRootSec) ? round(sigmaPerRootSec, 9) : undefined,
+    ladderSigmaT: ladder ? round(ladder.sigmaT, 6) : undefined,
+    ladderRSquared: ladder ? round(ladder.rSquared, 4) : undefined,
+    ladderPoints: ladder?.points,
+    ladderSigmaRatio: Number.isFinite(ladderSigmaRatio) ? round(ladderSigmaRatio, 4) : undefined,
   };
 
   let invalidReason: string | undefined;
@@ -140,6 +159,7 @@ function scoreCryptoLead(input: CryptoLeadInput): CryptoScore {
   else if (context.windowMs <= 0) invalidReason = 'crypto-binance-window-missing';
   else if (!Number.isFinite(timeToExpirySec) || timeToExpirySec <= 0) invalidReason = 'crypto-expiry-unavailable';
   else if (!Number.isFinite(sigmaT) || sigmaT < MIN_SIGMA_T) invalidReason = 'crypto-sigma-unusable';
+  else if (ladderUncalibrated) invalidReason = 'crypto-sigma-uncalibrated';
 
   const d = invalidReason
     ? Number.NaN
@@ -166,7 +186,9 @@ function scoreCryptoLead(input: CryptoLeadInput): CryptoScore {
       impact: round(volatilityImpact),
       detail: invalidReason
         ? invalidReason
-        : `sigmaT ${sigmaT.toFixed(4)} over ${Math.round(timeToExpirySec)}s; floor ${(floorAnnualVol * 100).toFixed(0)}% ann`,
+        : `sigmaT ${sigmaT.toFixed(4)} over ${Math.round(timeToExpirySec)}s${
+          ladder ? `; ladder ${ladder.sigmaT.toFixed(4)} (R2 ${ladder.rSquared.toFixed(3)}, ${ladder.points} strikes)` : '; no ladder fit'
+        }`,
     },
   ];
 
