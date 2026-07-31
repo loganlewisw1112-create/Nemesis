@@ -507,3 +507,156 @@ node scripts/analyze-dataplane-run.cjs   # at T+15, T+60, and after the stop
 
 The analyzer exits non-zero while any data-plane gate fails, which is the Phase 4 abort criterion
 in executable form. A failed gate means the run is a diagnostic, not evidence about edge.
+
+---
+
+## 2026-07-31 — ordered remediation from the 2026-07-29 audit (items 1–6, all pushed)
+
+Six items worked in order, each gating the next. 769/769 tests, typecheck and build
+green at every commit. Nothing was launched: Phases 4–5 remain the operator's call.
+
+**Do not treat the existing simulated record (103 scored / 24 wins / −$90.68) as evidence
+about the strategy in either direction.** Two independent defects manufactured both sides
+of it, and both are fixed below. The record predates every fix here.
+
+### 1. Ledger deep-copy — `bab41c1`
+
+`PaperQualificationStore.record` and `StrategyValidationStore.record` recover the 1–2
+events they just appended via `tracker.eventsAfter()`, which routed through `allEvents()` —
+a JSON deep copy of the **entire** append-only ledger, on every append, on the
+per-orderbook-delta hot path. Same shape as the clone that once starved the renderer
+heartbeat; `sevenHourCampaignStore` was fixed then and these two siblings never were.
+
+Measured at the live ledger size (249,245 events / 89 MB): **342.6 ms per append before,
+0.238 ms after** — and the remainder is the `appendFileSync`, not the lookup. At five to
+ten writes per five seconds that was 1.7–3.4 s of blocked main thread per five seconds.
+
+Fixed in the trackers rather than the stores: sequences are assigned as `events.length + 1`
+on an append-only array, so the events after a given sequence are always a contiguous tail.
+`eventsAfter` walks back from the end and clones only that tail. Output is unchanged for
+every input, which is why this was preferred over trusting the mutation's return value — it
+still captures events appended as a side effect of a mutation that returns only some of them.
+
+### 2. The two scoring defects — `a508796`
+
+Both moved out of `main.ts` into `shadowFollowUp.ts` as a pure decision function; neither
+path had any coverage before.
+
+- **A missing thesis card read as zero edge.** `cardForTickerSide(...)?.netEdge ?? 0`
+  manufactured a `0.000000` reading whenever no card existed, and `0` satisfies the
+  `netEdge <= 0` give-up test, closing the position into the spread on absent data. 42 of 74
+  edge-gone closes had all three final readings at exactly 0.000000; **67% of all recorded
+  losses**. A missing card is now the absence of a reading, not a reading of zero: no
+  observation is recorded and no model-driven close can fire. The 15-minute deadline still
+  fires without a card — it is time-based and its mark comes from the book.
+- **The target fired on the first poll that crossed it**, with no stop on the other side.
+  Taking the first crossing of a noisy mark systematically harvests the running maximum: all
+  15 target-scored wins landed on the running maximum of their entire history and 12 were
+  underwater first. The target must now hold across three observations spanning at least 10s,
+  and the candidate is scored at the latest mark rather than the peak.
+
+The loss stop stays deliberately absent (see the note at the call site). The asymmetry is
+fixed by making the win condition demand as much evidence as the give-up condition.
+
+### 3. Volatility input — `1c2794d`
+
+`normalCdf`, the unit conversions and the drift sign were checked and are correct; none are
+touched.
+
+- **Floor removed.** `Math.max(observedSigmaT, floorSigmaT)` won 57% of the time and
+  exceeded market-implied volatility in 34% of snapshots. `sigmaT` is now what was measured,
+  scaled by `sqrt(t)` and nothing else. A window with no measurable volatility fails closed
+  as `crypto-sigma-unusable` rather than borrowing a number nobody measured.
+- **Time-weighted estimator.** `rollingVolatilityBps` produced a per-sample dispersion with
+  no time unit, which `crypto-lead` rescaled by the *mean* sample gap — valid only for a
+  uniformly sampled series, and `recordQuote` is fed by a sub-second websocket and a 5s poll
+  at once. `realizedVolPerRootSec` accumulates realised variance over the wall time it
+  actually accrued across each real gap, after sparse-sampling to a 1s grid so sub-second
+  bid-ask bounce is not divided by its own tiny interval. `volatilityBps` stays for display
+  and confidence scoring, now documented as such.
+- **Ladder calibration gate.** The market quotes the whole strike ladder on one underlying at
+  one expiry and it fits lognormal at R-squared 0.997, so inverting each quote and regressing
+  `ln(S/K)` on the normal quantile recovers the volatility the market itself is quoting — one
+  line through data already in hand. Model volatility outside 0.5x–1.5x of it invalidates the
+  card (`crypto-sigma-uncalibrated`). The gate stays dormant when the ladder cannot support a
+  fit (too few quotes off the rails, no slope, backwards ladder, R-squared under 0.95); near
+  expiry a fixed-width ladder legitimately pins at the rails and reports no fit rather than
+  inventing one. New: `packages/core/src/stats/ladderImpliedVol.ts` (Acklam probit + the fit).
+
+Consequence addressed: the 3-cent contract priced at 16.5 cents.
+
+### 4. Quote-stream supervisor — `f0a83d5`
+
+`KalshiStream.scheduleReconnect` arms nothing on a no-retry verdict, by which point
+`closeCurrentSocket` has nulled the socket and cleared the heartbeat while `started` stays
+true — the identical absorbing dead state that ran the orderbook stream dark for 7.9h, and
+nothing on any timer was watching this one. `superviseDataPlane` mirrors the orderbook's:
+dead-socket recovery, a 20s connect deadline, heartbeat self-heal, bounded escalation to a
+full stream restart, its own 5s to 60s backoff independent of the controller's verdict,
+sticky auth classes retrying at the cap with a durable warn, and the invariant tripwire.
+Driven from the same health tick; every action goes to the connector warn trace.
+
+### 5. Leaks and rotation — `28962c6`
+
+- **Confirmation-state sweep.** States were only removed from inside `observe()`, so a chain
+  flow moved on from held a `maxPendingCandidates` slot and pinned its ticker via
+  `inFlightTickers()` forever — orphans grew 3 to 22 of 25 slots over seven hours. `sweep()`
+  drops chains not re-observed within `maxSourceAgeMs`, on the health tick.
+- **`usedSources` bounded** at 20,000, oldest-first — orders of magnitude above the
+  single-digit `maxPendingCandidates`, and `main.ts` re-seeds it from the ledger every start.
+  `markSourceUsed` also now releases its `sourceToStateKey` mapping, which leaked too.
+- **Bridge telemetry rotation.** 406 MB unrotated, now `RotatingJsonlWriter` at 4 x 32 MB.
+  Writes stay synchronous on purpose: this file is read after a crash, which is exactly when
+  buffered records would be the missing ones.
+- **Main-process memory guard** (the renderer had three, main had none while near 1 GB).
+  Warns on three consecutive samples over 1 GB with the heap breakdown and chain count. It
+  only reports — an unattended run that self-terminates on a memory reading loses its
+  evidence, which is worse.
+- **`app.requestSingleInstanceLock()`**, taken before `whenReady`. Two desktops on one
+  user-data directory interleave two sequence streams into both ledgers and corrupt both hash
+  chains. `OperationalLeaseTracker` was never this guard despite the name, so it is renamed
+  `HealthAttestationTracker` (the `lease` field in `RuntimeHealthSnapshot` keeps its name; it
+  is broadcast and persisted).
+- **`process.on('unhandledRejection')`** keeps the process alive and records the reason. The
+  two campaign-ledger appends reached from fire-and-forget callers now go through
+  `recordCampaignEventSafely`, which pauses evidence and records the failure instead of
+  ending an unattended run hours in.
+
+**Deliberately not done: compacting the two large ledgers.** They are hash-chained
+append-only evidence — replaying every event from the first is what proves the chain intact,
+and rewriting a prefix forfeits exactly the integrity the paper test exists to produce. Safe
+compaction needs a signed-checkpoint design that does not exist. The supported mechanism
+remains the operator archiving a completed run; startup now warns with the actual size once a
+ledger passes 64 MB.
+
+### 6. Safety hardening — `5797525`
+
+Real trading is still unreachable (one order function, one manual caller, nothing automatic),
+so none of this changes behaviour today.
+
+- **Stored settings re-validated at load.** `evaluateStoredLiveAuthorization` checks that
+  whatever live trading the settings claim is backed by a certificate that exists, names a
+  real stage, agrees with `liveStage`, and is not authorising auto live off a manual-live
+  unlock. Failure forces back to paper and records why. **Deliberately not cryptographic** —
+  fabricating a whole well-formed certificate by hand still gets through; closing that needs
+  a signing key this system does not have. The gap removed is flipping a boolean in a JSON file.
+- **The 24-hour expiry is now read**, at load and again at the order itself (the process can
+  outlive the certificate). A hand-written far-future expiry is rejected: the certificate's
+  *lifetime*, not just its end date, must be inside the maximum.
+- **`dryRun` gates the live order path.** It previously did not, at all.
+- **Clearing `killSwitchActive` takes a typed confirmation** and is written to the audit log.
+  Arming it still needs nothing — that direction only ever makes the system safer.
+
+### Next action (operator) — unchanged from Phase 4
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/launch-paper-allowlist.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stop-nemesis-at.ps1 -AfterMinutes 300
+node scripts/analyze-dataplane-run.cjs   # at T+15, T+60, and after the stop
+```
+
+Items 1–4 were the ones gating a meaningful run, and all four have landed. The run will now
+produce numbers about the strategy rather than about the poller — but the shadow ledger it
+starts from is contaminated by both defects in item 2, so **judge only shadows scored after
+this commit**, and re-read the `SHADOW_MAX_CONTAMINATED_SHARE` note before trusting any
+clean-subset tally.
