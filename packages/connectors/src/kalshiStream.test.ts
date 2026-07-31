@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { resetKalshiProductionRetryCoordinatorForTests } from '@nemesis/core';
 import { ConnectorRegistry } from './registry.js';
-import { KalshiStream } from './kalshiStream.js';
+import {
+  KalshiStream,
+  TICKER_CONNECT_DEADLINE_MS,
+  TICKER_SUPERVISOR_BASE_BACKOFF_MS,
+  TICKER_SUPERVISOR_MAX_BACKOFF_MS,
+} from './kalshiStream.js';
 import type { KalshiProductionConnectionController, KalshiSocketHealthV2 } from './kalshiTransportController.js';
 
 interface StreamInternals {
@@ -332,6 +337,234 @@ describe('KalshiStream replay safety', () => {
     expect(socket.terminate).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(10_000);
     expect(socket.terminate).toHaveBeenCalledTimes(1);
+    stream.stop();
+  });
+});
+
+function fakeSocket(readyState: number) {
+  return { readyState, close: vi.fn(), ping: vi.fn(), send: vi.fn(), terminate: vi.fn() };
+}
+
+/**
+ * Reuses the fake-socket seam for `connect()`: the stub installs a CONNECTING
+ * socket exactly as the real WebSocket constructor would, so the supervisor sees
+ * the same post-attempt state it sees in production without opening a socket.
+ */
+function stubConnect(stream: KalshiStream) {
+  const sockets: Array<ReturnType<typeof fakeSocket>> = [];
+  const spy = vi.spyOn(stream as unknown as { connect(): void }, 'connect').mockImplementation(() => {
+    const socket = fakeSocket(WebSocket.CONNECTING);
+    sockets.push(socket);
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket,
+      connectAttemptStartedAt: Date.now(),
+    });
+  });
+  return { spy, sockets };
+}
+
+describe('KalshiStream data-plane supervisor', () => {
+  beforeEach(() => resetKalshiProductionRetryCoordinatorForTests());
+  afterEach(() => vi.restoreAllMocks());
+
+  it('recovers a started stream the transport controller refused to retry', () => {
+    // The absorbing dead state: scheduleReconnect arms nothing on a no-retry
+    // verdict, closeCurrentSocket has already nulled the socket and cleared the
+    // heartbeat, and `started` stays true. Nothing inside the stream can revive
+    // it, and until the supervisor existed nothing outside was looking.
+    const closedAt = 1_700_000_000_000;
+    vi.setSystemTime(closedAt);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const warn = vi.spyOn(ConnectorRegistry.prototype, 'recordWarn');
+    const socket = fakeSocket(WebSocket.OPEN);
+    const { generation, internals } = primeCurrentGeneration(stream, ['KXBTCD-TEST']);
+    internals.started = true;
+    internals.authenticated = true;
+    internals.socket = socket as unknown as WebSocket;
+    internals.connectedAt = closedAt;
+    const { spy } = stubConnect(stream);
+
+    // 1008 + "invalid credentials" classifies as sticky `authentication`, so
+    // recordFailure returns noRetry() -- the exact dead end.
+    (stream as unknown as { handleClose(s: WebSocket, g: number, c: number, r: string | null): void })
+      .handleClose(socket as unknown as WebSocket, generation, 1008, 'invalid credentials');
+
+    expect(stream.socketState()).toBe('none');
+    expect(stream.telemetry(closedAt)).toMatchObject({
+      socketState: 'none',
+      reconnectScheduled: false,
+      connectInFlight: false,
+    });
+    expect(spy).not.toHaveBeenCalled();
+
+    const recovered = stream.superviseDataPlane(closedAt + 1);
+    expect(recovered.action).toBe('reconnect-dead-socket');
+    // Sticky classes go straight to the cap and keep retrying, never latch off.
+    expect(recovered.nextAttemptInMs).toBe(TICKER_SUPERVISOR_MAX_BACKOFF_MS);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(stream.socketState()).toBe('connecting');
+    expect(stream.telemetry(closedAt + 1)).toMatchObject({
+      connectInFlight: true,
+      supervisorEscalations: 1,
+      lastSupervisionAction: 'reconnect-dead-socket',
+    });
+    expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-ticker-ws' && /sticky authentication/.test(detail)))
+      .toBe(true);
+
+    // A connect in flight is left alone.
+    expect(stream.superviseDataPlane(closedAt + 2)).toMatchObject({ action: 'none', reason: 'connect in flight' });
+    expect(spy).toHaveBeenCalledTimes(1);
+    stream.stop();
+  });
+
+  it('leaves a stopped stream stopped', () => {
+    const stream = new KalshiStream(new ConnectorRegistry(), () => null);
+    const { spy } = stubConnect(stream);
+    expect(stream.superviseDataPlane()).toEqual({ action: 'none', reason: null, nextAttemptInMs: null });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('leaves a healthy open socket alone', () => {
+    const at = 1_700_001_000_000;
+    vi.setSystemTime(at);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const socket = fakeSocket(WebSocket.OPEN);
+    const { generation, internals } = primeCurrentGeneration(stream, ['KXBTCD-TEST']);
+    internals.started = true;
+    internals.authenticated = true;
+    internals.socket = socket as unknown as WebSocket;
+    internals.connectedAt = at;
+    internals.lastMessageAt = at;
+    internals.startHeartbeat(socket as unknown as WebSocket, generation);
+    const { spy } = stubConnect(stream);
+
+    expect(stream.superviseDataPlane(at)).toEqual({ action: 'none', reason: null, nextAttemptInMs: null });
+    expect(spy).not.toHaveBeenCalled();
+    stream.stop();
+  });
+
+  it('restarts a heartbeat that went missing on an open socket', () => {
+    const at = 1_700_002_000_000;
+    vi.setSystemTime(at);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const socket = fakeSocket(WebSocket.OPEN);
+    const { internals } = primeCurrentGeneration(stream, ['KXBTCD-TEST']);
+    internals.started = true;
+    internals.authenticated = true;
+    internals.socket = socket as unknown as WebSocket;
+    internals.connectedAt = at;
+
+    expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'heartbeat-restarted' });
+    // Idempotent: once restarted there is nothing left to fix.
+    expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'none' });
+    stream.stop();
+  });
+
+  it('reaps a connect that never opened or closed', () => {
+    const at = 1_700_003_000_000;
+    vi.setSystemTime(at);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const { internals } = primeCurrentGeneration(stream, []);
+    internals.started = true;
+    const socket = fakeSocket(WebSocket.CONNECTING);
+    Object.assign(stream as unknown as Record<string, unknown>, { socket, connectAttemptStartedAt: at });
+    const { spy } = stubConnect(stream);
+
+    expect(stream.superviseDataPlane(at + TICKER_CONNECT_DEADLINE_MS))
+      .toMatchObject({ action: 'none', reason: 'connect in flight' });
+    expect(spy).not.toHaveBeenCalled();
+
+    const reaped = stream.superviseDataPlane(at + TICKER_CONNECT_DEADLINE_MS + 1);
+    expect(reaped.action).toBe('reconnect-connect-timeout');
+    expect(socket.close).toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledTimes(1);
+    stream.stop();
+  });
+
+  it('backs off between supervised attempts and resets once a frame arrives', () => {
+    const at = 1_700_004_000_000;
+    vi.setSystemTime(at);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const { generation, internals } = primeCurrentGeneration(stream, ['KXBTCD-TEST']);
+    internals.started = true;
+    const { spy } = stubConnect(stream);
+
+    expect(stream.superviseDataPlane(at)).toMatchObject({
+      action: 'reconnect-dead-socket',
+      nextAttemptInMs: TICKER_SUPERVISOR_BASE_BACKOFF_MS,
+    });
+    // The attempt dies without opening or closing, so nothing is armed. The
+    // tripwire says so once, and the backoff still holds the next attempt back.
+    Object.assign(stream as unknown as Record<string, unknown>, { socket: null, connectAttemptStartedAt: null });
+    expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'invariant-violation' });
+    expect(stream.superviseDataPlane(at + 2)).toMatchObject({ action: 'none', reason: 'supervisor backoff pending' });
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // Second attempt only once the backoff is due, and it doubles.
+    expect(stream.superviseDataPlane(at + TICKER_SUPERVISOR_BASE_BACKOFF_MS)).toMatchObject({
+      action: 'reconnect-dead-socket',
+      nextAttemptInMs: TICKER_SUPERVISOR_BASE_BACKOFF_MS * 2,
+    });
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    // An application frame is the only proof recovery worked, so it is what
+    // clears the backoff -- `open` alone has produced silent zombies.
+    internals.generation = generation;
+    stream.ingest(JSON.stringify({ type: 'ok', id: 1 }), generation);
+    Object.assign(stream as unknown as Record<string, unknown>, { socket: null, connectAttemptStartedAt: null });
+    expect(stream.superviseDataPlane(at + TICKER_SUPERVISOR_BASE_BACKOFF_MS + 1)).toMatchObject({
+      action: 'reconnect-dead-socket',
+      nextAttemptInMs: TICKER_SUPERVISOR_BASE_BACKOFF_MS,
+    });
+    stream.stop();
+  });
+
+  it('escalates to a bounded full stream restart after three failed supervised attempts', () => {
+    let now = 1_700_005_000_000;
+    vi.setSystemTime(now);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const { internals } = primeCurrentGeneration(stream, ['KXBTCD-TEST']);
+    internals.started = true;
+    internals.subscribed.add('KXBTCD-TEST');
+    stubConnect(stream);
+
+    const actions: string[] = [];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      Object.assign(stream as unknown as Record<string, unknown>, { socket: null, connectAttemptStartedAt: null });
+      actions.push(stream.superviseDataPlane(now).action);
+      now += TICKER_SUPERVISOR_MAX_BACKOFF_MS;
+    }
+
+    expect(actions.slice(0, 3)).toEqual([
+      'reconnect-dead-socket',
+      'reconnect-dead-socket',
+      'reconnect-dead-socket',
+    ]);
+    expect(actions[3]).toBe('stream-restarted');
+    // A rebuild must force a full resubscribe rather than trusting stale membership.
+    expect(internals.subscribed.size).toBe(0);
+    expect(internals.tickers.has('KXBTCD-TEST')).toBe(true);
+    stream.stop();
+  });
+
+  it('warns on the tripwire when a supervised attempt cannot even open a socket', () => {
+    const at = 1_700_006_000_000;
+    vi.setSystemTime(at);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const warn = vi.spyOn(ConnectorRegistry.prototype, 'recordWarn');
+    const { internals } = primeCurrentGeneration(stream, []);
+    internals.started = true;
+    // connect() that no-ops -- e.g. the headers provider returns null.
+    vi.spyOn(stream as unknown as { connect(): void }, 'connect').mockImplementation(() => {});
+    Object.assign(stream as unknown as Record<string, unknown>, { socket: null, connectAttemptStartedAt: null });
+
+    expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'reconnect-dead-socket' });
+    expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-ticker-ws' && /invariant violated/.test(detail)))
+      .toBe(true);
+    const warnsAfterFirst = warn.mock.calls.length;
+    // Reported once per supervised attempt, so it can never spam the ledger.
+    expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'none', reason: 'supervisor backoff pending' });
+    expect(warn.mock.calls.length).toBe(warnsAfterFirst);
     stream.stop();
   });
 });

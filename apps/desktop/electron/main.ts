@@ -977,6 +977,26 @@ function superviseOrderbookDataPlane(now = Date.now()): void {
   }
 }
 
+/**
+ * The ticker stream has the same absorbing dead state the order-book stream had,
+ * and until now nothing on any timer looked at it: only the order-book stream was
+ * supervised. A quote feed that dies silently is not as loud as a dead book -- it
+ * just freezes every price at its last value -- which is exactly why it needs an
+ * owner rather than a reader noticing.
+ */
+function superviseTickerStream(now = Date.now()): void {
+  const before = kalshiStream.telemetry(now);
+  const supervision = kalshiStream.superviseDataPlane(now);
+  if (supervision.action === 'none') return;
+  const after = kalshiStream.telemetry(now);
+  const message = `[nemesis] ticker supervisor ${supervision.action}`
+    + ` (reason=${supervision.reason ?? 'unspecified'}, socket=${before.socketState}→${after.socketState},`
+    + ` tracked=${before.trackedTickers}, msgAgeMs=${before.lastMessageAt == null ? 'null' : now - before.lastMessageAt},`
+    + ` reconnects ${before.reconnects}→${after.reconnects}, retryInMs=${supervision.nextAttemptInMs ?? 'n/a'})`;
+  console.warn(message);
+  connectorWarnTrace.record({ at: now, connector: 'kalshi-ticker-ws', source: 'supervisor', message });
+}
+
 function currentProcessTelemetry(now = Date.now()): Record<string, unknown> {
   const mainWorkingSetMb = Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3));
   bridgeStatus.mainPid = process.pid;
@@ -6982,6 +7002,7 @@ app.whenReady().then(async () => {
     void evaluateCampaignConfirmations();
     void evaluateCampaignDiagnostics();
     superviseOrderbookDataPlane();
+    superviseTickerStream();
     broadcastToGea({ type: 'bridge:ping', payload: {} });
     recordCampaignOperationalTelemetry();
     broadcast('connectors:update', registry.getAll());
