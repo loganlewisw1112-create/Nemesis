@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { OperationalLeaseTracker } from './operationalLease.js';
+import { HealthAttestationTracker } from './healthAttestation.js';
 
-describe('OperationalLeaseTracker', () => {
+describe('HealthAttestationTracker', () => {
   it('expires evidence instead of treating an old pass as current', () => {
-    const tracker = new OperationalLeaseTracker('runtime', 15_000);
+    const tracker = new HealthAttestationTracker('runtime', 15_000);
     tracker.issue({ status: 'healthy', observedAt: 1_000 });
     expect(tracker.current(16_000)?.status).toBe('healthy');
     expect(tracker.current(16_001)).toBeNull();
   });
 
   it('keeps blocking failures sticky for the attempt', () => {
-    const tracker = new OperationalLeaseTracker('runtime');
+    const tracker = new HealthAttestationTracker('runtime');
     tracker.issue({ status: 'failed', observedAt: 1_000, stickyFailure: true, action: 'invalidate' });
     const next = tracker.issue({ status: 'healthy', observedAt: 2_000 });
     expect(next.status).toBe('failed');
@@ -18,7 +18,7 @@ describe('OperationalLeaseTracker', () => {
   });
 
   it('requires current evidence and 95 percent sample and health coverage', () => {
-    const tracker = new OperationalLeaseTracker('runtime', 10_000);
+    const tracker = new HealthAttestationTracker('runtime', 10_000);
     for (let index = 0; index < 20; index += 1) {
       tracker.issue({ status: 'healthy', observedAt: index * 5_000 });
     }

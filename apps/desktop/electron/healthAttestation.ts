@@ -1,9 +1,21 @@
-export type OperationalLeaseStatus = 'healthy' | 'degraded' | 'failed';
+/**
+ * Rolling health attestations: each sample asserts "this subsystem was healthy
+ * at time T and that claim is good until validUntil", and the tracker reports
+ * what fraction of the expected samples actually arrived healthy.
+ *
+ * Renamed from `OperationalLeaseTracker` on 2026-07-31. "Lease" invited the
+ * reading that this grants exclusive ownership of something and would stop a
+ * second process running -- it does not, and never did. Mutual exclusion is
+ * `app.requestSingleInstanceLock()` in main.ts. The `lease` field name in
+ * `RuntimeHealthSnapshot` is deliberately unchanged, because that one is
+ * broadcast and persisted.
+ */
+export type HealthAttestationStatus = 'healthy' | 'degraded' | 'failed';
 
-export interface CampaignOperationalLeaseV2 {
+export interface CampaignHealthAttestationV2 {
   schemaVersion: 2;
   name: string;
-  status: OperationalLeaseStatus;
+  status: HealthAttestationStatus;
   observedAt: number;
   validUntil: number;
   metrics: Readonly<Record<string, number | string | boolean | null>>;
@@ -11,18 +23,18 @@ export interface CampaignOperationalLeaseV2 {
   stickyFailure: boolean;
 }
 
-export interface OperationalLeaseCoverage {
+export interface HealthAttestationCoverage {
   expectedSamples: number;
   observedSamples: number;
   healthySamples: number;
   sampleCoverage: number;
   healthyCoverage: number;
-  current: CampaignOperationalLeaseV2 | null;
+  current: CampaignHealthAttestationV2 | null;
   qualificationReady: boolean;
 }
 
-export class OperationalLeaseTracker {
-  private readonly samples: CampaignOperationalLeaseV2[] = [];
+export class HealthAttestationTracker {
+  private readonly samples: CampaignHealthAttestationV2[] = [];
   private stickyFailure = false;
 
   constructor(
@@ -32,15 +44,15 @@ export class OperationalLeaseTracker {
   ) {}
 
   issue(input: {
-    status: OperationalLeaseStatus;
+    status: HealthAttestationStatus;
     observedAt?: number;
-    metrics?: CampaignOperationalLeaseV2['metrics'];
+    metrics?: CampaignHealthAttestationV2['metrics'];
     action?: string;
     stickyFailure?: boolean;
-  }): CampaignOperationalLeaseV2 {
+  }): CampaignHealthAttestationV2 {
     const observedAt = input.observedAt ?? Date.now();
     this.stickyFailure ||= input.stickyFailure === true || input.status === 'failed';
-    const lease: CampaignOperationalLeaseV2 = Object.freeze({
+    const lease: CampaignHealthAttestationV2 = Object.freeze({
       schemaVersion: 2,
       name: this.name,
       status: this.stickyFailure ? 'failed' : input.status,
@@ -57,13 +69,13 @@ export class OperationalLeaseTracker {
     return lease;
   }
 
-  current(now = Date.now()): CampaignOperationalLeaseV2 | null {
+  current(now = Date.now()): CampaignHealthAttestationV2 | null {
     const latest = this.samples.at(-1) ?? null;
     if (!latest || latest.validUntil < now) return null;
     return latest;
   }
 
-  coverage(runStartedAt: number, now: number, expectedIntervalMs = 5_000): OperationalLeaseCoverage {
+  coverage(runStartedAt: number, now: number, expectedIntervalMs = 5_000): HealthAttestationCoverage {
     const expectedSamples = Math.max(1, Math.floor(Math.max(0, now - runStartedAt) / expectedIntervalMs) + 1);
     const observed = this.samples.filter((sample) => sample.observedAt >= runStartedAt && sample.observedAt <= now);
     const healthySamples = observed.filter((sample) => sample.status === 'healthy' && !sample.stickyFailure).length;
@@ -84,7 +96,7 @@ export class OperationalLeaseTracker {
     };
   }
 
-  history(): readonly CampaignOperationalLeaseV2[] {
+  history(): readonly CampaignHealthAttestationV2[] {
     return this.samples;
   }
 }

@@ -1,5 +1,5 @@
 import type { RendererMemoryAssessment } from './rendererMemoryMonitor.js';
-import { OperationalLeaseTracker, type CampaignOperationalLeaseV2 } from './operationalLease.js';
+import { HealthAttestationTracker, type CampaignHealthAttestationV2 } from './healthAttestation.js';
 
 export type RuntimeComponentName =
   | 'rest-markets'
@@ -39,7 +39,7 @@ export interface RuntimeHealthDecision {
   invalidated: boolean;
   reasons: string[];
   action: 'none' | 'pause' | 'resume' | 'invalidate';
-  lease: CampaignOperationalLeaseV2;
+  lease: CampaignHealthAttestationV2;
   recoveryCount: number;
 }
 
@@ -63,7 +63,7 @@ const DEFAULT_POLICY: Readonly<RuntimeHealthPolicy> = Object.freeze({
 
 export class RuntimeHealthController {
   private readonly policy: RuntimeHealthPolicy;
-  private readonly leases: OperationalLeaseTracker;
+  private readonly leases: HealthAttestationTracker;
   private state: RuntimeControlState = 'warming';
   private recoveringAt: number | null = null;
   private healthyStreak = 0;
@@ -73,7 +73,7 @@ export class RuntimeHealthController {
 
   constructor(policy: Partial<RuntimeHealthPolicy> = {}) {
     this.policy = { ...DEFAULT_POLICY, ...policy };
-    this.leases = new OperationalLeaseTracker('runtime_health', this.policy.leaseTtlMs);
+    this.leases = new HealthAttestationTracker('runtime_health', this.policy.leaseTtlMs);
   }
 
   observe(input: {

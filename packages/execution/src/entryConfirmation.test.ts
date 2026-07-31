@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { buildKalshiFeePolicy, DEFAULT_ENTRY_QUALIFICATION, type ProfitCertificate, type ThesisCard } from '@nemesis/core';
 import type { DryRunOrder } from './dryRun.js';
-import { EntryConfirmationEngine, MAX_PROVEN_QUIET_BOOK_AGE_MS } from './entryConfirmation.js';
+import {
+  EntryConfirmationEngine,
+  MAX_PROVEN_QUIET_BOOK_AGE_MS,
+  MAX_REMEMBERED_USED_SOURCES,
+} from './entryConfirmation.js';
 
 const startedAt = Date.UTC(2026, 6, 14, 12, 0, 0);
 const feePolicy = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'direct' });
@@ -504,5 +508,89 @@ describe('EntryConfirmationEngine', () => {
       ...relaxed,
       minStressedNetPnlUsd: probe.stressedNetPnlUsd + 0.000001,
     }), 0).reason).toMatch(/stressed/i);
+  });
+});
+
+describe('EntryConfirmationEngine leak bounds', () => {
+  it('sweeps chains flow stopped feeding, and leaves live ones alone', () => {
+    // Confirmation state was only ever removed from inside observe(), which needs
+    // flow to keep surfacing that same card. When flow moved on the chain was
+    // stranded: it held a slot against maxPendingCandidates and pinned its ticker
+    // in the orderbook tracking set through inFlightTickers(), forever. Measured
+    // over seven hours on 2026-07-29: orphans grew from 3 to 22 of 25 slots.
+    const engine = new EntryConfirmationEngine();
+    const maxSourceAgeMs = DEFAULT_ENTRY_QUALIFICATION.maxSourceAgeMs;
+
+    observe(engine, 0, { id: 'flow-abandoned', ticker: 'KXGONE-26' });
+    observe(engine, 0, { id: 'flow-live', ticker: 'KXLIVE-26' });
+    expect(engine.pendingStateCount()).toBe(2);
+    expect(engine.inFlightTickers().sort()).toEqual(['KXGONE-26', 'KXLIVE-26']);
+
+    // Nothing is stale yet.
+    expect(engine.sweep(startedAt + maxSourceAgeMs)).toBe(0);
+    expect(engine.pendingStateCount()).toBe(2);
+
+    // One chain keeps being observed; the other is never seen again.
+    const laterAt = startedAt + maxSourceAgeMs + 1;
+    engine.observe({
+      card: card({ id: 'flow-live', ticker: 'KXLIVE-26', createdAt: laterAt, updatedAt: laterAt }),
+      fill: fill({ ticker: 'KXLIVE-26' }),
+      baseCertificate: certificate(),
+      bookTimestamp: laterAt,
+      bookSequence: 99,
+      feePolicy,
+      observedAt: laterAt,
+    });
+
+    expect(engine.sweep(laterAt)).toBe(1);
+    expect(engine.pendingStateCount()).toBe(1);
+    expect(engine.inFlightTickers()).toEqual(['KXLIVE-26']);
+  });
+
+  it('sweeping frees the ticker rather than leaving it pinned', () => {
+    const engine = new EntryConfirmationEngine();
+    observe(engine, 0, { id: 'flow-orphan', ticker: 'KXORPHAN-26' });
+    expect(engine.inFlightTickers()).toEqual(['KXORPHAN-26']);
+
+    engine.sweep(startedAt + DEFAULT_ENTRY_QUALIFICATION.maxSourceAgeMs + 1);
+    expect(engine.inFlightTickers()).toEqual([]);
+    expect(engine.pendingStateCount()).toBe(0);
+  });
+
+  it('bounds the consumed-source set instead of growing it for the life of the process', () => {
+    const engine = new EntryConfirmationEngine();
+    const total = MAX_REMEMBERED_USED_SOURCES + 500;
+    for (let index = 0; index < total; index += 1) engine.markSourceUsed(`signal-${index}`);
+
+    // The most recent are still remembered -- that is what stops a double entry.
+    expect(engine.hasUsedSource(`signal-${total - 1}`)).toBe(true);
+    expect(engine.hasUsedSource(`signal-${total - MAX_REMEMBERED_USED_SOURCES}`)).toBe(true);
+    // The oldest, far beyond anything that could still be live, are evicted.
+    expect(engine.hasUsedSource('signal-0')).toBe(false);
+    expect(engine.hasUsedSource(`signal-${total - MAX_REMEMBERED_USED_SOURCES - 1}`)).toBe(false);
+  });
+
+  it('re-marking a source keeps it from being evicted as if it were old', () => {
+    const engine = new EntryConfirmationEngine();
+    engine.markSourceUsed('signal-keep');
+    for (let index = 0; index < MAX_REMEMBERED_USED_SOURCES - 1; index += 1) {
+      engine.markSourceUsed(`filler-${index}`);
+    }
+    engine.markSourceUsed('signal-keep');
+    for (let index = 0; index < 100; index += 1) engine.markSourceUsed(`later-${index}`);
+
+    expect(engine.hasUsedSource('signal-keep')).toBe(true);
+    expect(engine.hasUsedSource('filler-0')).toBe(false);
+  });
+
+  it('marking a source used releases its confirmation chain and its key mapping', () => {
+    const engine = new EntryConfirmationEngine();
+    observe(engine, 0, { id: 'flow-used', ticker: 'KXUSED-26' });
+    expect(engine.pendingStateCount()).toBe(1);
+
+    engine.markSourceUsed('flow-used');
+    expect(engine.pendingStateCount()).toBe(0);
+    expect(engine.inFlightTickers()).toEqual([]);
+    expect(engine.hasUsedSource('flow-used')).toBe(true);
   });
 });

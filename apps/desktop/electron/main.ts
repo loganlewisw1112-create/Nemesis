@@ -8,6 +8,21 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) return;
   throw err;
 });
+// Without this, any rejected promise nobody awaited terminates the main process
+// on Node's default. Two campaign-store writes reached for by fire-and-forget
+// callers can throw on a persistence fault -- losing the whole run to a ledger
+// hiccup, hours into an unattended soak, with nothing written down about why.
+// Log loudly and keep running: the store has already latched itself closed, so
+// nothing can be silently appended after a failure.
+process.on('unhandledRejection', (reason) => {
+  const detail = reason instanceof Error ? `${reason.message}\n${reason.stack ?? ''}` : String(reason);
+  console.error('[nemesis] unhandled promise rejection (process kept alive)', detail);
+  try {
+    recordUnhandledRejection(detail);
+  } catch {
+    // Never let the reporter itself become the thing that kills the process.
+  }
+});
 
 import { app, BrowserWindow, ipcMain, globalShortcut, safeStorage } from 'electron';
 import path from 'node:path';
@@ -177,6 +192,7 @@ import {
   SHADOW_EDGE_GONE_OBSERVATIONS,
   SHADOW_TARGET_HOLD_OBSERVATIONS,
 } from './shadowFollowUp.js';
+import { RotatingJsonlWriter } from './rotatingJsonl.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -392,6 +408,24 @@ const orderbookTrace = createTraceWriter('NEMESIS_ORDERBOOK_TRACE_PATH');
  * Never deduped -- a repeated warning is itself the signal.
  */
 const connectorWarnTrace = createTraceWriter('NEMESIS_CONNECTOR_WARN_TRACE_PATH', { dedupeWindowMs: 0 });
+
+let unhandledRejectionCount = 0;
+
+/**
+ * Durable record of a rejection that would previously have ended the process.
+ * Called from a `process.on` handler that can fire before module init finishes,
+ * so it must assume nothing about what is constructed yet.
+ */
+function recordUnhandledRejection(detail: string): void {
+  unhandledRejectionCount += 1;
+  if (typeof connectorWarnTrace === 'undefined') return;
+  connectorWarnTrace.record({
+    at: Date.now(),
+    connector: 'main-process',
+    source: 'unhandled-rejection',
+    message: `unhandled promise rejection #${unhandledRejectionCount}: ${detail}`,
+  });
+}
 /**
  * Latches when candidates cannot obtain a sequenced exchange book. Confirmation
  * rejections emitted while latched describe missing data, not absent edge, and
@@ -997,8 +1031,65 @@ function superviseTickerStream(now = Date.now()): void {
   connectorWarnTrace.record({ at: now, connector: 'kalshi-ticker-ws', source: 'supervisor', message });
 }
 
+/**
+ * Main-process memory guard. The renderer has three (slope, p95, hard cap); the
+ * main process had none at all, while sitting near 1 GB -- and it is the process
+ * holding both whole ledgers, every book, and the confirmation state. Warns on a
+ * sustained breach rather than a single sample, because a GC trough between
+ * samples is normal and the renderer guards already learned that lesson twice.
+ *
+ * This only reports. Nothing here kills or restarts the process: an unattended
+ * paper run that self-terminates on a memory reading loses its evidence, which
+ * is worse than the leak. The number is on the bridge status and the warn trace
+ * so a run can be judged on it afterwards.
+ */
+const MAIN_WORKING_SET_WARN_MB = 1_024;
+const MAIN_WORKING_SET_CONSECUTIVE_SAMPLES = 3;
+let mainWorkingSetBreaches = 0;
+let mainWorkingSetWarned = false;
+
+function observeMainWorkingSet(mainWorkingSetMb: number, now: number): void {
+  if (mainWorkingSetMb > MAIN_WORKING_SET_WARN_MB) {
+    mainWorkingSetBreaches += 1;
+    if (mainWorkingSetBreaches >= MAIN_WORKING_SET_CONSECUTIVE_SAMPLES && !mainWorkingSetWarned) {
+      mainWorkingSetWarned = true;
+      const usage = process.memoryUsage();
+      const message = `[nemesis] main process working set ${mainWorkingSetMb.toFixed(0)}MB over ${MAIN_WORKING_SET_WARN_MB}MB`
+        + ` for ${mainWorkingSetBreaches} consecutive samples`
+        + ` (heapUsed=${(usage.heapUsed / (1024 * 1024)).toFixed(0)}MB,`
+        + ` external=${(usage.external / (1024 * 1024)).toFixed(0)}MB,`
+        + ` confirmationStates=${entryConfirmationEngine?.pendingStateCount() ?? 'n/a'})`;
+      console.warn(message);
+      connectorWarnTrace.record({ at: now, connector: 'main-process', source: 'memory-guard', message });
+    }
+    return;
+  }
+  if (mainWorkingSetWarned) {
+    const message = `[nemesis] main process working set recovered to ${mainWorkingSetMb.toFixed(0)}MB`;
+    console.warn(message);
+    connectorWarnTrace.record({ at: now, connector: 'main-process', source: 'memory-guard', message });
+  }
+  mainWorkingSetBreaches = 0;
+  mainWorkingSetWarned = false;
+}
+
+/**
+ * Drops confirmation chains flow stopped feeding. Without this they are only
+ * ever removed from inside `observe()`, so a candidate flow moves on from holds
+ * a slot against `maxPendingCandidates` and pins its ticker in the orderbook
+ * tracking set forever: orphans reached 22 of 25 slots over seven hours.
+ */
+function sweepEntryConfirmationState(now = Date.now()): void {
+  const dropped = entryConfirmationEngine?.sweep(now) ?? 0;
+  if (dropped === 0) return;
+  const message = `[nemesis] swept ${dropped} stranded entry-confirmation chain(s);`
+    + ` ${entryConfirmationEngine.pendingStateCount()} still in flight`;
+  connectorWarnTrace.record({ at: now, connector: 'entry-confirmation', source: 'sweep', message });
+}
+
 function currentProcessTelemetry(now = Date.now()): Record<string, unknown> {
   const mainWorkingSetMb = Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3));
+  observeMainWorkingSet(mainWorkingSetMb, now);
   bridgeStatus.mainPid = process.pid;
   bridgeStatus.mainWorkingSetMb = mainWorkingSetMb;
   bridgeStatus.mainProcessSampledAt = now;
@@ -1094,19 +1185,30 @@ async function waitForFreshRendererProbe(timeoutMs = 30_000): Promise<boolean> {
   return false;
 }
 
+/**
+ * Bridge telemetry is diagnostic -- nothing replays it and no gate reads it --
+ * so only the recent tail matters. Unrotated it reached 406 MB on a single run.
+ * Bounded here at 4 x 32 MB.
+ */
+const bridgeTelemetryWriter = new RotatingJsonlWriter(BRIDGE_TELEMETRY_PATH, {
+  maxBytesPerFile: 32 * 1024 * 1024,
+  maxFiles: 3,
+});
+
 function persistBridgeTelemetry(event: string, detail: Record<string, unknown> = {}): void {
   try {
     ensureDataDir();
     refreshBridgeConnectivity();
-    fs.appendFileSync(BRIDGE_TELEMETRY_PATH, `${JSON.stringify({
-      at: Date.now(),
-      event,
-      ...bridgeStatus,
-      ...detail,
-    })}\n`, 'utf8');
   } catch (error) {
     console.error('[nemesis] bridge telemetry persistence failed', error);
+    return;
   }
+  bridgeTelemetryWriter.append({
+    at: Date.now(),
+    event,
+    ...bridgeStatus,
+    ...detail,
+  });
 }
 
 function ensureDataDir() {
@@ -1265,8 +1367,42 @@ function strategyConfigHash(): string {
   return buildStrategyConfigHash(settings, discovery.settings);
 }
 
+/**
+ * Warns when a ledger has grown past the point where replaying it is cheap.
+ *
+ * These are deliberately NOT compacted. Both are hash-chained append-only
+ * evidence: every event links to the previous one, so replaying all of them from
+ * the first is what proves the chain intact, and dropping or rewriting a prefix
+ * would forfeit exactly the integrity the paper test exists to produce. Safe
+ * compaction needs a signed-checkpoint design that does not exist yet, and is
+ * not worth inventing under a remediation pass.
+ *
+ * The supported mechanism is the operator archiving a completed run
+ * (`npm run paper:archive-reset -- ARCHIVE_AND_RESET_PAPER`, with the app
+ * stopped), which preserves the old chain in full and starts a new one. This
+ * warning exists so that decision is prompted by a number rather than by a
+ * startup that has become mysteriously slow.
+ */
+const LEDGER_SIZE_WARN_BYTES = 64 * 1024 * 1024;
+
+function warnOnLargeLedger(label: string, filePath: string): void {
+  let sizeBytes: number;
+  try {
+    sizeBytes = fs.statSync(filePath).size;
+  } catch {
+    return;
+  }
+  if (sizeBytes < LEDGER_SIZE_WARN_BYTES) return;
+  const message = `[nemesis] ${label} ledger is ${(sizeBytes / (1024 * 1024)).toFixed(0)}MB`
+    + ' and is replayed in full at every start; archive the completed run'
+    + ' (npm run paper:archive-reset -- ARCHIVE_AND_RESET_PAPER, app stopped) to start a fresh chain';
+  console.warn(message);
+  connectorWarnTrace.record({ at: Date.now(), connector: 'ledger', source: 'size-guard', message });
+}
+
 function initializePaperQualification(): void {
   const existed = fs.existsSync(PAPER_QUALIFICATION_PATH);
+  warnOnLargeLedger('paper-qualification', PAPER_QUALIFICATION_PATH);
   const portfolio = paperDesk.snapshot();
   qualificationStore = PaperQualificationStore.open(PAPER_QUALIFICATION_PATH, {
     startingCash: portfolio.startingCash,
@@ -1303,6 +1439,7 @@ function initializePaperQualification(): void {
 }
 
 function initializeStrategyValidation(): void {
+  warnOnLargeLedger('strategy-validation', STRATEGY_VALIDATION_PATH);
   strategyValidationStore = StrategyValidationStore.open(STRATEGY_VALIDATION_PATH, {
     stage: 'shadow',
     strategyConfigHash: strategyConfigHash(),
@@ -2186,6 +2323,39 @@ function finalizeCampaign(now: number): void {
     campaignFinalizationState = 'done';
     invalidateEvidenceAttempt(['unclean shutdown: GEA did not exit within 20 seconds'], Date.now(), false);
   }, 20_000);
+}
+
+/**
+ * Appends to the campaign ledger from a path nobody is awaiting.
+ *
+ * `SevenHourCampaignStore.record` throws on any persistence fault and latches
+ * itself closed. Called from a fire-and-forget worker or a sync diagnostic
+ * handler, that throw ends the process -- losing an unattended run, hours in, to
+ * a single disk hiccup, with nothing written down about why. The store has
+ * already refused the append, so the honest response is to stop producing
+ * evidence and say so, not to die.
+ */
+function recordCampaignEventSafely(
+  label: string,
+  mutation: Parameters<SevenHourCampaignStore['record']>[0],
+): boolean {
+  if (!campaignStore) return false;
+  try {
+    campaignStore.record(mutation);
+    return true;
+  } catch (error) {
+    campaignEvidencePaused = true;
+    const message = `[nemesis] campaign ledger append failed (${label}); evidence paused: `
+      + (error instanceof Error ? error.message : String(error));
+    console.error(message);
+    connectorWarnTrace.record({
+      at: Date.now(),
+      connector: 'campaign-store',
+      source: 'append-failure',
+      message,
+    });
+    return false;
+  }
 }
 
 function invalidateEvidenceAttempt(reasons: readonly string[], now: number, restartable = true): void {
@@ -4610,7 +4780,7 @@ async function evaluateCampaignConfirmations(tickerFilter?: ReadonlySet<string>)
           && !['book_unavailable', 'entry_confirmation_pending', 'execution_in_flight', 'campaign_runtime_paused'].includes(result.abortCode ?? '')
           && !['campaign_candidate_ready', 'campaign_candidate_terminal'].includes(result.abortCode ?? '')
         ) {
-          campaignStore.record((tracker) => tracker.terminalize(
+          recordCampaignEventSafely('confirmation-terminalize', (tracker) => tracker.terminalize(
             candidate.candidateId,
             'rejected',
             result.abortReason ?? result.error ?? 'campaign confirmation failed closed',
@@ -4636,7 +4806,7 @@ function recordDiagnosticFailure(
   completedAt: number,
   book?: KalshiOrderbook,
 ): void {
-  campaignStore?.record((tracker) => tracker.recordDiagnosticAttempt({
+  recordCampaignEventSafely('diagnostic-attempt', (tracker) => tracker.recordDiagnosticAttempt({
     diagnosticId,
     outcome,
     detail,
@@ -6859,6 +7029,28 @@ function createWindow(rendererRetryOrdinal = 0) {
   startupTrace('window-create-return');
 }
 
+/**
+ * One desktop per user-data directory, enforced by the OS rather than by
+ * convention. Two instances against the same `nemesis-data` both append to the
+ * paper-qualification and strategy-validation ledgers, interleaving two
+ * sequence streams into one file and corrupting both hash chains -- the exact
+ * evidence a paper run exists to produce. `HealthAttestationTracker` is not and
+ * never was this guard, despite having been called a lease.
+ *
+ * Exits before `whenReady`, so the second instance never opens a store.
+ */
+if (!app.requestSingleInstanceLock()) {
+  console.error('[nemesis] another NEMESIS desktop already owns this user-data directory; exiting');
+  app.exit(1);
+}
+
+app.on('second-instance', () => {
+  console.warn('[nemesis] refused a second desktop instance; focusing the running window');
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+});
+
 app.whenReady().then(async () => {
   startupTrace('ready');
   loadSettings();
@@ -7003,6 +7195,7 @@ app.whenReady().then(async () => {
     void evaluateCampaignDiagnostics();
     superviseOrderbookDataPlane();
     superviseTickerStream();
+    sweepEntryConfirmationState();
     broadcastToGea({ type: 'bridge:ping', payload: {} });
     recordCampaignOperationalTelemetry();
     broadcast('connectors:update', registry.getAll());

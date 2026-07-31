@@ -45,6 +45,8 @@ interface ConfirmationState {
   ticker: string;
   side: 'yes' | 'no';
   samples: ConfirmationSample[];
+  /** Wall time of the last `observe` that touched this state. Drives `sweep`. */
+  lastObservedAt: number;
 }
 
 export interface EntryConfirmationResult {
@@ -91,17 +93,75 @@ function absoluteBarFailure(
   return null;
 }
 
+/**
+ * Ceiling on remembered consumed sources. `usedSources` is append-only by
+ * design -- it is what stops one signal being entered twice -- so without a
+ * bound it grows for the life of the process. Eviction is oldest-first and this
+ * cap is orders of magnitude above the number of signals that can be live at
+ * once (`maxPendingCandidates` is single digits), so an evicted id is one no
+ * candidate could still be referencing. main.ts also re-seeds this set from the
+ * ledger on every start, so durable double-entry protection does not depend on
+ * it surviving in memory.
+ */
+export const MAX_REMEMBERED_USED_SOURCES = 20_000;
+
 export class EntryConfirmationEngine {
   private readonly states = new Map<string, ConfirmationState>();
-  /** Consumed source signal ids and economic identities (post-trade / shadow claim). */
+  /**
+   * Consumed source signal ids and economic identities (post-trade / shadow
+   * claim). Insertion-ordered and capped at MAX_REMEMBERED_USED_SOURCES.
+   */
   private readonly usedSources = new Set<string>();
   /** Maps a sourceSignalId to the state key it last belonged to. */
   private readonly sourceToStateKey = new Map<string, string>();
 
   constructor(private readonly settings: EntryQualificationSettings = DEFAULT_ENTRY_QUALIFICATION) {}
 
-  markSourceUsed(sourceSignalId: string): void {
+  private rememberUsedSource(sourceSignalId: string): void {
+    // Re-adding an existing key does not move it in a Set's insertion order, so
+    // delete first to keep the eviction order a true least-recently-marked.
+    this.usedSources.delete(sourceSignalId);
     this.usedSources.add(sourceSignalId);
+    while (this.usedSources.size > MAX_REMEMBERED_USED_SOURCES) {
+      const oldest = this.usedSources.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.usedSources.delete(oldest);
+    }
+  }
+
+  /**
+   * Drops confirmation chains nothing is feeding any more.
+   *
+   * A state was only ever removed from inside `observe()`, which requires flow
+   * to keep surfacing that same card. When flow moves on, the chain is stranded:
+   * it holds a slot against `maxPendingCandidates` and pins its ticker in the
+   * orderbook tracking set through `inFlightTickers()`, forever. Measured over
+   * seven hours on 2026-07-29: orphans grew from 3 to 22 of 25 tracking slots.
+   *
+   * `maxSourceAgeMs` is the right bound because it is the same one `observe`
+   * uses to declare a source too old to enter on -- a chain that has not been
+   * re-observed inside it could not confirm even if flow returned.
+   */
+  sweep(now = Date.now()): number {
+    const maxAgeMs = this.settings.maxSourceAgeMs;
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) return 0;
+    let dropped = 0;
+    for (const [key, state] of this.states) {
+      if (now - state.lastObservedAt <= maxAgeMs) continue;
+      this.states.delete(key);
+      this.sourceToStateKey.delete(state.sourceSignalId);
+      dropped += 1;
+    }
+    return dropped;
+  }
+
+  /** Confirmation chains currently held, for leak telemetry. */
+  pendingStateCount(): number {
+    return this.states.size;
+  }
+
+  markSourceUsed(sourceSignalId: string): void {
+    this.rememberUsedSource(sourceSignalId);
     const keysToClear = new Set<string>();
     const mappedKey = this.sourceToStateKey.get(sourceSignalId);
     if (mappedKey) keysToClear.add(mappedKey);
@@ -114,11 +174,13 @@ export class EntryConfirmationEngine {
     for (const key of keysToClear) {
       const state = this.states.get(key);
       if (state) {
-        this.usedSources.add(state.economicIdentity);
-        this.usedSources.add(state.sourceSignalId);
+        this.rememberUsedSource(state.economicIdentity);
+        this.rememberUsedSource(state.sourceSignalId);
+        this.sourceToStateKey.delete(state.sourceSignalId);
       }
       this.states.delete(key);
     }
+    this.sourceToStateKey.delete(sourceSignalId);
   }
 
   hasUsedSource(sourceSignalId: string): boolean {
@@ -178,6 +240,9 @@ export class EntryConfirmationEngine {
       ticker: input.ticker,
       side: input.side,
       samples,
+      // Restored evidence is only as fresh as its newest sample, so it ages out
+      // on the same clock as anything else rather than getting a free window.
+      lastObservedAt: samples.at(-1)?.at ?? Date.now(),
     });
     this.sourceToStateKey.set(input.sourceSignalId, input.candidateId);
   }
@@ -288,9 +353,11 @@ export class EntryConfirmationEngine {
         ticker: input.card.ticker,
         side: input.card.side,
         samples: [],
+        lastObservedAt: now,
       };
       this.states.set(candidateId, state);
     }
+    state.lastObservedAt = now;
     // Ticker/side/playbook/sourceMove are encoded in economicIdentity. A new
     // card.id for the same identity is a re-issued GEA signal — continue the
     // chain and adopt the latest id. A true identity change rejects.
