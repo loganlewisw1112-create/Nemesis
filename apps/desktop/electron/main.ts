@@ -63,6 +63,7 @@ import {
   scoreOpportunityForCard,
   HotOpportunityIndex,
   evaluateLiveUnlock,
+  evaluateStoredLiveAuthorization,
   kalshiFeeForOrder,
   isKnownKalshiFeePolicy,
   kalshiProductionCircuitSnapshot,
@@ -1384,6 +1385,9 @@ function strategyConfigHash(): string {
  * startup that has become mysteriously slow.
  */
 const LEDGER_SIZE_WARN_BYTES = 64 * 1024 * 1024;
+
+/** Confirmation an operator must type to clear an armed kill switch. */
+const KILL_SWITCH_CLEAR_CONFIRMATION = 'CLEAR KILL SWITCH';
 
 function warnOnLargeLedger(label: string, filePath: string): void {
   let sizeBytes: number;
@@ -2891,6 +2895,38 @@ function loadSettings() {
       demoMode: false,
       dryRun: true,
     });
+  }
+  enforceStoredLiveAuthorization();
+}
+
+/**
+ * Live trading survives a restart only if its certificate does.
+ *
+ * The staged unlock wizard runs ~30 evidence gates once and writes a
+ * certificate; nothing ever read it back. settings.json was trusted verbatim on
+ * every start, so a hand-edited `liveEnabled: true` inherited every gate's
+ * blessing without passing one, and the certificate's 24-hour expiry was written
+ * and never checked. Both are now enforced at load, before any window opens or
+ * any order path exists.
+ */
+function enforceStoredLiveAuthorization(now = Date.now()): void {
+  const authorization = evaluateStoredLiveAuthorization(settings, now);
+  if (authorization.ok) return;
+  const claimed = `liveEnabled=${settings.liveEnabled === true}, autoLiveEnabled=${settings.autoLiveEnabled === true}, stage=${settings.liveStage ?? 'paper'}`;
+  settings = normalizeGuardrailSettings({
+    ...settings,
+    liveUnlockCertificate: undefined,
+    liveEnabled: false,
+    autoLiveEnabled: false,
+    liveStage: 'paper',
+    dryRun: true,
+  });
+  const message = `[nemesis] refused stored live settings (${claimed}); forced back to paper: ${authorization.blockers.join('; ')}`;
+  console.warn(message);
+  try {
+    connectorWarnTrace.record({ at: now, connector: 'live-unlock', source: 'stored-authorization', message });
+  } catch {
+    // Load runs before the trace writer is guaranteed; the console line stands.
   }
 }
 
@@ -6348,9 +6384,31 @@ function setupIpc() {
     if (partial.liveEnabled) {
       return { ok: false, error: 'Use the staged live unlock wizard; credentials alone cannot enable live trading' };
     }
-    const legacyCredentialPayload = partial as Partial<GuardrailSettings> & { kalshiPrivateKey?: unknown };
+    const legacyCredentialPayload = partial as Partial<GuardrailSettings> & {
+      kalshiPrivateKey?: unknown;
+      killSwitchConfirmation?: unknown;
+    };
     if (legacyCredentialPayload.kalshiPrivateKey !== undefined) {
       return { ok: false, error: 'Private keys must be saved through encrypted credential storage' };
+    }
+    // Arming the kill switch is always allowed and never needs a confirmation --
+    // it only ever makes the system safer. Clearing it is the dangerous
+    // direction, and it was a plain boolean in a settings patch: the same
+    // one-field update that changes a display preference could re-arm trading.
+    // Setting it now takes the same deliberate confirmation the live unlock does.
+    if (partial.killSwitchActive === false && settings.killSwitchActive) {
+      if (legacyCredentialPayload.killSwitchConfirmation !== KILL_SWITCH_CLEAR_CONFIRMATION) {
+        return {
+          ok: false,
+          error: `Type ${KILL_SWITCH_CLEAR_CONFIRMATION} to clear the kill switch`,
+        };
+      }
+      auditLog.append({
+        action: 'gate_block',
+        detail: 'kill switch cleared by explicit operator confirmation',
+        ok: true,
+      });
+      saveAuditLog();
     }
     const riskOverride = settings.liveEnabled && isRiskSettingOverride(partial);
     const credentialChange = partial.kalshiApiKeyId !== undefined;
@@ -6535,6 +6593,18 @@ function setupIpc() {
     if (mutationLock) return { ok: false, error: mutationLock };
     if (!settings.liveEnabled) return { ok: false, error: 'live trading not enabled' };
     if (settings.killSwitchActive) return { ok: false, error: 'kill switch active' };
+    // dryRun named a mode it did not enforce: the live order path ignored it
+    // entirely, so a run every other surface reported as dry could still place a
+    // real order. It is the last flag an operator would expect to be decorative.
+    if (settings.dryRun) return { ok: false, error: 'dry run is enabled; no live order will be placed' };
+    // The certificate expires 24 hours after it was issued, and this process can
+    // outlive that. Re-check at the order itself, not only at load.
+    const authorization = evaluateStoredLiveAuthorization(settings, Date.now());
+    if (!authorization.ok) {
+      enforceStoredLiveAuthorization();
+      broadcast('settings:update', settings);
+      return { ok: false, error: `live unlock is no longer valid: ${authorization.blockers.join('; ')}` };
+    }
     const creds = getLiveCreds();
     if (!creds) return { ok: false, error: 'Kalshi credentials not configured' };
     const card = theses.find((t) => t.id === thesisId);

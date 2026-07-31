@@ -76,7 +76,85 @@ export interface LiveUnlockEvaluation {
   certificate?: LiveUnlockCertificate;
 }
 
-const CERTIFICATE_TTL_MS = 24 * 60 * 60 * 1000;
+export const CERTIFICATE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Tolerance for a certificate issued a moment ahead of the reader's clock. */
+const CERTIFICATE_CLOCK_SKEW_MS = 60_000;
+
+export interface StoredLiveSettings {
+  liveEnabled?: boolean;
+  autoLiveEnabled?: boolean;
+  liveStage?: 'paper' | 'manual-live' | 'auto-live';
+  liveUnlockCertificate?: LiveUnlockCertificate;
+}
+
+export interface StoredLiveAuthorization {
+  /** True when the live flags in these settings are backed by a valid certificate. */
+  ok: boolean;
+  blockers: string[];
+}
+
+/**
+ * Re-checks, against a settings object that has just been read from disk, that
+ * whatever live trading it claims is actually backed by a live certificate.
+ *
+ * `evaluateLiveUnlock` runs the roughly thirty evidence gates once, at unlock
+ * time, and writes a certificate. Nothing ever looked at that certificate again:
+ * settings.json was trusted verbatim on every subsequent start, so a hand-edited
+ * `liveEnabled: true` inherited every gate's blessing without passing any of
+ * them, and the 24-hour `expiresAt` was written and never read.
+ *
+ * This closes the "edited a flag" path and enforces the TTL. It is deliberately
+ * NOT a cryptographic check: someone who fabricates a whole well-formed,
+ * unexpired certificate by hand still gets through, and closing that needs a
+ * signing key this system does not have yet. The gap it removes is the realistic
+ * one -- flipping a boolean in a JSON file.
+ */
+export function evaluateStoredLiveAuthorization(
+  settings: StoredLiveSettings,
+  now: number,
+): StoredLiveAuthorization {
+  const claimsLive = settings.liveEnabled === true || settings.autoLiveEnabled === true;
+  const stage = settings.liveStage ?? 'paper';
+  const blockers: string[] = [];
+
+  if (!claimsLive && stage === 'paper') return { ok: true, blockers };
+  if (!claimsLive) {
+    // A non-paper stage with live disabled is inert, but only if it is backed.
+    // Fall through to the same certificate checks rather than trusting it.
+  }
+
+  const certificate = settings.liveUnlockCertificate;
+  if (!certificate) {
+    blockers.push('live settings carry no unlock certificate');
+    return { ok: false, blockers };
+  }
+  if (certificate.stage !== 'manual-live' && certificate.stage !== 'auto-live') {
+    blockers.push(`unlock certificate names an unknown stage: ${String(certificate.stage)}`);
+  }
+  if (stage !== certificate.stage) {
+    blockers.push(`live stage ${stage} does not match the certificate stage ${String(certificate.stage)}`);
+  }
+  if (settings.autoLiveEnabled === true && certificate.stage !== 'auto-live') {
+    blockers.push('auto live is enabled on a certificate that only unlocked manual live');
+  }
+  if (!Number.isFinite(certificate.issuedAt) || !Number.isFinite(certificate.expiresAt)) {
+    blockers.push('unlock certificate has a malformed issuedAt or expiresAt');
+    return { ok: false, blockers };
+  }
+  if (certificate.issuedAt > now + CERTIFICATE_CLOCK_SKEW_MS) {
+    blockers.push('unlock certificate is issued in the future');
+  }
+  if (certificate.expiresAt <= now) {
+    blockers.push('unlock certificate has expired');
+  }
+  // A hand-written expiry years out would otherwise satisfy the check above.
+  if (certificate.expiresAt - certificate.issuedAt > CERTIFICATE_TTL_MS + CERTIFICATE_CLOCK_SKEW_MS) {
+    blockers.push('unlock certificate lifetime exceeds the 24-hour maximum');
+  }
+
+  return { ok: blockers.length === 0, blockers };
+}
 
 function addPaperBlockers(input: LiveUnlockInput, blockers: string[]) {
   if (!input.hasCredentials) blockers.push('Kalshi credentials not configured');
