@@ -97,6 +97,15 @@ export type OrderbookSupervisionAction =
   | 'reconnect-connect-timeout'
   | 'heartbeat-restarted'
   | 'stream-restarted'
+  /**
+   * A supervised attempt called `connect()` and got no socket back — the
+   * headers provider returned null, or the endpoint policy is empty. Real and
+   * worth a durable line (it is what a rejected API key looks like from here),
+   * but recovery is still owned: the supervisor's own backoff is armed and will
+   * try again. Distinct from `invariant-violation` so it cannot fail the gate
+   * that exists to catch an unrecoverable stream.
+   */
+  | 'connect-produced-no-socket'
   | 'invariant-violation';
 
 export interface OrderbookSupervisionResult {
@@ -347,6 +356,8 @@ export class KalshiOrderbookStream {
     return action === 'reconnect-silent'
       || action === 'reconnect-dead-socket'
       || action === 'reconnect-connect-timeout'
+      // A connect that produced no socket was still an attempt.
+      || action === 'connect-produced-no-socket'
       || action === 'stream-restarted';
   }
 
@@ -1433,6 +1444,20 @@ export class KalshiOrderbookStream {
       `order-book data-plane supervisor reconnecting (${action}): ${reason}; next supervised attempt in ${backoffMs}ms`,
     );
     this.connect();
+    const produced = this.socketState();
+    if (produced === 'none' || produced === 'closed') {
+      // connect() returned without installing a socket: no headers, or no
+      // endpoint in the environment policy. The backoff is already armed, so
+      // this is a diagnostic, not a lost stream.
+      this.registry.recordWarn(
+        'kalshi-orderbook-ws',
+        `order-book supervised connect produced no socket (${reason}); retrying in ${backoffMs}ms`,
+      );
+      return this.checkSupervisionInvariant(
+        now,
+        this.finishSupervision(now, 'connect-produced-no-socket', reason, backoffMs),
+      );
+    }
     return this.checkSupervisionInvariant(now, this.finishSupervision(now, action, reason, backoffMs));
   }
 
@@ -1476,11 +1501,20 @@ export class KalshiOrderbookStream {
    * Tripwire for the next variant of the 2026-07-26 bug: a started stream that
    * is not open, has no reconnect armed and no connect in flight has nobody who
    * can revive it. Reported once per supervised attempt so it cannot spam.
+   *
+   * The supervisor's own pending attempt counts as ownership. Without that, this
+   * fired on every backoff wait — 2026-07-31 saw it report a violation while the
+   * supervisor was holding a timer with 55 seconds still to run, which both
+   * diluted the signal and failed the Phase 4 gate that exists to catch a stream
+   * nothing can revive. An attempt that produces no socket is reported as
+   * `connect-produced-no-socket` instead; this stays for the case where nothing
+   * whatsoever is arranged.
    */
   private checkSupervisionInvariant(now: number, result: OrderbookSupervisionResult): OrderbookSupervisionResult {
     if (!this.started) return result;
     const state = this.socketState();
     if (state === 'open' || state === 'connecting' || this.reconnectTimer != null) return result;
+    if (this.supervisorNextAttemptAt != null) return result;
     if (this.supervisionInvariantReported) return result;
     this.supervisionInvariantReported = true;
     const reason = `started stream has socketState=${state} with no reconnect scheduled and no connect in flight`;

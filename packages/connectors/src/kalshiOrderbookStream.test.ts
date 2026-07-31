@@ -1098,39 +1098,76 @@ describe('KalshiOrderbookStream', () => {
       const stream = new KalshiOrderbookStream(registry, () => null);
       Object.assign(stream as unknown as Record<string, unknown>, { started: true });
 
-      expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'reconnect-dead-socket' });
+      // A connect that installs no socket is real and worth a durable line -- it
+      // is what a rejected API key looks like from in here -- but recovery is
+      // still owned by the backoff just armed, so it is NOT an invariant breach.
+      expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'connect-produced-no-socket' });
       expect(stream.socketState()).toBe('none');
-      expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-orderbook-ws' && /invariant violated/.test(detail)))
+      expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-orderbook-ws' && /produced no socket/.test(detail)))
         .toBe(true);
-      // Reported once per supervised attempt, so it can never spam the ledger.
+      expect(warn.mock.calls.some(([, detail]) => /invariant violated/.test(detail))).toBe(false);
       const warnsAfterFirst = warn.mock.calls.length;
       expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'none', reason: 'supervisor backoff pending' });
       expect(warn.mock.calls).toHaveLength(warnsAfterFirst);
       // The supervisor still keeps retrying rather than latching off.
       expect(stream.superviseDataPlane(at + ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS))
-        .toMatchObject({ action: 'reconnect-dead-socket' });
+        .toMatchObject({ action: 'connect-produced-no-socket' });
       stream.stop();
     });
 
-    it('returns invariant-violation when a socket vanishes with nothing armed to bring it back', () => {
+    it('does not call a pending supervisor backoff an invariant violation', () => {
+      // Regression for 2026-07-31: this fired while the supervisor held a timer
+      // with 55s still to run, which diluted the tripwire and failed the Phase 4
+      // gate that exists to catch a stream nothing can revive.
       vi.useFakeTimers();
       const at = 1_700_020_000_000;
       vi.setSystemTime(at);
       const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const warn = vi.spyOn(ConnectorRegistry.prototype, 'recordWarn');
       Object.assign(stream as unknown as Record<string, unknown>, { started: true, socket: null });
       stubConnect(stream);
 
       expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'reconnect-dead-socket' });
-      // The attempt is in flight, so the invariant holds.
       expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'none', reason: 'connect in flight' });
 
-      // Socket disappears mid-backoff with no timer armed: the tripwire state.
+      // The attempt dies mid-backoff. Recovery is still owned: the supervisor
+      // will try again when its own timer comes due.
       killSocket(stream);
-      const violation = stream.superviseDataPlane(at + 2);
-      expect(violation.action).toBe('invariant-violation');
-      expect(violation.reason).toContain('no reconnect scheduled');
-      expect(violation.nextAttemptInMs).toBe(ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS - 2);
-      expect(stream.superviseDataPlane(at + 3)).toMatchObject({ action: 'none' });
+      expect(stream.superviseDataPlane(at + 2)).toMatchObject({
+        action: 'none',
+        reason: 'supervisor backoff pending',
+        nextAttemptInMs: ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS - 2,
+      });
+      expect(warn.mock.calls.some(([, detail]) => /invariant violated/.test(detail))).toBe(false);
+      // And it does try again.
+      expect(stream.superviseDataPlane(at + ORDERBOOK_SUPERVISOR_BASE_BACKOFF_MS))
+        .toMatchObject({ action: 'reconnect-dead-socket' });
+      stream.stop();
+    });
+
+    it('still trips when nothing whatsoever is arranged', () => {
+      vi.useFakeTimers();
+      const at = 1_700_021_000_000;
+      vi.setSystemTime(at);
+      const stream = new KalshiOrderbookStream(new ConnectorRegistry(), () => ({ authorization: 'test' }));
+      const warn = vi.spyOn(ConnectorRegistry.prototype, 'recordWarn');
+      // Started, no socket, no reconnect timer, and no supervised attempt ever
+      // scheduled -- the 2026-07-26 terminal condition itself.
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        started: true,
+        socket: null,
+        reconnectTimer: null,
+        supervisorNextAttemptAt: null,
+      });
+      vi.spyOn(stream as unknown as { connect(): void }, 'connect').mockImplementation(() => {});
+      const result = (stream as unknown as {
+        checkSupervisionInvariant(now: number, r: unknown): { action: string; reason: string | null };
+      }).checkSupervisionInvariant(at, { action: 'none', reason: null, nextAttemptInMs: null });
+
+      expect(result.action).toBe('invariant-violation');
+      expect(result.reason).toContain('no reconnect scheduled');
+      expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-orderbook-ws' && /invariant violated/.test(detail)))
+        .toBe(true);
       stream.stop();
     });
   });

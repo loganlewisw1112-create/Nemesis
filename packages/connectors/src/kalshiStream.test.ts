@@ -493,10 +493,10 @@ describe('KalshiStream data-plane supervisor', () => {
       action: 'reconnect-dead-socket',
       nextAttemptInMs: TICKER_SUPERVISOR_BASE_BACKOFF_MS,
     });
-    // The attempt dies without opening or closing, so nothing is armed. The
-    // tripwire says so once, and the backoff still holds the next attempt back.
+    // The attempt dies without opening or closing. Recovery is still owned by
+    // the backoff the supervisor just armed, so this is not a tripwire state.
     Object.assign(stream as unknown as Record<string, unknown>, { socket: null, connectAttemptStartedAt: null });
-    expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'invariant-violation' });
+    expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'none', reason: 'supervisor backoff pending' });
     expect(stream.superviseDataPlane(at + 2)).toMatchObject({ action: 'none', reason: 'supervisor backoff pending' });
     expect(spy).toHaveBeenCalledTimes(1);
 
@@ -547,7 +547,11 @@ describe('KalshiStream data-plane supervisor', () => {
     stream.stop();
   });
 
-  it('warns on the tripwire when a supervised attempt cannot even open a socket', () => {
+  it('reports a supervised connect that produced no socket, without calling it an invariant breach', () => {
+    // This is what a rejected API key looks like from in here: connect() returns
+    // early, no socket is installed. Worth a durable line -- it named the live
+    // 403 on 2026-07-31 inside a minute -- but recovery is still owned by the
+    // backoff just armed, so it must not fail the unrecoverable-stream gate.
     const at = 1_700_006_000_000;
     vi.setSystemTime(at);
     const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
@@ -558,13 +562,37 @@ describe('KalshiStream data-plane supervisor', () => {
     vi.spyOn(stream as unknown as { connect(): void }, 'connect').mockImplementation(() => {});
     Object.assign(stream as unknown as Record<string, unknown>, { socket: null, connectAttemptStartedAt: null });
 
-    expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'reconnect-dead-socket' });
-    expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-ticker-ws' && /invariant violated/.test(detail)))
+    expect(stream.superviseDataPlane(at)).toMatchObject({ action: 'connect-produced-no-socket' });
+    expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-ticker-ws' && /produced no socket/.test(detail)))
       .toBe(true);
+    expect(warn.mock.calls.some(([, detail]) => /invariant violated/.test(detail))).toBe(false);
     const warnsAfterFirst = warn.mock.calls.length;
-    // Reported once per supervised attempt, so it can never spam the ledger.
+    // Backoff still holds the next attempt back, and nothing spams the ledger.
     expect(stream.superviseDataPlane(at + 1)).toMatchObject({ action: 'none', reason: 'supervisor backoff pending' });
     expect(warn.mock.calls.length).toBe(warnsAfterFirst);
+    stream.stop();
+  });
+
+  it('still trips when nothing whatsoever is arranged', () => {
+    const at = 1_700_007_000_000;
+    vi.setSystemTime(at);
+    const stream = new KalshiStream(new ConnectorRegistry(), () => ({ Authorization: 'test' }));
+    const warn = vi.spyOn(ConnectorRegistry.prototype, 'recordWarn');
+    const { internals } = primeCurrentGeneration(stream, []);
+    internals.started = true;
+    Object.assign(stream as unknown as Record<string, unknown>, {
+      socket: null,
+      reconnectTimer: null,
+      supervisorNextAttemptAt: null,
+    });
+    const result = (stream as unknown as {
+      checkSupervisionInvariant(now: number, r: unknown): { action: string; reason: string | null };
+    }).checkSupervisionInvariant(at, { action: 'none', reason: null, nextAttemptInMs: null });
+
+    expect(result.action).toBe('invariant-violation');
+    expect(result.reason).toContain('no reconnect scheduled');
+    expect(warn.mock.calls.some(([id, detail]) => id === 'kalshi-ticker-ws' && /invariant violated/.test(detail)))
+      .toBe(true);
     stream.stop();
   });
 });
