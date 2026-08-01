@@ -441,6 +441,15 @@ export interface CryptoThesisContext {
 export interface ModelCalibrationEvidence {
   /** Total volatility the model priced with. */
   sigmaT?: number;
+  /**
+   * The two factors `sigmaT` is the product of. Recorded separately because
+   * `sigmaT` alone cannot be judged: a tiny value is correct for a contract
+   * seconds from expiry and badly wrong for one hours out, and those need
+   * opposite responses. Persisting only the product left exactly that question
+   * unanswerable on 2026-07-31.
+   */
+  sigmaPerRootSec?: number;
+  timeToExpirySec?: number;
   /** See `CryptoThesisContext.ladderQuoteCount`. */
   ladderQuoteCount: number;
   /** Quotes surviving into the regression; absent when no fit was obtainable. */

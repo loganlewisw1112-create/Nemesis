@@ -53,6 +53,40 @@ describe('fitLadderImpliedVol', () => {
     }
   });
 
+  it('starves on a thin sample of a wide ladder that fits whole [production dormancy]', () => {
+    // The defect measured 2026-07-31: the caller passed the depth-filtered signal
+    // slice instead of the market set, so the model saw 8 strikes of an 80-strike
+    // ladder and produced 0 fits across 23 confirmations — every one of which HAD
+    // reached the model. The gate was not mis-tuned, it was starved.
+    //
+    // The mechanism is the interaction of ladder width with sigma, not the raw
+    // count. A venue lists strikes far past the distribution: at the measured
+    // sigmaT of 0.0095 on spot 62,998, one sigma is ~$600, so a ladder spanning
+    // 53k-73k is +/-16 sigma and only ~11 of its 80 quotes sit off the rails.
+    // Sample 8 of those 80 and you almost surely draw fewer than the 3 the
+    // regression needs.
+    const sigmaT = 0.009542;
+    const spot = 62_998;
+    const strikes = Array.from({ length: 80 }, (_unused, i) => 53_000 + i * 250);
+    const whole = lognormalLadder(sigmaT, strikes, spot);
+
+    const usableWhole = whole.filter((q) => q.marketPrice >= 0.02 && q.marketPrice <= 0.98);
+    // Matches the live ladder: 80 quotes, a small minority of them informative.
+    expect(usableWhole.length).toBeLessThan(20);
+    const fitWhole = fitLadderImpliedVol(spot, whole);
+    expect(fitWhole).not.toBeNull();
+    expect(fitWhole!.sigmaT).toBeCloseTo(sigmaT, 4);
+
+    // Every evenly-spaced 8-strike sample of that same ladder starves.
+    let starved = 0;
+    for (let offset = 0; offset < 10; offset += 1) {
+      const sample = whole.filter((_unused, i) => i % 10 === offset);
+      expect(sample).toHaveLength(8);
+      if (fitLadderImpliedVol(spot, sample) === null) starved += 1;
+    }
+    expect(starved).toBe(10);
+  });
+
   it('reports no fit when a fixed-width ladder pins at the rails', () => {
     // Near expiry the distribution collapses inside one strike increment, so the
     // ladder carries no information about volatility. Saying so beats inventing a

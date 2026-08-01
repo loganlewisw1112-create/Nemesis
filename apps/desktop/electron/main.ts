@@ -3982,6 +3982,8 @@ function modelCalibrationFor(card: ThesisCard): ModelCalibrationEvidence | undef
   if (!context) return undefined;
   return {
     sigmaT: context.sigmaT,
+    sigmaPerRootSec: context.sigmaPerRootSec,
+    timeToExpirySec: context.timeToExpirySec,
     ladderQuoteCount: context.ladderQuoteCount ?? 0,
     ladderPoints: context.ladderPoints,
     ladderSigmaT: context.ladderSigmaT,
@@ -5749,6 +5751,26 @@ async function refreshUniverseLoop() {
 const runMarketRefresh = createSingleFlight(refreshMarkets);
 const runUniverseRefresh = createSingleFlight(refreshUniverseLoop);
 
+/**
+ * Groups every crypto market by underlying and expiry into the strike ladders the
+ * volatility calibration reads. Keyed the same way the cards look them up, so a
+ * card gets its own siblings and nothing else.
+ */
+function buildCryptoLadders(markets: KalshiMarket[]): Map<string, LadderQuote[]> {
+  const ladders = new Map<string, LadderQuote[]>();
+  for (const market of markets) {
+    if (!isCryptoMarket(market)) continue;
+    const price = normalizeMarketPrice(market);
+    const cx = feedHub.cryptoInputFor(market, price);
+    if (!Number.isFinite(cx.strike) || cx.strike <= 0) continue;
+    const key = `${cx.symbol}|${market.close_time ?? ''}`;
+    const quotes = ladders.get(key);
+    if (quotes) quotes.push({ strike: cx.strike, marketPrice: price });
+    else ladders.set(key, [{ strike: cx.strike, marketPrice: price }]);
+  }
+  return ladders;
+}
+
 async function buildThesesFromMarkets(markets: KalshiMarket[]) {
   // Single choke point for the series allowlist. The discovery universe is
   // already filtered, but candidates also arrive via the marketsCache fallback,
@@ -5785,22 +5807,24 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
     }),
   );
 
-  // Every strike quoted on one underlying at one expiry, so crypto-lead can read
-  // the market's own volatility off the ladder and refuse to signal when its
-  // model disagrees with it. Built once per refresh rather than per card: the
-  // whole slice is already in hand, and each card needs its siblings, not itself.
   const cryptoInputs = new Map<string, ReturnType<typeof feedHub.cryptoInputFor>>();
-  const cryptoLadders = new Map<string, LadderQuote[]>();
   for (const { m, p } of micro) {
     if (!isCryptoMarket(m)) continue;
-    const cx = feedHub.cryptoInputFor(m, p);
-    cryptoInputs.set(m.ticker, cx);
-    if (!Number.isFinite(cx.strike) || cx.strike <= 0) continue;
-    const key = `${cx.symbol}|${m.close_time ?? ''}`;
-    const ladder = cryptoLadders.get(key);
-    if (ladder) ladder.push({ strike: cx.strike, marketPrice: p });
-    else cryptoLadders.set(key, [{ strike: cx.strike, marketPrice: p }]);
+    cryptoInputs.set(m.ticker, feedHub.cryptoInputFor(m, p));
   }
+  // Every strike quoted on one underlying at one expiry, so crypto-lead can read
+  // the market's own volatility off the ladder and refuse to signal when its model
+  // disagrees with it.
+  //
+  // Built from the widest market set available, NOT from `slice`. The ladder is
+  // reference data for calibration, not a list of trading candidates, and `slice`
+  // is `getMarketsForSignals()` — depth-filtered and capped at 75. Measured
+  // 2026-07-31: sourced from the slice the model saw 8 strikes where the live
+  // ladder holds 50-80, so the fit never cleared its 3-point minimum and the gate
+  // was dormant in production — 0 fits across 23 confirmations, every one of which
+  // had reached the model. A calibration check that cannot see the ladder is not a
+  // check.
+  const cryptoLadders = buildCryptoLadders(marketsCache.length > 0 ? marketsCache : slice);
 
   for (const { m, p, spread, depthUsd } of micro) {
     if (isWeatherMarket(m)) {

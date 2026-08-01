@@ -367,9 +367,24 @@ if (args.includes('--json')) {
       .filter((r) => Number.isFinite(r))
       .sort((a, b) => a - b);
     const outOfBand = ratios.filter((r) => r < 0.5 || r > 1.5);
+    const quoteCounts = calibrated.map((c) => c.modelCalibration.ladderQuoteCount || 0).sort((a, b) => a - b);
+    // sigmaT is meaningless without its factors: tiny is correct near expiry and
+    // wrong hours out. Annualise so the number can be compared to a real vol.
+    const annual = calibrated
+      .map((c) => c.modelCalibration)
+      .filter((m) => Number.isFinite(m.sigmaPerRootSec))
+      .map((m) => m.sigmaPerRootSec * Math.sqrt(365 * 24 * 3600))
+      .sort((a, b) => a - b);
     line('confirmations carrying calibration', `${calibrated.length} of ${confirmations.length}`);
     line('  ladder reached the model', `${withLadder.length} (${pct(withLadder.length, calibrated.length)})`);
+    line('  ladder quotes supplied (min/median/max)',
+      `${quoteCounts[0]} / ${quoteCounts[Math.floor(quoteCounts.length / 2)]} / ${quoteCounts[quoteCounts.length - 1]}`);
     line('  ladder produced a fit', `${fitted.length} (${pct(fitted.length, calibrated.length)})`);
+    if (annual.length > 0) {
+      line('  model vol, annualised (min/median/max)',
+        `${(annual[0] * 100).toFixed(1)}% / ${(annual[Math.floor(annual.length / 2)] * 100).toFixed(1)}%`
+        + ` / ${(annual[annual.length - 1] * 100).toFixed(1)}%`);
+    }
     if (ratios.length > 0) {
       line('  median model/ladder sigma ratio', ratios[Math.floor(ratios.length / 2)].toFixed(3));
       line('  ratio range', `${ratios[0].toFixed(3)} – ${ratios[ratios.length - 1].toFixed(3)}`);
