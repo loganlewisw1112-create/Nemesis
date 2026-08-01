@@ -145,6 +145,15 @@ const stickyFailures = new Set<KalshiTransportFailureClass>([
 
 export class KalshiProductionConnectionController {
   private endpointIndex = 0;
+  /**
+   * Endpoints that have answered a sticky auth failure since the last time this
+   * controller reached a working socket. A 403 is ambiguous — it is what a
+   * revoked key looks like, and equally what a decommissioned host looks like —
+   * so the two are told apart by evidence rather than guessed at: try each
+   * configured endpoint once, and only conclude "the credential is bad" when
+   * every one of them has said so.
+   */
+  private stickyExhaustedEndpoints = new Set<string>();
   private generation = 0;
   private attemptCounter = 0;
   private attemptId: string | null = null;
@@ -261,9 +270,23 @@ export class KalshiProductionConnectionController {
     this.pongReceived = false;
     this.exchangeDataReceived = false;
 
-    const retry = failure.retryable && !failure.sticky;
-    const rotateEndpoint = retry && failure.rotateEndpoint && this.endpoints.length > 1;
-    if (rotateEndpoint) this.endpointIndex = (this.endpointIndex + 1) % this.endpoints.length;
+    // A sticky auth failure is only conclusive once every configured endpoint has
+    // produced one. Until then it is indistinguishable from a dead host, so keep
+    // exploring: rotate to an endpoint that has not answered yet and try there.
+    // Measured 2026-07-31: `external-api-ws.kalshi.com` returned 403 to anonymous
+    // requests on a public endpoint — decommissioned, not authenticating — while
+    // `api.elections.kalshi.com` was live. Going sticky on the first 403 meant a
+    // configured, working fallback was never reached, and a host migration read
+    // as a credential problem.
+    if (failure.sticky && this.failedEndpoint) this.stickyExhaustedEndpoints.add(this.failedEndpoint);
+    const unexploredStickyEndpoint = failure.sticky
+      ? this.nextUnexploredEndpointIndex()
+      : null;
+    const retry = (failure.retryable && !failure.sticky) || unexploredStickyEndpoint != null;
+    const rotateEndpoint = unexploredStickyEndpoint != null
+      || (retry && failure.rotateEndpoint && this.endpoints.length > 1);
+    if (unexploredStickyEndpoint != null) this.endpointIndex = unexploredStickyEndpoint;
+    else if (rotateEndpoint) this.endpointIndex = (this.endpointIndex + 1) % this.endpoints.length;
     this.nextEndpoint = retry ? this.currentEndpoint() : null;
     this.switchReason = rotateEndpoint ? failure.classification : null;
     if (!retry) {
@@ -279,7 +302,11 @@ export class KalshiProductionConnectionController {
       : this.reconnectDelayMs;
     const jitter = Math.round(minimumDelay * this.jitterRatio * Math.max(0, Math.min(1, this.random())));
     const proposedRetryAt = this.now() + minimumDelay + jitter;
-    const reservedRetryAt = this.coordinateRetries
+    // The shared coordinator spaces out *health* retries across streams against a
+    // rate-limited host. Asking one other endpoint once whether it also rejects
+    // this credential is neither a health probe nor load worth budgeting, so it
+    // does not draw from that budget or disturb the breaker's state.
+    const reservedRetryAt = this.coordinateRetries && unexploredStickyEndpoint == null
       ? reserveKalshiProductionRetry(this.environment, proposedRetryAt, this.attemptPrefix)
       : proposedRetryAt;
     this.nextRetryAt = reservedRetryAt;
@@ -317,8 +344,27 @@ export class KalshiProductionConnectionController {
     return generation === this.generation && this.attemptId != null;
   }
 
+  /**
+   * Index of a configured endpoint that has not yet answered a sticky auth
+   * failure since the last working socket, or null when every one of them has.
+   * Pure: the caller marks the failed endpoint before asking.
+   */
+  private nextUnexploredEndpointIndex(): number | null {
+    if (this.endpoints.length <= 1) return null;
+    for (let offset = 1; offset <= this.endpoints.length; offset += 1) {
+      const index = (this.endpointIndex + offset) % this.endpoints.length;
+      const endpoint = this.endpoints[index];
+      if (endpoint && !this.stickyExhaustedEndpoints.has(endpoint)) return index;
+    }
+    return null;
+  }
+
   private tryResetBackoff(): void {
     if (!this.subscriptionAcknowledged || !this.pongReceived || !this.exchangeDataReceived) return;
+    // This endpoint demonstrably works, so any earlier auth rejections stop
+    // counting: a later 403 gets a fresh round of exploration rather than
+    // inheriting a verdict from before the connection that just succeeded.
+    this.stickyExhaustedEndpoints.clear();
     this.reconnectDelayMs = this.baseDelayMs;
     this.failure = null;
     this.nextRetryAt = null;

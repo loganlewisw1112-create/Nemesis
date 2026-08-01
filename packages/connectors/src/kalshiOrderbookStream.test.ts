@@ -785,10 +785,20 @@ describe('KalshiOrderbookStream', () => {
       });
       const { spy } = stubConnect(stream);
 
-      // 1008 + "invalid credentials" classifies as sticky `authentication`, so
-      // recordFailure returns noRetry() — the exact absorbing dead end.
-      (stream as unknown as { handleSocketClose(s: WebSocket, g: number, c: number, r: Buffer): void })
-        .handleSocketClose(socket as unknown as WebSocket, attempt.generation, 1008, Buffer.from('invalid credentials'));
+      // 1008 + "invalid credentials" classifies as sticky `authentication`. The
+      // first one rotates to the other configured endpoint to find out whether
+      // that host rejects the credential too, so the dead end is only reached
+      // once every endpoint has answered. Exhaust them.
+      const closeSticky = (generation: number, s = socket) =>
+        (stream as unknown as { handleSocketClose(s: WebSocket, g: number, c: number, r: Buffer): void })
+          .handleSocketClose(s as unknown as WebSocket, generation, 1008, Buffer.from('invalid credentials'));
+
+      closeSticky(attempt.generation);
+      const exploring = controllerOf(stream).beginAttempt()!;
+      Object.assign(stream as unknown as Record<string, unknown>, {
+        socket, generation: exploring.generation, reconnectTimer: null,
+      });
+      closeSticky(exploring.generation);
 
       expect(stream.socketState()).toBe('none');
       expect(stream.telemetry(closedAt)).toMatchObject({

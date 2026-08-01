@@ -78,13 +78,54 @@ describe('KalshiProductionConnectionController', () => {
     expect(decision).toMatchObject({ retry: true, rotateEndpoint: false, delayMs: 4_000 });
     expect(rateLimited.telemetry().nextEndpoint).toBe(endpoints[0]);
 
+    // A sticky auth rejection is only conclusive once every configured endpoint
+    // has produced one. A 403 from a decommissioned host is indistinguishable
+    // from a revoked key on the first response, so each endpoint gets asked once
+    // before the credential is blamed (2026-07-31: external-api-ws.kalshi.com
+    // answered 403 to anonymous public requests while the alias was live).
     for (const failureClass of ['authentication', 'authorization'] as const) {
       const blocked = controller({ value: now.value + 10_000 });
-      const attempt = blocked.beginAttempt()!;
-      expect(blocked.recordFailure(attempt.generation, createKalshiTransportFailure(failureClass, failureClass)))
+      const first403 = blocked.beginAttempt()!;
+      expect(blocked.recordFailure(first403.generation, createKalshiTransportFailure(failureClass, failureClass)))
+        .toMatchObject({ retry: true, rotateEndpoint: true });
+      expect(blocked.telemetry().nextEndpoint).toBe(endpoints[1]);
+
+      const second403 = blocked.beginAttempt()!;
+      expect(second403.endpoint).toBe(endpoints[1]);
+      expect(blocked.recordFailure(second403.generation, createKalshiTransportFailure(failureClass, failureClass)))
         .toEqual({ retry: false, rotateEndpoint: false, delayMs: null, nextRetryAt: null });
       expect(blocked.telemetry().nextEndpoint).toBeNull();
     }
+  });
+
+  it('gives auth exploration a fresh round after a working socket', () => {
+    const now = { value: 1_700_000_500_000 };
+    const stream = controller(now);
+    const first = stream.beginAttempt()!;
+    expect(stream.recordFailure(first.generation, createKalshiTransportFailure('authorization', '403')))
+      .toMatchObject({ retry: true, rotateEndpoint: true });
+
+    // The alias works: ack + pong + exchange data.
+    const good = stream.beginAttempt()!;
+    stream.recordSubscriptionAck(good.generation);
+    stream.recordPong(good.generation);
+    stream.recordExchangeData(good.generation, now.value);
+
+    // A later 403 must not inherit the verdict from before that success.
+    const later = stream.beginAttempt()!;
+    expect(stream.recordFailure(later.generation, createKalshiTransportFailure('authorization', '403')))
+      .toMatchObject({ retry: true, rotateEndpoint: true });
+  });
+
+  it('does not explore when only one endpoint is configured', () => {
+    const now = { value: 1_700_000_600_000 };
+    const single = new KalshiProductionConnectionController('production', [endpoints[0]!], {
+      now: () => now.value,
+      random: () => 0,
+    });
+    const attempt = single.beginAttempt()!;
+    expect(single.recordFailure(attempt.generation, createKalshiTransportFailure('authorization', '403')))
+      .toEqual({ retry: false, rotateEndpoint: false, delayMs: null, nextRetryAt: null });
   });
 
   it('resets backoff only after ack, real pong, and exchange data', () => {
@@ -159,9 +200,15 @@ describe('KalshiProductionConnectionController', () => {
       random: () => 0,
       coordinateRetries: true,
     });
-    const attempt = stream.beginAttempt()!;
-    const decision = stream.recordFailure(attempt.generation, createKalshiTransportFailure('authentication', '401', {}, now.value));
+    // Each endpoint is asked once before the credential is blamed, then it is sticky.
+    const first = stream.beginAttempt()!;
+    expect(stream.recordFailure(first.generation, createKalshiTransportFailure('authentication', '401', {}, now.value)))
+      .toMatchObject({ retry: true, rotateEndpoint: true });
+    const second = stream.beginAttempt()!;
+    const decision = stream.recordFailure(second.generation, createKalshiTransportFailure('authentication', '401', {}, now.value));
     expect(decision).toEqual({ retry: false, rotateEndpoint: false, delayMs: null, nextRetryAt: null });
+    // An auth rejection is not evidence the host is unhealthy, so the breaker is
+    // untouched however many endpoints were tried.
     const snapshot = kalshiProductionCircuitSnapshot('production', now.value + 10);
     expect(snapshot.state).toBe('open');
     expect(snapshot.failuresInWindow).toBe(8);

@@ -24,7 +24,8 @@ describe('Kalshi REST response provenance', () => {
     expect(metadata).toHaveBeenCalledWith(expect.objectContaining({
       environment: 'production',
       endpointClass: 'market-data',
-      sourceBaseUrl: 'https://api.elections.kalshi.com/trade-api/v2',
+      // The leading host rejected, so the alias is what actually answered.
+      sourceBaseUrl: 'https://external-api.kalshi.com/trade-api/v2',
       status: 200,
     }));
   });

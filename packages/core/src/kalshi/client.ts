@@ -21,15 +21,23 @@ import {
 } from './retryCoordinator.js';
 
 export const KALSHI_ENDPOINT_POLICIES: Readonly<Record<KalshiEnvironment, KalshiEndpointPolicy>> = {
+  // Measured 2026-07-31: the `external-api*.kalshi.com` hosts answer 403 to
+  // *anonymous* requests on the public /exchange/status endpoint, which is a
+  // decommissioned host rejecting everything rather than an auth failure.
+  // `api.elections.kalshi.com` answers 200 there and 401 on an unauthenticated
+  // websocket handshake — the correct response from a live endpoint. They are
+  // different addresses (16.58.x vs 52.84.x), not one host behind one CDN.
+  // The dead pair stays configured as a fallback: it costs nothing, and being
+  // wrong about which host is current is exactly what this list exists to absorb.
   production: {
     environment: 'production',
     restBaseUrls: [
-      'https://external-api.kalshi.com/trade-api/v2',
       'https://api.elections.kalshi.com/trade-api/v2',
+      'https://external-api.kalshi.com/trade-api/v2',
     ],
     websocketUrls: [
-      'wss://external-api-ws.kalshi.com/trade-api/ws/v2',
       'wss://api.elections.kalshi.com/trade-api/ws/v2',
+      'wss://external-api-ws.kalshi.com/trade-api/ws/v2',
     ],
   },
   demo: {

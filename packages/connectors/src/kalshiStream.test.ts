@@ -21,6 +21,7 @@ interface StreamInternals {
   tickers: Set<string>;
   subscribed: Set<string>;
   transport: KalshiProductionConnectionController;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
   startHeartbeat(socket: WebSocket, generation: number): void;
 }
 
@@ -384,10 +385,20 @@ describe('KalshiStream data-plane supervisor', () => {
     internals.connectedAt = closedAt;
     const { spy } = stubConnect(stream);
 
-    // 1008 + "invalid credentials" classifies as sticky `authentication`, so
-    // recordFailure returns noRetry() -- the exact dead end.
-    (stream as unknown as { handleClose(s: WebSocket, g: number, c: number, r: string | null): void })
-      .handleClose(socket as unknown as WebSocket, generation, 1008, 'invalid credentials');
+    // 1008 + "invalid credentials" classifies as sticky `authentication`. The
+    // first one rotates to the other configured endpoint to find out whether that
+    // host rejects the credential too, so the dead end is only reached once every
+    // endpoint has answered. Exhaust them.
+    const closeSticky = (gen: number) =>
+      (stream as unknown as { handleClose(s: WebSocket, g: number, c: number, r: string | null): void })
+        .handleClose(socket as unknown as WebSocket, gen, 1008, 'invalid credentials');
+
+    closeSticky(generation);
+    const exploring = internals.transport.beginAttempt()!;
+    internals.socket = socket as unknown as WebSocket;
+    internals.generation = exploring.generation;
+    internals.reconnectTimer = null;
+    closeSticky(exploring.generation);
 
     expect(stream.socketState()).toBe('none');
     expect(stream.telemetry(closedAt)).toMatchObject({

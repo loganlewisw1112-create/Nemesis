@@ -81,8 +81,11 @@ describe('kalshi client', () => {
   it('keeps production and demo endpoint policies isolated and excludes retired hosts', () => {
     const production = getKalshiEndpointPolicy('production');
     const demo = getKalshiEndpointPolicy('demo');
-    expect(production.restBaseUrls[0]).toBe('https://external-api.kalshi.com/trade-api/v2');
-    expect(production.websocketUrls[0]).toBe('wss://external-api-ws.kalshi.com/trade-api/ws/v2');
+    // api.elections.* leads: measured 2026-07-31, the external-api* pair answers
+    // 403 to anonymous requests on the public status endpoint (decommissioned),
+    // while this host answers 200 there and 401 on an unauthenticated handshake.
+    expect(production.restBaseUrls[0]).toBe('https://api.elections.kalshi.com/trade-api/v2');
+    expect(production.websocketUrls[0]).toBe('wss://api.elections.kalshi.com/trade-api/ws/v2');
     expect(production.restBaseUrls.join(' ')).not.toContain('trading-api.kalshi.com');
     expect(production.restBaseUrls.some((url) => demo.restBaseUrls.includes(url))).toBe(false);
   });
@@ -107,14 +110,14 @@ describe('kalshi client', () => {
       fetchFn: vi.fn<typeof fetch>(async (input) => {
         const url = String(input);
         firstUrls.push(url);
-        if (url.startsWith('https://external-api.kalshi.com')) throw new Error('request timed out');
+        if (url.startsWith('https://api.elections.kalshi.com')) throw new Error('request timed out');
         return new Response(JSON.stringify({ markets: [] }), { status: 200 });
       }),
     });
     expect(firstUrls).toHaveLength(2);
     expect(getKalshiHostHealth()).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        baseUrl: 'https://external-api.kalshi.com/trade-api/v2',
+        baseUrl: 'https://api.elections.kalshi.com/trade-api/v2',
         failureClass: 'timeout',
         failureCount: 1,
       }),
@@ -128,7 +131,8 @@ describe('kalshi client', () => {
         return new Response(JSON.stringify({ markets: [] }), { status: 200 });
       }),
     });
-    expect(nextUrls[0]).toMatch(/^https:\/\/api\.elections\.kalshi\.com/);
+    // The evicted host is not retried first; the alias that answered is.
+    expect(nextUrls[0]).toMatch(/^https:\/\/external-api\.kalshi\.com/);
   });
 
   it('learns working hosts per endpoint class instead of poisoning all requests', async () => {
@@ -137,7 +141,7 @@ describe('kalshi client', () => {
     const marketFetch = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
       marketUrls.push(url);
-      if (url.startsWith('https://external-api.kalshi.com')) throw new Error('fetch failed');
+      if (url.startsWith('https://api.elections.kalshi.com')) throw new Error('fetch failed');
       return new Response(JSON.stringify({ markets: [] }), { status: 200 });
     });
     await fetchMarkets({ fetchFn: marketFetch, limit: 1 });
@@ -149,8 +153,10 @@ describe('kalshi client', () => {
         return new Response(JSON.stringify({ balance: 100, payout: 0 }), { status: 200 });
       }),
     });
-    expect(marketUrls[1]).toMatch(/^https:\/\/api\.elections\.kalshi\.com/);
-    expect(portfolioUrls[0]).toMatch(/^https:\/\/external-api\.kalshi\.com/);
+    // Markets fell through to the alias; the portfolio class never saw a failure,
+    // so it still starts at the policy's leading host.
+    expect(marketUrls[1]).toMatch(/^https:\/\/external-api\.kalshi\.com/);
+    expect(portfolioUrls[0]).toMatch(/^https:\/\/api\.elections\.kalshi\.com/);
   });
 
   it('classifies and exposes server-directed 429 backoff without host rotation', async () => {
