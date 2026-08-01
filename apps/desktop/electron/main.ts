@@ -3985,6 +3985,7 @@ function modelCalibrationFor(card: ThesisCard): ModelCalibrationEvidence | undef
     sigmaPerRootSec: context.sigmaPerRootSec,
     timeToExpirySec: context.timeToExpirySec,
     ladderQuoteCount: context.ladderQuoteCount ?? 0,
+    ladderUsableCount: context.ladderUsableCount,
     ladderPoints: context.ladderPoints,
     ladderSigmaT: context.ladderSigmaT,
     ladderRSquared: context.ladderRSquared,
@@ -5752,9 +5753,24 @@ const runMarketRefresh = createSingleFlight(refreshMarkets);
 const runUniverseRefresh = createSingleFlight(refreshUniverseLoop);
 
 /**
- * Groups every crypto market by underlying and expiry into the strike ladders the
- * volatility calibration reads. Keyed the same way the cards look them up, so a
- * card gets its own siblings and nothing else.
+ * One ladder per underlying-and-expiry. `event_ticker` is that identity by
+ * construction, and it is present where `close_time` is merely optional —
+ * measured 2026-07-31, keying on `close_time ?? ''` silently collapsed every
+ * market lacking one into a single bucket, handing the fit 189 quotes drawn from
+ * three different expiries. A mixture of expiries is not a lognormal at any one
+ * volatility, so it cannot fit and never will. Returns null rather than guessing
+ * when neither identifier is available: a ladder of unknown expiry is not a ladder.
+ */
+function cryptoLadderKey(market: KalshiMarket, symbol: string): string | null {
+  if (market.event_ticker) return `event:${market.event_ticker}`;
+  if (market.close_time) return `${symbol}|${market.close_time}`;
+  return null;
+}
+
+/**
+ * Groups every crypto market into the strike ladders the volatility calibration
+ * reads. Keyed the same way the cards look them up, so a card gets its own
+ * siblings and nothing else.
  */
 function buildCryptoLadders(markets: KalshiMarket[]): Map<string, LadderQuote[]> {
   const ladders = new Map<string, LadderQuote[]>();
@@ -5763,7 +5779,8 @@ function buildCryptoLadders(markets: KalshiMarket[]): Map<string, LadderQuote[]>
     const price = normalizeMarketPrice(market);
     const cx = feedHub.cryptoInputFor(market, price);
     if (!Number.isFinite(cx.strike) || cx.strike <= 0) continue;
-    const key = `${cx.symbol}|${market.close_time ?? ''}`;
+    const key = cryptoLadderKey(market, cx.symbol);
+    if (!key) continue;
     const quotes = ladders.get(key);
     if (quotes) quotes.push({ strike: cx.strike, marketPrice: price });
     else ladders.set(key, [{ strike: cx.strike, marketPrice: price }]);
@@ -5853,7 +5870,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
         lagMs: cx.lagMs,
         binanceQuote: cx.binanceQuote,
         closeTime: m.close_time,
-        strikeLadder: cryptoLadders.get(`${cx.symbol}|${m.close_time ?? ''}`),
+        strikeLadder: cryptoLadders.get(cryptoLadderKey(m, cx.symbol) ?? ' none'),
       }));
     } else if (isMacroMarket(m)) {
       const macro = feedHub.macroInputFor(m);

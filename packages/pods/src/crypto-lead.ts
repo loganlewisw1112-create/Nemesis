@@ -5,6 +5,7 @@ import {
   qualifyThesis,
   computeNetEdge,
   detectSourceDisagreement,
+  countUsableLadderQuotes,
   fitLadderImpliedVol,
   kalshiFeePerContract,
   normalCdf,
@@ -155,6 +156,9 @@ function scoreCryptoLead(input: CryptoLeadInput): CryptoScore {
     // reached it but could not be fitted" are different problems with different
     // fixes, and ladderSigmaT alone cannot tell them apart.
     ladderQuoteCount: input.strikeLadder?.length ?? 0,
+    ladderUsableCount: input.strikeLadder && input.strikeLadder.length > 0
+      ? countUsableLadderQuotes(context.spotPrice, input.strikeLadder)
+      : 0,
   };
 
   let invalidReason: string | undefined;

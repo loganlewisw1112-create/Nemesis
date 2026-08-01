@@ -425,6 +425,12 @@ export interface CryptoThesisContext {
    * this.
    */
   ladderQuoteCount?: number;
+  /**
+   * Of those quotes, how many the fit could use. A large supply with few usable
+   * points means a ladder mostly pinned at the rails; few of both means the
+   * ladder never reached the model. Different problems, different fixes.
+   */
+  ladderUsableCount?: number;
 }
 
 /**
@@ -452,6 +458,8 @@ export interface ModelCalibrationEvidence {
   timeToExpirySec?: number;
   /** See `CryptoThesisContext.ladderQuoteCount`. */
   ladderQuoteCount: number;
+  /** See `CryptoThesisContext.ladderUsableCount`. */
+  ladderUsableCount?: number;
   /** Quotes surviving into the regression; absent when no fit was obtainable. */
   ladderPoints?: number;
   ladderSigmaT?: number;

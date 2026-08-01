@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { normalCdf } from './normalCdf.js';
 import {
+  countUsableLadderQuotes,
   fitLadderImpliedVol,
   normalInvCdf,
   LADDER_MIN_R_SQUARED,
@@ -85,6 +86,41 @@ describe('fitLadderImpliedVol', () => {
       if (fitLadderImpliedVol(spot, sample) === null) starved += 1;
     }
     expect(starved).toBe(10);
+  });
+
+  it('cannot fit a mixture of expiries, however many quotes it holds', () => {
+    // Measured 2026-07-31: the caller keyed ladders on `close_time ?? ''`, and
+    // `close_time` is optional, so every market lacking one collapsed into a single
+    // bucket -- 189 quotes drawn from three different expiries. Supply looked
+    // healthy and the fit still refused, because a mixture of expiries is not a
+    // lognormal at any one volatility. Quote count alone cannot detect this; the
+    // R-squared floor is what catches it.
+    const spot = 62_998;
+    const mixture = [
+      ...lognormalLadder(0.0095, spanningStrikes(0.0095, spot), spot),
+      ...lognormalLadder(0.0530, spanningStrikes(0.0530, spot), spot),
+      ...lognormalLadder(0.1200, spanningStrikes(0.1200, spot), spot),
+    ];
+    expect(mixture.length).toBeGreaterThan(20);
+    expect(countUsableLadderQuotes(spot, mixture)).toBeGreaterThan(10);
+    expect(fitLadderImpliedVol(spot, mixture)).toBeNull();
+
+    // Each expiry on its own fits cleanly.
+    for (const sigmaT of [0.0095, 0.0530, 0.1200]) {
+      const fit = fitLadderImpliedVol(spot, lognormalLadder(sigmaT, spanningStrikes(sigmaT, spot), spot));
+      expect(fit).not.toBeNull();
+      expect(fit.sigmaT).toBeCloseTo(sigmaT, 5);
+    }
+  });
+
+  it('separates a starved ladder from a pinned one', () => {
+    const spot = 62_998;
+    const pinned = lognormalLadder(0.004, STRIKES, spot);
+    // Plenty supplied, almost none usable: pinned at the rails.
+    expect(pinned.length).toBe(STRIKES.length);
+    expect(countUsableLadderQuotes(spot, pinned)).toBeLessThan(3);
+    // Nothing supplied at all is a different problem with the same fit outcome.
+    expect(countUsableLadderQuotes(spot, [])).toBe(0);
   });
 
   it('reports no fit when a fixed-width ladder pins at the rails', () => {

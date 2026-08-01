@@ -377,8 +377,18 @@ if (args.includes('--json')) {
       .sort((a, b) => a - b);
     line('confirmations carrying calibration', `${calibrated.length} of ${confirmations.length}`);
     line('  ladder reached the model', `${withLadder.length} (${pct(withLadder.length, calibrated.length)})`);
+    const usableCounts = calibrated
+      .map((c) => c.modelCalibration.ladderUsableCount)
+      .filter((v) => Number.isFinite(v))
+      .sort((a, b) => a - b);
     line('  ladder quotes supplied (min/median/max)',
       `${quoteCounts[0]} / ${quoteCounts[Math.floor(quoteCounts.length / 2)]} / ${quoteCounts[quoteCounts.length - 1]}`);
+    if (usableCounts.length > 0) {
+      // Supply vs usable separates "the ladder never reached the model" from
+      // "it reached the model pinned at the rails". Different fixes.
+      line('  of those, usable (min/median/max)',
+        `${usableCounts[0]} / ${usableCounts[Math.floor(usableCounts.length / 2)]} / ${usableCounts[usableCounts.length - 1]}`);
+    }
     line('  ladder produced a fit', `${fitted.length} (${pct(fitted.length, calibrated.length)})`);
     if (annual.length > 0) {
       line('  model vol, annualised (min/median/max)',

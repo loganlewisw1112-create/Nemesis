@@ -76,13 +76,15 @@ export function normalInvCdf(p: number): number {
  * non-positive slope (the ladder is not priced as a distribution over this
  * underlying), or a fit too poor to read a volatility off.
  */
-export function fitLadderImpliedVol(
-  spotPrice: number,
-  quotes: readonly LadderQuote[],
-): LadderImpliedVol | null {
-  if (!Number.isFinite(spotPrice) || spotPrice <= 0) return null;
+/**
+ * The quotes that can enter the regression at all: priced off the rails, one per
+ * strike, invertible. Shared with `fitLadderImpliedVol` so the count reported as
+ * evidence can never drift from the count actually used.
+ */
+function usablePoints(spotPrice: number, quotes: readonly LadderQuote[]): { xs: number[]; zs: number[] } {
   const xs: number[] = [];
   const zs: number[] = [];
+  if (!Number.isFinite(spotPrice) || spotPrice <= 0) return { xs, zs };
   const seenStrikes = new Set<number>();
   for (const quote of quotes) {
     if (!Number.isFinite(quote.strike) || quote.strike <= 0) continue;
@@ -98,6 +100,26 @@ export function fitLadderImpliedVol(
     xs.push(x);
     zs.push(z);
   }
+  return { xs, zs };
+}
+
+/**
+ * How many of these quotes the fit can actually use. Recorded alongside the raw
+ * quote count because the two answer different questions: a large supply with
+ * few usable points means the ladder is mostly pinned at the rails, while few of
+ * both means the ladder never reached the model. Without this the difference has
+ * to be guessed at, which is how the gate stayed dormant unnoticed.
+ */
+export function countUsableLadderQuotes(spotPrice: number, quotes: readonly LadderQuote[]): number {
+  return usablePoints(spotPrice, quotes).xs.length;
+}
+
+export function fitLadderImpliedVol(
+  spotPrice: number,
+  quotes: readonly LadderQuote[],
+): LadderImpliedVol | null {
+  if (!Number.isFinite(spotPrice) || spotPrice <= 0) return null;
+  const { xs, zs } = usablePoints(spotPrice, quotes);
   const n = xs.length;
   if (n < LADDER_MIN_POINTS) return null;
 
