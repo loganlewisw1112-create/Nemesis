@@ -24,7 +24,7 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-import { app, BrowserWindow, ipcMain, globalShortcut, safeStorage } from 'electron';
+import { app, BrowserWindow, ipcMain, globalShortcut, powerSaveBlocker, safeStorage } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -3970,6 +3970,82 @@ function fallbackCardForPosition(pos: PaperPosition, mark = pos.entryPrice): The
 }
 
 /**
+ * Holds the process awake for the length of a run.
+ *
+ * 2026-08-01: an 11-hour unattended run produced 3.85 hours of data and 7.1 hours
+ * of nothing, because the machine entered Modern Standby at 01:36 and the health
+ * tick stopped executing until 08:41. Nothing was broken — the supervisor
+ * recovered the socket in 45 seconds once it was running again — but the run was
+ * worthless and the deadline stop was suspended along with it, so it never fired.
+ *
+ * `prevent-app-suspension` keeps the system awake while letting the display sleep,
+ * which is what an overnight measurement rig wants. Set NEMESIS_ALLOW_SUSPEND=true
+ * to opt out.
+ *
+ * Honest limit: this maps to ES_SYSTEM_REQUIRED on Windows, which a Modern Standby
+ * policy can still override. It reduces the risk; it does not remove it. The
+ * suspend detector below is what makes the failure legible when it happens anyway.
+ */
+let powerSaveBlockerId: number | null = null;
+
+function recordPowerWarn(source: string, message: string): void {
+  console.warn(message);
+  connectorWarnTrace.record({ at: Date.now(), connector: 'main-process', source, message });
+}
+
+function startPowerSaveBlocker(): void {
+  if (process.env.NEMESIS_ALLOW_SUSPEND === 'true') {
+    recordPowerWarn('suspend-blocker', '[nemesis] NEMESIS_ALLOW_SUSPEND=true; the process may be suspended mid-run');
+    return;
+  }
+  try {
+    powerSaveBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+    recordPowerWarn('suspend-blocker',
+      `[nemesis] power-save blocker started (id=${powerSaveBlockerId}); system sleep held off for the run`);
+  } catch (error) {
+    powerSaveBlockerId = null;
+    recordPowerWarn('suspend-blocker',
+      `[nemesis] power-save blocker unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function stopPowerSaveBlocker(): void {
+  if (powerSaveBlockerId == null) return;
+  try {
+    if (powerSaveBlocker.isStarted(powerSaveBlockerId)) powerSaveBlocker.stop(powerSaveBlockerId);
+  } catch {
+    /* releasing a blocker during shutdown must never block shutdown */
+  }
+  powerSaveBlockerId = null;
+}
+
+/**
+ * Names a suspend or stall for what it is, on the tick that discovers it.
+ *
+ * Without this a resume looks exactly like a dead data plane: every age counter
+ * reads hours, the latch fires, and the trace holds one lonely sample. That cost
+ * a full investigation on 2026-08-01 and produced a wrong conclusion first --
+ * that the supervisor had failed to recover for seven hours, when it simply had
+ * not been executing. A gap in the tick is evidence about the *host*, and it must
+ * never again have to be inferred from a frozen counter.
+ */
+let lastHealthTickAt: number | null = null;
+
+function recordHealthTickGap(now: number): number {
+  const previous = lastHealthTickAt;
+  lastHealthTickAt = now;
+  if (previous == null) return 0;
+  const elapsed = now - previous;
+  // Three missed ticks: comfortably past scheduler jitter, well short of anything
+  // a healthy loop produces.
+  if (elapsed < BRIDGE_HEARTBEAT_MS * 3) return elapsed;
+  recordPowerWarn('tick-gap',
+    `[nemesis] health tick gap ${Math.round(elapsed / 1000)}s (expected ${BRIDGE_HEARTBEAT_MS / 1000}s)`
+    + ' — the process was suspended or stalled; age counters spanning this window describe the host, not the feed');
+  return elapsed;
+}
+
+/**
  * Projects the card's volatility calibration onto the confirmation record, so
  * "was the ladder gate reached, and what did it see?" is answerable from the
  * ledger instead of by probing a live market.
@@ -7321,7 +7397,11 @@ app.whenReady().then(async () => {
 
   // Health broadcast starts before the window opens so the first connectors:update
   // arrives within 5 s of the renderer mounting its listener.
+  startPowerSaveBlocker();
   setInterval(() => {
+    // First, so a suspend is named on the tick that discovers it rather than
+    // inferred later from age counters that only look like a dead feed.
+    recordHealthTickGap(Date.now());
     tickApiHealthDegraded();
     processWorkingOrders();
     void evaluateAutoClosePositions('health-tick');
@@ -7424,6 +7504,7 @@ app.whenReady().then(async () => {
 
 app.on('will-quit', () => {
   startupTrace('app-will-quit');
+  stopPowerSaveBlocker();
   globalShortcut.unregisterAll();
   stopRendererProbe();
   campaignBookTriggerScheduler.stop();

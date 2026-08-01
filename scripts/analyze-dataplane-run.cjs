@@ -356,6 +356,26 @@ if (args.includes('--json')) {
   // exactly when this app is most active. A gate that never fires is either
   // always in range or never consulted, and only these counts tell them apart.
   const calibrated = confirmations.filter((c) => c.modelCalibration);
+  // Host suspension, named. On 2026-08-01 a machine entering Modern Standby at
+  // 01:36 produced one trace sample every few hours, every age counter reading
+  // hours on resume, and an initial diagnosis of a seven-hour dead socket that was
+  // wrong -- the supervisor had simply not been executing. A gap in the tick is
+  // evidence about the host, and the run's own report has to say so.
+  // Every trace sample, not just those carrying an action: the tick writes one at
+  // least every 30s, so absence of samples IS the signal.
+  const tickGaps = orderbook
+    .map((row, i) => (i === 0 ? 0 : row.at - orderbook[i - 1].at))
+    .filter((ms) => ms > 60_000);
+  console.log('\nHOST CONTINUITY');
+  if (tickGaps.length === 0) {
+    line('gaps in the health tick', 'none over 60s — the process ran continuously');
+  } else {
+    const total = tickGaps.reduce((sum, ms) => sum + ms, 0);
+    line('gaps in the health tick', `${tickGaps.length}, longest ${(Math.max(...tickGaps) / 3600000).toFixed(2)}h`);
+    line('total time not executing', `${(total / 3600000).toFixed(2)}h`);
+    line('WARNING', 'age counters spanning these gaps describe the host, not the feed');
+  }
+
   console.log('\nMODEL CALIBRATION (volatility vs the strike ladder)');
   if (calibrated.length === 0) {
     line('confirmations carrying calibration', `0 of ${confirmations.length} — not recorded before 2026-07-31`);
