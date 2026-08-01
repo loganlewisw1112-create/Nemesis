@@ -417,6 +417,38 @@ export interface CryptoThesisContext {
   ladderPoints?: number;
   /** `sigmaT / ladderSigmaT`. Outside roughly 0.5-1.5 the card is invalidated. */
   ladderSigmaRatio?: number;
+  /**
+   * Strike quotes handed to the fit, before any filtering. Zero means no ladder
+   * reached the model at all, which is a different failure from a ladder that
+   * reached it and could not be fitted — the two are indistinguishable from
+   * `ladderSigmaT` alone, and telling them apart is the whole point of recording
+   * this.
+   */
+  ladderQuoteCount?: number;
+}
+
+/**
+ * What the volatility calibration check actually saw, carried onto each entry
+ * confirmation so the gate's reach is answerable from the ledger rather than by
+ * probing a live market.
+ *
+ * Measured 2026-07-31 against live KXBTCD ladders: the fit is obtainable and
+ * sensible at 17h (R-squared 0.955, 21.6% annualised) and at a week (0.980,
+ * 39.4%), but the near-expiry event had *zero* quotes off the rails and so no
+ * fit at all — and near expiry is where this app is most active. Whether the
+ * gate is reached in production therefore cannot be assumed either way.
+ */
+export interface ModelCalibrationEvidence {
+  /** Total volatility the model priced with. */
+  sigmaT?: number;
+  /** See `CryptoThesisContext.ladderQuoteCount`. */
+  ladderQuoteCount: number;
+  /** Quotes surviving into the regression; absent when no fit was obtainable. */
+  ladderPoints?: number;
+  ladderSigmaT?: number;
+  ladderRSquared?: number;
+  /** `sigmaT / ladderSigmaT` — the statistic the gate tests. */
+  ladderSigmaRatio?: number;
 }
 
 export interface JournalEntry {

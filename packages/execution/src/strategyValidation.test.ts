@@ -246,6 +246,59 @@ describe('StrategyValidationTracker data-plane contamination', () => {
     expect(JSON.stringify(tracker.allEvents())).not.toContain('dataPlaneDegraded');
   });
 
+  it('records volatility calibration without disturbing rows that carry none', () => {
+    // The gate's reach has to be answerable from the ledger: measured 2026-07-31,
+    // a near-expiry KXBTCD ladder had every quote pinned at the rails and produced
+    // no fit, so "never fired" could mean always-in-range or never-consulted.
+    // A ladder that reached the model but could not be fitted must therefore be
+    // distinguishable from no ladder at all.
+    const economics = calculateEntryEconomics({
+      entryPrice: 0.4, entryFeesUsd: 0.34, contracts: 20, sideFairPrice: 0.55,
+      marketPrice: 0.4, grossEdge: 0.15, screeningNetEdge: 0.11,
+      executableEntryNetEdge: 0.13, spread: 0.02, fillSlippage: 0,
+    });
+    const base = {
+      sourceSignalId: 'source-cal', ticker: 'KXBTCD-TEST', side: 'yes' as const,
+      status: 'pending' as const, reason: 'collecting evidence', samples: 1,
+      windowMs: 0, edgeRetention: 1, targetRewardUsd: economics.targetRewardUsd,
+      plannedLossUsd: economics.plannedLossUsd, rewardRiskRatio: economics.rewardRiskRatio,
+      stressedNetPnlUsd: economics.stressedNetPnlUsd, economics,
+    };
+
+    const bare = StrategyValidationTracker.create('shadow', 'config-a', 3, start, 'cal-bare');
+    bare.recordEntryConfirmation({ ...base, at: start + 1 });
+    // A row with no calibration must hash exactly as it did before the field existed.
+    expect(JSON.stringify(bare.allEvents())).not.toContain('modelCalibration');
+
+    const tracker = StrategyValidationTracker.create('shadow', 'config-a', 3, start, 'cal-bare');
+    // Ladder reached the model but every quote was pinned: quotes counted, no fit.
+    tracker.recordEntryConfirmation({
+      ...base,
+      modelCalibration: { sigmaT: 0.0121, ladderQuoteCount: 70 },
+      at: start + 1,
+    });
+    // Ladder reached the model and fitted.
+    tracker.recordEntryConfirmation({
+      ...base,
+      modelCalibration: {
+        sigmaT: 0.0121, ladderQuoteCount: 80, ladderPoints: 11,
+        ladderSigmaT: 0.009542, ladderRSquared: 0.9551, ladderSigmaRatio: 1.268,
+      },
+      at: start + 2,
+    });
+
+    const events = tracker.allEvents().filter((e) => e.type === 'entry_confirmation_observed');
+    expect(events[0].modelCalibration).toEqual({ sigmaT: 0.0121, ladderQuoteCount: 70 });
+    // No fit, but the ladder was present -- the two are distinguishable.
+    expect(events[0].modelCalibration.ladderSigmaT).toBeUndefined();
+    expect(events[0].modelCalibration.ladderQuoteCount).toBe(70);
+    expect(events[1].modelCalibration.ladderSigmaRatio).toBeCloseTo(1.268, 3);
+    // And it survives a replay, which is what makes it evidence rather than a log line.
+    const replayed = StrategyValidationTracker.replay(tracker.allEvents());
+    expect(replayed.integrityFailure()).toBeUndefined();
+    expect(replayed.allEvents()).toEqual(tracker.allEvents());
+  });
+
   it('excludes a shadow entered while the data plane was degraded but still records it', () => {
     const tracker = StrategyValidationTracker.create('shadow', 'config-a', 2, start, 'start-degraded');
     const clean = candidate(1, start);

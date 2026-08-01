@@ -350,6 +350,38 @@ if (args.includes('--json')) {
     line(`  ${String(reason).slice(0, 34)}`, count);
   }
 
+  // Volatility calibration reach. The gate can only bind where the strike ladder
+  // actually fits, and measurement on 2026-07-31 showed a near-expiry KXBTCD
+  // ladder with every quote pinned at the rails and so no fit at all -- which is
+  // exactly when this app is most active. A gate that never fires is either
+  // always in range or never consulted, and only these counts tell them apart.
+  const calibrated = confirmations.filter((c) => c.modelCalibration);
+  console.log('\nMODEL CALIBRATION (volatility vs the strike ladder)');
+  if (calibrated.length === 0) {
+    line('confirmations carrying calibration', `0 of ${confirmations.length} — not recorded before 2026-07-31`);
+  } else {
+    const withLadder = calibrated.filter((c) => (c.modelCalibration.ladderQuoteCount || 0) > 0);
+    const fitted = calibrated.filter((c) => Number.isFinite(c.modelCalibration.ladderSigmaT));
+    const ratios = fitted
+      .map((c) => c.modelCalibration.ladderSigmaRatio)
+      .filter((r) => Number.isFinite(r))
+      .sort((a, b) => a - b);
+    const outOfBand = ratios.filter((r) => r < 0.5 || r > 1.5);
+    line('confirmations carrying calibration', `${calibrated.length} of ${confirmations.length}`);
+    line('  ladder reached the model', `${withLadder.length} (${pct(withLadder.length, calibrated.length)})`);
+    line('  ladder produced a fit', `${fitted.length} (${pct(fitted.length, calibrated.length)})`);
+    if (ratios.length > 0) {
+      line('  median model/ladder sigma ratio', ratios[Math.floor(ratios.length / 2)].toFixed(3));
+      line('  ratio range', `${ratios[0].toFixed(3)} – ${ratios[ratios.length - 1].toFixed(3)}`);
+      line('  outside the 0.5–1.5 band', `${outOfBand.length} (${pct(outOfBand.length, ratios.length)})`);
+    }
+    if (fitted.length === 0) {
+      line('  VERDICT', 'gate is DORMANT — no ladder ever fitted, so it can never invalidate');
+    } else if (outOfBand.length === 0) {
+      line('  VERDICT', 'gate live and never tripped — model agrees with the ladder where it fits');
+    }
+  }
+
   console.log('\nSHADOW LEDGER (whole ledger — the gate accumulates across relaunches)');
   const clean = shadowStat(cleanShadows);
   const dirty = shadowStat(dirtyShadows);

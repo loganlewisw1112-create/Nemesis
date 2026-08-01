@@ -75,6 +75,7 @@ import {
   type GuardrailSettings,
   type StrategyValidationStage,
   type ThesisCard,
+  type ModelCalibrationEvidence,
   type KalshiMarket,
   type KalshiOrderbook,
   type KalshiFeePolicy,
@@ -3740,6 +3741,7 @@ async function executeReservedStrictPaperBuyForCard(
       observedAt,
     ));
   }
+  const modelCalibration = modelCalibrationFor(card);
   const confirmationRecorded = evidenceOnlyCampaign || recordStrategyValidation((tracker) => tracker.recordEntryConfirmation({
     sourceSignalId: card.id,
     ticker: card.ticker,
@@ -3755,6 +3757,9 @@ async function executeReservedStrictPaperBuyForCard(
     rewardRiskRatio: confirmation.rewardRiskRatio,
     stressedNetPnlUsd: confirmation.stressedNetPnlUsd,
     economics: confirmation.economics,
+    // Written only for cards that carry a model context, so rows that never had
+    // one hash exactly as they did before.
+    ...(modelCalibration ? { modelCalibration } : {}),
     // Tag, never suppress: a rejection recorded while the data plane is latched
     // degraded is evidence about the feed, not about the strategy's edge.
     dataPlaneDegraded: dataPlaneDegradedSnapshot.degraded,
@@ -3961,6 +3966,27 @@ function fallbackCardForPosition(pos: PaperPosition, mark = pos.entryPrice): The
     edgeHistory: [],
     drivers: [],
     invalidations: [],
+  };
+}
+
+/**
+ * Projects the card's volatility calibration onto the confirmation record, so
+ * "was the ladder gate reached, and what did it see?" is answerable from the
+ * ledger instead of by probing a live market.
+ *
+ * Returns undefined for cards with no model context (every non-crypto playbook),
+ * which keeps those rows hashing exactly as before.
+ */
+function modelCalibrationFor(card: ThesisCard): ModelCalibrationEvidence | undefined {
+  const context = card.cryptoContext;
+  if (!context) return undefined;
+  return {
+    sigmaT: context.sigmaT,
+    ladderQuoteCount: context.ladderQuoteCount ?? 0,
+    ladderPoints: context.ladderPoints,
+    ladderSigmaT: context.ladderSigmaT,
+    ladderRSquared: context.ladderRSquared,
+    ladderSigmaRatio: context.ladderSigmaRatio,
   };
 }
 

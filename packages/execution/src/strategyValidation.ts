@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { EntryQualificationSettings, StrategyValidationStage } from '@nemesis/core';
+import type { EntryQualificationSettings, ModelCalibrationEvidence, StrategyValidationStage } from '@nemesis/core';
 import type { EntryEconomicsEvidence } from './tradeEconomics.js';
 
 export const STRATEGY_VALIDATION_SCHEMA_VERSION = 2;
@@ -87,6 +87,12 @@ export type StrategyValidationEvent = ValidationEventBase & (
     rewardRiskRatio: number;
     stressedNetPnlUsd: number;
     economics?: EntryEconomicsEvidence;
+    /**
+     * What the volatility calibration check saw. Absent for non-crypto cards and
+     * for any row written before 2026-07-31, so a missing value means "not
+     * recorded", never "no ladder".
+     */
+    modelCalibration?: ModelCalibrationEvidence;
     /**
      * True when this observation was made while the orderbook data plane was
      * latched degraded. Such rejections describe missing data, not absent edge,
@@ -402,6 +408,7 @@ export class StrategyValidationTracker {
     rewardRiskRatio: number;
     stressedNetPnlUsd: number;
     economics: EntryEconomicsEvidence;
+    modelCalibration?: ModelCalibrationEvidence;
     dataPlaneDegraded?: boolean;
     at?: number;
   }): StrategyValidationEvent {

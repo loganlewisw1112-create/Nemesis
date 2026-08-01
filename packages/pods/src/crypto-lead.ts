@@ -151,6 +151,10 @@ function scoreCryptoLead(input: CryptoLeadInput): CryptoScore {
     ladderRSquared: ladder ? round(ladder.rSquared, 4) : undefined,
     ladderPoints: ladder?.points,
     ladderSigmaRatio: Number.isFinite(ladderSigmaRatio) ? round(ladderSigmaRatio, 4) : undefined,
+    // Recorded even when zero: "no ladder reached the model" and "a ladder
+    // reached it but could not be fitted" are different problems with different
+    // fixes, and ladderSigmaT alone cannot tell them apart.
+    ladderQuoteCount: input.strikeLadder?.length ?? 0,
   };
 
   let invalidReason: string | undefined;
