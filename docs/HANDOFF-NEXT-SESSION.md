@@ -1,158 +1,157 @@
-# NEMESIS — Next-Session Handoff (pick up 2026-07-24 after overnight)
+# NEMESIS — Next-Session Handoff (written 2026-08-05, during the run ending 07:00 PDT)
 
-## Current override — 2026-07-26
+**Headline: the central question is answered. crypto-lead has no edge, and the test that says so
+is clean.** After ~6 weeks of infrastructure work whose entire purpose was to make a fair test
+possible, the fair test ran and the strategy failed it. No real money was ever at risk.
 
-This section supersedes the older July 24 instructions below.
+This supersedes the 2026-08-02 handoff.
 
-- The focused shadow campaign is now **50 scored observations across 1 elapsed
-  day**. `scripts/launch-paper-allowlist.ps1` exports
-  `NEMESIS_SHADOW_MIN_SCORED=50` and
-  `NEMESIS_SHADOW_MIN_OBSERVATION_DAYS=1`.
-- Count is never enough by itself. Net P&L, profit factor, win rate, stressed
-  P&L/PF, largest-win concentration, ledger integrity, and exchange-origin book
-  checks remain mandatory.
-- The `Start paper (force)` / `FORCE_ADVANCE_TO_PILOT` UI and drop-file bypasses
-  were removed. Only a full `shadowPassed` snapshot plus exact
-  `ADVANCE_TO_PILOT` confirmation may enter the capped paper pilot.
-- At the 2026-07-26 live inspection, the existing runtime still showed the old
-  launch values (`50/25`, one day) because it had not been restarted:
-  shadow net **-$19.81**, PF **0.75**, win rate **18%**, stressed net
-  **-$40.11**, stressed PF **0.58**. Paper trades/positions remained zero.
-- Directional split at that checkpoint: YES **+$30.14 / PF 1.99**; NO
-  **-$49.94 / 0 wins from 27**. Treat this as a calibration/regime risk, not a
-  reason to weaken the acceptance bars.
-- The source tree was built and verified without stopping the running desk.
-  A later controlled relaunch is required before the live UI/runtime uses the
-  committed 50/1-day gate and no-bypass build.
+## The verdict
 
-**Next runtime action:** controlled relaunch with
-`scripts/launch-paper-allowlist.ps1`, record a new cutoff, verify the UI reports
-50 samples / 1 day and exposes no force button, then judge only post-cutoff
-events. Do not reset the paper portfolio or strategy ledger from automation.
+Run launched **2026-08-04 20:01:21 PDT** (cutoff `1785898881530`), HEAD `0cb82b6`, allowlist
+`KXBTCD`, shadow gate 50 scored / 1 observation day. Numbers below are as of **06:08 PDT
+2026-08-05**; the run continues until a 07:00 deadline stop, so final counts will be modestly
+higher (see "Final numbers" at the bottom, to be filled in from the stop receipt).
 
-**Read this first.** Do **not** start new plumbing overnight. The app was left running for a
-crypto-overnight measurement.
+| Metric | Measured | Gate requires |
+|---|---|---|
+| Shadows scored | **44** | ≥ 50 |
+| Win rate | **11.4%** (5/44) | ≥ 55% |
+| Profit factor | **0.314** | ≥ 1.25 |
+| Net P&L | **−$72.01** | > 0 |
+| **Shadows tagged `dataPlaneDegraded`** | **0** | ≤ 20% share |
+| Observation days | ~0.4 (hibernation-interrupted) | ≥ 1 |
+| Paper trades | **0** | — |
+| Portfolio | $5,000 unchanged | — |
 
-**Morning implement plan (PLAN ONLY until T‑30):**
-`docs/superpowers/plans/2026-07-24-provenance-throughput-green-paper.md`
+**44 samples is enough.** A 95% Wilson interval on 5/44 tops out near **24%** — the 55% bar is far
+outside it. Six more samples cannot reverse this, and the two unmet *count* bars (50 scored, 1 day)
+only ever gated a **pass**; the quality bars are decisively failed regardless.
 
-**Clock:** Freeze after-cutoff report at **06:00 PDT** (T‑30 before 09:30 ET cash open), then
-provenance → throughput → persistence residuals → **first green paper trade**. Do not chase a
-fill until those fixes (as demanded by the report) are done.
+**The zero-contamination number is what makes this different from every prior read.** Previous
+"no edge" conclusions were all recoverable by "maybe the feed was broken" — §7 of the project
+history is an entire 8-hour run that looked like a strategy result and was actually a dead socket.
+This run has **zero degraded-tagged shadows** and 2.4 minutes of total degraded time. The escape
+hatch is closed.
 
-Tomorrow’s first job is still **post-cutoff analysis** (`AFTER-CUTOFF-REPORT.md`), then execute
-that plan — not a thesis pivot — unless the report’s go/no-go table says otherwise.
+## Why — one explanation now covers every failure this project has had
 
----
+Measured against live Kalshi data on 2026-08-04 (full detail:
+`docs/superpowers/plans/2026-08-02-arb-pivot-scoping.md`):
 
-## One-paragraph state
+- Kalshi crypto is priced **efficiently to ~1 tick**. Three independent model-free tests
+  (ladder monotonicity, bracket completeness, cross-series CDF/bracket consistency across 696
+  aligned triples) found nothing above 1¢ price-grid discretization.
+- A taker round-trip costs **4.5–6.5¢** at mid prices (≈3.5¢ fees + 1–3¢ spread).
+- Every edge NEMESIS has ever measured is **1–3¢**.
 
-Execution tail (ready → shadow → pilot → paper buy/close) is proven. Sampler stall at 1/4
-(re-issued `card.id` resetting confirmation) was fixed 2026-07-23 and built into
-`dist-electron`. App was relaunched **2026-07-23 ~14:43 PDT** with a focused series
-allowlist and left running through **crypto overnight** (US cash hours were already closed
-at relaunch, so daytime silence was expected). **Still no clean post-fix first-ready on
-fitting instruments at handoff time** — that is what overnight + morning analysis answer.
+So the shadows bleed the round trip: −$72.01 over 44 scored is **−$1.64 average**, which is what
+paying 5¢ to capture 2¢ looks like. **This is not a signal problem, it is a cost-structure
+problem** — and it explains crypto-lead momentum (§6), the corrected volatility model (§7b), and
+ladder arb identically. It is also the same wall as the older finding that fees were 73.8% of
+modeled `plannedLoss`.
 
----
+**Do not respond to this by lowering `minExpectedNetPnlUsd` / `minRewardRiskRatio` or the shadow
+quality bars.** With these odds, a "green" trade manufactured by loosening a bar only books losses.
+The bars did their job.
 
-## Live measurement already in flight (do not relaunch unless dead)
+## What was validated this session (and one self-correction)
 
-| Field | Value |
-|--------|--------|
-| Cutoff ms | `1784843034218` |
-| Cutoff ISO | `2026-07-23T21:43:54.2215136Z` (~14:43 PDT) |
-| Cutoff file | `nemesis/.nemesis-relaunch-cutoff.txt` |
-| Allowlist env | `NEMESIS_SERIES_ALLOWLIST=KXINXHUD,KXNASDAQ100HUD,KXBTCD` |
-| Main PID (at launch) | `27168` (may have changed; confirm process still up) |
-| Flags | `demoMode=false`, `liveEnabled=false`, `dryRun=true` |
-| Build | `apps/desktop/dist-electron/main.js` size ~375455 after sampler fix |
+- **A1 — correlated-market arb within Kalshi: falsified before any code was written.** See the
+  scoping doc. Zero monotonicity violations *even at zero fees*; bracket sums 1.48–4.70 vs a $1
+  payout *at zero fees*; best cross-series edge exactly one tick, and **not executable** because the
+  binding leg had **1.00 / 0.16 contracts** of depth against a 5–10 contract break-even.
+- **A2 — two-leg paired execution: real work, but moot without a signal.** Audited: `yes|no` side
+  selection is already first-class (Kalshi has no short — "buy NO" is the correct model), but there
+  is no pairing concept, no atomicity primitive (a half-filled pair leaves a naked position nothing
+  unwinds), the per-position `autoCloseEngine` would close the profitable leg and strand the hedge,
+  and `decideCapitalAllocation` would double-count a hedge's risk.
+- **Self-correction worth keeping:** the first pass of the arb analysis claimed Kalshi's fee has a
+  "1-cent floor per contract." **Wrong** — rounding is to the centicent per order, applied once to
+  the total (`packages/core/src/fees/kalshiFee.ts:122-133`, `:149-151`). The real driver is the rate
+  `0.07·P·(1−P)` ≈ 1.75¢/contract at P=0.50. The verdict survived, but it was right for the wrong
+  reason — which would not have held in a different market. **Gross edge, fee model, and executable
+  depth are three separate questions.**
 
-**Hard rule:** every analysis filter is `e.at > 1784843034218`. Mixing pre-cutoff lines
-will fake “still broken” or “already working.”
+## Run/ops facts worth not re-deriving
 
-If the Electron/NEMESIS process is **dead** tomorrow morning: note that as an invalid/
-truncated run, relaunch with the **same** allowlist + new cutoff, and treat overnight as
-lost. Do not invent a new fix first.
+- **The overnight gap was battery hibernation, not a bug and not a sleep-fix failure.** A 7.17h tick
+  gap ended 05:48 PDT; the process survived with its original PID (hibernate restores RAM).
+  `powerSaveBlocker` maps to `ES_SYSTEM_REQUIRED`, which prevents **idle** sleep and **cannot**
+  prevent battery-critical hibernation — no in-app API can. **Mitigation is operational: keep the
+  machine plugged in for unattended runs.** This is the second overnight run lost this way.
+- **Flow is far richer than previously assumed.** ~3 effective hours produced **2,852** confirmations
+  / **50 `ready`** / 58 distinct tickers, versus 555 / 6 / ~11 across the entire ~20h Aug 1 run. A
+  useful shadow sample takes hours, not days — earlier "we need a full day" pacing was too
+  pessimistic. Note the 1-observation-day gate bar is still a real requirement for a formal pass.
+- **The qualification ledger is 156MB and is replayed in full at every start** (startup still only
+  took ~15s, so it is not yet a practical problem, but it is growing). Archiving is operator-run and
+  resets the paper ledger: `npm run paper:archive-reset -- ARCHIVE_AND_RESET_PAPER` with the app
+  stopped. Claude is classifier-blocked from this.
+- **Deadline stops are reliable** — `scripts/stop-nemesis-at.ps1 -At '<local datetime>'` run
+  detached. Measured drift: **0.461s** (2026-08-02) vs the 101-minute drift of the one manual stop
+  this project ever did. Only ever arm one at a time; two would overwrite each other's receipt.
+- Top rejection reasons this run (all genuine economics, no structural blockers):
+  R:R below minimum 1,097 · collecting evidence 575 · entry book stale 490 · net reward below
+  minimum 270 · source signal stale 167 · needs flow-driven source 118 · exchange-origin 72.
+  Exchange-origin at 72/2,852 (2.5%) confirms the structural fixes from §4/§5 still hold.
 
----
+## Repo state
 
-## What landed 2026-07-23 (committed locally? check `git status`)
+- Branch `agent/nemesis-seven-hour-campaign`, HEAD **`0cb82b6`**, tree clean,
+  **0 ahead / 0 behind origin**.
+- **Full suite verified green this session: 777 tests / 109 files, 0 failures.** (The prior handoff
+  flagged this as unverified; it is now confirmed.)
+- No source changes were made this session — all work was measurement and documentation.
 
-Sampler identity fix (may still be uncommitted — check before assuming it’s on remote):
+## Where to go next
 
-1. `campaignEconomicIdentity` = `ticker|side|playbook|sourceMove` (**no** `card.id`).
-2. `EntryConfirmationEngine` keys on that identity; re-issued signal IDs continue one chain;
-   `markSourceUsed` also burns the economic identity.
-3. Quiet-book persistence without a new sequence each sample (prior commit) remains.
-4. Plan: `docs/superpowers/plans/2026-07-23-confirmation-sampler-identity.md`.
+The infrastructure is genuinely finished and valuable: data-plane supervision with proven recovery,
+fail-closed degraded tagging, honest fee/economics modeling, a shadow→pilot→buy ladder with
+contamination-aware gating, deterministic deadline stops, and hash-chained evidence ledgers. **That
+work is not wasted by this verdict — it is what made the verdict trustworthy.**
 
-Unfocused smoke before allowlist only saw **sports** + reward-bar / exchange-origin rejects.
-Allowlisted relaunch: equity/session/bridge kept writing; **0** confirmation events in the
-first ~5 minutes (expected post–US close).
+Given the cost-structure finding, only two directions are coherent. Either get an edge **larger than
+the ~5¢ round trip**, or **stop paying the spread and start earning it**:
 
----
+| Option | Case for | Case against |
+|---|---|---|
+| **Cross-venue (Kalshi vs Polymarket), observation-only first** | Polymarket reportedly leads price discovery by minutes; during a real move that lag could plausibly be worth 5–10¢, the first candidate that clears the bar. Testable with **public data from both venues before writing any feed, execution, or custody code.** | A full build is weeks: new feed hardening from scratch, an unsolved contract-mapping problem, no shared settlement, and a second (on-chain) custody model this project has never touched. |
+| **Maker instead of taker** | This is demonstrably where the money is — market makers quote `sum(bid) 0.75–0.91` against `sum(ask) 1.48–4.70` and collect that spread, and Kalshi's maker rate is **a quarter** of taker. Structurally the correct side of this market. | Requires resting-order execution NEMESIS has none of, plus adverse selection and queue-position modeling; competes with ~23 professional MMs. Large build on a hunch. |
+| **Park it** | Infrastructure is done and the central question is answered. A clean stopping point. | Leaves the platform unused. |
 
-## Tomorrow — post-analysis checklist (in order)
-
-### 0. Confirm the run is still valid
-- [ ] NEMESIS desktop still running (or note crash time).
-- [ ] `bridge-telemetry.jsonl` / `equity-history.json` / `session-stats.json` have writes
-      after cutoff.
-- [ ] Settings still: live off, dry-run on, demo off. **Do not edit settings.json**
-      (classifier boundary — see `nemesis-ops`).
-
-### 1. Confirmation funnel (post-cutoff only)
-Data dir: `%APPDATA%\@nemesis\desktop\nemesis-data\`
-
-Mine `paper-strategy-validation-events.jsonl` for `type === entry_confirmation_observed`
-with `at > 1784843034218`:
-
-- Counts by `status` / `reason`
-- `max(samples)` and histogram of `samples` (need evidence of 2, 3, 4 — not stuck at 1)
-- Tickers: must be allowlisted prefixes only; sports = invalid contamination
-- Any `status === 'ready'`?
-
-### 2. Ground truth
-- `paper-portfolio.json` → `trades[]` length / any open positions
-- Shadow / pilot events in the same validation log if present
-
-### 3. Decision (pre-agreed — do not move bars)
-
-| Outcome | Criteria | Next |
-|---------|----------|------|
-| **Go** | ≥1 `ready` on allowlisted series that clears shadow (`PF≥1.25`, win≥0.55) and/or produces a paper trade | Thesis viable on that class; scale; defer live-only residuals |
-| **No-go** | Healthy post-cutoff flow + samples reaching 4, but zero readys / zero shadow clears over overnight (+ optional next US open) | Stop flow-momentum tuning; design arb pivot |
-| **Invalid** | Process died, still max samples=1, off-allowlist sports only, or bars were relaxed | Discard; relaunch clean; **do not** declare thesis dead |
-
-### 4. Only after a valid Go or No-go
-- **Go:** optional live-only residuals (electron timer wiring, shadow 15-min book re-fetch).
-- **No-go:** thesis pivot plan (cross-venue / correlated arb) — new design doc, not more
-  sampler tweaks.
-- **Invalid:** fix the measurement conditions, not the thesis.
-
----
+**Recommended:** the cross-venue **observation-only spread logger** — it is the only option that can
+be falsified cheaply, and it now has a concrete quantitative bar to clear (**>4.5–6.5¢ round-trip**)
+rather than a vague "does a mispricing exist." Do not build execution or touch custody until the
+logger shows the mispricing is real, large enough, and persistent.
 
 ## Hard rules (unchanged)
 
-- Do not relax exchange-origin book timestamp+sequence checks.
-- Do not lower profit bars to manufacture a trade.
-- Live stays hard-locked.
-- Do not continue the “fixing plan” until this analysis is written down.
+- Do not lower `minExpectedNetPnlUsd:1` / `minRewardRiskRatio:2` or the shadow quality bars
+  (`shadowMinWinRate:0.55`, `shadowMinProfitFactor:1.25`, `shadowMinStressedProfitFactor:1.1`).
+- Do not relax the exchange-origin book timestamp+sequence check.
+- Live stays hard-locked (`liveEnabled:false`, `autoLiveEnabled:false`, `dryRun:true`; since
+  `5797525` these are cross-checked against a certificate at load rather than trusted verbatim).
+- Claude is classifier-blocked from `settings.json` and paper-reset commands — hand the operator
+  exact keys/commands instead. See the `nemesis-ops` skill.
+- Don't widen a health/heartbeat watchdog in response to a stall without first establishing whether
+  it was the feed or the host (suspend, hibernation, dead battery).
 
----
+## Data locations
 
-## Operational pointers
+| What | Where |
+|---|---|
+| Cutoff/config for this run | `.nemesis-relaunch-cutoff.txt` (cutoffMs `1785898881530`) |
+| Portfolio / trades | `%APPDATA%\@nemesis\desktop\nemesis-data\paper-portfolio.json` |
+| Confirmations + shadow ledger | `...\nemesis-data\paper-strategy-validation-events.jsonl` — filter `e.at > 1785898881530` |
+| Bridge telemetry | `...\nemesis-data\bridge-telemetry.jsonl` (rotated, 4×32MB) |
+| Connector warns / traces | `nemesis/overnight-logs/2026-08-04/` |
+| Stop receipt | `nemesis/overnight-logs/2026-08-05/stop-receipt.json` |
+| Arb validation + A2 audit | `docs/superpowers/plans/2026-08-02-arb-pivot-scoping.md` |
 
-- Ops runbook: `.claude/skills/nemesis-ops/SKILL.md`
-- Personal funnel skill: `diagnose-qualification-funnel` (filter by cutoff)
-- Prior architecture note: plumbing proven; offensive thesis is the open risk; this overnight
-  is the first fair test on fitting instruments after the sampler fix.
+## Final numbers
 
-## Suggested analysis one-liner (PowerShell + node)
-
-```powershell
-$cutoff = 1784843034218
-$val = "$env:APPDATA\@nemesis\desktop\nemesis-data\paper-strategy-validation-events.jsonl"
-node -e "const fs=require('fs');const c=$cutoff;const conf=fs.readFileSync(process.argv[1],'utf8').trim().split(/\r?\n/).filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(e=>e&&e.at>c&&e.type==='entry_confirmation_observed');const by={};let max=0;for(const e of conf){const k=(e.status||'')+'|'+(e.reason||'').slice(0,80);by[k]=(by[k]||0)+1;max=Math.max(max,e.samples||0)}console.log(JSON.stringify({n:conf.length,ready:conf.filter(e=>e.status==='ready').length,maxSamples:max,tickers:[...new Set(conf.map(e=>e.ticker))],top:Object.entries(by).sort((a,b)=>b[1]-a[1]).slice(0,15)},null,2))" $val
-```
+To be filled in from `overnight-logs/2026-08-05/stop-receipt.json` and a final ledger read after the
+07:00 PDT stop. The 06:08 figures above are not expected to move materially — and cannot change the
+verdict, since the quality bars are missed by margins several times larger than the remaining
+sample could close.
