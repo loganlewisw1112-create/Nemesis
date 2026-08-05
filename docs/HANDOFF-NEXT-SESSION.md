@@ -149,9 +149,41 @@ logger shows the mispricing is real, large enough, and persistent.
 | Stop receipt | `nemesis/overnight-logs/2026-08-05/stop-receipt.json` |
 | Arb validation + A2 audit | `docs/superpowers/plans/2026-08-02-arb-pivot-scoping.md` |
 
-## Final numbers
+## Final numbers (run closed 2026-08-05 07:00:00 PDT, drift 0.279s, 9 processes stopped, 0 remain)
 
-To be filled in from `overnight-logs/2026-08-05/stop-receipt.json` and a final ledger read after the
-07:00 PDT stop. The 06:08 figures above are not expected to move materially — and cannot change the
-verdict, since the quality bars are missed by margins several times larger than the remaining
-sample could close.
+**The run crossed the sample-count bar.** 53 scored shadows against a required 50 — so the verdict
+below is not "too small a sample," it is a completed count that failed on quality.
+
+| Gate criterion | Required | Measured | |
+|---|---|---|---|
+| Shadows scored | ≥ 50 | **53** | **MET** |
+| Contaminated share | ≤ 20% | **1.9%** (1 of 53) | **MET — clean** |
+| Win rate | ≥ 0.55 | **0.151** (8/53) | FAILED |
+| Profit factor | ≥ 1.25 | **0.327** | FAILED |
+| Stressed net P&L | > 0 | **−$112.58** | FAILED |
+| Largest-win share | ≤ 0.20 | **0.388** | FAILED |
+| Observation days | ≥ 1 | 0.46 (hibernation-shortened) | not met |
+| Net P&L | — | **−$88.46** | |
+| Paper trades | — | **0** | |
+| Portfolio | — | **$5,000 unchanged** | |
+
+Pipeline volume over the 10.93h window (~3.8h effective after the hibernation gap): **3,917
+confirmations**, **58 reached `ready`**, max samples 9, **69 distinct tickers**, 58 shadows started.
+Only **8 of 3,917 confirmations** were tagged `dataPlaneDegraded` (0.2%).
+
+**Five independent quality bars failed simultaneously on a clean, count-complete sample.** The one
+unmet count bar (observation days) only ever gated a *pass*. Win rate moved 11.4% → 15.1% as the
+sample grew from 44 to 53 — directionally noise, still under a third of the 55% requirement.
+
+**`largestWinShare` 0.388 is worth noting separately:** a single win accounts for 39% of all gross
+profit, against a 20% concentration limit. Even the winning side is one outlier rather than a
+repeatable edge — the same overfitting signature recorded in §6 of the project history, now
+reproduced on the corrected model.
+
+Top rejection reasons (all genuine economics, no structural blockers): R:R below minimum 1,261 ·
+entry book stale 883 · collecting evidence 709 · net reward below minimum 341 · source signal stale
+312. `apiDegradedMinutes: 434` is almost entirely the hibernation window.
+
+**This is the cleanest negative result the project has produced, and it is conclusive.** Do not
+re-run crypto-lead hoping for a different number; re-running is how a 15% win rate eventually
+produces a lucky window, not how an edge is found.
