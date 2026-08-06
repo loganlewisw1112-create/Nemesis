@@ -434,3 +434,99 @@ Honest reading of the numbers:
 initial pass would have carried two candidates forward, one of which turns negative at scale and
 negative at the back of the queue. The 10-hour data converted a two-horse shortlist into a single
 answer.
+
+---
+
+## 6. SIMULATION (19:05) — the edge is NOT capturable. Maker-making does not work here.
+
+Built the resting-order machinery and simulated it against the same 10h capture. **The result
+overturns section 5.** Realized spread said +5.59c/contract; a full simulation with honest exits
+loses money, and every parameter that helps in-sample fails out-of-sample.
+
+New, tested code (806 tests green, typecheck clean):
+`packages/execution/src/makerQueue.ts` (queue-position fill model, 18 tests),
+`makerSim.ts` (two-sided MM with inventory + honest exit accounting, 9 tests),
+`makerSim.replay.test.ts` (replay harness, `MAKER_REPLAY=1`).
+
+### First, a sign bug that invalidated the section-5 numbers
+
+`taker_book_side` names the side the taker's **own order** sat on, not the side consumed — a buyer
+('bid') lifts the ask. Established empirically (`sidecheck.cjs`): of 53,949 prints landing exactly
+on a prevailing quote, `side=bid` consumed the ask 32,681 vs 4,913 (86.9%) and `side=ask` consumed
+the bid 12,952 vs 3,403 (79.2%). `taker_outcome_side` adds nothing.
+
+My analyzers had derived this from the sign of mean effective spread instead, and got `side=ask`
+backwards — **30% of prints mis-signed**. Corrected RS60 vs what section 5 reported:
+
+| Series | reported | **corrected** |
+|---|---|---|
+| KXCS2GAME | +3.07c | **+5.59c** |
+| KXMLBTOTAL | −0.65c | +1.39c |
+| KXITFWMATCH | −0.04c | +0.92c |
+| KXBTCD | **−3.92c** | **+0.05c** |
+
+**"Crypto is toxic for makers" was largely a sign artifact** — `KXBTCD` is roughly flat, not −3.92c.
+A self-consistency check (ES > 0) constrains the aggregate orientation but cannot detect a flipped
+subset; only ground truth could.
+
+### The simulation result
+
+Honest accounting throughout: queue position never credits invisible cancels; inventory is marked at
+the price we could actually exit into, never the mid; every crossing pays the real taker fee;
+residual inventory is force-flattened so its exit cost is not deferred.
+
+**Baseline symmetric quoting loses on 4 of 5 series.** The diagnostic explains why:
+
+| Series | buy share | net |
+|---|---|---|
+| KXBTCD | 49% (balanced) | −0.07c/ct |
+| KXMLBTOTAL | 32% | +0.63c/ct |
+| KXITFWMATCH | 37% | −3.10c/ct |
+| KXMLBGAME | 27% | −5.90c/ct |
+| KXCS2GAME | 27% | −1.60c/ct |
+
+**Taker flow is heavily one-sided.** On CS2 we sell 885 contracts passively but buy only 332. Retail
+lifts asks; almost nobody hits bids. A symmetric quoter therefore accumulates a short against
+persistent buying pressure, loses on the drift, and never gets the passive offset that captures the
+spread — and crossing to flatten a short means buying back at the ask, surrendering the whole spread.
+**Balanced flow (`KXBTCD`, 49%) is the only series that comes out ~flat**, which is the mechanism
+stated twice over.
+
+### Two fixes attempted, both failed
+
+**(a) Select balanced-flow tickers.** A real pocket exists ex post — 216 of 541 liquid tickers have
+balance ≥0.6, and individual CS2 matches range 32–65% even though the series aggregates to 70%. But
+**flow balance is not predictable**: corr(first-half, second-half balance) = **0.170**; selecting on
+first-half balance ≥0.8 yields second-half balance 0.597 vs 0.581 unfiltered — a 1.6pp improvement.
+Per-series correlations 0.03–0.24. Unusable ex ante.
+
+**(b) Inventory skewing** (reactive, needs no forecast). In-sample this looked like the answer —
+aggressive-reduce flipped CS2 to **+1.64c/ct (+$16.04)** and MLBTOTAL to **+1.91c/ct (+$27.18)**.
+**It is overfitting.** Those came from searching 5 regimes × 5 series = 25 cells on one window. A
+train/test split on the same data:
+
+| Series | regime | TRAIN | TEST | |
+|---|---|---|---|---|
+| KXCS2GAME | aggressive-reduce | **+$26.85** (+3.42c/ct) | **−$11.28** (−4.93c/ct) | FLIP |
+| KXMLBTOTAL | aggressive-reduce | +$9.05 (+1.32c) | −$15.47 (−1.61c) | FLIP |
+| KXBTCD | baseline | +$50.75 (+1.27c) | −$46.65 (−2.93c) | FLIP |
+| KXITFWMATCH | reduce-only | −$15.67 | +$5.46 | FLIP |
+| KXMLBGAME | all three | −$37 to −$58 | −$27 to −$52 | AGREE (negative) |
+
+**Zero regimes are profitable in both halves. The only results that replicate are losses.**
+
+### Why realized spread overstated it
+
+Three reasons, and they are general enough to remember:
+1. **RS marks the fill against the future mid.** Nobody exits at the mid. You either wait passively
+   (carrying risk) or cross and pay spread + fee.
+2. **RS is per-fill and ignores what happens between fills.** In one-sided flow you accumulate
+   inventory and the drift dominates the spread you captured.
+3. **RS cannot see that the round trip never completes.** Two-thirds of CS2 fills were still open
+   inventory at the end of the run.
+
+**Verdict: passive market making is not viable here as designed, and its own headline metric
+systematically flatters it.** The machinery is kept — it is tested, honest, and turns any future
+quoting idea into a cheap out-of-sample question instead of a build. But nothing in this data
+supports placing real resting orders, and the responsible next step is **not** another parameter
+sweep: 25 cells already produced two false positives, and sweeping harder only manufactures more.

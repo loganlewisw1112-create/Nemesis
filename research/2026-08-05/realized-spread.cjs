@@ -54,10 +54,16 @@ function build(sign){
   const obs=[];
   for(const t of trades){
     const pre=midBefore(t.tk,t.t,TOL); if(!pre)continue;
-    // taker side -> direction. 'ask' = taker lifted the ask = taker BOUGHT (before calibration)
-    let D=(t.side==='ask')?1:-1;
-    // outcome-side encoding: a NO-side taker trade is a YES sale in yes-price space
-    if(t.os==='no') D=-D;
+    // Direction: D=+1 when the taker CONSUMED THE ASK (a buy).
+    // `taker_book_side` names the side the taker's OWN order sat on, so a buyer ('bid')
+    // lifts the ask. Established empirically in sidecheck.cjs against 53,949 prints matched
+    // to a prevailing quote: side=bid consumed the ask 32,681 vs 4,913 (86.9%), side=ask
+    // consumed the bid 12,952 vs 3,403 (79.2%). `taker_outcome_side` adds nothing -- it is
+    // perfectly correlated with taker_book_side in every observed row.
+    // The PREVIOUS version derived this from the sign of mean ES and got side=ask backwards,
+    // mis-signing 30% of prints. An aggregate self-consistency check cannot catch a flipped
+    // subset, which is why this is now pinned to measured ground truth.
+    let D=(t.side==='bid')?1:-1;
     D*=sign;
     const rec={tk:t.tk,ser:t.tk.split('-')[0],t:t.t,P:t.p,q:t.q,D,M:pre.mid,bid:pre.bid,ask:pre.ask,
       restBid:pre.bs,restAsk:pre.as,ES:2*D*(t.p-pre.mid),RS:{},PI:{}};

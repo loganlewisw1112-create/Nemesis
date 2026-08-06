@@ -16,7 +16,7 @@ const H=[30,60,120];
 const obs=[];
 for(const t of trades){
   const pre=before(t.tk,t.t);if(!pre)continue;
-  let D=(t.side==='ask')?1:-1; if(t.os==='no')D=-D; D=-D;      // calibrated sign (mean ES>0)
+  let D=(t.side==='bid')?1:-1;  // empirical: taker_book_side is the taker's own side; consumed side is its opposite (sidecheck.cjs)      // calibrated sign (mean ES>0)
   const M=(pre.bid+pre.ask)/2;
   const rec={ser:t.tk.split('-')[0],q:t.q,D,ES:2*D*(t.p-M),RS:{}};
   const rest=(D>0)?pre.as:pre.bs;

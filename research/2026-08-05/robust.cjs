@@ -11,7 +11,7 @@ function obsFor(pref,filt){
     if(!t.tk.startsWith(pref+'-'))continue;
     if(filt&&!filt(t))continue;
     const pre=before(t.tk,t.t);if(!pre)continue;
-    let D=(t.side==='ask')?1:-1;if(t.os==='no')D=-D;D=-D;
+    let D=(t.side==='bid')?1:-1;  // empirical: taker_book_side is the taker's own side; consumed side is its opposite (sidecheck.cjs)
     const po=after(t.tk,t.t+60000);if(!po)continue;
     out.push({tk:t.tk,t:t.t,v:2*D*(t.p-(po.bid+po.ask)/2),q:t.q,ev:t.tk.split('-').slice(0,2).join('-')});
   }
