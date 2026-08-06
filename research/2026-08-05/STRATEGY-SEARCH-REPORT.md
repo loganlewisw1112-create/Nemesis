@@ -622,3 +622,85 @@ under an hour each, caught five of my own analytical errors (fee model, taker-si
 significance/cost conflation, composition effects), and turns any future thesis into a cheap
 out-of-sample question. **An edge here would have to be informational — better forecasting of a
 specific domain — not structural.** Nothing in market microstructure is available at this size.
+
+---
+
+## 9. INFORMATIONAL EDGE (weather / public-model) — the seventh negative result
+
+The one category the rig could not test was an **informational** edge: forecasting some domain
+better than the market, using data from *outside* the price. Operator chose the "build models from
+free public data" variant (no domain expertise required, objective and testable). Target: Kalshi's
+daily temperature markets vs free NOAA/NWS data.
+
+### A real correction to this report's own cost figure
+
+**Kalshi charges no settlement fee.** A taker entry *held to resolution* therefore costs only the
+entry fee plus half the spread — roughly **2.25–3.25c**, not the 4.5–6.5c quoted throughout §6–8.
+That figure was correct for what was actually tested (crypto-lead exited on target/stop inside 15
+minutes; the maker sim round-tripped by construction) but it means **the hold-to-expiry regime was
+never properly explored.** Any future attempt should use it. Independent venue research and the
+weather market structure arrived at this same lever separately.
+
+### Venue check: the cost wall is not universal, but every exit is closed
+
+Commission-on-**net-winnings** venues (Betfair, Smarkets, Matchbook, Novig, ProphetX) barely touch a
+thin edge — they tax being right, not trading. On a 2–4c edge Betfair's expected cost is ~0.12–0.24c
+versus Kalshi's 4.5–6.5c. **But:** Betfair/Smarkets/Matchbook do not accept US persons; Novig and
+ProphetX are US-legal with that model but are sports-only and **exclude California**; Polymarket US
+is a lateral move (marginally better taker fee, identical CLOB microstructure that already defeated
+passive quoting); PredictIt caps a single position at $850. Kalshi's rebate program needs >$100/month
+in fees (~5,700 round-trip contracts) to reach even the 20% tier. **No venue switch is available.**
+
+### Why weather looked right, and why it isn't
+
+Genuinely the best-shaped setup found in this project: five cities (SF, Seattle, Austin, Phoenix,
+Chicago) with daily temperature ladders, **1c median spreads** (tightest on Kalshi), ~200 settled
+markets each at 8,000–11,500 median volume, resolving against an objective NWS station report, on a
+same-day cycle that permits hold-to-expiry.
+
+The first test needed no forecasting at all: daily max temperature is **monotonically
+non-decreasing**, so once observations show 80F a "max > 79" market is *certainly* YES. Purely
+whether the market keeps up with a free public feed.
+
+**Independent research says this was already tested and lost:**
+- A practitioner built exactly this (NOAA forecast vs Kalshi price) and went **0–32**. Postmortem:
+  Gaussian error assumption vs fat-tailed reality, flat fee as a ~20% tax on cheap contracts, and
+  15–60 min polling far too slow against dedicated weather-arb bots already in the niche.
+- Fed working paper (Diercks/Katz/Wright, Feb 2026): Kalshi's market-implied CPI and fed-funds
+  forecasts **beat** Bloomberg consensus and professional forecasters. The market is the
+  sophisticated party on macro.
+- Academic work finds CME temperature futures "very efficient despite lack of liquidity."
+- **The decisive stat:** university research found bot accounts made **$131M** in 2025 while
+  less-active retail lost the same ~$131M — **even though retail picked correct outcomes more
+  often.** Bots won on entry timing, not forecasting. Separately, 68.8% of 2.4M Polymarket users
+  are net losers. This is a latency game.
+
+### What the backtest actually showed
+
+v1 was wrong three ways and its own sanity check caught it — **1,067 of 1,760 "certain YES" moments
+had settled NO (61%)**, so its headline "+64c/contract" was pure artifact. Bugs: ASOS requested in
+local time but parsed as UTC; max-monotonicity logic applied to daily-*minimum* series; and the `-T`
+ticker prefix wrongly assumed directional (`-T79` is "80 or above", `-T72` is "71 or below" — the
+ladder runs both ways).
+
+v2 fixed all three and the mismatch collapsed to **one cell** (`KXLOWTCHI min/above`, 164 cases),
+every other series/direction clean. Spot-check confirmed the data is fine and Kalshi is right —
+ORD's Aug 4 minimum was 69.0F, correctly settling "greater than 65" as YES. The residual bug is
+mine. **No P&L is reported from a test that fails its own sanity check.**
+
+**But the clean cells are the real finding:** across **275 settled markets scanned, the
+correctly-handled cells produced only 28 determined moments** — instances where an outcome was
+already mechanically certain *while the market was still open and quoted*. Kalshi closes/settles
+these promptly. Even a flawless implementation would have almost nothing to trade.
+
+### Verdict
+
+**Stop.** Three independent lines agree: the hypothesis was already tested publicly and failed
+0–32; the clean data shows ~nothing to capture; and the winning input in this niche is latency
+infrastructure, not modelling. Continuing to debug the `min/above` branch would refine the
+measurement of something the evidence says is already arbitraged — the p-hacking failure mode in a
+different costume.
+
+**Seven measurements, seven negatives.** The map is complete. The single durable correction from
+this round is the hold-to-expiry cost figure; the single durable asset is the rig that produced
+seven honest answers instead of one expensive mistake.
