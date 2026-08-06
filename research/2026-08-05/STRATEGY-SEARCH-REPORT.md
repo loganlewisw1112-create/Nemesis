@@ -371,5 +371,66 @@ capacity question, and it requires the resting-order machinery NEMESIS does not 
 build on the table, and it should be scoped only after a longer observation window confirms the
 per-contract edge holds across more sessions.
 
-**Still collecting.** The collector continues gathering `KXCS2GAME` data across further matches to
-extend the robustness window before any build decision.
+---
+
+## 5. FULL-DAY VALIDATION (18:10 PDT) — 10 hours, 113,564 observations
+
+The collector ran ~10 hours (survived a mid-session process restart). This is a **3.6× larger sample**
+than the 1.9h window the initial conclusion rested on, and it is the real test — it both confirmed
+the survivor and **killed one candidate I had provisionally kept**.
+
+### Realized spread, 60s horizon: 1.9h vs 10h
+
+| Series | RS60 @1.9h | **RS60 @10h** | n @10h | verdict |
+|---|---|---|---|---|
+| **KXCS2GAME** | +3.31c | **+3.07c** | 4,060 | **HELD** |
+| KXITFWMATCH | +0.72c | **−0.04c** | 10,838 | **KILLED by bigger sample** |
+| KXMLBGAME | +0.97c | +0.15c | 12,419 | collapsed (and uncapturable anyway) |
+| KXMLBTOTAL | −0.11c | −0.65c | 4,307 | negative |
+| **KXBTCD** | −1.09c | **−3.92c** | 21,095 | **definitively toxic** |
+
+### The back-of-queue correction — the decisive column
+
+| Series | ES | sweep RS30 | **sweep RS60** | sweep RS120 | sweep n | sweep depth |
+|---|---|---|---|---|---|---|
+| **KXCS2GAME** | +3.88c | +4.42c | **+2.74c** | +1.68c | 1,917 | 10 |
+| KXITFWMATCH | +1.66c | −0.60c | **−1.93c** | +1.15c | 2,105 | 15 |
+| KXMLBGAME | +3.33c | +0.35c | **−7.42c** | +0.62c | 915 | 11 |
+| KXMLBTOTAL | −3.85c | −3.28c | −3.54c | +0.86c | 660 | 6 |
+| KXBTCD | +2.14c | −2.67c | **−6.39c** | −7.68c | 3,912 | 20 |
+
+**`KXCS2GAME` is the only series that is positive at the back of the queue.** Every other candidate —
+including tennis and MLB, which looked positive tape-wide — goes **negative** once restricted to
+prints that consumed the whole visible queue. That is queue theory working exactly as predicted, and
+it eliminates four of five candidates.
+
+### Robustness across matches
+
+`KXCS2GAME`, **55 distinct matches**, 8 largest: +3.01, +2.66, +5.85, +1.56, **−0.04**, +6.27, +1.58,
+**−5.10** → **6 of 8 positive**. Time halves +3.26c / +2.11c.
+
+`KXITFWMATCH`, 56 matches: signs scatter (+1.23, +1.69, +2.76, −0.15, −1.10, +0.29, +2.90, +0.16) and
+the aggregate is now **−0.04c**. Confirmed not an edge.
+
+`KXBTCD`, 12 events: −8.51, −1.69, +0.11, −2.76, +1.16, −5.34, −4.28, −0.97. Confirmed toxic.
+
+### Final answer
+
+**The ONE GOAL stands, now validated on 10 hours of data: passive market making on Kalshi esports
+(`KXCS2GAME`), and nothing else.**
+
+Honest reading of the numbers:
+- **Central estimate +2.7 to +3.1c per contract** at the 30–60s horizon, back-of-queue-adjusted.
+- **The edge decays fast with horizon** (sweep: +4.42c @30s → +2.74c @60s → +1.68c @120s). This is a
+  quick in-and-out strategy; holding erodes it.
+- **Not every match works** — 2 of 8 largest were negative, one at −5.10c. Match-level selection or
+  per-match risk limits matter.
+- **Capacity remains unmeasured and unmeasurable from public data.** Still the biggest open question,
+  and still requires resting real orders.
+- Esports are **event-driven** — `KXCS2GAME` disappeared from the active tape mid-day. Tradeable
+  windows are limited to match times, which caps daily opportunity independent of edge.
+
+**What changed from the 1.9h read:** tennis died. That is the value of the longer window — the
+initial pass would have carried two candidates forward, one of which turns negative at scale and
+negative at the back of the queue. The 10-hour data converted a two-horse shortlist into a single
+answer.
