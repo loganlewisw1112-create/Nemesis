@@ -2,7 +2,14 @@
 
 [![NEMESIS CI](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml/badge.svg)](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml)
 
-Current as of July 22, 2026.
+> **PROJECT PARKED — 2026-08-05.** NEMESIS answered the question it was built to answer:
+> **no tradeable edge was found, proven across seven independent measurements, with $0 risked.**
+> Portfolio closed at $5,000 with 0 trades executed; live trading was never enabled.
+> **Read [`docs/PROJECT-CLOSEOUT.md`](docs/PROJECT-CLOSEOUT.md) first** — it explains the reasoning,
+> what worked, what didn't, and why not to re-run any of the seven theses.
+> Everything below describes the system as built and remains accurate as engineering documentation.
+
+Current as of July 22, 2026 (engineering docs); project closed out 2026-08-05.
 
 NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha (GEA) intelligence app. It is built for event-market thesis discovery, fillability-aware ticket ranking, paper execution, profit-retention research, fail-closed bridge recommendations, and staged live-trading readiness.
 

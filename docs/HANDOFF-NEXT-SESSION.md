@@ -1,4 +1,13 @@
-# NEMESIS — Next-Session Handoff (written 2026-08-05, during the run ending 07:00 PDT)
+# NEMESIS — Next-Session Handoff
+
+> **SUPERSEDED — PROJECT PARKED 2026-08-05.**
+> This file records the state at the crypto-lead verdict. Six further measurements followed, all
+> negative. **Read [`PROJECT-CLOSEOUT.md`](PROJECT-CLOSEOUT.md) first**; it is the authoritative
+> final document. Full numbers for all seven theses:
+> `research/2026-08-05/STRATEGY-SEARCH-REPORT.md`.
+>
+> The "Where to go next" section below is **obsolete** — every option in it was subsequently tested
+> and falsified. Do not act on it.
 
 **Headline: the central question is answered. crypto-lead has no edge, and the test that says so
 is clean.** After ~6 weeks of infrastructure work whose entire purpose was to make a fair test
