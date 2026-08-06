@@ -530,3 +530,95 @@ systematically flatters it.** The machinery is kept — it is tested, honest, an
 quoting idea into a cheap out-of-sample question instead of a build. But nothing in this data
 supports placing real resting orders, and the responsible next step is **not** another parameter
 sweep: 25 cells already produced two false positives, and sweeping harder only manufactures more.
+
+---
+
+## 7. TAIL CALIBRATION (19:45) — the last untested region. No exploitable mispricing.
+
+Everything above measured **liquid** markets; "Kalshi is efficient" was a statement about those.
+This tests the tail: niche series no professional bothers to price. Categories never previously
+touched — Entertainment, Politics, Elections, Climate, Health, Companies, Mentions, Commodities.
+
+**Scale of the tail:** 12,505 series exist (12,493 non-MVE). Stratified sample of **545 series
+across 17 categories**; only **80 (14.7%)** had ≥3 genuinely traded settled markets. **~85% of the
+non-MVE tail does not trade enough to assess at all** — untradeable, not mispriced. Final dataset:
+**919 markets across 79 series, 11 categories**, quoted mid at 50% of each market's life vs realized
+outcome. Median spread **4c**, p90 **27c** — far wider than the liquid series.
+
+### The result depends entirely on book quality, which is the tell
+
+| filter | n | mid | realized | edge | Wilson CI | significant? |
+|---|---|---|---|---|---|---|
+| all | 919 | 0.412 | 0.453 | +0.040 | [0.421, 0.485] | yes |
+| **spread ≤ 0.02** | 356 | 0.407 | 0.421 | **+0.015** | [0.371, 0.473] | **no** |
+| **spread ≤ 0.03** | 430 | 0.407 | 0.440 | **+0.033** | [0.393, 0.487] | **no** |
+| spread ≤ 0.05 | 586 | 0.409 | 0.456 | +0.046 | [0.416, 0.496] | yes |
+
+**Where the mid is actually a probability, there is no edge.** The aggregate edge exists only once
+wide books are included — and a 27c-wide book's midpoint is not a forecast, it is the absence of one.
+
+### Three of 62 series survive, and all three fail their own artifact check
+
+Series-level: 62 judged (≥8 markets), **15 significant**, **4 beat the round-trip cost**, of which
+**3 are non-degenerate**: `KXCOPPERW`, `KXHOOD`, `KXSILVERD`.
+
+Against **62 tests at 95%, ~3.1 false positives are expected by chance. Three survived.** That is
+exactly the chance rate. And the directional check finishes them off:
+
+| series | overall | first half | second half | reading |
+|---|---|---|---|---|
+| `KXSILVERD` | 0.50 | **1.00** | **0.00** | complete sign flip — noise, n=7/half |
+| `KXCOPPERW` | 0.86 | 1.00 | 0.71 | copper trending over the window |
+| `KXHOOD` | 0.93 | 0.86 | 1.00 | single equity trending over the window |
+
+All three are the **trending-underlying artifact** already diagnosed in §3 (`KXINXU` 0.513→0.831,
+`KXNASDAQ100U` 0.383→0.745): sample a short window in which the underlying moved one way, and every
+"above X" market resolves YES. The elevated significance count (15 vs 3.1) is explained the same
+way — the significant series cluster in Commodities and Financials, i.e. trending underlyings, and
+5 of the 15 are degenerate all-one-outcome samples.
+
+### Two of my own statistical errors, corrected
+
+- **Wald CI collapses at the boundary.** `1.96·√(p(1−p)/n)` returns **exactly zero** when every
+  outcome is identical, so degenerate 14-sample series read as infinitely significant — the first
+  pass reported 12 "tradeable" series on that basis. Switched to the **Wilson score interval**,
+  which gives [0.78, 1.00] for 14/14 rather than [1.00, 1.00]. Survivors: 12 → 4.
+- **Significance and cost were tested independently**, so a non-significant series (`Crypto`,
+  −0.114 with CI ±0.119) got flagged tradeable purely for exceeding cost. Now both bars must clear.
+
+### Verdict
+
+**No exploitable mispricing in the tail.** Ranked by how much each explains:
+1. **~85% of the tail is untradeable**, not mispriced.
+2. **In tight books there is no measurable edge** — the aggregate signal is a wide-book artifact.
+3. **Survivors match the chance rate** (3 vs 3.1 expected) and every one shows a trending underlying.
+
+**Honest limit on this conclusion:** the settled-markets endpoint returns recent settlements, so the
+sample is ≤14 markets per series from a short window — inherently vulnerable to exactly the trending
+artifact that dominates the results. A test that could rule mispricing in or out properly needs
+months of history so underlying trends average away. So this is *no evidence of edge* rather than
+*proof of efficiency*. It does not change the decision: nothing here is actionable.
+
+---
+
+## 8. FINAL STATE — the map is complete
+
+| Direction | Result | How it died |
+|---|---|---|
+| Directional crypto (crypto-lead) | **No edge** | 53 scored shadows, 5 quality bars failed on clean data |
+| Correlated arb within Kalshi | **No edge** | Efficient to ~1 tick; binding leg had 1.00 contract of depth |
+| Cross-venue (Polymarket) | **Premise fails** | No mappable instrument at our horizon |
+| Passive market making | **Not capturable** | One-sided flow; every fix flips out-of-sample |
+| Favorite-longshot bias | **Not present** | Liquid series calibrated to <1pp |
+| Tail mispricing | **No evidence** | 85% untradeable; survivors = chance + trending underlyings |
+
+Six independent measurements, all negative, each falsified by data rather than opinion. The
+consistent explanation is the cost structure: a retail taker pays **4.5–6.5c** round-trip while the
+market is priced efficiently to **~1c**, and the one place that asymmetry inverts (zero maker fees)
+is unreachable because flow is one-sided and queue position cannot be bought.
+
+**What is genuinely worth keeping:** the measurement rig. It falsified four multi-week builds in
+under an hour each, caught five of my own analytical errors (fee model, taker-side sign, Wald CI,
+significance/cost conflation, composition effects), and turns any future thesis into a cheap
+out-of-sample question. **An edge here would have to be informational — better forecasting of a
+specific domain — not structural.** Nothing in market microstructure is available at this size.
