@@ -1,5 +1,5 @@
 import type { KalshiTrade, GeoNewsItem } from '@nemesis/core';
-import { fetchText, fetchMarkets, resilientFetch } from '@nemesis/core';
+import { fetchText, resilientFetch } from '@nemesis/core';
 import type { ConnectorRegistry } from './registry.js';
 
 export interface NewsItem {
@@ -30,6 +30,8 @@ export interface CryptoSnapshot {
   fetchedAt: number;
   momentumBps?: number;
   volatilityBps?: number;
+  /** See `BinanceQuote.sigmaPerRootSec`. Absent on the REST-only fallback, which has no window to estimate from. */
+  sigmaPerRootSec?: number;
   sampleCount?: number;
   windowMs?: number;
 }
@@ -356,16 +358,21 @@ export async function fetchEspnScoreboard(
 }
 
 export async function pingKalshiWs(registry: ConnectorRegistry): Promise<boolean> {
-  const start = Date.now();
-  try {
-    // Reuse the same base-URL fallback logic as the REST connector
-    await fetchMarkets({ limit: 1 });
-    registry.recordSuccess('kalshi-ws', Date.now() - start);
-    return true;
-  } catch (e) {
-    registry.recordWarn('kalshi-ws', e instanceof Error ? e.message : 'Kalshi stream offline');
-    return false;
-  }
+  const ticker = registry.refreshFreshness('kalshi-ticker-ws', 25_000);
+  const orderbook = registry.refreshFreshness('kalshi-orderbook-ws', 25_000);
+  const ready = ticker?.qualificationReady === true && orderbook?.qualificationReady === true;
+  registry.recordTelemetry('kalshi-ws', {
+    status: ready ? 'ok' : 'warn',
+    lastError: ready ? null : 'Kalshi websocket components are not both qualification-ready',
+    transportConnected: ticker?.transportConnected === true && orderbook?.transportConnected === true,
+    authenticated: ticker?.authenticated === true && orderbook?.authenticated === true,
+    qualificationReady: ready,
+    lastMessageAt: Math.max(ticker?.lastMessageAt ?? 0, orderbook?.lastMessageAt ?? 0) || null,
+    lastPongAt: Math.max(ticker?.lastPongAt ?? 0, orderbook?.lastPongAt ?? 0) || null,
+    reconnects: (ticker?.reconnects ?? 0) + (orderbook?.reconnects ?? 0),
+    sequenceGaps: (ticker?.sequenceGaps ?? 0) + (orderbook?.sequenceGaps ?? 0),
+  });
+  return ready;
 }
 
 interface RegionQuery { query: string; region: string; lat: number; lon: number; countryCode: string }

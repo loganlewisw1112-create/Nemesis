@@ -8,13 +8,29 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) return;
   throw err;
 });
+// Without this, any rejected promise nobody awaited terminates the main process
+// on Node's default. Two campaign-store writes reached for by fire-and-forget
+// callers can throw on a persistence fault -- losing the whole run to a ledger
+// hiccup, hours into an unattended soak, with nothing written down about why.
+// Log loudly and keep running: the store has already latched itself closed, so
+// nothing can be silently appended after a failure.
+process.on('unhandledRejection', (reason) => {
+  const detail = reason instanceof Error ? `${reason.message}\n${reason.stack ?? ''}` : String(reason);
+  console.error('[nemesis] unhandled promise rejection (process kept alive)', detail);
+  try {
+    recordUnhandledRejection(detail);
+  } catch {
+    // Never let the reporter itself become the thing that kills the process.
+  }
+});
 
-import { app, BrowserWindow, ipcMain, globalShortcut, safeStorage } from 'electron';
+import { app, BrowserWindow, ipcMain, globalShortcut, powerSaveBlocker, safeStorage } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { WebSocketServer, WebSocket as WsSocket, type RawData } from 'ws';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { validateBridgeMessage, type BridgeStatus, type ExitRecommendation, type NemesisBridgeMessage, type NemesisStateMirror, type RecommendationPacket } from '@nemesis/bridge-contracts';
+import { validateBridgeMessage, type BridgeProcessTelemetry, type BridgeStatus, type ExitRecommendation, type NemesisBridgeMessage, type NemesisStateMirror, type RecommendationPacket } from '@nemesis/bridge-contracts';
 import {
   DEFAULT_GUARDRAILS,
   DEFAULT_AUTO_CLOSE_SETTINGS,
@@ -27,10 +43,12 @@ import {
   isExecutablePrice,
   normalizeMarketPrice,
   sanitizeExecutableBook,
+  KalshiRequestFailure,
   evaluateGates,
   rankTheses,
   detectNoTradeRegimes,
   shouldShutdownSession,
+  sessionShutdownFreezesTheses,
   computeNetEdge,
   DEFAULT_SHUTDOWN_COUNTERS,
   recordInvalidation,
@@ -45,7 +63,10 @@ import {
   scoreOpportunityForCard,
   HotOpportunityIndex,
   evaluateLiveUnlock,
+  evaluateStoredLiveAuthorization,
   kalshiFeeForOrder,
+  isKnownKalshiFeePolicy,
+  kalshiProductionCircuitSnapshot,
   positionUnrealizedPnl,
   type AutoCloseDecision,
   type AutoCloseSettings,
@@ -54,8 +75,11 @@ import {
   type GuardrailSettings,
   type StrategyValidationStage,
   type ThesisCard,
+  type ModelCalibrationEvidence,
   type KalshiMarket,
   type KalshiOrderbook,
+  type KalshiFeePolicy,
+  type KalshiResponseMetadata,
   type OpportunityRadarRow,
   type PriceTick,
   type PaperPortfolio,
@@ -64,8 +88,9 @@ import {
   type PaperOrder,
   type GeoMarket,
   type WorldEventsPayload,
+  type LadderQuote,
 } from '@nemesis/core';
-import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo } from '@nemesis/connectors';
+import { ActiveTradeMarketResolver, ConnectorRegistry, FeedHub, KalshiStream, KalshiOrderbookStream, DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS, isTradableMarketAt, isCryptoMarket, isMacroMarket, isSportsMarket, isWeatherMarket, inferMarketGeo, tradeNotionalUsd, withinSeriesAllowlist, tickerWithinSeriesAllowlist, seriesAllowlistConfigured, seriesDenylistConfigured, type ProductionUniverseRecord } from '@nemesis/connectors';
 import { JournalStore } from '@nemesis/journal';
 import {
   dryRunFill,
@@ -102,6 +127,17 @@ import {
   type PaperQualificationEvent,
   type PaperQualificationSnapshot,
   EntryConfirmationEngine,
+  authHeaders,
+  candidateEconomicIdentity,
+  qualifyCampaignEnrollment,
+  calculateEntryEconomics,
+  type CampaignBookUpdateView,
+  type CampaignCandidateRecord,
+  type CampaignScreenedOut,
+  type CampaignScreeningReasonCode,
+  type CampaignScreeningDecisionV2,
+  type DryRunOrder,
+  type DiagnosticAttemptOutcome,
   type StrategyValidationEvent,
   type StrategyValidationSnapshot,
 } from '@nemesis/execution';
@@ -109,10 +145,22 @@ import { StrategyQuarantine } from '@nemesis/capital';
 import { tradeToThesis, weatherToThesis, macroToThesis, cryptoToThesis, globalToThesis, infraToThesis, sportsToThesis, releaseRadarWarning, scanMarketTheses } from '@nemesis/pods';
 import { DiscoveryOrchestrator } from './discovery.js';
 import { BookFetchCoordinator, isBookFetchBackoffError } from './bookFetchCoordinator.js';
+import { pacedDispatch } from './pacedDispatch.js';
 import { dedupeByExecutionKey } from './executionConcurrency.js';
 import { PaperExecutionCoordinator } from './paperExecutionCoordinator.js';
 import { PaperQualificationStore } from './paperQualificationStore.js';
 import { StrategyValidationStore } from './strategyValidationStore.js';
+import { SevenHourCampaignStore } from './sevenHourCampaignStore.js';
+import { requalifyThesisCard } from './thesisRequalification.js';
+import {
+  CampaignBookTriggerScheduler,
+  campaignBookUpdateWork,
+  campaignEnrollmentReadiness,
+  campaignPendingCapacity,
+  isEvidenceOnlyCampaignExecution,
+  shouldInvalidateSupervisedEvidence,
+} from './campaignRuntime.js';
+import { KalshiFeePolicyResolver } from './kalshiFeePolicyResolver.js';
 import { buildStrategyConfigHash, PAPER_STRATEGY_ENGINE_VERSION } from './qualificationConfig.js';
 import { upsertRecommendationMarket, upsertRecommendationThesis } from './bridgeRecommendations.js';
 import { createGeaBridgeUrl, createGeaChildEnv, createGeaSpawnPlan } from './geaSpawn.js';
@@ -120,6 +168,33 @@ import { createSingleFlight, withAbortTimeout } from './singleFlight.js';
 import { startupTrace } from './startupTrace.js';
 import { createBridgeAuth, isBridgeRequestAuthenticated, resolveBridgeHost } from './bridgeSecurity.js';
 import { resolveNemesisUserDataPath } from './userDataPath.js';
+import { RendererMemoryMonitor } from './rendererMemoryMonitor.js';
+import type { RendererMemoryAssessment } from './rendererMemoryMonitor.js';
+import { RuntimeHealthController, type RuntimeComponentHealth, type RuntimeHealthDecision } from './runtimeHealthController.js';
+import { RuntimeEvidenceSidecar } from './runtimeEvidenceSidecar.js';
+import { EvidenceRunSupervisor } from './evidenceRunSupervisor.js';
+import { VersionedStateStream } from './stateStreamCoalescer.js';
+import { RuntimeStatusExporter, runtimeStatusPathFromEnvironment } from './runtimeStatusExport.js';
+import { RendererHeartbeatMonitor } from './rendererHeartbeatMonitor.js';
+import {
+  mergeAllowlistForceFillDesired,
+  selectBoundedOrderbookTracking,
+  shouldHoldEmptyDesiredOrderbook,
+} from './orderbookTrackingRotation.js';
+import { assessProductionObservation, productionObservationStateHash } from './productionObservation.js';
+import { createTraceWriter } from './orderbookTrace.js';
+import {
+  DataPlaneDegradationLatch,
+  computeCandidateSequencedBookHealth,
+  DEFAULT_SEQUENCED_BOOK_THRESHOLD_MS,
+  type CandidateBookSample,
+} from './dataPlaneHealth.js';
+import {
+  decideShadowFollowUp,
+  SHADOW_EDGE_GONE_OBSERVATIONS,
+  SHADOW_TARGET_HOLD_OBSERVATIONS,
+} from './shadowFollowUp.js';
+import { RotatingJsonlWriter } from './rotatingJsonl.js';
 
 if (process.env.NEMESIS_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -135,11 +210,18 @@ const EQUITY_HISTORY_PATH = path.join(DATA_DIR, 'equity-history.json');
 const SESSION_STATS_PATH = path.join(DATA_DIR, 'session-stats.json');
 const PAPER_ORDERS_PATH = path.join(DATA_DIR, 'paper-orders.json');
 const AUDIT_PATH = path.join(DATA_DIR, 'audit-log.json');
+// The in-memory audit log is capped; without this archive the oldest entries
+// vanish silently (a 2026-07-27 run lost its last 2.6h to the cap).
+const AUDIT_ARCHIVE_PATH = path.join(DATA_DIR, 'audit-log-archive.jsonl');
 const DISCOVERY_SETTINGS_PATH = path.join(DATA_DIR, 'discovery-settings.json');
 const AUTO_CLOSE_PATH = path.join(DATA_DIR, 'auto-close-state.json');
 const KALSHI_CREDENTIALS_PATH = path.join(DATA_DIR, 'kalshi-credentials.v1.json');
 const PAPER_QUALIFICATION_PATH = path.join(DATA_DIR, 'paper-qualification-events.jsonl');
 const STRATEGY_VALIDATION_PATH = path.join(DATA_DIR, 'paper-strategy-validation-events.jsonl');
+const CAMPAIGN_DIR = path.join(DATA_DIR, 'evidence-campaigns');
+const ACTIVE_CAMPAIGN_PATH = path.join(CAMPAIGN_DIR, 'active-campaign.json');
+const BRIDGE_TELEMETRY_PATH = path.join(DATA_DIR, 'bridge-telemetry.jsonl');
+const PRODUCTION_OBSERVATION_MODE = process.env.NEMESIS_PRODUCTION_OBSERVATION === 'true';
 
 const MAX_TICKS = 120;
 const LIQUIDITY_PREFILTER_MAX_AGE_MS = 45_000;
@@ -148,47 +230,451 @@ const WATCHED_TICK_MS = 1_000;
 const FEED_WAIT_MS = 2_000;
 const BOOK_CACHE_TTL_MS = 600;
 const MARKET_BROADCAST_THROTTLE_MS = 750;
+const DEGRADED_MARKET_BROADCAST_THROTTLE_MS = 3_000;
 const PAPER_BROADCAST_THROTTLE_MS = 1_000;
+const PAPER_SUMMARY_BROADCAST_THROTTLE_MS = 5_000;
+const CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS = 500;
 const EQUITY_SNAPSHOT_MIN_MS = 5_000;
-const UNIVERSE_FETCH_TIMEOUT_MS = 20_000;
+// Sparse live-universe pages can require more than the old single-page
+// timeout before 25 executable markets are found. The preflight still has its
+// own 20-minute ceiling; this only prevents a valid paginated discovery from
+// being aborted before the orderbook readiness minimum is reachable.
+const UNIVERSE_FETCH_TIMEOUT_MS = 120_000;
+const REST_HEALTH_POLL_MS = 20_000;
+const UNIVERSE_REFRESH_MS = 5 * 60_000;
+const BRIDGE_HEARTBEAT_MS = 5_000;
+const BRIDGE_TRAFFIC_TTL_MS = 15_000;
+const RUNTIME_SAMPLE_INTERVAL_MS = 5_000;
+const RENDERER_MEMORY_SAMPLE_INTERVAL_MS = 30_000;
+// Packaged Electron startup can be delayed by a cold profile or a busy
+// desktop. Keep the renderer-load grace bounded, but long enough to cover the
+// five-minute soak warm-up; the renderer must still finish loading and answer
+// a fresh probe before feeds or evidence can start.
+const RENDERER_LOAD_RETRY_GRACE_MS = 5 * 60_000;
+// Discovery still evaluates 500 tickers. Live depth is a smaller, rotating
+// working set so the authenticated socket carries only immediately useful
+// markets; active campaign candidates preempt this set.
+// Production qualification requires exactly 25 tracked markets. The target is
+// overridable (1..25) only for reduced-bar validation rehearsals when the live
+// universe is thin; offline evidence verifiers remain pinned at 25, so a
+// reduced-bar run can never verify as a real qualification.
+const ORDERBOOK_TRACKING_LIMIT = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_ORDERBOOK_TRACKING_LIMIT ?? '', 10);
+  return Number.isInteger(raw) && raw >= 1 && raw <= 25 ? raw : 25;
+})();
+const ORDERBOOK_ROTATION_INTERVAL_MS = 5 * 60_000;
+const ORDERBOOK_ROTATION_BATCH_SIZE = 4;
+// A flow-driven candidate's ticker frequently is not yet one of the <=25
+// tickers the orderbook WebSocket actively tracks -- that set only rotates a
+// few tickers in every five minutes, far slower than new candidates appear.
+// Falling back to a REST orderbook snapshot for an untracked ticker can never
+// satisfy entry confirmation's exchange-origin book check: Kalshi's REST
+// snapshot carries no match-engine sequence number, only the WS delta stream
+// does (see parseOrderbook in packages/core/src/kalshi/client.ts), so
+// sourceTimestamp/sequence come back undefined and the candidate is rejected
+// before profit or persistence are ever evaluated -- regardless of the hour
+// or feed health. Give a candidate whose ticker just cleared economics a
+// short window to receive its first sequenced WS snapshot before resorting
+// to that unverifiable REST fallback.
+const PRIORITY_ORDERBOOK_WAIT_MS = 3_000;
+const PRIORITY_ORDERBOOK_POLL_MS = 200;
+// Bounded, not attempt-counted, matching this file's other timeout constants.
+// A candidate whose book fetch fails right at its 15-minute due deadline gets
+// this much extra runway (roughly 60 health ticks) before being abandoned --
+// enough to rule out one transient failure, not enough to retry forever.
+const SHADOW_ABANDON_GRACE_MS = 5 * 60_000;
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Production-provenance re-verification cadence and pacing. Every cycle refreshes
+// the (<=25) tracked orderbook markets. Firing all of them at once (the previous
+// concurrency-5 burst) reliably drew Kalshi 429s during a full-bar soak; the
+// un-refreshed markets then lapsed at the 90s provenance TTL and the tracked set
+// decayed below 25, failing R10. Pacing spreads each cycle's requests across
+// REVERIFY_INTERVAL_UTILIZATION of the interval (adaptive gap per market, capped
+// at REVERIFY_MAX_REQUEST_GAP_MS) with at most REVERIFY_MAX_CONCURRENCY in flight,
+// so the full set re-verifies well inside the TTL without ever bursting.
+const REVERIFY_INTERVAL_MS = 20_000;
+const REVERIFY_MAX_CONCURRENCY = 3;
+const REVERIFY_INTERVAL_UTILIZATION = 0.75;
+const REVERIFY_MAX_REQUEST_GAP_MS = 2_000;
 
 app.commandLine.appendSwitch('disable-features', 'NetworkServiceSandbox');
 
 startupTrace('module-loaded');
 
 let mainWindow: BrowserWindow | null = null;
+let rendererLoadReadyPromise: Promise<void> = Promise.resolve();
+let resolveRendererLoadReady: (() => void) | null = null;
+let rendererRetryInProgress = false;
+let rendererProbePendingAfterPaint = false;
+let rendererProbeGateInProgress = false;
 const widgetWindows = new Set<BrowserWindow>();
 const registry = new ConnectorRegistry();
 const discovery = new DiscoveryOrchestrator(registry);
 const feedHub = new FeedHub(registry);
-const activeTradeMarketResolver = new ActiveTradeMarketResolver();
-const kalshiStream = new KalshiStream(registry);
+// Hydrate enough tape-active markets to fill the whole tracked set. The default
+// of 6 left most orderbook slots to the fill path below, which could only offer
+// dormant markets and starved qualification.
+const activeTradeMarketResolver = new ActiveTradeMarketResolver({
+  maxMarkets: ORDERBOOK_TRACKING_LIMIT,
+});
+const kalshiStream = new KalshiStream(registry, () => {
+  const credentials = getLiveCreds();
+  return credentials
+    ? authHeaders(credentials.apiKeyId, credentials.privateKeyPem, 'GET', '/trade-api/ws/v2')
+    : null;
+});
 const hotOpportunityIndex = new HotOpportunityIndex({ maxRows: 25, targetDecisionMs: 3 });
 const journal = new JournalStore();
 const quarantine = new StrategyQuarantine();
 let settings: GuardrailSettings = { ...DEFAULT_GUARDRAILS };
+const kalshiFeePolicyResolver = new KalshiFeePolicyResolver(
+  () => settings.kalshiAccountPrecision ?? 'unknown',
+);
+const kalshiOrderbookStream = new KalshiOrderbookStream(registry, () => {
+  const credentials = getLiveCreds();
+  return credentials
+    ? authHeaders(credentials.apiKeyId, credentials.privateKeyPem, 'GET', '/trade-api/ws/v2')
+    : null;
+}, 'production', ORDERBOOK_TRACKING_LIMIT);
 let theses: ThesisCard[] = [];
 let geaTheses: ThesisCard[] = [];
 let reviewOnly = false;
 let marketsCache: KalshiMarket[] = [];
 let marketFeedReady = false;
 let geaMarkets: KalshiMarket[] = [];
+const productionMarketRecords = new Map<string, ProductionUniverseRecord>();
 const paperDesk = new PaperDesk(DEFAULT_PAPER_CASH);
 const paperBuyExecutionCoordinator = new PaperExecutionCoordinator();
 const paperOrderBook = new PaperOrderBook();
-const auditLog = new AuditLog();
+let productionObservationBaselineHash: string | null = null;
+const auditLog = new AuditLog({
+  onEvict: (evicted) => {
+    try {
+      ensureDataDir();
+      fs.appendFileSync(AUDIT_ARCHIVE_PATH, `${evicted.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+    } catch {
+      // Archival must never disturb the runtime; the cap still applies.
+    }
+  },
+});
 const profitabilityBenchmark = new ProfitabilityBenchmark({ targetLiftPct: 80 });
 const opportunityQueue = new OpportunityThroughputQueue(DEFAULT_OPPORTUNITY_THROUGHPUT);
 let entryConfirmationEngine = new EntryConfirmationEngine(DEFAULT_ENTRY_QUALIFICATION);
+let campaignEntryConfirmationEngine = new EntryConfirmationEngine(DEFAULT_ENTRY_QUALIFICATION);
 const lastTickerSideExecutionAt = new Map<string, number>();
 const tickHistory = new Map<string, PriceTick[]>();
 const autoCloseStates = new Map<string, AutoCloseState>();
 const latestExitSignals = new Map<string, AutoCloseExitSignal>();
 const worstUnrealizedLossByPosition = new Map<string, number>();
+/**
+ * Resolves a book for entry confirmation, preferring a WS-tracked, exchange-
+ * sequenced snapshot over an unverifiable REST fallback. If the ticker is not
+ * yet in the (<=25-slot) live tracking set, add it immediately -- bounded by
+ * the same cap the periodic rotation respects -- and give it a short window
+ * to receive its first sequenced snapshot before resorting to REST. Keeps
+ * `orderbookTrackedTickers` (the module's view of tracked membership) in sync
+ * so the next periodic `refreshOrderbookTracking()` does not immediately undo
+ * this by recomputing membership without the newly-added ticker.
+ */
+/**
+ * Off unless NEMESIS_PRIORITY_TRACK_TRACE_PATH is set. Priority tracking either
+ * works or silently doesn't, and the difference is invisible after the fact: a
+ * candidate that never gets a book looks identical whether its subscription was
+ * still warming up or the stream's own provenance store refused to admit the
+ * ticker in the first place. Records both, per attempt.
+ */
+function tracePriorityTracking(fields: Record<string, string | number | boolean>): void {
+  const tracePath = process.env.NEMESIS_PRIORITY_TRACK_TRACE_PATH;
+  if (!tracePath) return;
+  try {
+    fs.appendFileSync(tracePath, `${JSON.stringify({ at: Date.now(), ...fields })}\n`);
+  } catch {
+    // Diagnostics must never disturb the runtime.
+  }
+}
+
+/**
+ * Orderbook stream state, sampled on the health tick. The 2026-07-27 run went
+ * 7.9h with a dead socket while every persisted ledger described either the
+ * desktop<->GEA bridge or the funnel's downstream symptoms; the stream's own
+ * socket/membership/quarantine state was recoverable only from a console. This
+ * writer is the durable record. Deduped, so a healthy 8h run costs kilobytes.
+ */
+const orderbookTrace = createTraceWriter('NEMESIS_ORDERBOOK_TRACE_PATH');
+/**
+ * Connector warnings, verbatim. `registry.recordWarn('kalshi-orderbook-ws', ...)`
+ * strings would have identified that outage in five minutes; they went nowhere.
+ * Never deduped -- a repeated warning is itself the signal.
+ */
+const connectorWarnTrace = createTraceWriter('NEMESIS_CONNECTOR_WARN_TRACE_PATH', { dedupeWindowMs: 0 });
+
+let unhandledRejectionCount = 0;
+
+/**
+ * Durable record of a rejection that would previously have ended the process.
+ * Called from a `process.on` handler that can fire before module init finishes,
+ * so it must assume nothing about what is constructed yet.
+ */
+function recordUnhandledRejection(detail: string): void {
+  unhandledRejectionCount += 1;
+  if (typeof connectorWarnTrace === 'undefined') return;
+  connectorWarnTrace.record({
+    at: Date.now(),
+    connector: 'main-process',
+    source: 'unhandled-rejection',
+    message: `unhandled promise rejection #${unhandledRejectionCount}: ${detail}`,
+  });
+}
+/**
+ * Latches when candidates cannot obtain a sequenced exchange book. Confirmation
+ * rejections emitted while latched describe missing data, not absent edge, and
+ * are tagged so no verdict can read "no data" as "no edge" again.
+ */
+const dataPlaneLatch = new DataPlaneDegradationLatch();
+let dataPlaneDegradedSnapshot = dataPlaneLatch.snapshot(Date.now());
+
+/**
+ * `track`/`replaceTracked` admit a ticker only if the stream's own provenance
+ * store vouches for it, and that store is fed solely by the periodic universe
+ * sweep -- so a flow-driven candidate that discovery has not covered (or whose
+ * 90s provenance has lapsed) is refused outright. Measured: every untracked
+ * candidate sampled arrived with no record in either store, so priority
+ * tracking silently did nothing.
+ *
+ * Hydrates the one ticker from the single-market production endpoint and files
+ * the result through `recordProductionUniverse`, which is what populates both
+ * the stream's store and `productionMarketRecords`. Same verification the GEA
+ * recommendation path already performs: production environment, HTTP 200, and
+ * the source base URL the transport actually returned -- provenance is still
+ * earned from a real production response, never assumed.
+ */
+/**
+ * Tickers whose hydration has already failed, and when to stop believing it.
+ *
+ * `verifyProductionMarket` refuses a market that is not active/open or whose
+ * `close_time` has passed (`productionMarketProvenance.ts isActiveAt`), so a
+ * settled contract can NEVER earn provenance -- yet flow kept re-issuing cards
+ * for it and every attempt paid a REST call plus the full
+ * `PRIORITY_ORDERBOOK_WAIT_MS`. Measured 2026-07-27: 69 of 149 priority-track
+ * attempts were five already-expired KXBTCD contracts (the 00:00/15:00/18:00/
+ * 23:00 UTC strikes, retried 15-17 times each) -- 46% of the funnel's priority
+ * work spent on markets that had closed hours earlier.
+ *
+ * Expired is permanent and gets a long suppression; a transport failure is not,
+ * and gets a short one so a live ticker is never blacklisted by one timeout.
+ */
+const provenanceRetryAfter = new Map<string, number>();
+const expiredProvenanceTickers = new Set<string>();
+const PROVENANCE_EXPIRED_SUPPRESSION_MS = 60 * 60_000;
+const PROVENANCE_TRANSIENT_SUPPRESSION_MS = 30_000;
+
+function suppressProvenanceRetry(ticker: string, now: number, expired: boolean): void {
+  if (expired) expiredProvenanceTickers.add(ticker);
+  provenanceRetryAfter.set(
+    ticker,
+    now + (expired ? PROVENANCE_EXPIRED_SUPPRESSION_MS : PROVENANCE_TRANSIENT_SUPPRESSION_MS),
+  );
+  // Bounded: a long-running session sees many settled contracts.
+  if (provenanceRetryAfter.size > 512) {
+    for (const [key, retryAt] of provenanceRetryAfter) {
+      if (retryAt <= now) {
+        provenanceRetryAfter.delete(key);
+        expiredProvenanceTickers.delete(key);
+      }
+    }
+  }
+}
+
+/** A market that has closed can never produce a book; it is not evidence of a sick data plane. */
+function isKnownExpiredTicker(ticker: string): boolean {
+  return expiredProvenanceTickers.has(ticker);
+}
+
+async function ensureProductionProvenance(ticker: string): Promise<boolean> {
+  if (kalshiOrderbookStream.hasProductionProvenance(ticker)) return true;
+  const startedAt = Date.now();
+  const retryAfter = provenanceRetryAfter.get(ticker);
+  if (retryAfter != null && startedAt < retryAfter) return false;
+  let responseMetadata: KalshiResponseMetadata | null = null;
+  try {
+    const hydrated = await fetchMarket(ticker, {
+      environment: 'production',
+      onResponseMetadata: (metadata) => { responseMetadata = metadata as KalshiResponseMetadata; },
+    });
+    const verified = responseMetadata as KalshiResponseMetadata | null;
+    if (!verified || verified.environment !== 'production' || verified.status !== 200) {
+      suppressProvenanceRetry(ticker, Date.now(), false);
+      return false;
+    }
+    recordProductionUniverse([{
+      market: hydrated,
+      sourceBaseUrl: verified.sourceBaseUrl,
+      verifiedAt: verified.verifiedAt,
+    }]);
+    const admitted = kalshiOrderbookStream.hasProductionProvenance(ticker);
+    if (admitted) {
+      provenanceRetryAfter.delete(ticker);
+      expiredProvenanceTickers.delete(ticker);
+      return true;
+    }
+    // A genuine production 200 that still earned no provenance means the market
+    // itself was refused, and the only grounds for that are status and close
+    // time. Classify so this can never again be read as a hydration failure --
+    // the same mistake `admitted-no-book` caused by collapsing four causes into
+    // one bucket.
+    // Only a close time in the past is permanent. A contract that exists but is
+    // not `active`/`open` yet has a FUTURE close time, and suppressing it for an
+    // hour would blacklist it across exactly the window in which it goes live --
+    // which would starve the next hour's contracts to fix the last hour's.
+    const closeAt = hydrated.close_time ? Date.parse(hydrated.close_time) : Number.NaN;
+    const expired = Number.isFinite(closeAt) && closeAt <= Date.now();
+    suppressProvenanceRetry(ticker, Date.now(), expired);
+    return false;
+  } catch {
+    // A candidate we cannot verify simply stays untracked; the REST fallback
+    // below still applies and the exchange-origin check still rejects it.
+    // Transport failures are transient, so this suppression is short.
+    suppressProvenanceRetry(ticker, Date.now(), false);
+    return false;
+  }
+}
+
+/**
+ * A streamed book is only useful for entry confirmation if it carries the
+ * exchange provenance that check requires. getBook can return a book whose
+ * sequence/sourceTimestamp are still undefined -- a snapshot received with no
+ * sequenced delta yet -- and such a book is truthy, so testing the object alone
+ * skipped the remedy and then failed downstream on exchange origin anyway.
+ */
+function hasExchangeProvenance(book: KalshiOrderbook | null): boolean {
+  return book != null && Number.isFinite(book.sourceTimestamp) && Number.isInteger(book.sequence);
+}
+
+async function fetchOrderbookWithPriorityTracking(ticker: string): Promise<KalshiOrderbook> {
+  let streamed = kalshiOrderbookStream.getBook(ticker);
+  // Trigger on the absence of a usable book, not on membership. A ticker can sit
+  // in orderbookTrackedTickers and still return null from getBook, because
+  // getBook also requires unlapsed provenance in the stream's own store -- and
+  // that store is refreshed only by the periodic universe sweep, on a TTL
+  // shorter than the sweep interval. Gating this remedy on "not currently
+  // tracked" meant the tracked-but-bookless case, which is the common one, fell
+  // straight through to the REST fallback: measured at 56% of all rejections
+  // (15 stale-book plus 9 exchange-origin of 43), both of which are the same
+  // null book wearing two different reasons -- no sequence fails exchange
+  // origin, and no book also forces bookContinuityProven false, which reverts
+  // the freshness bound to its strict form.
+  if (!hasExchangeProvenance(streamed)) {
+    const startedAt = Date.now();
+    const alreadyTracked = orderbookTrackedTickers.includes(ticker);
+    const hadMainRecord = productionMarketRecord(ticker) != null;
+    const hadStreamProvenance = kalshiOrderbookStream.hasProductionProvenance(ticker);
+    const atCapacity = orderbookTrackedTickers.length >= ORDERBOOK_TRACKING_LIMIT;
+    // Establish provenance BEFORE touching membership. Evicting a slot for a
+    // ticker the stream will then refuse is strictly destructive: the evicted
+    // occupant loses its book (`replaceTracked` deletes books for removed
+    // tickers) and the candidate gains nothing.
+    const provenanceReady = hadStreamProvenance || await ensureProductionProvenance(ticker);
+    if (!provenanceReady) {
+      tracePriorityTracking({
+        ticker,
+        hadMainRecord,
+        hadStreamProvenance,
+        atCapacity,
+        admitted: false,
+        resolved: false,
+        waitedMs: Date.now() - startedAt,
+        trackedCount: orderbookTrackedTickers.length,
+        // Split: a settled contract is not a sick data plane, and conflating the
+        // two put 46% of one run's priority attempts into a bucket that read as
+        // a hydration failure.
+        outcome: isKnownExpiredTicker(ticker) ? 'provenance-expired' : 'provenance-unavailable',
+      });
+      return fetchOrderbook(ticker);
+    }
+    if (alreadyTracked) {
+      // Nothing to admit: the ticker is already in the desired set and the
+      // membership must not be disturbed. The book was missing because the
+      // stream's provenance for it had lapsed, which ensureProductionProvenance
+      // has now refreshed -- re-applying membership below readmits it, and the
+      // book it already holds becomes visible again.
+    } else if (orderbookTrackedTickers.length < ORDERBOOK_TRACKING_LIMIT) {
+      orderbookTrackedTickers = [...orderbookTrackedTickers, ticker];
+    } else if (orderbookTrackedTickers.length > 0) {
+      // desiredOrderbookTickers() builds this list in priority order --
+      // campaign-critical tickers, then entry-eligible candidates ranked by
+      // edge, then discovery signal markets, then most-active "fill" markets
+      // added only to keep idle slots busy -- so the tracking set is full
+      // (25/25) in the overwhelmingly common case and the branch above almost
+      // never runs. The tail of the list is always the lowest-priority
+      // occupant. Evict exactly that one slot to make room for a candidate
+      // that has already cleared economics and is attempting a real entry
+      // right now; bounded to one eviction per untracked candidate, and
+      // `entryQualification.maxPendingCandidates` caps how many can be in
+      // flight at once. A pending candidate whose ticker happens to occupy
+      // the evicted slot loses its in-progress confirmation samples and
+      // restarts them -- an accepted, bounded cost against the alternative of
+      // never reaching a confirmed entry at all.
+      orderbookTrackedTickers = [...orderbookTrackedTickers.slice(0, -1), ticker];
+    }
+    kalshiOrderbookStream.replaceTracked(orderbookTrackedTickers);
+    const admitted = kalshiOrderbookStream.isTracked(ticker);
+    // A lapsed-provenance book is restored the instant provenance is refreshed,
+    // with no new packet required, so check before paying the wait.
+    streamed = kalshiOrderbookStream.getBook(ticker);
+    const deadline = Date.now() + PRIORITY_ORDERBOOK_WAIT_MS;
+    while (!hasExchangeProvenance(streamed) && Date.now() < deadline) {
+      await delay(PRIORITY_ORDERBOOK_POLL_MS);
+      streamed = kalshiOrderbookStream.getBook(ticker);
+    }
+    const resolved = hasExchangeProvenance(streamed);
+    const finalBookState = kalshiOrderbookStream.bookState(ticker);
+    const streamTelemetry = kalshiOrderbookStream.telemetry();
+    tracePriorityTracking({
+      ticker,
+      hadMainRecord,
+      hadStreamProvenance,
+      atCapacity,
+      admitted,
+      resolved,
+      waitedMs: Date.now() - startedAt,
+      trackedCount: orderbookTrackedTickers.length,
+      alreadyTracked,
+      // `admitted-no-book` collapsed four different failures into one bucket,
+      // which is why an 8h dead socket read as a provenance-shaped symptom.
+      // Split them; `sequenced-book`/`provenance-unavailable`/`refused` keep
+      // their meaning so historical traces stay comparable.
+      outcome: resolved
+        ? 'sequenced-book'
+        : !admitted
+          ? 'refused'
+          : streamTelemetry.socketState !== 'open'
+            ? 'admitted-socket-dead'
+            : finalBookState.state === 'tracked-no-provenance'
+              ? 'admitted-provenance-lapsed'
+              : finalBookState.state === 'subscribed-awaiting-snapshot'
+                ? 'admitted-awaiting-snapshot'
+                : finalBookState.state === 'snapshot-quarantined'
+                  ? 'admitted-quarantined'
+                  : 'admitted-no-delta',
+      bookState: finalBookState.state,
+      socketState: streamTelemetry.socketState,
+      snapshotAgeMs: finalBookState.snapshotAgeMs ?? -1,
+      sequencedAgeMs: finalBookState.sequencedAgeMs ?? -1,
+      streamSequencedDeltaAgeMs: streamTelemetry.lastSequencedDeltaAt == null
+        ? -1
+        : Date.now() - streamTelemetry.lastSequencedDeltaAt,
+    });
+  }
+  return hasExchangeProvenance(streamed) ? streamed! : fetchOrderbook(ticker);
+}
 const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
   async (ticker) => {
-    const raw = await fetchOrderbook(ticker);
-    const book = sanitizeExecutableBook(raw);
+    const raw = await fetchOrderbookWithPriorityTracking(ticker);
+    const feePolicy = await kalshiFeePolicyResolver.resolve(ticker);
+    const book = sanitizeExecutableBook({ ...raw, feePolicy });
     const hasAnyExecutableSurface =
       isExecutablePrice(book.yesAsk) ||
       isExecutablePrice(book.noAsk) ||
@@ -199,7 +685,15 @@ const bookFetchCoordinator = new BookFetchCoordinator<KalshiOrderbook>(
     }
     return book;
   },
-  { successTtlMs: BOOK_CACHE_TTL_MS },
+  {
+    successTtlMs: BOOK_CACHE_TTL_MS,
+    // Keep a rate-limited book fetch retryable before its provenance lapses: cap
+    // the 'rate-limit' backoff at two-thirds of the provenance TTL so a market
+    // never backs off past the window in which it must be re-verified.
+    maxFailureBackoffMsByKind: {
+      'rate-limit': Math.floor(DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS * 2 / 3),
+    },
+  },
 );
 let opportunityRadarRows: OpportunityRadarRow[] = [];
 let watchedTicker: string | null = null;
@@ -210,8 +704,30 @@ let autoCloseQueued = false;
 let throughputRunning = false;
 let qualificationStore: PaperQualificationStore | null = null;
 let strategyValidationStore: StrategyValidationStore | null = null;
+let campaignStore: SevenHourCampaignStore | null = null;
 let qualificationFollowUpRunning = false;
 let strategyValidationFollowUpRunning = false;
+let campaignConfirmationWorkerRunning = false;
+let campaignDiagnosticWorkerRunning = false;
+const pendingCampaignConfirmationTickers = new Set<string>();
+const pendingCampaignThroughputTickers = new Set<string>();
+const pendingCampaignDiagnosticTickers = new Set<string>();
+interface CampaignBookObservation {
+  ticker: string;
+  sequence: number;
+  observedAt: number;
+  completedAt: number;
+  book: KalshiOrderbook;
+  feeResult:
+    | { status: 'resolved'; policy: KalshiFeePolicy }
+    | {
+        status: 'failed';
+        outcome: 'book_fetch_failed' | 'missing_provenance' | 'stale_book' | 'fee_unknown';
+        detail: string;
+      };
+}
+const latestCampaignObservationSequence = new Map<string, number>();
+const pendingCampaignDiagnosticObservations = new Map<string, CampaignBookObservation>();
 let shutdownEvidenceRecorded = false;
 let lastQualificationEquity: number | null = null;
 let sessionStatsData: SessionStats = {
@@ -228,6 +744,83 @@ let lastApiHealthTickAt = Date.now();
 let lastEquitySnapshotAt = 0;
 let marketBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 let paperBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+let marketBroadcastThrottleMs = MARKET_BROADCAST_THROTTLE_MS;
+const rendererMemoryMonitor = new RendererMemoryMonitor();
+let latestRendererMemoryAssessment: RendererMemoryAssessment = rendererMemoryMonitor.snapshot();
+let runtimeHealthController = new RuntimeHealthController();
+let latestRuntimeDecision: RuntimeHealthDecision | null = null;
+const rendererHeartbeatMonitor = new RendererHeartbeatMonitor();
+let rendererProbeTimer: ReturnType<typeof setInterval> | null = null;
+let rendererProbeSequence = 0;
+let campaignEvidencePaused = true;
+let pendingCampaignPointer: ActiveCampaignPointer | null = null;
+let evidenceRunSupervisor: EvidenceRunSupervisor | null = null;
+let runtimeEvidenceSidecar: RuntimeEvidenceSidecar | null = null;
+let runtimeStatusState = 'idle';
+let lastRuntimeStatusWriteAt = 0;
+let lastRuntimeTransitionAction: RuntimeHealthDecision['action'] | null = null;
+let runtimeObservedSamples = 0;
+let runtimeHealthySamples = 0;
+let preflightRestSuccessAt = 0;
+let preflightTradeSuccessAt = 0;
+let preflightRestCycles = 0;
+let preflightTradeCycles = 0;
+let lastRendererMemorySampleAt = 0;
+let lastRuntimeSampleAt = 0;
+let closeoutPrepared = false;
+let campaignFinalizationState: 'idle' | 'waiting-gea' | 'running' | 'done' = 'idle';
+let campaignFinalizationTimer: ReturnType<typeof setTimeout> | null = null;
+let evidenceInvalidationInProgress = false;
+// Export the expiring lease more often than the soak sampler so a boundary
+// sample cannot reuse a stale feed/bridge state.
+const unsupervisedRuntimeStatusExporter = new RuntimeStatusExporter(runtimeStatusPathFromEnvironment(), 5_000);
+let lastDiscoveryRevision = '';
+let lastWorldRevision = '';
+let orderbookTrackedTickers: string[] = [];
+let tickerTrackedTickers: string[] = [];
+let lastTracedRuntimeState: string | null = null;
+let orderbookLastRotationAt = 0;
+let orderbookRotationCursor = 0;
+const campaignBookTriggerScheduler = new CampaignBookTriggerScheduler(
+  CAMPAIGN_BOOK_TRIGGER_INTERVAL_MS,
+  ({ throughputTickers, confirmationTickers, diagnosticTickers }) => {
+    if (throughputTickers.length > 0) {
+      void runThroughputCertification('exchange-book-delta', new Set(throughputTickers));
+    }
+    if (confirmationTickers.length > 0) {
+      void evaluateCampaignConfirmations(new Set(confirmationTickers));
+    }
+    if (diagnosticTickers.length > 0) {
+      void evaluateCampaignDiagnostics(new Set(diagnosticTickers), true);
+    }
+  },
+);
+
+type MarketStateStreamItem =
+  | { key: string; kind: 'market'; value: KalshiMarket }
+  | { key: string; kind: 'thesis'; value: ThesisCard };
+type EquityHistoryPoint = { t: number; equity: number; deployed: number; cash: number };
+const marketStreamItemCache = new Map<string, { fingerprint: string; item: MarketStateStreamItem }>();
+const marketStateStream = new VersionedStateStream<MarketStateStreamItem>(
+  'markets',
+  (item) => item.key,
+  (envelope) => broadcast('markets:state-v2', envelope),
+  1_000,
+);
+const equityHistoryStream = new VersionedStateStream<EquityHistoryPoint>(
+  'equity-history',
+  (point) => String(point.t),
+  (envelope) => broadcast('equity-history:state-v2', envelope),
+);
+
+function marketStreamItem(key: string, kind: MarketStateStreamItem['kind'], value: KalshiMarket | ThesisCard): MarketStateStreamItem {
+  const fingerprint = JSON.stringify(value);
+  const cached = marketStreamItemCache.get(key);
+  if (cached?.fingerprint === fingerprint) return cached.item;
+  const item = { key, kind, value } as MarketStateStreamItem;
+  marketStreamItemCache.set(key, { fingerprint, item });
+  return item;
+}
 
 interface StoredKalshiCredentials {
   storage: 'electron-safeStorage-v1';
@@ -248,13 +841,377 @@ interface KalshiCredentialStatus {
 const bridgeClients = new Set<WsSocket>();
 let bridgeSeq = 0;
 let geaProcess: ChildProcess | null = null;
+let geaExitedDuringEvidence = false;
 const bridgeAuth = createBridgeAuth(process.env);
 const bridgeStatus: BridgeStatus = {
   connected: false,
   brainRole: null,
   lastSeenAt: null,
   clientCount: 0,
+  lastInboundAt: null,
+  lastOutboundAt: null,
+  lastPongAt: null,
+  lastSequenceIn: null,
+  lastSequenceOut: null,
+  reconnects: 0,
+  disconnects: 0,
+  failovers: 0,
+  tapeFreshnessMs: null,
 };
+let bridgeConnectionCount = 0;
+
+function refreshBridgeConnectivity(now = Date.now()): void {
+  const stream = kalshiOrderbookStream.telemetry();
+  const tradeFeed = feedHub.getTradeFeedState();
+  bridgeStatus.tradeTapeFreshnessMs = tradeFeed.tapeAgeMs;
+  // Prefer application ingest / sequenced delta age — protocol ping must not
+  // make a dead orderbook look fresh.
+  const orderbookTrafficAt = stream.lastApplicationMessageAt
+    ?? stream.lastSequencedDeltaAt
+    ?? stream.lastMessageAt;
+  bridgeStatus.orderbookObservationFreshnessMs = orderbookTrafficAt == null
+    ? null
+    : Math.max(0, now - orderbookTrafficAt);
+  bridgeStatus.exchangeDeltaFreshnessMs = stream.lastExchangeTimestamp == null
+    ? null
+    : Math.max(0, now - stream.lastExchangeTimestamp);
+  // Orderbook-stream state, distinct from the bridge counters above: a healthy
+  // bridge says nothing about whether Kalshi books are arriving.
+  bridgeStatus.orderbookSocketState = stream.socketState;
+  bridgeStatus.orderbookStreamReconnects = stream.reconnects;
+  bridgeStatus.orderbookTrackedTickers = stream.trackedTickers;
+  bridgeStatus.orderbookQualifiedTickers = stream.qualifiedTickers;
+  bridgeStatus.orderbookSupervisorEscalations = stream.supervisorEscalations;
+  bridgeStatus.dataPlaneDegraded = dataPlaneDegradedSnapshot.degraded;
+  bridgeStatus.dataPlaneDegradedMs = dataPlaneDegradedSnapshot.totalDegradedMs;
+  bridgeStatus.tapeFreshnessMs = bridgeStatus.tradeTapeFreshnessMs;
+  const inboundRecent = bridgeStatus.lastInboundAt != null && now - bridgeStatus.lastInboundAt <= BRIDGE_TRAFFIC_TTL_MS;
+  const outboundRecent = bridgeStatus.lastOutboundAt != null && now - bridgeStatus.lastOutboundAt <= BRIDGE_TRAFFIC_TTL_MS;
+  bridgeStatus.socketConnected = bridgeStatus.clientCount > 0;
+  bridgeStatus.connected = bridgeStatus.socketConnected && inboundRecent && outboundRecent;
+  bridgeStatus.qualificationReady = bridgeStatus.connected && bridgeStatus.lastPongAt != null
+    && now - bridgeStatus.lastPongAt <= BRIDGE_TRAFFIC_TTL_MS;
+  bridgeStatus.trafficFreshnessMs = bridgeStatus.lastInboundAt == null || bridgeStatus.lastOutboundAt == null
+    ? null
+    : Math.max(now - bridgeStatus.lastInboundAt, now - bridgeStatus.lastOutboundAt);
+}
+
+/**
+ * Tickers whose book actually matters right now: anything mid-confirmation plus
+ * campaign-critical names. Health is judged on these, not on the whole tracked
+ * set -- 24 quiet fill markets must not mask the one candidate that is starving.
+ */
+function candidateBookSamples(now = Date.now()): CandidateBookSample[] {
+  const tickers = new Set<string>([
+    ...confirmationInFlightTickers(),
+    ...campaignCriticalOrderbookTickers(now),
+  ]);
+  // A market that has closed can never produce a sequenced book, so counting it
+  // as a starving candidate latches the run degraded on corpses rather than on a
+  // sick data plane -- measured at 29% degraded while the socket was 96% open.
+  // Only *provably* settled tickers are dropped (a production 200 said so);
+  // "no provenance" on a live market stays in, because that is a real failure.
+  return [...tickers].filter((ticker) => !isKnownExpiredTicker(ticker)).map((ticker) => {
+    const state = kalshiOrderbookStream.bookState(ticker, now);
+    return { ticker, state: state.state, sequencedAgeMs: state.sequencedAgeMs };
+  });
+}
+
+/**
+ * Supervises the orderbook data plane on every health tick and records what it
+ * saw. Replaces the previous watchdog, which could only act on a socket that
+ * was still OPEN -- the 2026-07-27 outage left no socket at all, so nothing
+ * fired for 7.9h. Also drives the degraded latch that tags rejections made
+ * while no candidate could obtain a sequenced book.
+ */
+function superviseOrderbookDataPlane(now = Date.now()): void {
+  const before = kalshiOrderbookStream.telemetry(now);
+  const supervision = kalshiOrderbookStream.superviseDataPlane(now);
+  const after = kalshiOrderbookStream.telemetry(now);
+  // Advisory ordering only: after any invalidation the stream repairs these
+  // tickers first. Kalshi ran 44 reconnects/hour in the final hour of the
+  // 2026-07-27 run, and each one legitimately drops every book -- we cannot
+  // stop that, only recover the tickers that matter before the other 20.
+  kalshiOrderbookStream.setRepairPriority([
+    ...confirmationInFlightTickers(),
+    ...campaignCriticalOrderbookTickers(now),
+  ]);
+  const samples = candidateBookSamples(now);
+  const health = computeCandidateSequencedBookHealth(samples, {
+    thresholdMs: DEFAULT_SEQUENCED_BOOK_THRESHOLD_MS,
+  });
+  const observation = dataPlaneLatch.observe({
+    at: now,
+    health,
+    streamSequencedAgeMs: after.lastSequencedDeltaAt == null ? null : Math.max(0, now - after.lastSequencedDeltaAt),
+  });
+  dataPlaneDegradedSnapshot = observation;
+  bridgeStatus.candidateSequencedBookFraction = health.candidateCount === 0 ? null : health.fractionSequencedWithin;
+  orderbookTrace.record({
+    at: now,
+    socketState: after.socketState,
+    reconnectScheduled: after.reconnectScheduled,
+    connectInFlight: after.connectInFlight,
+    connected: after.connected,
+    authenticated: after.authenticated,
+    generation: after.generation,
+    reconnects: after.reconnects,
+    supervisorEscalations: after.supervisorEscalations,
+    supervisionAction: supervision.action,
+    supervisionReason: supervision.reason,
+    nextAttemptInMs: supervision.nextAttemptInMs,
+    trackedTickers: after.trackedTickers,
+    verifiedTrackedTickers: after.verifiedTrackedTickers,
+    serverTrackedTickers: after.serverTrackedTickers,
+    qualifiedTickers: after.qualifiedTickers,
+    quarantinedTickers: after.quarantinedTickers,
+    booksWithExchangeTime: after.booksWithExchangeTime,
+    membershipAcknowledged: after.membershipAcknowledged,
+    trackingRevision: after.trackingRevision,
+    acknowledgedTrackingRevision: after.acknowledgedTrackingRevision,
+    subscriptionUpdateQueueDepth: after.subscriptionUpdateQueueDepth,
+    subscriptionUpdateInFlight: after.subscriptionUpdateInFlight,
+    sequenceGaps: after.sequenceGaps,
+    sequenceRegressions: after.sequenceRegressions,
+    applicationSilenceMs: after.lastApplicationMessageAt == null ? null : Math.max(0, now - after.lastApplicationMessageAt),
+    sequencedDeltaAgeMs: after.lastSequencedDeltaAt == null ? null : Math.max(0, now - after.lastSequencedDeltaAt),
+    exchangeTimestampAgeMs: after.lastExchangeTimestamp == null ? null : Math.max(0, now - after.lastExchangeTimestamp),
+    lastCloseAt: after.lastCloseAt,
+    lastCloseCode: after.lastCloseCode,
+    lastCloseReason: after.lastCloseReason,
+    lastCloseTrigger: after.lastCloseTrigger,
+    failureClass: after.failureClass,
+    errorCode: after.errorCode,
+    httpStatus: after.httpStatus,
+    nextRetryAt: after.nextRetryAt,
+    activeEndpoint: after.activeEndpoint,
+    failedEndpoint: after.failedEndpoint,
+    switchReason: after.switchReason,
+    candidateCount: health.candidateCount,
+    candidateSequencedWithin: health.sequencedWithinCount,
+    candidateFractionSequenced: health.fractionSequencedWithin,
+    candidateMaxSequencedAgeMs: health.maxSequencedAgeMs,
+    dataPlaneDegraded: observation.degraded,
+    dataPlaneDegradedMs: observation.totalDegradedMs,
+    dataPlaneUnhealthyReason: observation.unhealthyReason,
+  });
+  if (supervision.action !== 'none') {
+    const message = `[nemesis] orderbook supervisor ${supervision.action}`
+      + ` (reason=${supervision.reason ?? 'unspecified'}, socket=${before.socketState}→${after.socketState},`
+      + ` tracked=${before.trackedTickers}, appAgeMs=${before.lastApplicationMessageAt == null ? 'null' : now - before.lastApplicationMessageAt},`
+      + ` deltaAgeMs=${before.lastSequencedDeltaAt == null ? 'null' : now - before.lastSequencedDeltaAt},`
+      + ` reconnects ${before.reconnects}→${after.reconnects}, retryInMs=${supervision.nextAttemptInMs ?? 'n/a'})`;
+    console.warn(message);
+    connectorWarnTrace.record({ at: now, connector: 'kalshi-orderbook-ws', source: 'supervisor', message });
+  }
+  if (observation.changed) {
+    const message = observation.degraded
+      ? `[nemesis] data plane DEGRADED (${observation.unhealthyReason ?? 'unknown'}); confirmation rejections from here are not economic evidence`
+      : `[nemesis] data plane recovered after ${Math.round(observation.totalDegradedMs / 1000)}s degraded`;
+    console.warn(message);
+    connectorWarnTrace.record({ at: now, connector: 'kalshi-orderbook-ws', source: 'data-plane-latch', message });
+  }
+}
+
+/**
+ * The ticker stream has the same absorbing dead state the order-book stream had,
+ * and until now nothing on any timer looked at it: only the order-book stream was
+ * supervised. A quote feed that dies silently is not as loud as a dead book -- it
+ * just freezes every price at its last value -- which is exactly why it needs an
+ * owner rather than a reader noticing.
+ */
+function superviseTickerStream(now = Date.now()): void {
+  const before = kalshiStream.telemetry(now);
+  const supervision = kalshiStream.superviseDataPlane(now);
+  if (supervision.action === 'none') return;
+  const after = kalshiStream.telemetry(now);
+  const message = `[nemesis] ticker supervisor ${supervision.action}`
+    + ` (reason=${supervision.reason ?? 'unspecified'}, socket=${before.socketState}→${after.socketState},`
+    + ` tracked=${before.trackedTickers}, msgAgeMs=${before.lastMessageAt == null ? 'null' : now - before.lastMessageAt},`
+    + ` reconnects ${before.reconnects}→${after.reconnects}, retryInMs=${supervision.nextAttemptInMs ?? 'n/a'})`;
+  console.warn(message);
+  connectorWarnTrace.record({ at: now, connector: 'kalshi-ticker-ws', source: 'supervisor', message });
+}
+
+/**
+ * Main-process memory guard. The renderer has three (slope, p95, hard cap); the
+ * main process had none at all, while sitting near 1 GB -- and it is the process
+ * holding both whole ledgers, every book, and the confirmation state. Warns on a
+ * sustained breach rather than a single sample, because a GC trough between
+ * samples is normal and the renderer guards already learned that lesson twice.
+ *
+ * This only reports. Nothing here kills or restarts the process: an unattended
+ * paper run that self-terminates on a memory reading loses its evidence, which
+ * is worse than the leak. The number is on the bridge status and the warn trace
+ * so a run can be judged on it afterwards.
+ */
+const MAIN_WORKING_SET_WARN_MB = 1_024;
+const MAIN_WORKING_SET_CONSECUTIVE_SAMPLES = 3;
+let mainWorkingSetBreaches = 0;
+let mainWorkingSetWarned = false;
+
+function observeMainWorkingSet(mainWorkingSetMb: number, now: number): void {
+  if (mainWorkingSetMb > MAIN_WORKING_SET_WARN_MB) {
+    mainWorkingSetBreaches += 1;
+    if (mainWorkingSetBreaches >= MAIN_WORKING_SET_CONSECUTIVE_SAMPLES && !mainWorkingSetWarned) {
+      mainWorkingSetWarned = true;
+      const usage = process.memoryUsage();
+      const message = `[nemesis] main process working set ${mainWorkingSetMb.toFixed(0)}MB over ${MAIN_WORKING_SET_WARN_MB}MB`
+        + ` for ${mainWorkingSetBreaches} consecutive samples`
+        + ` (heapUsed=${(usage.heapUsed / (1024 * 1024)).toFixed(0)}MB,`
+        + ` external=${(usage.external / (1024 * 1024)).toFixed(0)}MB,`
+        + ` confirmationStates=${entryConfirmationEngine?.pendingStateCount() ?? 'n/a'})`;
+      console.warn(message);
+      connectorWarnTrace.record({ at: now, connector: 'main-process', source: 'memory-guard', message });
+    }
+    return;
+  }
+  if (mainWorkingSetWarned) {
+    const message = `[nemesis] main process working set recovered to ${mainWorkingSetMb.toFixed(0)}MB`;
+    console.warn(message);
+    connectorWarnTrace.record({ at: now, connector: 'main-process', source: 'memory-guard', message });
+  }
+  mainWorkingSetBreaches = 0;
+  mainWorkingSetWarned = false;
+}
+
+/**
+ * Drops confirmation chains flow stopped feeding. Without this they are only
+ * ever removed from inside `observe()`, so a candidate flow moves on from holds
+ * a slot against `maxPendingCandidates` and pins its ticker in the orderbook
+ * tracking set forever: orphans reached 22 of 25 slots over seven hours.
+ */
+function sweepEntryConfirmationState(now = Date.now()): void {
+  const dropped = entryConfirmationEngine?.sweep(now) ?? 0;
+  if (dropped === 0) return;
+  const message = `[nemesis] swept ${dropped} stranded entry-confirmation chain(s);`
+    + ` ${entryConfirmationEngine.pendingStateCount()} still in flight`;
+  connectorWarnTrace.record({ at: now, connector: 'entry-confirmation', source: 'sweep', message });
+}
+
+function currentProcessTelemetry(now = Date.now()): Record<string, unknown> {
+  const mainWorkingSetMb = Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3));
+  observeMainWorkingSet(mainWorkingSetMb, now);
+  bridgeStatus.mainPid = process.pid;
+  bridgeStatus.mainWorkingSetMb = mainWorkingSetMb;
+  bridgeStatus.mainProcessSampledAt = now;
+  const geaSampledAt = bridgeStatus.geaProcessSampledAt ?? null;
+  return {
+    main: {
+      pid: process.pid,
+      workingSetMb: mainWorkingSetMb,
+      sampledAt: now,
+    },
+    gea: bridgeStatus.geaPid != null && bridgeStatus.geaWorkingSetMb != null && geaSampledAt != null
+      ? {
+          pid: bridgeStatus.geaPid,
+          workingSetMb: bridgeStatus.geaWorkingSetMb,
+          sampledAt: geaSampledAt,
+          sampleAgeMs: Math.max(0, now - geaSampledAt),
+        }
+      : null,
+  };
+}
+
+function currentRendererRuntimeAssessment(now = Date.now()): RendererMemoryAssessment & Record<string, unknown> {
+  const heartbeat = rendererHeartbeatMonitor.snapshot(now);
+  const reasons = [...new Set([
+    ...latestRendererMemoryAssessment.reasons,
+    ...heartbeat.reasons,
+  ])];
+  const blocked = latestRendererMemoryAssessment.blocked || heartbeat.blocked;
+  return {
+    ...latestRendererMemoryAssessment,
+    status: blocked ? 'unstable-growth' : latestRendererMemoryAssessment.status,
+    blocked,
+    reasons,
+    detail: heartbeat.blocked
+      ? reasons.join('; ')
+      : latestRendererMemoryAssessment.detail,
+    heartbeatAgeMs: heartbeat.heartbeatAgeMs,
+    unresponsiveForMs: heartbeat.unresponsiveForMs,
+    heartbeatReceived: heartbeat.lastHeartbeatAt != null,
+    heartbeatPainted: heartbeat.painted,
+    heartbeatLoadingGraceUntil: heartbeat.loadingGraceUntil,
+    heartbeatLastReceivedAt: heartbeat.lastHeartbeatAt,
+    heartbeatLastRendererReportedAt: heartbeat.lastRendererReportedAt,
+    rendererLoadStartedAt: heartbeat.loadStartedAt,
+    rendererLoadFinishedAt: heartbeat.loadFinishedAt,
+    rendererMonitoringStartedAt: heartbeat.monitoringStartedAt,
+    rendererFirstHeartbeatAt: heartbeat.firstHeartbeatAt,
+    rendererFirstPaintedAt: heartbeat.firstPaintedAt,
+    rendererLastHeartbeatSequence: heartbeat.lastHeartbeatSequence,
+    rendererHeartbeatSendFailures: heartbeat.heartbeatSendFailures,
+    rendererProbeSentAt: heartbeat.lastProbeSentAt,
+    rendererProbeResponseAt: heartbeat.lastProbeResponseAt,
+    rendererProbeSequence: heartbeat.lastProbeSequence,
+    rendererProbeAgeMs: heartbeat.probeAgeMs,
+    rendererProbeResponseReceived: heartbeat.probeResponseReceived,
+  };
+}
+
+function stopRendererProbe(): void {
+  if (rendererProbeTimer) clearInterval(rendererProbeTimer);
+  rendererProbeTimer = null;
+}
+
+function sendRendererProbe(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const sentAt = Date.now();
+  const sequence = ++rendererProbeSequence;
+  rendererHeartbeatMonitor.recordProbeSent(sentAt, sequence);
+  try {
+    mainWindow.webContents.send('renderer:probe', { sentAt, sequence });
+    startupTrace(`renderer-probe-sent:${sequence}`);
+  } catch (error) {
+    rendererHeartbeatMonitor.recordHeartbeatSendFailure();
+    startupTrace(`renderer-probe-send-failed:${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function startRendererProbe(): void {
+  stopRendererProbe();
+  rendererProbePendingAfterPaint = false;
+  rendererProbeSequence = 0;
+  sendRendererProbe();
+  rendererProbeTimer = setInterval(sendRendererProbe, 5_000);
+}
+
+async function waitForFreshRendererProbe(timeoutMs = 30_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const heartbeat = rendererHeartbeatMonitor.snapshot();
+    if (heartbeat.probeResponseReceived && heartbeat.probeAgeMs <= 15_000 && !heartbeat.blocked) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
+/**
+ * Bridge telemetry is diagnostic -- nothing replays it and no gate reads it --
+ * so only the recent tail matters. Unrotated it reached 406 MB on a single run.
+ * Bounded here at 4 x 32 MB.
+ */
+const bridgeTelemetryWriter = new RotatingJsonlWriter(BRIDGE_TELEMETRY_PATH, {
+  maxBytesPerFile: 32 * 1024 * 1024,
+  maxFiles: 3,
+});
+
+function persistBridgeTelemetry(event: string, detail: Record<string, unknown> = {}): void {
+  try {
+    ensureDataDir();
+    refreshBridgeConnectivity();
+  } catch (error) {
+    console.error('[nemesis] bridge telemetry persistence failed', error);
+    return;
+  }
+  bridgeTelemetryWriter.append({
+    at: Date.now(),
+    event,
+    ...bridgeStatus,
+    ...detail,
+  });
+}
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -370,16 +1327,22 @@ function ensureShutdownCounters() {
 }
 
 function recordDryRunInvalidation() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   recordInvalidation(ensureShutdownCounters());
   saveSessionStats();
 }
 
 function recordDryRunAbnormalExecution() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
+  // Paper/shadow screening rejects must not accumulate session-shutdown counters.
+  // Live unlock still sees blocking paper_abort rows via blockingSafetyEventCount.
+  if (!settings.liveEnabled) return;
   recordAbnormalExecution(ensureShutdownCounters());
   saveSessionStats();
 }
 
 function resetDryRunInvalidationStreak() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   const shutdown = ensureShutdownCounters();
   if (shutdown.consecutiveInvalidations === 0) return;
   resetInvalidationStreak(shutdown);
@@ -406,8 +1369,45 @@ function strategyConfigHash(): string {
   return buildStrategyConfigHash(settings, discovery.settings);
 }
 
+/**
+ * Warns when a ledger has grown past the point where replaying it is cheap.
+ *
+ * These are deliberately NOT compacted. Both are hash-chained append-only
+ * evidence: every event links to the previous one, so replaying all of them from
+ * the first is what proves the chain intact, and dropping or rewriting a prefix
+ * would forfeit exactly the integrity the paper test exists to produce. Safe
+ * compaction needs a signed-checkpoint design that does not exist yet, and is
+ * not worth inventing under a remediation pass.
+ *
+ * The supported mechanism is the operator archiving a completed run
+ * (`npm run paper:archive-reset -- ARCHIVE_AND_RESET_PAPER`, with the app
+ * stopped), which preserves the old chain in full and starts a new one. This
+ * warning exists so that decision is prompted by a number rather than by a
+ * startup that has become mysteriously slow.
+ */
+const LEDGER_SIZE_WARN_BYTES = 64 * 1024 * 1024;
+
+/** Confirmation an operator must type to clear an armed kill switch. */
+const KILL_SWITCH_CLEAR_CONFIRMATION = 'CLEAR KILL SWITCH';
+
+function warnOnLargeLedger(label: string, filePath: string): void {
+  let sizeBytes: number;
+  try {
+    sizeBytes = fs.statSync(filePath).size;
+  } catch {
+    return;
+  }
+  if (sizeBytes < LEDGER_SIZE_WARN_BYTES) return;
+  const message = `[nemesis] ${label} ledger is ${(sizeBytes / (1024 * 1024)).toFixed(0)}MB`
+    + ' and is replayed in full at every start; archive the completed run'
+    + ' (npm run paper:archive-reset -- ARCHIVE_AND_RESET_PAPER, app stopped) to start a fresh chain';
+  console.warn(message);
+  connectorWarnTrace.record({ at: Date.now(), connector: 'ledger', source: 'size-guard', message });
+}
+
 function initializePaperQualification(): void {
   const existed = fs.existsSync(PAPER_QUALIFICATION_PATH);
+  warnOnLargeLedger('paper-qualification', PAPER_QUALIFICATION_PATH);
   const portfolio = paperDesk.snapshot();
   qualificationStore = PaperQualificationStore.open(PAPER_QUALIFICATION_PATH, {
     startingCash: portfolio.startingCash,
@@ -444,6 +1444,7 @@ function initializePaperQualification(): void {
 }
 
 function initializeStrategyValidation(): void {
+  warnOnLargeLedger('strategy-validation', STRATEGY_VALIDATION_PATH);
   strategyValidationStore = StrategyValidationStore.open(STRATEGY_VALIDATION_PATH, {
     stage: 'shadow',
     strategyConfigHash: strategyConfigHash(),
@@ -463,8 +1464,1192 @@ function initializeStrategyValidation(): void {
   }
 }
 
+interface ActiveCampaignPointer {
+  schemaVersion: 2;
+  evidenceNamespace: string;
+  stage: 'instrumentation' | 'seven-hour';
+  filePath: string;
+  parentRunId: string | null;
+  restartOrdinal: number;
+  healthPolicyHash: string;
+  productionArtifactHash: string;
+  soakVerificationReceiptHash: string;
+  runtimeSidecarPath: string;
+  runtimeLedgerPath: string;
+  controlPath: string;
+  status: 'preflight' | 'active' | 'closeout';
+}
+
+function readActiveCampaignPointer(): ActiveCampaignPointer | null {
+  if (!fs.existsSync(ACTIVE_CAMPAIGN_PATH)) return null;
+  try {
+    const pointer = JSON.parse(fs.readFileSync(ACTIVE_CAMPAIGN_PATH, 'utf8')) as ActiveCampaignPointer;
+    return campaignPointerValidationError(pointer) == null ? pointer : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeActiveCampaignPointer(pointer: ActiveCampaignPointer): void {
+  const validationError = campaignPointerValidationError(pointer);
+  if (validationError) throw new Error(`refusing invalid active campaign pointer: ${validationError}`);
+  fs.mkdirSync(CAMPAIGN_DIR, { recursive: true });
+  writeAtomicJson(ACTIVE_CAMPAIGN_PATH, pointer);
+}
+
+function writeAtomicJson(filePath: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { encoding: 'utf8', flag: 'wx' });
+  fs.renameSync(temporary, filePath);
+}
+
+function configuredCampaignPointer(stage: ActiveCampaignPointer['stage'], evidenceNamespace: string): ActiveCampaignPointer {
+  const namespace = campaignNamespace(evidenceNamespace);
+  const healthPolicyHash = process.env.NEMESIS_HEALTH_POLICY_HASH?.trim();
+  const productionArtifactHash = process.env.NEMESIS_PRODUCTION_ARTIFACT_HASH?.trim();
+  const soakVerificationReceiptHash = process.env.NEMESIS_SOAK_VERIFICATION_RECEIPT_HASH?.trim();
+  const runtimeSidecarPath = process.env.NEMESIS_EVIDENCE_RUNTIME_SIDECAR?.trim();
+  const runtimeLedgerPath = process.env.NEMESIS_EVIDENCE_RUNTIME_LEDGER?.trim();
+  const controlPath = process.env.NEMESIS_EVIDENCE_CONTROL?.trim();
+  if (process.env.NEMESIS_EVIDENCE_PREFLIGHT !== 'true') {
+    throw new Error('supervised evidence must begin in preflight mode');
+  }
+  if (!healthPolicyHash || !productionArtifactHash || !soakVerificationReceiptHash || !runtimeSidecarPath || !runtimeLedgerPath || !controlPath) {
+    throw new Error('supervised evidence requires explicit upstream hashes, health-policy, runtime, and control paths');
+  }
+  const pointer: ActiveCampaignPointer = {
+    schemaVersion: 2,
+    evidenceNamespace: namespace,
+    stage,
+    filePath: path.join(CAMPAIGN_DIR, `${namespace}.jsonl`),
+    parentRunId: process.env.NEMESIS_EVIDENCE_PARENT_RUN_ID?.trim() || null,
+    restartOrdinal: Number.parseInt(process.env.NEMESIS_EVIDENCE_RESTART_ORDINAL ?? '0', 10) || 0,
+    healthPolicyHash,
+    productionArtifactHash,
+    soakVerificationReceiptHash,
+    runtimeSidecarPath,
+    runtimeLedgerPath,
+    controlPath,
+    status: 'preflight',
+  };
+  const validationError = campaignPointerValidationError(pointer);
+  if (validationError) throw new Error(validationError);
+  return pointer;
+}
+
+function campaignPointerValidationError(pointer: ActiveCampaignPointer): string | null {
+  if (pointer.schemaVersion !== 2) return 'schema version must be 2';
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(pointer.evidenceNamespace)) return 'evidence namespace is invalid';
+  if (!['instrumentation', 'seven-hour'].includes(pointer.stage)) return 'campaign stage is invalid';
+  if (!['preflight', 'active', 'closeout'].includes(pointer.status)) return 'campaign status is invalid';
+  if (!Number.isInteger(pointer.restartOrdinal) || pointer.restartOrdinal < 0 || pointer.restartOrdinal > 2) {
+    return 'restart ordinal must be 0, 1, or 2';
+  }
+  if (!/^[a-f0-9]{64}$/i.test(pointer.healthPolicyHash)) return 'health policy hash is invalid';
+  if (!/^[a-f0-9]{64}$/i.test(pointer.productionArtifactHash)) return 'production artifact hash is invalid';
+  if (!/^[a-f0-9]{64}$/i.test(pointer.soakVerificationReceiptHash)) return 'soak verification receipt hash is invalid';
+  if (pointer.parentRunId != null && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(pointer.parentRunId)) {
+    return 'parent run id is invalid';
+  }
+  const expectedPaths: ReadonlyArray<[string, string]> = [
+    [pointer.filePath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.jsonl`)],
+    [pointer.runtimeSidecarPath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.runtime.json`)],
+    [pointer.runtimeLedgerPath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.runtime.jsonl`)],
+    [pointer.controlPath, path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.control.json`)],
+  ];
+  return expectedPaths.some(([actual, expected]) => !actual || path.resolve(actual) !== path.resolve(expected))
+    ? 'campaign artifact paths must match the isolated namespace'
+    : null;
+}
+
+function currentOrderbookTrackingState(now = Date.now()) {
+  // The stream owns the definitive OrderbookTrackingStateV2 projection so
+  // runners and verifiers read one authoritative object.
+  return kalshiOrderbookStream.trackingStateV2(now);
+}
+
+function currentFeedHealthSnapshot(now = Date.now()) {
+  const base = feedHub.getFeedHealthSnapshot(now);
+  const ticker = kalshiStream.telemetry(now);
+  const orderbook = kalshiOrderbookStream.telemetry(now);
+  const tickerWebSocket = { ...(base.tickerWebSocket ?? {}), ...ticker };
+  const orderbookWebSocket = { ...(base.orderbookWebSocket ?? {}), ...orderbook };
+  return {
+    ...base,
+    tickerWebSocket,
+    orderbookWebSocket,
+    transportCircuit: kalshiProductionCircuitSnapshot('production', now),
+    // Feed qualification means OUR FEED is healthy: REST and tape polling
+    // current, both sockets connected, authenticated, membership acknowledged,
+    // answering pings, no recorded failure. It deliberately does NOT require the
+    // tracked markets to be ticking. Market liveness is a property of the
+    // markets, and folding it in here made a perfectly healthy feed read as
+    // unqualified during ordinary Kalshi lulls -- measured at 32-58% of samples
+    // even while the exchange was busy, which no consumer gating on sustained
+    // coverage could ever satisfy. Market activity is reported separately below
+    // so callers can still evidence it.
+    qualificationReady: base.restMarkets?.qualificationReady === true
+      && base.tradeTape?.qualificationReady === true
+      && ticker.transportQualificationReady
+      && orderbook.transportQualificationReady,
+    marketDataActive: ticker.qualificationReady && orderbook.qualificationReady,
+    tickerExchangeDataAgeMs: ticker.lastExchangeDataAt == null
+      ? null
+      : Math.max(0, now - ticker.lastExchangeDataAt),
+    orderbookExchangeDataAgeMs: orderbook.lastExchangeDataAt == null
+      ? null
+      : Math.max(0, now - orderbook.lastExchangeDataAt),
+  };
+}
+
+function runtimeStatusPayload(
+  state: string,
+  detail: Record<string, unknown> = {},
+  now = Date.now(),
+): Record<string, unknown> {
+  const pointer = pendingCampaignPointer ?? readActiveCampaignPointer();
+  const processes = currentProcessTelemetry(now);
+  return {
+    schemaVersion: 2,
+    runId: pointer?.evidenceNamespace ?? null,
+    state,
+    restartable: state === 'invalidated' && (pointer?.restartOrdinal ?? 2) < 2,
+    updatedAt: now,
+    campaign: campaignStore?.snapshot() ?? null,
+    runtime: latestRuntimeDecision,
+    renderer: currentRendererRuntimeAssessment(now),
+    bridge: { ...bridgeStatus },
+    processes,
+    feeds: currentFeedHealthSnapshot(now),
+    orderbookTracking: currentOrderbookTrackingState(now),
+    productionObservation: currentProductionObservationState(),
+    evidenceIdentity: pointer ? {
+      gitCommit: process.env.NEMESIS_GIT_COMMIT?.trim() ?? null,
+      healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
+    } : null,
+    ...detail,
+  };
+}
+
+function writeRuntimeStatus(state: string, detail: Record<string, unknown> = {}, force = false): void {
+  const pointer = pendingCampaignPointer ?? readActiveCampaignPointer();
+  if (!pointer?.runtimeSidecarPath) return;
+  const now = Date.now();
+  if (!force && state === runtimeStatusState && now - lastRuntimeStatusWriteAt < RUNTIME_SAMPLE_INTERVAL_MS) return;
+  writeAtomicJson(pointer.runtimeSidecarPath, runtimeStatusPayload(state, detail));
+  runtimeStatusState = state;
+  lastRuntimeStatusWriteAt = now;
+}
+
+function campaignNamespace(input: string): string {
+  const normalized = input.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!normalized) throw new Error('campaign evidence namespace is empty after normalization');
+  return normalized;
+}
+
+function startEvidenceCampaign(pointer: ActiveCampaignPointer, startedAt: number): boolean {
+  const config = entryQualificationSettings();
+  campaignEntryConfirmationEngine = new EntryConfirmationEngine(config);
+  const isNewLedger = !fs.existsSync(pointer.filePath);
+  const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
+  if (
+    pointer.status !== 'preflight'
+    || pendingCampaignPointer !== pointer
+    || !evidenceRunSupervisor
+    || evidenceRunSupervisor.snapshot().status !== 'active'
+    || !runtimeEvidenceSidecar
+  ) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: successful supervised preflight authorization is required');
+    return false;
+  }
+  if (!isNewLedger) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign restart refused: attempts require an isolated namespace and fresh clock');
+    return false;
+  }
+  if (!frozenCommit) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: NEMESIS_GIT_COMMIT is required');
+    return false;
+  }
+  if (!PRODUCTION_OBSERVATION_MODE || !currentProductionObservationState().qualificationReady) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: locked production observation state is required');
+    return false;
+  }
+  if ((settings.kalshiAccountPrecision ?? 'unknown') === 'unknown') {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: account balance precision must be explicit');
+    return false;
+  }
+  if (paperDesk.snapshot().positions.length > 0) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: close all paper positions first');
+    return false;
+  }
+  campaignStore = SevenHourCampaignStore.open(pointer.filePath, {
+    runId: pointer.evidenceNamespace,
+    evidenceNamespace: pointer.evidenceNamespace,
+    configurationHash: strategyConfigHash(),
+    gitCommit: frozenCommit,
+    stage: pointer.stage,
+    startedAt,
+    settings: config,
+    parentRunId: pointer.parentRunId ?? undefined,
+    restartOrdinal: pointer.restartOrdinal,
+    healthPolicyHash: pointer.healthPolicyHash,
+    productionArtifactHash: pointer.productionArtifactHash,
+    soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
+    runtimeSidecarPath: pointer.runtimeLedgerPath,
+  }, config);
+  pointer.status = 'active';
+  pendingCampaignPointer = pointer;
+  writeActiveCampaignPointer(pointer);
+  const snapshot = campaignStore.snapshot();
+  if (snapshot.integrityError || snapshot.manifest.schemaVersion !== 2) {
+    reviewOnly = true;
+    campaignStore = null;
+    return false;
+  }
+  campaignEvidencePaused = latestRuntimeDecision?.state !== 'healthy';
+  return true;
+}
+
+function initializeEvidenceCampaign(): void {
+  const requestedStage = process.env.NEMESIS_EVIDENCE_CAMPAIGN_STAGE;
+  const stage = requestedStage === 'instrumentation' || requestedStage === 'seven-hour'
+    ? requestedStage
+    : undefined;
+  const requestedNamespace = process.env.NEMESIS_EVIDENCE_NAMESPACE;
+  if (!requestedStage && !requestedNamespace) return;
+  if (!stage || !requestedNamespace || process.env.NEMESIS_EVIDENCE_PREFLIGHT !== 'true') {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: explicit stage, namespace, and preflight mode are required');
+    return;
+  }
+  if (fs.existsSync(ACTIVE_CAMPAIGN_PATH)) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: an active pointer already exists and attempts cannot resume');
+    return;
+  }
+  let pointer: ActiveCampaignPointer;
+  try {
+    pointer = configuredCampaignPointer(stage, requestedNamespace);
+  } catch (error) {
+    reviewOnly = true;
+    console.error(`[nemesis] evidence campaign not started: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const frozenCommit = process.env.NEMESIS_GIT_COMMIT;
+  if (!frozenCommit) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign not started: NEMESIS_GIT_COMMIT is required');
+    return;
+  }
+  pendingCampaignPointer = pointer;
+  writeActiveCampaignPointer(pointer);
+  if (fs.existsSync(pointer.filePath) || fs.existsSync(pointer.runtimeLedgerPath) || fs.existsSync(pointer.runtimeSidecarPath)) {
+    reviewOnly = true;
+    invalidateEvidenceAttempt(['preflight namespace is not clean'], Date.now(), false);
+    return;
+  }
+  try {
+    runtimeEvidenceSidecar = RuntimeEvidenceSidecar.create(pointer.runtimeLedgerPath, {
+      runId: pointer.evidenceNamespace,
+      gitCommit: frozenCommit,
+      configurationHash: strategyConfigHash(),
+      healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
+    });
+    evidenceRunSupervisor = new EvidenceRunSupervisor({
+      at: Date.now(),
+      runId: pointer.evidenceNamespace,
+      parentRunId: pointer.parentRunId,
+      restartOrdinal: pointer.restartOrdinal,
+      evidenceNamespace: pointer.evidenceNamespace,
+      gitCommit: frozenCommit,
+      configurationHash: strategyConfigHash(),
+      healthPolicyHash: pointer.healthPolicyHash,
+      stage: pointer.stage,
+      runtimeSidecarPath: pointer.runtimeLedgerPath,
+    });
+    campaignEvidencePaused = true;
+    writeRuntimeStatus('preflight', {}, true);
+  } catch (error) {
+    reviewOnly = true;
+    invalidateEvidenceAttempt([
+      `runtime evidence startup failed: ${error instanceof Error ? error.message : String(error)}`,
+    ], Date.now(), false);
+  }
+}
+
+function campaignSnapshot() {
+  if (!campaignStore) return null;
+  try {
+    campaignStore.record((tracker) => tracker.ensureConfiguration(strategyConfigHash()));
+    return campaignStore.snapshot();
+  } catch (error) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign failed closed', error);
+    return campaignStore.snapshot();
+  }
+}
+
+/**
+ * Hot-path variant of campaignSnapshot() for the per-orderbook-delta stream.
+ * Runs the same config-drift guard but returns the cheap bookUpdateView()
+ * projection instead of a full deep-cloned snapshot, so tens-of-deltas-per-
+ * second processing never clones the growing campaign collections.
+ */
+function campaignBookView(): CampaignBookUpdateView | null {
+  if (!campaignStore) return null;
+  try {
+    campaignStore.record((tracker) => tracker.ensureConfiguration(strategyConfigHash()));
+    return campaignStore.tracker.bookUpdateView();
+  } catch (error) {
+    reviewOnly = true;
+    console.error('[nemesis] evidence campaign failed closed', error);
+    return campaignStore.tracker.bookUpdateView();
+  }
+}
+
+function campaignMutationLockReason(): string | null {
+  if (PRODUCTION_OBSERVATION_MODE && !pendingCampaignPointer) {
+    return 'paper/live mutation locked during production observation';
+  }
+  if (!pendingCampaignPointer) return null;
+  return `paper/live mutation locked during supervised evidence state ${pendingCampaignPointer.status}`;
+}
+
+function protectedArtifactDigest(filePath: string): string {
+  try {
+    if (!fs.existsSync(filePath)) return 'missing';
+    return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+  } catch {
+    return 'unreadable';
+  }
+}
+
+function productionObservationInput() {
+  const portfolio = paperDesk.snapshot();
+  return {
+    enabled: PRODUCTION_OBSERVATION_MODE,
+    liveEnabled: settings.liveEnabled === true,
+    autoLiveEnabled: settings.autoLiveEnabled === true,
+    dryRun: settings.dryRun === true,
+    demoMode: settings.demoMode === true,
+    paperPositions: portfolio.positions,
+    paperTrades: portfolio.trades,
+    workingOrders: paperOrderBook.working(),
+    paperPortfolio: portfolio,
+    paperOrderState: paperOrderBook.snapshot(),
+    protectedArtifacts: {
+      settings: protectedArtifactDigest(SETTINGS_PATH),
+      discoverySettings: protectedArtifactDigest(DISCOVERY_SETTINGS_PATH),
+      credentials: protectedArtifactDigest(KALSHI_CREDENTIALS_PATH),
+      paperPortfolio: protectedArtifactDigest(PAPER_PATH),
+      paperOrders: protectedArtifactDigest(PAPER_ORDERS_PATH),
+      equityHistory: protectedArtifactDigest(EQUITY_HISTORY_PATH),
+      sessionStats: protectedArtifactDigest(SESSION_STATS_PATH),
+      autoCloseState: protectedArtifactDigest(AUTO_CLOSE_PATH),
+      paperQualification: protectedArtifactDigest(PAPER_QUALIFICATION_PATH),
+      strategyValidation: protectedArtifactDigest(STRATEGY_VALIDATION_PATH),
+    },
+    configurationHash: strategyConfigHash(),
+    protectedRuntimeState: {
+      settings,
+      discoverySettings: discovery.settings,
+      sessionStats: sessionStatsData,
+      equityHistory,
+      autoCloseStates: [...autoCloseStates.entries()],
+      autoCloseDecisions,
+    },
+  };
+}
+
+function captureProductionObservationBaseline(): void {
+  productionObservationBaselineHash = productionObservationStateHash(productionObservationInput());
+}
+
+function currentProductionObservationState() {
+  return assessProductionObservation(productionObservationInput(), productionObservationBaselineHash);
+}
+
+function sampleRendererMemory(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const devToolsClosed = !mainWindow.webContents.isDevToolsOpened();
+  if (!devToolsClosed) {
+    latestRendererMemoryAssessment = {
+      ...rendererMemoryMonitor.snapshot(),
+      status: 'unstable-growth',
+      blocked: true,
+      reasons: ['DevTools must remain closed during production memory evidence'],
+      detail: 'DevTools must remain closed during production memory evidence',
+    };
+    return;
+  }
+  const rendererPid = mainWindow.webContents.getOSProcessId();
+  const metric = app.getAppMetrics().find((item) => item.pid === rendererPid);
+  const workingSetKb = metric?.memory.workingSetSize;
+  if (!workingSetKb) return;
+  const now = Date.now();
+  const heartbeat = rendererHeartbeatMonitor.snapshot(now);
+  lastRendererMemorySampleAt = now;
+  latestRendererMemoryAssessment = rendererMemoryMonitor.add({
+    at: now,
+    workingSetKb,
+    rendererPid,
+    // Do not feed a pre-load age into the memory gate. Electron can take time
+    // to finish loading the packaged page while the renderer process already
+    // exists; liveness starts only after did-finish-load and the heartbeat
+    // monitor still requires a real heartbeat after that point.
+    heartbeatAgeMs: heartbeat.loadFinishedAt == null
+      ? 0
+      : heartbeat.lastHeartbeatAt == null && now <= heartbeat.loadingGraceUntil
+        ? 0
+        : heartbeat.heartbeatAgeMs,
+    unresponsiveForMs: heartbeat.unresponsiveForMs,
+    painted: heartbeat.painted,
+  });
+  const stable = latestRendererMemoryAssessment.status === 'stable' && !latestRendererMemoryAssessment.blocked;
+  marketBroadcastThrottleMs = stable
+    ? MARKET_BROADCAST_THROTTLE_MS
+    : DEGRADED_MARKET_BROADCAST_THROTTLE_MS;
+}
+
+function runtimeComponents(now: number): RuntimeComponentHealth[] {
+  refreshBridgeConnectivity(now);
+  const feeds = currentFeedHealthSnapshot(now);
+  const ticker = kalshiStream.telemetry(now);
+  const orderbook = kalshiOrderbookStream.telemetry(now);
+  const component = (
+    name: RuntimeComponentHealth['name'],
+    health: ReturnType<typeof registry.get>,
+  ): RuntimeComponentHealth => ({
+    name,
+    connected: health?.transportConnected === true || health?.status === 'ok',
+    qualificationReady: health?.qualificationReady === true,
+    lastSuccessAt: health?.lastMessageAt ?? health?.lastSuccess ?? null,
+    lastPongAt: health?.lastPongAt ?? null,
+    retryAt: health?.nextRetryAt ?? null,
+    failureClass: health?.failureClass ?? null,
+    failures: health?.errorCount1h ?? 0,
+    // Both REST pollers run an 8s tick behind a 15s request floor, so healthy
+    // polls land ~16s apart and one failed request pushes the next success to
+    // ~31s. A 30s bound therefore fails on a single dropped request, which the
+    // runtime-health controller counts as a recovery. Measured: trade-tape
+    // flapped at 30.8s and 32.2s. 60s absorbs two missed cycles; sustained
+    // failure beyond that is genuine and should still open a recovery window.
+    maxAgeMs: name === 'rest-markets' || name === 'trade-tape' ? 60_000 : undefined,
+  });
+  return [
+    component('rest-markets', feeds.restMarkets ?? undefined),
+    component('trade-tape', feeds.tradeTape ?? undefined),
+    {
+      // Runtime health asks whether the RUNTIME is healthy, so these components
+      // report transport liveness. Keying on the market-activity-inclusive
+      // qualificationReady made an ordinary trading lull look like a failing
+      // component: the controller opened a recovery window and invalidated the
+      // run after 30s, which aborted a soak 11% into its scored minutes with
+      // "orderbook-websocket is not qualification-ready (7628ms old)" while both
+      // sockets were connected, authenticated and answering pings. Whether the
+      // tracked markets are trading is asserted separately, by the readiness
+      // conditions and the soak cutoff checks.
+      name: 'ticker-websocket',
+      connected: ticker.connected,
+      qualificationReady: ticker.transportQualificationReady,
+      lastSuccessAt: ticker.lastMessageAt,
+      lastPongAt: ticker.lastPongAt,
+      retryAt: ticker.nextRetryAt,
+      failureClass: ticker.failureClass,
+      failures: ticker.sequenceGaps,
+      maxAgeMs: 25_000,
+    },
+    {
+      name: 'orderbook-websocket',
+      connected: orderbook.connected,
+      trackingReady: orderbook.trackingReady,
+      // Transport liveness only, for the reason above. trackingReady is
+      // deliberately not folded in either: membershipAcknowledged goes false
+      // while a routine membership update is in flight, and a component that
+      // flaps on every universe refresh is not a useful health signal. It stays
+      // reported on the line above, and is asserted directly by the readiness
+      // runner and the soak cutoff check on finalOrderbookTrackingReady.
+      qualificationReady: orderbook.transportQualificationReady,
+      lastSuccessAt: orderbook.lastMessageAt,
+      lastPongAt: orderbook.lastPongAt,
+      retryAt: orderbook.nextRetryAt,
+      failureClass: orderbook.failureClass,
+      failures: orderbook.sequenceGaps + orderbook.sequenceRegressions,
+      maxAgeMs: 25_000,
+    },
+    {
+      name: 'bridge',
+      connected: bridgeStatus.connected,
+      qualificationReady: bridgeStatus.qualificationReady === true,
+      lastSuccessAt: bridgeStatus.lastPongAt ?? bridgeStatus.lastInboundAt,
+      lastPingAt: bridgeStatus.lastPingAt ?? null,
+      lastPongAt: bridgeStatus.lastPongAt,
+      failures: bridgeStatus.sequenceGaps ?? 0,
+      maxAgeMs: BRIDGE_TRAFFIC_TTL_MS,
+    },
+    {
+      name: 'gea',
+      connected: Boolean(geaProcess && !geaProcess.killed),
+      qualificationReady: Boolean(geaProcess && !geaProcess.killed && bridgeStatus.connected),
+      lastSuccessAt: bridgeStatus.lastInboundAt,
+      failures: bridgeStatus.disconnects,
+      maxAgeMs: BRIDGE_TRAFFIC_TTL_MS,
+    },
+  ];
+}
+
+function updatePreflightCycleCounts(): void {
+  const feeds = currentFeedHealthSnapshot();
+  const restAt = feeds.restMarkets?.lastSuccess ?? 0;
+  const tradeAt = feeds.tradeTape?.lastSuccess ?? 0;
+  if (restAt > preflightRestSuccessAt) {
+    preflightRestSuccessAt = restAt;
+    preflightRestCycles += 1;
+  }
+  if (tradeAt > preflightTradeSuccessAt) {
+    preflightTradeSuccessAt = tradeAt;
+    preflightTradeCycles += 1;
+  }
+}
+
+function preflightHealthyForStability(): boolean {
+  const ticker = kalshiStream.telemetry();
+  const orderbook = kalshiOrderbookStream.telemetry();
+  const heartbeat = rendererHeartbeatMonitor.snapshot();
+  return currentProductionObservationState().qualificationReady
+    && settings.liveEnabled !== true
+    && settings.autoLiveEnabled !== true
+    && settings.dryRun === true
+    && paperDesk.snapshot().positions.length === 0
+    && paperDesk.snapshot().trades.length === 0
+    && paperOrderBook.working().length === 0
+    && !latestRendererMemoryAssessment.blocked
+    && !heartbeat.blocked
+    && heartbeat.loadFinishedAt != null
+    && heartbeat.lastHeartbeatAt != null
+    && heartbeat.painted
+    && heartbeat.heartbeatAgeMs <= 15_000
+    && heartbeat.probeResponseReceived
+    && heartbeat.probeAgeMs <= 15_000
+    && preflightRestCycles >= 3
+    && preflightTradeCycles >= 3
+    && ticker.authenticated
+    // Transport liveness, not market activity. This predicate arms the campaign
+    // stability window, so keying on the market-inclusive qualificationReady let
+    // an ordinary trading lull reset the window and could keep a campaign from
+    // ever starting. Real market presence is still required alongside, by
+    // trackedTickers === LIMIT, trackingReady, and booksWithExchangeTime > 0.
+    && ticker.transportQualificationReady
+    && orderbook.authenticated
+    && orderbook.transportQualificationReady
+    && orderbook.trackedTickers === ORDERBOOK_TRACKING_LIMIT
+    && orderbook.trackingReady
+    && orderbook.booksWithExchangeTime > 0
+    && (bridgeStatus.pongCount ?? 0) >= 3
+    && bridgeStatus.qualificationReady === true
+    && Boolean(geaProcess && !geaProcess.killed)
+    && latestRuntimeDecision?.state === 'healthy'
+    && Boolean(pendingCampaignPointer && !fs.existsSync(pendingCampaignPointer.filePath));
+}
+
+function preflightReadinessDetail(): Record<string, unknown> {
+  const orderbook = kalshiOrderbookStream.telemetry();
+  return {
+    preflightFailureReason: orderbook.trackedTickers < ORDERBOOK_TRACKING_LIMIT
+      ? 'orderbook_tracking_set_below_25'
+      : null,
+    orderbookTracking: currentOrderbookTrackingState(),
+    productionObservation: currentProductionObservationState(),
+  };
+}
+
+function readEvidenceControl(): { command?: string; runId?: string } | null {
+  const pointer = pendingCampaignPointer;
+  if (!pointer || !fs.existsSync(pointer.controlPath)) return null;
+  try {
+    const control = JSON.parse(fs.readFileSync(pointer.controlPath, 'utf8')) as { command?: string; runId?: string };
+    fs.rmSync(pointer.controlPath, { force: true });
+    return control.runId === pointer.evidenceNamespace ? control : null;
+  } catch {
+    return null;
+  }
+}
+
+function stopCampaignInputs(): void {
+  campaignEvidencePaused = true;
+  pendingCampaignConfirmationTickers.clear();
+  pendingCampaignThroughputTickers.clear();
+  pendingCampaignDiagnosticTickers.clear();
+  pendingCampaignDiagnosticObservations.clear();
+  latestCampaignObservationSequence.clear();
+  campaignBookTriggerScheduler.stop();
+  marketStateStream.stop();
+  equityHistoryStream.stop();
+  kalshiStream.stop();
+  kalshiOrderbookStream.stop();
+  feedHub.stopBackgroundPolling();
+}
+
+function writeCampaignResult(result: ReturnType<SevenHourCampaignStore['snapshot']>, extra: Record<string, unknown> = {}): void {
+  const pointer = pendingCampaignPointer;
+  if (!pointer) return;
+  const resultPath = path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.result.json`);
+  const summaryPath = path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.summary.md`);
+  const payload = {
+    schemaVersion: 2,
+    generatedAt: Date.now(),
+    runId: pointer.evidenceNamespace,
+    passed: result.passed,
+    reasons: result.reasons,
+    manifest: result.manifest,
+    evidenceIdentity: {
+      gitCommit: result.manifest.gitCommit,
+      configurationHash: result.manifest.configurationHash,
+      healthPolicyHash: result.manifest.schemaVersion === 2 ? result.manifest.healthPolicyHash : null,
+      productionArtifactHash: result.manifest.schemaVersion === 2 ? result.manifest.productionArtifactHash : null,
+      soakVerificationReceiptHash: result.manifest.schemaVersion === 2 ? result.manifest.soakVerificationReceiptHash : null,
+    },
+    metrics: {
+      candidates: result.candidates.length,
+      screenedOut: result.screenedOut?.length ?? 0,
+      validDiagnosticOutcomes: result.validDiagnosticOutcomes,
+      readyCandidates: result.readyCandidates,
+      terminalCoverage: result.terminalCoverage,
+      diagnosticSchedulingCoverage: result.diagnosticSchedulingCoverage,
+      validDiagnosticCoverage: result.validDiagnosticCoverage,
+      freshConfirmationRate: result.freshConfirmationRate,
+      runtimeObservedSamples,
+      runtimeHealthySamples,
+    },
+    ...extra,
+  };
+  writeAtomicJson(resultPath, payload);
+  fs.writeFileSync(summaryPath, [
+    `# NEMESIS ${pointer.evidenceNamespace}`,
+    '',
+    `Result: **${result.passed ? 'PASS' : 'FAIL'}**`,
+    '',
+    ...result.reasons.map((reason) => `- ${reason}`),
+    '',
+    `Candidates: ${result.candidates.length}`,
+    `Valid diagnostics: ${result.validDiagnosticOutcomes}`,
+    `Ready candidates: ${result.readyCandidates}`,
+    `Runtime health samples: ${runtimeHealthySamples}/${runtimeObservedSamples}`,
+    '',
+  ].join('\n'), 'utf8');
+}
+
+function writePreflightFailureResult(reason: string, now: number, restartable: boolean): void {
+  const pointer = pendingCampaignPointer;
+  if (!pointer) return;
+  writeAtomicJson(path.join(CAMPAIGN_DIR, `${pointer.evidenceNamespace}.result.json`), {
+    schemaVersion: 2,
+    generatedAt: now,
+    runId: pointer.evidenceNamespace,
+    passed: false,
+    reasons: [reason],
+    manifest: {
+      schemaVersion: 2,
+      runId: pointer.evidenceNamespace,
+      evidenceNamespace: pointer.evidenceNamespace,
+      parentRunId: pointer.parentRunId,
+      restartOrdinal: pointer.restartOrdinal,
+      healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
+      stage: pointer.stage,
+      status: 'invalidated',
+      invalidationReason: reason,
+    },
+    metrics: {
+      candidates: 0,
+      screenedOut: 0,
+      validDiagnosticOutcomes: 0,
+      readyCandidates: 0,
+      runtimeObservedSamples,
+      runtimeHealthySamples,
+    },
+    invalidated: true,
+    restartable,
+  });
+}
+
+function prepareCampaignCloseout(now: number): void {
+  if (closeoutPrepared || !campaignStore || !pendingCampaignPointer) return;
+  closeoutPrepared = true;
+  const finalOrderbookTelemetry = kalshiOrderbookStream.telemetry(now);
+  stopCampaignInputs();
+  const snapshot = campaignStore.snapshot();
+  const startedAt = snapshot.manifest.startedAt;
+  const expectedSamples = Math.max(1, Math.floor((now - startedAt) / RUNTIME_SAMPLE_INTERVAL_MS) + 1);
+  const sampleCoverage = runtimeObservedSamples / expectedSamples;
+  const healthyCoverage = runtimeHealthySamples / expectedSamples;
+  const rendererHealthy = latestRendererMemoryAssessment.status === 'stable'
+    && !latestRendererMemoryAssessment.blocked
+    && (latestRendererMemoryAssessment.p95WorkingSetKb ?? Number.POSITIVE_INFINITY) <= 384 * 1024
+    && latestRendererMemoryAssessment.slopeWindowComplete
+    && latestRendererMemoryAssessment.slopeWindowMs >= 30 * 60_000
+    && latestRendererMemoryAssessment.slopePerHour <= 0.02
+    && now - lastRendererMemorySampleAt <= 60_000;
+  const bridgeHealthy = bridgeStatus.qualificationReady === true && now - lastRuntimeSampleAt <= 60_000;
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'renderer_memory_stable',
+    rendererHealthy,
+    latestRendererMemoryAssessment.detail,
+    now,
+  ));
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'bridge_bidirectional_traffic',
+    bridgeHealthy,
+    `bridge coverage current=${bridgeStatus.qualificationReady === true} roundTripMs=${bridgeStatus.roundTripMs ?? 'unknown'}`,
+    now,
+  ));
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'runtime_health_coverage',
+    sampleCoverage >= 0.95 && healthyCoverage >= 0.995,
+    `sample coverage ${(sampleCoverage * 100).toFixed(3)}%; healthy coverage ${(healthyCoverage * 100).toFixed(3)}%`,
+    now,
+  ));
+  const finalExchangeAgeMs = finalOrderbookTelemetry.lastExchangeTimestamp == null
+    ? Number.POSITIVE_INFINITY
+    : now - finalOrderbookTelemetry.lastExchangeTimestamp;
+  const finalExchangeEvidenceReady = finalOrderbookTelemetry.qualificationReady
+    && finalExchangeAgeMs >= 0
+    && finalExchangeAgeMs <= 25_000;
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'exchange_book_time_available',
+    finalExchangeEvidenceReady,
+    `final sequenced delta received at ${finalOrderbookTelemetry.lastSequencedDeltaAt ?? 'unknown'}; exchange age ${Number.isFinite(finalExchangeAgeMs) ? `${finalExchangeAgeMs}ms` : 'unknown'}`,
+    now,
+  ));
+  const restartOrdinal = snapshot.manifest.schemaVersion === 2 ? snapshot.manifest.restartOrdinal : -1;
+  const noRuntimeMitigation = restartOrdinal === 0
+    && (latestRuntimeDecision?.recoveryCount ?? 0) === 0;
+  campaignStore.record((tracker) => tracker.recordOperationalCheck(
+    'no_runtime_restart_or_emergency_mitigation',
+    noRuntimeMitigation,
+    `restart ordinal ${restartOrdinal}; runtime recoveries ${latestRuntimeDecision?.recoveryCount ?? 0}`,
+    now,
+  ));
+  campaignStore.record((tracker) => tracker.prepareCloseout(now));
+  pendingCampaignPointer.status = 'closeout';
+  writeActiveCampaignPointer(pendingCampaignPointer);
+  runtimeEvidenceSidecar?.appendTransition({ action: 'closeout', sampleCoverage, healthyCoverage }, now);
+  writeRuntimeStatus('closeout-ready', { sampleCoverage, healthyCoverage }, true);
+}
+
+function finishOfflineCampaignFinalization(now: number): void {
+  if (campaignFinalizationState === 'running' || campaignFinalizationState === 'done') return;
+  if (!campaignStore || !pendingCampaignPointer || !runtimeEvidenceSidecar) return;
+  campaignFinalizationState = 'running';
+  if (campaignFinalizationTimer) {
+    clearTimeout(campaignFinalizationTimer);
+    campaignFinalizationTimer = null;
+  }
+  try {
+    const pointer = pendingCampaignPointer;
+    const liveSnapshot = campaignStore.snapshot();
+    if (liveSnapshot.integrityError || liveSnapshot.manifest.schemaVersion !== 2 || liveSnapshot.manifest.status !== 'closeout') {
+      throw new Error(liveSnapshot.integrityError ?? `offline replay requires schema-v2 closeout, got ${liveSnapshot.manifest.status}`);
+    }
+    // Inputs and GEA are closed before this single replay becomes the authoritative finalizer.
+    const replayedStore = SevenHourCampaignStore.open(pointer.filePath, {
+      runId: pointer.evidenceNamespace,
+      evidenceNamespace: pointer.evidenceNamespace,
+      configurationHash: liveSnapshot.manifest.configurationHash,
+      gitCommit: liveSnapshot.manifest.gitCommit,
+      stage: pointer.stage,
+      startedAt: liveSnapshot.manifest.startedAt,
+      settings: entryQualificationSettings(),
+      parentRunId: pointer.parentRunId ?? undefined,
+      restartOrdinal: pointer.restartOrdinal,
+      healthPolicyHash: pointer.healthPolicyHash,
+      productionArtifactHash: pointer.productionArtifactHash,
+      soakVerificationReceiptHash: pointer.soakVerificationReceiptHash,
+      runtimeSidecarPath: pointer.runtimeLedgerPath,
+    }, entryQualificationSettings());
+    const replayed = replayedStore.snapshot();
+    if (replayed.integrityError || replayed.manifest.status !== 'closeout') {
+      throw new Error(replayed.integrityError ?? `offline replay produced unexpected status ${replayed.manifest.status}`);
+    }
+    const runtimeHash = runtimeEvidenceSidecar.finalize({ cleanShutdownRequested: true }, now);
+    replayedStore.record((tracker) => tracker.finalize(now, runtimeHash));
+    evidenceRunSupervisor?.finalize(runtimeHash);
+    campaignStore = replayedStore;
+    const result = replayedStore.snapshot();
+    writeCampaignResult(result, { finalRuntimeSidecarHash: runtimeHash, offlineReplayCount: 1 });
+    writeRuntimeStatus('finalized', {
+      passed: result.passed,
+      finalRuntimeSidecarHash: runtimeHash,
+      offlineReplayCount: 1,
+      restartable: false,
+    }, true);
+    // The active pointer is cleared only after both durable result and status writes succeed.
+    fs.rmSync(ACTIVE_CAMPAIGN_PATH, { force: true });
+    campaignFinalizationState = 'done';
+    setTimeout(() => app.quit(), 250);
+  } catch (error) {
+    campaignFinalizationState = 'done';
+    invalidateEvidenceAttempt([
+      `offline campaign finalization failed: ${error instanceof Error ? error.message : String(error)}`,
+    ], Date.now(), false);
+  }
+}
+
+function finalizeCampaign(now: number): void {
+  if (!campaignStore || !pendingCampaignPointer || !runtimeEvidenceSidecar) return;
+  if (campaignFinalizationState !== 'idle') return;
+  stopCampaignInputs();
+  if (!geaProcess || geaProcess.killed) {
+    finishOfflineCampaignFinalization(now);
+    return;
+  }
+  campaignFinalizationState = 'waiting-gea';
+  const closingGea = geaProcess;
+  closingGea.once('exit', () => finishOfflineCampaignFinalization(Date.now()));
+  if (!closingGea.kill()) {
+    campaignFinalizationState = 'done';
+    invalidateEvidenceAttempt(['GEA did not accept the clean closeout signal'], now, false);
+    return;
+  }
+  campaignFinalizationTimer = setTimeout(() => {
+    campaignFinalizationTimer = null;
+    campaignFinalizationState = 'done';
+    invalidateEvidenceAttempt(['unclean shutdown: GEA did not exit within 20 seconds'], Date.now(), false);
+  }, 20_000);
+}
+
+/**
+ * Appends to the campaign ledger from a path nobody is awaiting.
+ *
+ * `SevenHourCampaignStore.record` throws on any persistence fault and latches
+ * itself closed. Called from a fire-and-forget worker or a sync diagnostic
+ * handler, that throw ends the process -- losing an unattended run, hours in, to
+ * a single disk hiccup, with nothing written down about why. The store has
+ * already refused the append, so the honest response is to stop producing
+ * evidence and say so, not to die.
+ */
+function recordCampaignEventSafely(
+  label: string,
+  mutation: Parameters<SevenHourCampaignStore['record']>[0],
+): boolean {
+  if (!campaignStore) return false;
+  try {
+    campaignStore.record(mutation);
+    return true;
+  } catch (error) {
+    campaignEvidencePaused = true;
+    const message = `[nemesis] campaign ledger append failed (${label}); evidence paused: `
+      + (error instanceof Error ? error.message : String(error));
+    console.error(message);
+    connectorWarnTrace.record({
+      at: Date.now(),
+      connector: 'campaign-store',
+      source: 'append-failure',
+      message,
+    });
+    return false;
+  }
+}
+
+function invalidateEvidenceAttempt(reasons: readonly string[], now: number, restartable = true): void {
+  if (evidenceInvalidationInProgress) return;
+  evidenceInvalidationInProgress = true;
+  const reason = [...new Set(reasons)].join('; ') || 'runtime invalidated';
+  campaignEvidencePaused = true;
+  evidenceRunSupervisor?.invalidate(reason);
+  let runtimeHash: string | null = null;
+  if (campaignStore && ['active', 'closeout'].includes(campaignStore.snapshot().manifest.status)) {
+    campaignStore.record((tracker) => tracker.invalidate(reason, now));
+  }
+  try {
+    runtimeEvidenceSidecar?.appendTransition({ action: 'invalidate', reason }, now);
+    runtimeHash = runtimeEvidenceSidecar?.finalize({ invalidated: true, reason }, now) ?? null;
+  } catch {
+    restartable = false;
+  }
+  stopCampaignInputs();
+  try {
+    if (campaignStore) {
+      writeCampaignResult(campaignStore.snapshot(), {
+        invalidated: true,
+        restartable,
+        finalRuntimeSidecarHash: runtimeHash,
+      });
+    } else {
+      writePreflightFailureResult(reason, now, restartable);
+    }
+    writeRuntimeStatus('invalidated', { reason, restartable }, true);
+    // Preserve the pointer whenever either durable invalidation artifact fails.
+    fs.rmSync(ACTIVE_CAMPAIGN_PATH, { force: true });
+  } catch (error) {
+    restartable = false;
+    console.error('[nemesis] invalidation artifact persistence failed; active pointer preserved', error);
+  }
+  if (geaProcess && !geaProcess.killed) geaProcess.kill();
+  setTimeout(() => app.quit(), 250);
+}
+
+function processEvidenceSupervisor(now: number): void {
+  if (!pendingCampaignPointer || !evidenceRunSupervisor) return;
+  const control = readEvidenceControl();
+  const state = evidenceRunSupervisor.snapshot().status;
+  if (control?.command === 'unclean-shutdown') {
+    invalidateEvidenceAttempt(['unclean shutdown requested by external supervisor'], now, false);
+    return;
+  }
+  if (state === 'preflight') {
+    updatePreflightCycleCounts();
+    const ticker = kalshiStream.telemetry(now);
+    const orderbook = kalshiOrderbookStream.telemetry(now);
+    const permanentTransportFailure = [ticker.failureClass, orderbook.failureClass]
+      .find((failure) => failure === 'authentication' || failure === 'authorization' || failure === 'configuration');
+    if (permanentTransportFailure) {
+      invalidateEvidenceAttempt([`permanent Kalshi websocket failure: ${permanentTransportFailure}`], now, false);
+      return;
+    }
+    const freshProductionMarkets = [...productionMarketRecords.keys()]
+      .filter((ticker) => productionMarketRecord(ticker, now) != null).length;
+    if (discovery.hasLiveUniverse() && preflightRestCycles >= 3 && freshProductionMarkets < ORDERBOOK_TRACKING_LIMIT) {
+      invalidateEvidenceAttempt(['orderbook_tracking_set_below_25'], now, false);
+      return;
+    }
+    const continuouslyHealthy = preflightHealthyForStability();
+    const readyForStart = continuouslyHealthy && latestRendererMemoryAssessment.status === 'stable';
+    const decision = evidenceRunSupervisor.observePreflight(now, continuouslyHealthy, readyForStart);
+    if (decision.state === 'invalidated') {
+      invalidateEvidenceAttempt([decision.reason], now);
+      return;
+    }
+    if (decision.state === 'preflight-ready') writeRuntimeStatus('preflight-ready', preflightReadinessDetail(), true);
+    else writeRuntimeStatus('preflight', preflightReadinessDetail());
+    if (control?.command === 'start-campaign' && decision.state === 'preflight-ready') {
+      const start = evidenceRunSupervisor.start(now);
+      if (!startEvidenceCampaign(pendingCampaignPointer, now)) {
+        invalidateEvidenceAttempt(['campaign ledger could not be started after preflight'], now, false);
+        return;
+      }
+      runtimeObservedSamples = 0;
+      runtimeHealthySamples = 0;
+      runtimeHealthController = new RuntimeHealthController();
+      latestRuntimeDecision = null;
+      campaignEvidencePaused = false;
+      runtimeEvidenceSidecar?.appendTransition({ action: 'start-campaign' }, now);
+      writeRuntimeStatus('active', { cutoffAt: start.manifest.cutoffAt }, true);
+    }
+    return;
+  }
+  if (state === 'preflight-ready') {
+    writeRuntimeStatus('preflight-ready', preflightReadinessDetail());
+    if (control?.command === 'start-campaign') {
+      const start = evidenceRunSupervisor.start(now);
+      if (!startEvidenceCampaign(pendingCampaignPointer, now)) {
+        invalidateEvidenceAttempt(['campaign ledger could not be started after preflight'], now, false);
+        return;
+      }
+      runtimeObservedSamples = 0;
+      runtimeHealthySamples = 0;
+      runtimeHealthController = new RuntimeHealthController();
+      latestRuntimeDecision = null;
+      campaignEvidencePaused = false;
+      runtimeEvidenceSidecar?.appendTransition({ action: 'start-campaign' }, now);
+      writeRuntimeStatus('active', { cutoffAt: start.manifest.cutoffAt }, true);
+    }
+    return;
+  }
+  if (state === 'active') {
+    const transition = evidenceRunSupervisor.tick(now);
+    if (transition.state === 'closeout') prepareCampaignCloseout(now);
+    else writeRuntimeStatus('active');
+    return;
+  }
+  if (state === 'closeout' && control?.command === 'finalize') finalizeCampaign(now);
+}
+
+function recordCampaignOperationalTelemetry(): void {
+  const now = Date.now();
+  const activeSnapshot = campaignSnapshot();
+  if (activeSnapshot?.integrityError) {
+    invalidateEvidenceAttempt([activeSnapshot.integrityError], now, false);
+    return;
+  }
+  if (activeSnapshot?.manifest.status === 'invalidated') {
+    invalidateEvidenceAttempt([activeSnapshot.manifest.invalidationReason ?? 'campaign configuration invalidated'], now, false);
+    return;
+  }
+  const productionObservation = currentProductionObservationState();
+  if (pendingCampaignPointer && !productionObservation.qualificationReady) {
+    invalidateEvidenceAttempt([
+      `production observation integrity failed: ${productionObservation.reasons.join('; ')}`,
+    ], now, false);
+    return;
+  }
+  if (pendingCampaignPointer && !getLiveCreds()) {
+    invalidateEvidenceAttempt(['protected Kalshi credentials became unavailable'], now, false);
+    return;
+  }
+  if (pendingCampaignPointer && geaExitedDuringEvidence) {
+    invalidateEvidenceAttempt(['GEA process exited during supervised evidence'], now);
+    return;
+  }
+  const components = runtimeComponents(now);
+  const rendererRuntimeAssessment = currentRendererRuntimeAssessment(now);
+  const rendererHeartbeat = rendererHeartbeatMonitor.snapshot(now);
+  const rendererLoadRetryGraceActive = rendererHeartbeat.loadFinishedAt == null
+    && now - rendererHeartbeat.loadStartedAt <= RENDERER_LOAD_RETRY_GRACE_MS
+    && !rendererHeartbeat.blocked;
+  const supervisorState = evidenceRunSupervisor?.snapshot().status;
+  if (supervisorState === 'preflight') runtimeHealthController = new RuntimeHealthController();
+  latestRuntimeDecision = runtimeHealthController.observe({
+    at: now,
+    components,
+    renderer: rendererRuntimeAssessment,
+    process: {
+      // GEA is intentionally held until the renderer load gate opens. During
+      // the bounded renderer retry window, its absence is not a GEA failure;
+      // a terminal renderer load failure will block the attempt explicitly.
+      geaRunning: rendererLoadRetryGraceActive
+        || rendererProbeGateInProgress
+        || process.env.NEMESIS_AUTO_SPAWN_GEA === 'false'
+        || Boolean(geaProcess && !geaProcess.killed),
+      // Renderer memory/heartbeat faults are already carried with their exact
+      // reasons above. Main-process responsiveness is supervised externally.
+      nemesisResponsive: true,
+    },
+  });
+  lastRuntimeSampleAt = now;
+  // Off unless NEMESIS_RUNTIME_HEALTH_TRACE_PATH is set. A recovery that heals
+  // between soak samples leaves no trace in the evidence, so an invalidation
+  // reading "3 recoveries occurred within ten minutes" arrives with no way to
+  // see WHICH component flapped -- the sampled reasons are empty by then. This
+  // records every state change with its reasons and the offending component
+  // ages, and is what identified the trade-tape TTL breach behind a6ce478.
+  // Keep it: the failure mode is otherwise undiagnosable after the fact.
+  const runtimeTracePath = process.env.NEMESIS_RUNTIME_HEALTH_TRACE_PATH;
+  if (runtimeTracePath && latestRuntimeDecision.state !== lastTracedRuntimeState) {
+    lastTracedRuntimeState = latestRuntimeDecision.state;
+    try {
+      const unhealthy = components
+        .filter((c) => !(c.connected && c.qualificationReady))
+        .map((c) => `${c.name}(connected=${c.connected},qual=${c.qualificationReady},lastSuccessAt=${c.lastSuccessAt ?? 'null'},age=${c.lastSuccessAt == null ? 'inf' : now - c.lastSuccessAt})`);
+      fs.appendFileSync(
+        runtimeTracePath,
+        `${now} state=${latestRuntimeDecision.state} recoveries=${latestRuntimeDecision.recoveryCount} reasons=[${latestRuntimeDecision.reasons.join(' | ')}] unhealthy=[${unhealthy.join(' ; ')}]\n`,
+      );
+    } catch {
+      // Diagnostics must never disturb the runtime.
+    }
+  }
+  if (campaignStore?.snapshot().manifest.status === 'active') {
+    runtimeObservedSamples += 1;
+    if (latestRuntimeDecision.lease.status === 'healthy') runtimeHealthySamples += 1;
+  }
+  try {
+    unsupervisedRuntimeStatusExporter.writeIfDue(runtimeStatusPayload(
+      latestRuntimeDecision.state,
+      { externalRuntimeStatus: true },
+      now,
+    ), now);
+  } catch (error) {
+    console.error('[nemesis] optional runtime status export failed', error);
+  }
+  try {
+    const processes = currentProcessTelemetry(now);
+    runtimeEvidenceSidecar?.appendSample({
+      state: latestRuntimeDecision.state,
+      lease: latestRuntimeDecision.lease,
+      components,
+      renderer: rendererRuntimeAssessment,
+      bridge: { ...bridgeStatus },
+      processes,
+      feeds: currentFeedHealthSnapshot(now),
+      orderbookTracking: currentOrderbookTrackingState(now),
+      productionObservation,
+    }, now);
+  } catch (error) {
+    invalidateEvidenceAttempt([`runtime evidence persistence failed: ${error instanceof Error ? error.message : String(error)}`], now, false);
+    return;
+  }
+  if (latestRuntimeDecision.action !== lastRuntimeTransitionAction) {
+    runtimeEvidenceSidecar?.appendTransition({
+      action: latestRuntimeDecision.action,
+      reasons: latestRuntimeDecision.reasons,
+    }, now);
+    lastRuntimeTransitionAction = latestRuntimeDecision.action;
+  }
+  if (shouldInvalidateSupervisedEvidence(Boolean(pendingCampaignPointer), supervisorState, latestRuntimeDecision.invalidated)) {
+    invalidateEvidenceAttempt(latestRuntimeDecision.reasons, now);
+    return;
+  }
+  if (pendingCampaignPointer) {
+    if (latestRuntimeDecision.pauseEvidence) campaignEvidencePaused = true;
+    else if (latestRuntimeDecision.action === 'resume' || latestRuntimeDecision.state === 'healthy') campaignEvidencePaused = false;
+  }
+  const snapshot = campaignSnapshot();
+  const orderbookTelemetry = kalshiOrderbookStream.telemetry();
+  if (snapshot?.manifest.status === 'active'
+    && orderbookTelemetry.sequenceRegressions > 0
+    && !snapshot.safetyFailures.some((failure) => failure.includes('order-book sequence regression'))) {
+    campaignStore?.record((tracker) => tracker.recordSafetyFailure(
+      `${orderbookTelemetry.sequenceRegressions} order-book sequence regression(s) detected`,
+    ));
+  }
+  processEvidenceSupervisor(now);
+}
+
+/**
+ * Optional operator overrides for the shadow-stage ACCEPTANCE thresholds only:
+ * how many scored candidates (NEMESIS_SHADOW_MIN_SCORED), how many distinct
+ * days (NEMESIS_SHADOW_MIN_DISTINCT_DAYS), and how much elapsed observation time
+ * (NEMESIS_SHADOW_MIN_OBSERVATION_DAYS / _HOURS / _MS) are required before shadow
+ * can advance to pilot. They lower the *sample-size and calendar/time* bar so the execution path
+ * (pilot placing a real paper trade) can be reached and proven the same day,
+ * while the edge bar -- profit factor, win rate, stressed profitability -- is
+ * left untouched, so this reduces rigor, it does not manufacture a pass.
+ *
+ * Applied here at read-time rather than in settings.json on purpose: it does not
+ * enter buildStrategyConfigHash (which hashes `settings`), so it triggers no
+ * config-hash pause and needs no paper reset. Acceptance counts do not change
+ * what a shadow candidate is or how it is scored, so overriding them cannot
+ * corrupt evidence continuity. Unset preserves the shipped 100/3 thresholds.
+ */
+const SHADOW_MIN_SCORED_OVERRIDE = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_SHADOW_MIN_SCORED ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+})();
+const SHADOW_MIN_DISTINCT_DAYS_OVERRIDE = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_SHADOW_MIN_DISTINCT_DAYS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+})();
+const SHADOW_MIN_OBSERVATION_MS_OVERRIDE = (() => {
+  const ms = Number.parseInt(process.env.NEMESIS_SHADOW_MIN_OBSERVATION_MS ?? '', 10);
+  if (Number.isFinite(ms) && ms > 0) return ms;
+  const hours = Number.parseFloat(process.env.NEMESIS_SHADOW_MIN_OBSERVATION_HOURS ?? '');
+  if (Number.isFinite(hours) && hours > 0) return Math.round(hours * 60 * 60_000);
+  const days = Number.parseFloat(process.env.NEMESIS_SHADOW_MIN_OBSERVATION_DAYS ?? '');
+  if (Number.isFinite(days) && days > 0) return Math.round(days * 24 * 60 * 60_000);
+  return null;
+})();
+
 function entryQualificationSettings() {
-  return { ...DEFAULT_ENTRY_QUALIFICATION, ...(settings.entryQualification ?? {}) };
+  return {
+    ...DEFAULT_ENTRY_QUALIFICATION,
+    ...(settings.entryQualification ?? {}),
+    ...(SHADOW_MIN_SCORED_OVERRIDE != null ? { shadowMinScored: SHADOW_MIN_SCORED_OVERRIDE } : {}),
+    ...(SHADOW_MIN_DISTINCT_DAYS_OVERRIDE != null ? { shadowMinDistinctDays: SHADOW_MIN_DISTINCT_DAYS_OVERRIDE } : {}),
+    ...(SHADOW_MIN_OBSERVATION_MS_OVERRIDE != null ? { shadowMinObservationMs: SHADOW_MIN_OBSERVATION_MS_OVERRIDE } : {}),
+  };
 }
 
 function strategyValidationSnapshot(): StrategyValidationSnapshot | null {
@@ -475,6 +2660,7 @@ function strategyValidationSnapshot(): StrategyValidationSnapshot | null {
     !snapshot.paused
     && (snapshot.strategyConfigHash !== strategyConfigHash() || snapshot.strategyEngineVersion !== PAPER_STRATEGY_ENGINE_VERSION)
   ) {
+    if (PRODUCTION_OBSERVATION_MODE) return snapshot;
     try {
       strategyValidationStore.record((tracker) => tracker.pause('strategy configuration or engine version changed'));
     } catch (error) {
@@ -526,6 +2712,7 @@ function pilotValidationSnapshot() {
 function recordStrategyValidation(
   mutation: (tracker: StrategyValidationStore['tracker']) => StrategyValidationEvent | StrategyValidationEvent[],
 ): boolean {
+  if (PRODUCTION_OBSERVATION_MODE) return false;
   if (!strategyValidationStore) return false;
   try {
     strategyValidationStore.record(mutation);
@@ -542,6 +2729,7 @@ function qualificationSnapshot(now = Date.now()): PaperQualificationSnapshot | n
   if (snapshot.integrityError) return snapshot;
   const actualHash = strategyConfigHash();
   if (snapshot.configurationValid && snapshot.strategyConfigHash !== actualHash) {
+    if (PRODUCTION_OBSERVATION_MODE) return snapshot;
     try {
       qualificationStore.record((tracker) => tracker.invalidateConfiguration(actualHash, now));
     } catch (error) {
@@ -555,6 +2743,7 @@ function qualificationSnapshot(now = Date.now()): PaperQualificationSnapshot | n
 function recordQualification(
   mutation: (tracker: PaperQualificationStore['tracker']) => PaperQualificationEvent | PaperQualificationEvent[],
 ): void {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (!qualificationStore) return;
   try {
     qualificationStore.record(mutation);
@@ -574,7 +2763,9 @@ function recordPaperBlock(input: {
   code?: string;
   severity?: 'info' | 'warning' | 'error';
   blocksLiveUnlock?: boolean;
+  formalQualificationEligible?: boolean;
 }) {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (isAbnormalExecutionCode(input.code)) recordDryRunAbnormalExecution();
   const blocksLiveUnlock = input.blocksLiveUnlock ?? isAbnormalExecutionCode(input.code);
   auditLog.append({
@@ -587,20 +2778,24 @@ function recordPaperBlock(input: {
     severity: input.severity ?? (isAbnormalExecutionCode(input.code) ? 'error' : 'info'),
     blocksLiveUnlock,
   });
-  recordQualification((tracker) => tracker.recordAbort(
-    input.code ?? 'paper_abort',
-    input.detail,
-    blocksLiveUnlock,
-  ));
+  if (input.formalQualificationEligible !== false) {
+    recordQualification((tracker) => tracker.recordAbort(
+      input.code ?? 'paper_abort',
+      input.detail,
+      blocksLiveUnlock,
+    ));
+  }
   saveAuditLog();
 }
 
 function recordSettingsManualOverride() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   recordManualOverride(ensureShutdownCounters());
   saveSessionStats();
 }
 
 function tickApiHealthDegraded() {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   const now = Date.now();
   const elapsed = now - lastApiHealthTickAt;
   lastApiHealthTickAt = now;
@@ -676,6 +2871,64 @@ function loadSettings() {
   } else {
     settings = normalizeGuardrailSettings(settings);
   }
+  const campaignPrecision = process.env.NEMESIS_KALSHI_ACCOUNT_PRECISION;
+  if (campaignPrecision === 'direct' || campaignPrecision === 'non_direct') {
+    settings = normalizeGuardrailSettings({ ...settings, kalshiAccountPrecision: campaignPrecision });
+  }
+  if (process.env.NEMESIS_EVIDENCE_CAMPAIGN_STAGE) {
+    settings = normalizeGuardrailSettings({
+      ...settings,
+      liveEnabled: false,
+      liveStage: 'paper',
+      autoLiveEnabled: false,
+      // Supervised evidence always uses the production market-data feeds in
+      // dry-run mode; demo fixtures must never satisfy feed readiness.
+      demoMode: false,
+      dryRun: true,
+    });
+  }
+  if (PRODUCTION_OBSERVATION_MODE) {
+    settings = normalizeGuardrailSettings({
+      ...settings,
+      liveEnabled: false,
+      liveStage: 'paper',
+      autoLiveEnabled: false,
+      demoMode: false,
+      dryRun: true,
+    });
+  }
+  enforceStoredLiveAuthorization();
+}
+
+/**
+ * Live trading survives a restart only if its certificate does.
+ *
+ * The staged unlock wizard runs ~30 evidence gates once and writes a
+ * certificate; nothing ever read it back. settings.json was trusted verbatim on
+ * every start, so a hand-edited `liveEnabled: true` inherited every gate's
+ * blessing without passing one, and the certificate's 24-hour expiry was written
+ * and never checked. Both are now enforced at load, before any window opens or
+ * any order path exists.
+ */
+function enforceStoredLiveAuthorization(now = Date.now()): void {
+  const authorization = evaluateStoredLiveAuthorization(settings, now);
+  if (authorization.ok) return;
+  const claimed = `liveEnabled=${settings.liveEnabled === true}, autoLiveEnabled=${settings.autoLiveEnabled === true}, stage=${settings.liveStage ?? 'paper'}`;
+  settings = normalizeGuardrailSettings({
+    ...settings,
+    liveUnlockCertificate: undefined,
+    liveEnabled: false,
+    autoLiveEnabled: false,
+    liveStage: 'paper',
+    dryRun: true,
+  });
+  const message = `[nemesis] refused stored live settings (${claimed}); forced back to paper: ${authorization.blockers.join('; ')}`;
+  console.warn(message);
+  try {
+    connectorWarnTrace.record({ at: now, connector: 'live-unlock', source: 'stored-authorization', message });
+  } catch {
+    // Load runs before the trace writer is guaranteed; the console line stands.
+  }
 }
 
 function saveSettings() {
@@ -694,6 +2947,10 @@ function loadDiscoverySettings() {
       /* keep defaults */
     }
   }
+  const supervisedMaxTickers = Number.parseInt(process.env.NEMESIS_DISCOVERY_MAX_TRACKED_TICKERS ?? '', 10);
+  if (Number.isFinite(supervisedMaxTickers) && supervisedMaxTickers > 0) {
+    discovery.loadSettings({ ...discovery.settings, maxTrackedTickers: Math.min(500, supervisedMaxTickers) });
+  }
 }
 
 function saveDiscoverySettings() {
@@ -702,7 +2959,11 @@ function saveDiscoverySettings() {
 }
 
 function broadcastDiscovery() {
-  broadcast('discovery:update', discovery.getState());
+  const state = discovery.getState();
+  const revision = createHash('sha256').update(JSON.stringify(state)).digest('hex');
+  if (revision === lastDiscoveryRevision) return;
+  lastDiscoveryRevision = revision;
+  broadcast('discovery:update', state);
 }
 
 function buildWorldEventsPayload(): WorldEventsPayload {
@@ -739,7 +3000,11 @@ function buildWorldEventsPayload(): WorldEventsPayload {
 }
 
 function broadcastWorldEvents() {
-  broadcast('worldevents:update', buildWorldEventsPayload());
+  const payload = buildWorldEventsPayload();
+  const revision = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  if (revision === lastWorldRevision) return;
+  lastWorldRevision = revision;
+  broadcast('worldevents:update', payload);
 }
 
 function loadJournal() {
@@ -934,6 +3199,11 @@ function recordTick(ticker: string, yesPrice: number, spread: number, netEdge: n
 
 function snapshotEquity(force = false) {
   const now = Date.now();
+  if (PRODUCTION_OBSERVATION_MODE) {
+    // Renderer summaries may calculate mark-to-market values, but production
+    // observation must not append paper equity or session-stat evidence.
+    return;
+  }
   if (!force && now - lastEquitySnapshotAt < EQUITY_SNAPSHOT_MIN_MS) {
     refreshDailyPnl();
     return;
@@ -963,6 +3233,139 @@ function cachedBookForTicker(ticker: string): KalshiOrderbook | null {
 
 function opportunityKey(card: Pick<ThesisCard, 'ticker' | 'side'>): string {
   return `${card.ticker}:${card.side}`;
+}
+
+function entryBlockedDiagnosticReason(card: ThesisCard, baseReason: string): string {
+  const gates = [...new Set(card.invalidations)]
+    .filter((gate) => gate.trim().length > 0)
+    .slice(0, 5);
+  return gates.length > 0 ? `${baseReason}; gates=${gates.join(',')}` : baseReason;
+}
+
+function findCampaignCandidate(card: ThesisCard): CampaignCandidateRecord | null {
+  const snapshot = campaignSnapshot();
+  if (!snapshot || snapshot.manifest.status !== 'active') return null;
+  const identity = candidateEconomicIdentity(card);
+  return snapshot.candidates.find((candidate) => candidate.economicIdentity === identity) ?? null;
+}
+
+interface CampaignEnrollmentResult {
+  candidate: CampaignCandidateRecord | null;
+  decision: CampaignScreeningDecisionV2 | null;
+}
+
+interface CampaignScreeningEvidenceContext {
+  fill?: DryRunOrder;
+  feePolicy?: KalshiFeePolicy;
+  entryRiskUsd?: number;
+  maxSafeContracts?: number;
+}
+
+function finiteCampaignNumber(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) ? value! : fallback;
+}
+
+/** Records every pre-enrollment campaign rejection without creating lifecycle or diagnostic state. */
+function recordPreEnrollmentScreeningFailure(
+  card: ThesisCard,
+  reasonCode: CampaignScreeningReasonCode,
+  reason: string,
+  completedAt = Date.now(),
+  context: CampaignScreeningEvidenceContext = {},
+): void {
+  const snapshot = campaignSnapshot();
+  if (!campaignStore || snapshot?.manifest.status !== 'active' || findCampaignCandidate(card)) return;
+  const fallbackPrice = Math.max(0.0001, Math.min(0.9999, finiteCampaignNumber(card.marketPrice, 0.5)));
+  const fill: DryRunOrder = context.fill ?? {
+    ticker: card.ticker,
+    side: card.side,
+    contracts: 1,
+    expectedPrice: fallbackPrice,
+    fillPrice: fallbackPrice,
+    filled: 1,
+    fillLevels: [{ price: fallbackPrice, quantity: 1, cost: fallbackPrice }],
+    slippage: 0,
+    fees: 0,
+    feePolicyKnown: false,
+    netEdge: finiteCampaignNumber(card.netEdge, 0),
+    aborted: true,
+    abortReason: reason,
+  };
+  const contracts = Math.max(0.01, finiteCampaignNumber(fill.filled || fill.contracts, 1));
+  const entryPrice = Math.max(0.0001, Math.min(0.9999, finiteCampaignNumber(fill.fillPrice, fallbackPrice)));
+  const feePolicy = isKnownKalshiFeePolicy(context.feePolicy) ? context.feePolicy : undefined;
+  const economics = calculateEntryEconomics({
+    entryPrice,
+    entryFeesUsd: Math.max(0, finiteCampaignNumber(fill.fees, 0)),
+    contracts,
+    sideFairPrice: Math.max(0.0001, Math.min(0.9999, finiteCampaignNumber(card.impliedPrice, entryPrice))),
+    marketPrice: finiteCampaignNumber(card.marketPrice, entryPrice),
+    grossEdge: finiteCampaignNumber(card.grossEdge, 0),
+    screeningNetEdge: finiteCampaignNumber(card.netEdge, 0),
+    executableEntryNetEdge: finiteCampaignNumber(fill.netEdge, 0),
+    spread: Math.max(0, finiteCampaignNumber(card.spread, 0)),
+    fillSlippage: Math.max(0, finiteCampaignNumber(fill.slippage, 0)),
+    feePolicy,
+  });
+  const decision: CampaignScreenedOut = {
+    schemaVersion: 2,
+    economicIdentity: candidateEconomicIdentity(card),
+    originalCardId: card.id,
+    ticker: card.ticker,
+    side: card.side,
+    completedAt,
+    economics,
+    entryRiskUsd: finiteCampaignNumber(context.entryRiskUsd, economics.entryCostUsd),
+    maxSafeContracts: context.maxSafeContracts,
+    status: 'screened_out',
+    reasonCode,
+    reason,
+  };
+  campaignStore.record((tracker) => tracker.recordScreenedOut({ card, decision, completedAt }));
+}
+
+function screeningReasonForPreview(preview: PaperBuyResult): CampaignScreeningReasonCode {
+  const detail = `${preview.abortCode ?? ''} ${preview.abortReason ?? ''} ${preview.error ?? ''}`.toLowerCase();
+  if (/reward.?risk|2:1/.test(detail)) return 'reward_risk_below_minimum';
+  if (/stress/.test(detail)) return 'stress_profit_below_minimum';
+  if (/risk|\$10/.test(detail)) return 'entry_risk_above_limit';
+  if (/fair price/.test(detail)) return 'fair_price_not_above_entry';
+  if (/edge/.test(detail)) return 'non_positive_executable_edge';
+  if (/reward|profit|strict_profit/.test(detail)) return 'target_reward_below_minimum';
+  return 'incomplete_fill';
+}
+
+function enrollCampaignCandidate(card: ThesisCard, preview: PaperBuyResult, book: KalshiOrderbook, at: number): CampaignEnrollmentResult {
+  if (!campaignStore || !preview.fill || !preview.profitCertificate) return { candidate: null, decision: null };
+  const fill = preview.fill;
+  const existing = findCampaignCandidate(card);
+  if (existing) return { candidate: existing, decision: null };
+  const decision = qualifyCampaignEnrollment({
+    card,
+    fill,
+    bookTimestamp: book.sourceTimestamp ?? Number.NaN,
+    bookSequence: book.sequence,
+    bookContinuityProven: orderbookContinuityProven(card.ticker),
+    feePolicy: book.feePolicy,
+    observedAt: at,
+    sourceAlreadyUsed: campaignEntryConfirmationEngine.hasUsedSource(card.id),
+    lastTickerExecutionAt: lastTickerSideExecutionAt.get(opportunityKey(card)),
+    maxSafeContracts: preview.capitalDecision?.maxSafeContracts,
+    entryRiskUsd: preview.capitalDecision?.riskUsd,
+    settings: entryQualificationSettings(),
+  });
+  if (decision.status === 'screened_out') {
+    campaignStore.record((tracker) => tracker.recordScreenedOut({ card, decision, completedAt: at }));
+    return { candidate: null, decision };
+  }
+  campaignStore.record((tracker) => tracker.enrollQualified({
+    card,
+    initialFill: fill,
+    screening: decision,
+    completedAt: at,
+  }));
+  refreshOrderbookTracking();
+  return { candidate: findCampaignCandidate(card), decision };
 }
 
 function retryableFromResult(result: PaperBuyResult): boolean {
@@ -1005,6 +3408,41 @@ async function executeReservedStrictPaperBuyForCard(
   contracts: number | undefined,
   source: 'manual' | 'working-order' | 'throughput',
 ): Promise<PaperBuyResult> {
+  const activeCampaign = source === 'throughput' ? campaignSnapshot() : null;
+  const evidenceOnlyCampaign = isEvidenceOnlyCampaignExecution(source, activeCampaign);
+  // Hard choke: when NEMESIS_SERIES_ALLOWLIST / DENYLIST is set, never confirm/buy
+  // off-series cards (sports contamination previously burned confirmation capacity).
+  if ((seriesAllowlistConfigured() || seriesDenylistConfigured()) && !tickerWithinSeriesAllowlist(card.ticker)) {
+    const reason = seriesDenylistConfigured() && !seriesAllowlistConfigured()
+      ? `ticker ${card.ticker} is blocked by NEMESIS_SERIES_DENYLIST`
+      : `ticker ${card.ticker} is outside NEMESIS_SERIES_ALLOWLIST`;
+    recordPaperBlock({
+      thesisId: card.id,
+      ticker: card.ticker,
+      detail: reason,
+      code: 'series_allowlist_block',
+      severity: 'info',
+      blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
+    });
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: reason,
+      error: reason,
+      abortCode: 'series_allowlist_block',
+      queueState: 'blocked_final',
+      wouldMutate: false,
+    };
+  }
+  const mutationLock = campaignMutationLockReason();
+  if (mutationLock && !evidenceOnlyCampaign) {
+    return { ok: false, aborted: true, abortReason: mutationLock, error: mutationLock, abortCode: 'campaign_mutation_lock', queueState: 'blocked_final', wouldMutate: false };
+  }
+  if (evidenceOnlyCampaign && campaignEvidencePaused) {
+    const reason = `campaign evidence paused while runtime is ${latestRuntimeDecision?.state ?? 'not ready'}`;
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_runtime_paused', queueState: 'blocked_retryable', wouldMutate: false };
+  }
   if (source !== 'manual' && qualificationSnapshot()?.rollingLossPaused) {
     const reason = 'automatic entries paused by the rolling 20-position loss rule';
     recordPaperBlock({
@@ -1014,22 +3452,30 @@ async function executeReservedStrictPaperBuyForCard(
       code: 'rolling_loss_pause',
       severity: 'warning',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     return { ok: false, error: reason, abortCode: 'rolling_loss_pause', queueState: 'blocked_final', wouldMutate: false };
   }
-  const validation = strategyValidationSnapshot();
-  if (!validation || validation.integrityError) {
+  const validation = evidenceOnlyCampaign ? null : strategyValidationSnapshot();
+  if (!evidenceOnlyCampaign && (!validation || validation.integrityError)) {
     const reason = `strategy validation evidence is unavailable or corrupt: ${validation?.integrityError ?? 'store unavailable'}`;
     return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
   }
-  if (validation.paused) {
+  if (!evidenceOnlyCampaign && validation?.paused) {
     const reason = `strategy validation paused: ${validation.pauseReason ?? 'manual review required'}`;
     opportunityQueue.markBlocked(opportunityKey(card), reason, false);
     return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'strategy_validation_paused', queueState: 'blocked_final', wouldMutate: false };
   }
-  const validationStage: StrategyValidationStage = validation.stage;
+  const validationStage: StrategyValidationStage = evidenceOnlyCampaign ? 'shadow' : validation!.stage;
   const eligibilityBlock = entryEligibilityBlockReason(card);
   if (eligibilityBlock) {
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(
+        card,
+        /net edge/i.test(eligibilityBlock) ? 'non_positive_executable_edge' : 'automatic_source_required',
+        eligibilityBlock,
+      );
+    }
     recordPaperBlock({
       thesisId: card.id,
       ticker: card.ticker,
@@ -1037,6 +3483,7 @@ async function executeReservedStrictPaperBuyForCard(
       code: 'signal_eligibility_block',
       severity: 'info',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     return {
       ok: false,
@@ -1053,6 +3500,9 @@ async function executeReservedStrictPaperBuyForCard(
   const key = opportunityKey(card);
   const risk = checkPaperRisk(card, paperDesk.snapshot(), settings, getDailyPnl());
   if (!risk.ok) {
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(card, 'entry_risk_above_limit', risk.error ?? 'risk gate blocked');
+    }
     recordPaperBlock({
       thesisId,
       ticker: card.ticker,
@@ -1060,6 +3510,7 @@ async function executeReservedStrictPaperBuyForCard(
       code: 'risk_gate_block',
       severity: 'warning',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     opportunityQueue.markBlocked(key, risk.error ?? 'risk gate blocked', false);
     return { ok: false, error: risk.error, abortCode: 'risk_gate_block', queueState: 'blocked_final', wouldMutate: false };
@@ -1069,12 +3520,19 @@ async function executeReservedStrictPaperBuyForCard(
   try {
     book = await fetchBookForCard(card);
     opportunityQueue.markBookFetched(key);
-    if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('books_fetched'));
+    if (source === 'throughput' && !evidenceOnlyCampaign) {
+      recordQualification((tracker) => tracker.recordFunnel('books_fetched'));
+    }
   } catch (error) {
     const reason = describeBookFetchError(error);
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(card, 'missing_exchange_provenance', `book unavailable: ${reason}`);
+    }
     const backoffActive = isBookFetchBackoffError(error);
     opportunityQueue.markBlocked(key, `book unavailable: ${reason}`, true);
-    if (source === 'throughput') recordQualification((tracker) => tracker.recordFunnel('books_unavailable', 1, 'book_unavailable'));
+    if (source === 'throughput' && !evidenceOnlyCampaign) {
+      recordQualification((tracker) => tracker.recordFunnel('books_unavailable', 1, 'book_unavailable'));
+    }
     if (!backoffActive) {
       sessionStatsData.abortCount += 1;
       recordPaperBlock({
@@ -1084,6 +3542,7 @@ async function executeReservedStrictPaperBuyForCard(
         code: 'book_unavailable',
         severity: 'warning',
         blocksLiveUnlock: false,
+        formalQualificationEligible: !evidenceOnlyCampaign,
       });
       saveSessionStats();
     }
@@ -1096,6 +3555,34 @@ async function executeReservedStrictPaperBuyForCard(
       queueState: 'blocked_retryable',
       wouldMutate: false,
     };
+  }
+
+  if (evidenceOnlyCampaign) {
+    const readiness = campaignEnrollmentReadiness(
+      book,
+      Date.now(),
+      entryQualificationSettings().maxBookAgeMs,
+    );
+    if (!readiness.ready) {
+      const reasonCode: CampaignScreeningReasonCode = /fee/i.test(readiness.reason)
+        ? 'fee_policy_unknown'
+        : /stale|age/i.test(readiness.reason)
+          ? 'book_stale'
+          : 'missing_exchange_provenance';
+      recordPreEnrollmentScreeningFailure(card, reasonCode, readiness.reason, Date.now(), {
+        feePolicy: book.feePolicy,
+      });
+      opportunityQueue.markBlocked(key, readiness.reason, true);
+      return {
+        ok: false,
+        aborted: true,
+        abortReason: readiness.reason,
+        error: readiness.reason,
+        abortCode: 'entry_confirmation_pending',
+        queueState: 'blocked_retryable',
+        wouldMutate: false,
+      };
+    }
   }
 
   const startedAt = Date.now();
@@ -1125,17 +3612,43 @@ async function executeReservedStrictPaperBuyForCard(
   if (validationStage === 'shadow' || validationStage === 'pilot') {
     const rawAsk = card.side === 'yes' ? book.yesAsk : book.noAsk;
     if (!isExecutablePrice(rawAsk)) {
+      if (evidenceOnlyCampaign) {
+        recordPreEnrollmentScreeningFailure(card, 'incomplete_fill', 'entry ask is not executable', Date.now(), {
+          feePolicy: book.feePolicy,
+        });
+      }
       return { ok: false, aborted: true, abortReason: 'pilot entry ask is not executable', error: 'pilot entry ask is not executable', abortCode: 'invalid_price', queueState: 'blocked_final', wouldMutate: false };
     }
     const maxPilotContracts = Math.max(1, Math.floor(entryConfig.pilotMaxEntryRiskUsd / (rawAsk + kalshiFeeForOrder(rawAsk, 1))));
     const desiredContracts = contracts ?? resolveContractCount(card, paperDesk.snapshot(), settings);
-    effectiveContracts = Math.max(1, Math.min(maxPilotContracts, desiredContracts));
+    // Size up toward the absolute $ minExpectedNetPnlUsd bar when the per-contract
+    // edge can clear it inside the pilot risk / maxPosition caps. Leaving size at
+    // a thin Kelly slice left KXBTCD at ~$0.63 target reward with R:R already ≥2 —
+    // an honest edge rejected only for undersizing, not for failing the bar.
+    let sizedContracts = Math.max(1, Math.min(maxPilotContracts, desiredContracts));
+    const unitPreview = previewPaperBuy(paperDesk.snapshot(), card, book, settings, 1);
+    const unitReward = unitPreview.profitCertificate?.targetRewardUsd;
+    if (Number.isFinite(unitReward) && (unitReward as number) > 0) {
+      const needForBar = Math.ceil(entryConfig.minExpectedNetPnlUsd / (unitReward as number));
+      if (needForBar > sizedContracts && needForBar <= maxPilotContracts) {
+        sizedContracts = needForBar;
+      }
+    }
+    effectiveContracts = sizedContracts;
   }
 
   const beforeTradeCount = paperDesk.snapshot().trades.length;
   const preview = previewPaperBuy(paperDesk.snapshot(), card, book, settings, effectiveContracts);
   if (!preview.ok || !preview.fill || !preview.profitCertificate) {
     const blockReason = preview.abortReason ?? preview.error ?? preview.abortCode ?? 'paper buy preview blocked';
+    if (evidenceOnlyCampaign) {
+      recordPreEnrollmentScreeningFailure(card, screeningReasonForPreview(preview), blockReason, Date.now(), {
+        fill: preview.fill,
+        feePolicy: book.feePolicy,
+        entryRiskUsd: preview.capitalDecision?.riskUsd,
+        maxSafeContracts: preview.capitalDecision?.maxSafeContracts,
+      });
+    }
     opportunityQueue.markBlocked(key, blockReason, retryableFromResult(preview));
     recordPaperBlock({
       thesisId,
@@ -1144,22 +3657,92 @@ async function executeReservedStrictPaperBuyForCard(
       code: preview.abortCode,
       severity: preview.abortCode === 'strict_profit_block' ? 'info' : 'warning',
       blocksLiveUnlock: isAbnormalExecutionCode(preview.abortCode),
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     sessionStatsData.abortCount += 1;
     saveSessionStats();
     return preview;
   }
 
-  const confirmation = entryConfirmationEngine.observe({
-    card,
+  const observedAt = Date.now();
+  const enrollment = enrollCampaignCandidate(card, preview, book, observedAt);
+  const campaignCandidate = enrollment.candidate;
+  if (evidenceOnlyCampaign && enrollment.decision?.status === 'screened_out') {
+    opportunityQueue.markBlocked(key, enrollment.decision.reason, false);
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: enrollment.decision.reason,
+      error: enrollment.decision.reason,
+      abortCode: `campaign_screened_out:${enrollment.decision.reasonCode}`,
+      queueState: 'blocked_final',
+      wouldMutate: false,
+    };
+  }
+  if (evidenceOnlyCampaign && !campaignCandidate) {
+    const reason = 'campaign candidate evidence could not be persisted';
+    opportunityQueue.markBlocked(key, reason, false);
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_evidence_invalid', queueState: 'blocked_final', wouldMutate: false };
+  }
+  if (campaignCandidate?.terminalState) {
+    const reason = `campaign candidate already terminal: ${campaignCandidate.terminalState}`;
+    return { ok: false, aborted: true, abortReason: reason, error: reason, abortCode: 'campaign_candidate_terminal', queueState: 'blocked_final', wouldMutate: false };
+  }
+  const priorCampaignSamples = campaignCandidate?.samples.length ?? 0;
+  const confirmationCard = campaignCandidate?.card ?? card;
+  const confirmationEngine = evidenceOnlyCampaign
+    ? campaignEntryConfirmationEngine
+    : entryConfirmationEngine;
+  const confirmation = confirmationEngine.observe({
+    candidateId: campaignCandidate?.candidateId,
+    card: confirmationCard,
     fill: preview.fill,
     baseCertificate: preview.profitCertificate,
-    bookTimestamp: Date.now(),
-    observedAt: Date.now(),
-    sourceAlreadyUsed: strategyValidationStore?.tracker.hasUsedSource(card.id),
+    bookTimestamp: book.sourceTimestamp ?? Number.NaN,
+    bookSequence: book.sequence,
+    bookContinuityProven: orderbookContinuityProven(confirmationCard.ticker),
+    feePolicy: book.feePolicy,
+    observedAt,
+    sourceAlreadyUsed: evidenceOnlyCampaign
+      ? false
+      : strategyValidationStore?.tracker.hasUsedSource(confirmationCard.id),
     lastTickerExecutionAt: lastTickerSideExecutionAt.get(key),
   });
-  const confirmationRecorded = recordStrategyValidation((tracker) => tracker.recordEntryConfirmation({
+  if (campaignCandidate && campaignStore && confirmation.samples > priorCampaignSamples && book.sequence != null && book.sourceTimestamp != null) {
+    const operationalChecks = campaignStore.snapshot().operationalChecks;
+    if (!operationalChecks.some((check) => check.name === 'exchange_book_time_available' && check.passed)) {
+      campaignStore.record((tracker) => tracker.recordOperationalCheck(
+        'exchange_book_time_available',
+        true,
+        `exchange sequence ${book.sequence} observed ${Math.max(0, observedAt - book.sourceTimestamp!)}ms after matching-engine timestamp`,
+        observedAt,
+      ));
+    }
+    campaignStore.record((tracker) => tracker.recordSample(campaignCandidate.candidateId, {
+      at: observedAt,
+      observedAt,
+      netEdge: preview.fill!.netEdge,
+      spread: card.spread,
+      bookTimestamp: book.sourceTimestamp!,
+      bookSequence: book.sequence!,
+      exchangeTimestamp: book.sourceTimestamp!,
+      exchangeSequence: book.sequence!,
+      fillPrice: preview.fill!.fillPrice,
+      filled: preview.fill!.filled,
+      fees: preview.fill!.fees,
+      feePolicyKnown: isKnownKalshiFeePolicy(book.feePolicy),
+    }));
+  }
+  if (campaignCandidate && campaignStore && confirmation.status !== 'pending') {
+    campaignStore.record((tracker) => tracker.terminalize(
+      campaignCandidate.candidateId,
+      confirmation.status === 'ready' ? 'ready' : 'rejected',
+      confirmation.reason,
+      observedAt,
+    ));
+  }
+  const modelCalibration = modelCalibrationFor(card);
+  const confirmationRecorded = evidenceOnlyCampaign || recordStrategyValidation((tracker) => tracker.recordEntryConfirmation({
     sourceSignalId: card.id,
     ticker: card.ticker,
     side: card.side,
@@ -1174,6 +3757,12 @@ async function executeReservedStrictPaperBuyForCard(
     rewardRiskRatio: confirmation.rewardRiskRatio,
     stressedNetPnlUsd: confirmation.stressedNetPnlUsd,
     economics: confirmation.economics,
+    // Written only for cards that carry a model context, so rows that never had
+    // one hash exactly as they did before.
+    ...(modelCalibration ? { modelCalibration } : {}),
+    // Tag, never suppress: a rejection recorded while the data plane is latched
+    // degraded is evidence about the feed, not about the strategy's edge.
+    dataPlaneDegraded: dataPlaneDegradedSnapshot.degraded,
   }));
   if (!confirmationRecorded) {
     const reason = 'entry confirmation evidence could not be persisted';
@@ -1191,6 +3780,7 @@ async function executeReservedStrictPaperBuyForCard(
       code,
       severity: 'info',
       blocksLiveUnlock: false,
+      formalQualificationEligible: !evidenceOnlyCampaign,
     });
     return {
       ok: false,
@@ -1200,6 +3790,21 @@ async function executeReservedStrictPaperBuyForCard(
       abortCode: code,
       queueState: retryable ? 'blocked_retryable' : 'blocked_final',
       wouldMutate: false,
+    };
+  }
+
+  if (campaignCandidate) {
+    opportunityQueue.markBlocked(key, 'campaign candidate ready without paper mutation', false);
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: 'campaign candidate ready without paper mutation',
+      abortCode: 'campaign_candidate_ready',
+      queueState: 'blocked_final',
+      wouldMutate: false,
+      fill: preview.fill,
+      fillQuality: preview.fillQuality,
+      profitCertificate: confirmation.certificate,
     };
   }
 
@@ -1213,6 +3818,11 @@ async function executeReservedStrictPaperBuyForCard(
       playbook: card.playbook,
       startedAt: Date.now(),
       dueAt: Date.now() + entryConfig.shadowFollowUpMs,
+      // An entry taken while the data plane was latched degraded is a bad entry
+      // however cleanly it exits. Recorded, then excluded from the acceptance
+      // tallies -- the shadow ledger is what the gate reads, so this is where
+      // "no data" would otherwise be laundered into "no edge".
+      dataPlaneDegraded: dataPlaneDegradedSnapshot.degraded,
       contracts: preview.fill!.filled,
       entryPrice: preview.fill!.fillPrice,
       entryFeesUsd: preview.fill!.fees,
@@ -1356,6 +3966,106 @@ function fallbackCardForPosition(pos: PaperPosition, mark = pos.entryPrice): The
     edgeHistory: [],
     drivers: [],
     invalidations: [],
+  };
+}
+
+/**
+ * Holds the process awake for the length of a run.
+ *
+ * 2026-08-01: an 11-hour unattended run produced 3.85 hours of data and 7.1 hours
+ * of nothing, because the machine entered Modern Standby at 01:36 and the health
+ * tick stopped executing until 08:41. Nothing was broken — the supervisor
+ * recovered the socket in 45 seconds once it was running again — but the run was
+ * worthless and the deadline stop was suspended along with it, so it never fired.
+ *
+ * `prevent-app-suspension` keeps the system awake while letting the display sleep,
+ * which is what an overnight measurement rig wants. Set NEMESIS_ALLOW_SUSPEND=true
+ * to opt out.
+ *
+ * Honest limit: this maps to ES_SYSTEM_REQUIRED on Windows, which a Modern Standby
+ * policy can still override. It reduces the risk; it does not remove it. The
+ * suspend detector below is what makes the failure legible when it happens anyway.
+ */
+let powerSaveBlockerId: number | null = null;
+
+function recordPowerWarn(source: string, message: string): void {
+  console.warn(message);
+  connectorWarnTrace.record({ at: Date.now(), connector: 'main-process', source, message });
+}
+
+function startPowerSaveBlocker(): void {
+  if (process.env.NEMESIS_ALLOW_SUSPEND === 'true') {
+    recordPowerWarn('suspend-blocker', '[nemesis] NEMESIS_ALLOW_SUSPEND=true; the process may be suspended mid-run');
+    return;
+  }
+  try {
+    powerSaveBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+    recordPowerWarn('suspend-blocker',
+      `[nemesis] power-save blocker started (id=${powerSaveBlockerId}); system sleep held off for the run`);
+  } catch (error) {
+    powerSaveBlockerId = null;
+    recordPowerWarn('suspend-blocker',
+      `[nemesis] power-save blocker unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function stopPowerSaveBlocker(): void {
+  if (powerSaveBlockerId == null) return;
+  try {
+    if (powerSaveBlocker.isStarted(powerSaveBlockerId)) powerSaveBlocker.stop(powerSaveBlockerId);
+  } catch {
+    /* releasing a blocker during shutdown must never block shutdown */
+  }
+  powerSaveBlockerId = null;
+}
+
+/**
+ * Names a suspend or stall for what it is, on the tick that discovers it.
+ *
+ * Without this a resume looks exactly like a dead data plane: every age counter
+ * reads hours, the latch fires, and the trace holds one lonely sample. That cost
+ * a full investigation on 2026-08-01 and produced a wrong conclusion first --
+ * that the supervisor had failed to recover for seven hours, when it simply had
+ * not been executing. A gap in the tick is evidence about the *host*, and it must
+ * never again have to be inferred from a frozen counter.
+ */
+let lastHealthTickAt: number | null = null;
+
+function recordHealthTickGap(now: number): number {
+  const previous = lastHealthTickAt;
+  lastHealthTickAt = now;
+  if (previous == null) return 0;
+  const elapsed = now - previous;
+  // Three missed ticks: comfortably past scheduler jitter, well short of anything
+  // a healthy loop produces.
+  if (elapsed < BRIDGE_HEARTBEAT_MS * 3) return elapsed;
+  recordPowerWarn('tick-gap',
+    `[nemesis] health tick gap ${Math.round(elapsed / 1000)}s (expected ${BRIDGE_HEARTBEAT_MS / 1000}s)`
+    + ' — the process was suspended or stalled; age counters spanning this window describe the host, not the feed');
+  return elapsed;
+}
+
+/**
+ * Projects the card's volatility calibration onto the confirmation record, so
+ * "was the ladder gate reached, and what did it see?" is answerable from the
+ * ledger instead of by probing a live market.
+ *
+ * Returns undefined for cards with no model context (every non-crypto playbook),
+ * which keeps those rows hashing exactly as before.
+ */
+function modelCalibrationFor(card: ThesisCard): ModelCalibrationEvidence | undefined {
+  const context = card.cryptoContext;
+  if (!context) return undefined;
+  return {
+    sigmaT: context.sigmaT,
+    sigmaPerRootSec: context.sigmaPerRootSec,
+    timeToExpirySec: context.timeToExpirySec,
+    ladderQuoteCount: context.ladderQuoteCount ?? 0,
+    ladderUsableCount: context.ladderUsableCount,
+    ladderPoints: context.ladderPoints,
+    ladderSigmaT: context.ladderSigmaT,
+    ladderRSquared: context.ladderRSquared,
+    ladderSigmaRatio: context.ladderSigmaRatio,
   };
 }
 
@@ -1518,6 +4228,7 @@ function recordQualificationClose(
 }
 
 async function evaluateQualificationFollowUps(): Promise<void> {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (!qualificationStore || qualificationFollowUpRunning) return;
   qualificationFollowUpRunning = true;
   try {
@@ -1541,6 +4252,7 @@ async function evaluateQualificationFollowUps(): Promise<void> {
 }
 
 async function evaluateStrategyValidationFollowUps(): Promise<void> {
+  if (PRODUCTION_OBSERVATION_MODE) return;
   if (!strategyValidationStore || strategyValidationFollowUpRunning) return;
   const snapshot = strategyValidationSnapshot();
   if (!snapshot || snapshot.stage !== 'shadow' || snapshot.paused) return;
@@ -1551,45 +4263,84 @@ async function evaluateStrategyValidationFollowUps(): Promise<void> {
       try {
         const book = await bookFetchCoordinator.fetch(candidate.ticker, { allowCachedSuccess: false });
         const fill = dryRunCloseFill(book, candidate.side, candidate.contracts, candidate.entryPrice, settings.maxSlippagePp);
-        if (fill.aborted || fill.filled !== candidate.contracts || !isExecutablePrice(fill.fillPrice)) continue;
+        if (fill.aborted || fill.filled !== candidate.contracts || !isExecutablePrice(fill.fillPrice)) {
+          // A book exists but produced no executable fill (thin/frozen depth).
+          // Same permanent-pending risk as a fetch failure below if this never
+          // resolves before the abandon deadline.
+          if (now >= candidate.dueAt + SHADOW_ABANDON_GRACE_MS) {
+            recordStrategyValidation((tracker) => tracker.abandonShadowCandidate(
+              candidate.id,
+              'shadow abandoned: no executable fill before extended deadline',
+              now,
+            ));
+          }
+          continue;
+        }
         const entryCost = candidate.entryPrice * candidate.contracts + candidate.entryFeesUsd;
         const executableNetPnlUsd = fill.fillPrice * fill.filled - fill.fees - entryCost;
         const stressedPrice = Math.max(0.01, fill.fillPrice - 0.01);
         const stressedNetPnlUsd = stressedPrice * fill.filled
           - kalshiFeeForOrder(stressedPrice, fill.filled)
           - entryCost;
-        const currentEdge = cardForTickerSide(candidate.ticker, candidate.side)?.netEdge ?? 0;
-        recordStrategyValidation((tracker) => tracker.observeShadowCandidate(
-          candidate.id,
-          executableNetPnlUsd,
-          stressedNetPnlUsd,
-          currentEdge,
+        // Do not early-stop shadow on planned-loss MTM. Entry→immediate exit always
+        // burns spread+fees ≈ plannedLoss (11/11 measured), so a loss stop before the
+        // follow-up horizon guarantees shadowPassed can never clear. Score winners on
+        // a target that holds, abandon on sustained edge-gone after the confirmation
+        // window, and otherwise wait for the 15-minute due deadline. The rules live in
+        // shadowFollowUp.ts, which documents why a missing card must not read as zero
+        // edge and why the target needs persistence.
+        const currentCard = cardForTickerSide(candidate.ticker, candidate.side);
+        const decision = decideShadowFollowUp({
           now,
-        ));
-        const observations = strategyValidationStore.tracker.recentObservations(candidate.id, 3);
-        const edgeGone = observations.length >= 3 && observations.every((observation) => observation.netEdge <= 0);
-        const targetRewardUsd = candidate.targetRewardUsd ?? candidate.expectedRewardUsd;
-        const hitTarget = Number.isFinite(targetRewardUsd) && executableNetPnlUsd >= targetRewardUsd!;
-        const hitLoss = executableNetPnlUsd <= -candidate.plannedLossUsd;
-        const due = now >= candidate.dueAt;
-        if (hitTarget || hitLoss || edgeGone || due) {
-          const closeReason = hitTarget
-            ? 'shadow target reached'
-            : hitLoss
-              ? 'shadow planned-loss limit reached'
-              : edgeGone
-                ? 'shadow edge gone for three executable observations'
-                : 'shadow 15-minute follow-up complete';
+          startedAt: candidate.startedAt,
+          dueAt: candidate.dueAt,
+          targetRewardUsd: candidate.targetRewardUsd ?? candidate.expectedRewardUsd,
+          executableNetPnlUsd,
+          currentNetEdge: currentCard ? currentCard.netEdge : null,
+          priorObservations: strategyValidationStore.tracker.recentObservations(
+            candidate.id,
+            Math.max(SHADOW_EDGE_GONE_OBSERVATIONS, SHADOW_TARGET_HOLD_OBSERVATIONS),
+          ),
+          edgeStopArmMs: entryQualificationSettings().minWindowMs,
+        });
+        if (decision.observation) {
+          recordStrategyValidation((tracker) => tracker.observeShadowCandidate(
+            candidate.id,
+            executableNetPnlUsd,
+            stressedNetPnlUsd,
+            decision.observation!.netEdge,
+            now,
+          ));
+        }
+        if (decision.close) {
+          const closeReason = decision.closeReason!;
           recordStrategyValidation((tracker) => tracker.scoreShadowCandidate(
             candidate.id,
             executableNetPnlUsd,
             stressedNetPnlUsd,
             closeReason,
             now,
+            // A mark taken during a degraded window is an untrustworthy mark,
+            // just as an entry taken during one is a bad entry. Either end
+            // contaminates the row and excludes it from the acceptance tallies.
+            dataPlaneDegradedSnapshot.degraded,
           ));
         }
       } catch {
-        // Missing executable books remain pending and never count as scored evidence.
+        // A market that closes before the candidate can be scored would
+        // otherwise retry forever across every relaunch -- persisted state is
+        // the whole point of the shadow ledger. Measured 2026-07-29: 8
+        // candidates stuck this way, the oldest 2 days stale, 46% of one run's
+        // priority-track attempts spent retrying their dead books. Abandon only
+        // once genuinely past the extended deadline; a transient fetch failure
+        // right at `due` gets the same runway as any other candidate.
+        if (now >= candidate.dueAt + SHADOW_ABANDON_GRACE_MS) {
+          recordStrategyValidation((tracker) => tracker.abandonShadowCandidate(
+            candidate.id,
+            'shadow abandoned: no executable book before extended deadline',
+            now,
+          ));
+        }
       }
     }
   } finally {
@@ -1602,6 +4353,7 @@ async function executeAutoCloseDecision(
   decision: AutoCloseDecision,
   prepared?: { book: KalshiOrderbook; mark: number },
 ): Promise<boolean> {
+  if (campaignMutationLockReason()) return false;
   if (decision.action === 'hold' || decision.contracts < 1) return false;
   if (settings.killSwitchActive) return false;
   const card = cardForPosition(pos);
@@ -1720,6 +4472,7 @@ const SETTLEMENT_TICKER_COOLDOWN_MS = 10 * 60_000;
 let settlementSweepRunning = false;
 
 async function sweepSettledPositions() {
+  if (campaignMutationLockReason()) return;
   if (settlementSweepRunning) return;
   settlementSweepRunning = true;
   let settledCount = 0;
@@ -1904,12 +4657,28 @@ function computeRegimeState(spread: number, depthUsd: number, freshnessMs: numbe
     strategyDrawdown: sessionStatsData.dailyPnl < -settings.dailyLossCapUsd * 0.5,
   });
   activeRegimes = regime.active;
-  const shutdown = shouldShutdownSession(getShutdownCounters());
+  const shutdownCounters = getShutdownCounters();
+  const shutdown = shouldShutdownSession(shutdownCounters);
   if (shutdown && !shutdownEvidenceRecorded) {
     shutdownEvidenceRecorded = true;
-    recordQualificationSafety('shutdown_event', 'session shutdown counters triggered');
+    // Attribute the trip. The bare "session shutdown counters triggered" string
+    // read as an unexplained runtime risk marker in the 2026-07-27 report when
+    // the actual cause was 152 API-degraded minutes downstream of a dead
+    // orderbook socket. It freezes live theses only; paper/shadow keep flowing.
+    recordQualificationSafety(
+      'shutdown_event',
+      'session shutdown counters triggered (live theses frozen; paper/shadow unaffected): '
+      + `invalidations=${shutdownCounters.consecutiveInvalidations}/5, `
+      + `abnormalExecutions=${shutdownCounters.abnormalExecutions}/3, `
+      + `manualOverrides=${shutdownCounters.manualOverrides}/3, `
+      + `apiDegradedMinutes=${shutdownCounters.apiDegradedMinutes}/10, `
+      + `dataPlaneDegraded=${dataPlaneDegradedSnapshot.degraded}`,
+    );
   }
-  return { ...regime, reviewOnly: regime.reviewOnly || shutdown };
+  return {
+    ...regime,
+    reviewOnly: regime.reviewOnly || sessionShutdownFreezesTheses(shutdown, settings.liveEnabled),
+  };
 }
 
 function finalizeThesis(card: ThesisCard): ThesisCard {
@@ -1933,7 +4702,7 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
     changed = true;
     const marketPrice = t.side === 'yes' ? yesPrice : 1 - yesPrice;
     const edge = computeNetEdge(t.impliedPrice, marketPrice, spread);
-    return {
+    return finalizeThesis(requalifyThesisCard({
       ...t,
       marketPrice,
       spread,
@@ -1942,7 +4711,10 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
       feeEstimate: edge.feeCost,
       updatedAt: Date.now(),
       edgeHistory: [...t.edgeHistory.slice(-19), edge.netEdge],
-    };
+    }, {
+      reviewOnly,
+      demoMode: settings.demoMode,
+    }));
   };
   theses = theses.map(updateCard);
   geaTheses = geaTheses.map(updateCard);
@@ -1962,10 +4734,14 @@ function applyKalshiQuote(ticker: string, yesPrice: number, spread: number) {
     scheduleMarketStatePublish();
     void evaluateAutoClosePositions('quote');
     schedulePaperUpdate();
+    if (theses.some((t) => t.ticker === ticker && isEntryEligible(t))) {
+      void runThroughputCertification('quote', new Set([ticker]));
+    }
   }
 }
 
 function processWorkingOrders() {
+  if (campaignMutationLockReason()) return;
   const working = paperOrderBook.working();
   if (working.length === 0) return;
   for (const order of working) {
@@ -1988,11 +4764,17 @@ function processWorkingOrders() {
   }
 }
 
-async function runThroughputCertification(trigger: string) {
+async function runThroughputCertification(trigger: string, tickerFilter?: ReadonlySet<string>) {
   const throughput = { ...DEFAULT_OPPORTUNITY_THROUGHPUT, ...(settings.opportunityThroughput ?? {}) };
+  const activeCampaign = campaignSnapshot()?.manifest.status === 'active';
+  if (throughputRunning && activeCampaign && tickerFilter) {
+    for (const ticker of tickerFilter) pendingCampaignThroughputTickers.add(ticker);
+    return;
+  }
   if (
     !throughput.enabled
     || throughputRunning
+    || (activeCampaign && campaignEvidencePaused)
     || settings.killSwitchActive
     || qualificationSnapshot()?.rollingLossPaused
   ) return;
@@ -2005,26 +4787,82 @@ async function runThroughputCertification(trigger: string) {
       : Math.max(0, throughput.maxDailyCertifiedTrades - executed);
     if (remaining <= 0) return;
 
-    recordQualification((tracker) => tracker.recordFunnel('raw_candidates', theses.length));
-    const rankedCandidates = theses
-      .filter((card) => isEntryEligible(card)
-        && hasRealExecutableDepth(card)
-        && !openKeys.has(opportunityKey(card)))
+    const throughputCampaign = campaignSnapshot();
+    const existingCampaignIdentities = throughputCampaign?.manifest.status === 'active'
+      ? new Set(throughputCampaign.candidates.map((candidate) => candidate.economicIdentity))
+      : null;
+    const scopedTheses = theses.filter((card) => tickerWithinSeriesAllowlist(card.ticker));
+    const rawCandidates = tickerFilter
+      ? scopedTheses.filter((card) => tickerFilter.has(card.ticker))
+      : scopedTheses;
+    const formalQualificationEligible = throughputCampaign?.manifest.status !== 'active';
+    if (formalQualificationEligible) {
+      recordQualification((tracker) => tracker.recordFunnel('raw_candidates', rawCandidates.length));
+    }
+    const entryBlockReasons = new Map<string, number>();
+    const countEntryBlock = (reason: string) => {
+      entryBlockReasons.set(reason, (entryBlockReasons.get(reason) ?? 0) + 1);
+    };
+    const seriesAllowlistActive = seriesAllowlistConfigured();
+    const rankedCandidates = rawCandidates
+      .filter((card) => {
+        const eligibilityBlock = entryEligibilityBlockReason(card);
+        if (eligibilityBlock) {
+          countEntryBlock(`entry eligibility: ${entryBlockedDiagnosticReason(card, eligibilityBlock)}`);
+          return false;
+        }
+        // Under a series allowlist, depth labels only appear after a tracked book
+        // exists — and the track set is fed by entry-eligible work. Requiring
+        // hasRealExecutableDepth here deadlocks: raw allowlisted theses stay at
+        // entry_eligible=0 forever while books stay empty. Priority-track + the
+        // strict book gate still earn a sequenced book before any fill.
+        const economicIdentity = candidateEconomicIdentity(card);
+        if (
+          entryConfirmationEngine.hasUsedSource(card.id)
+          || entryConfirmationEngine.hasUsedSource(economicIdentity)
+          || strategyValidationStore?.tracker.hasUsedSource(card.id)
+        ) {
+          countEntryBlock('entry source already used');
+          return false;
+        }
+        if (!seriesAllowlistActive && !hasRealExecutableDepth(card)) {
+          countEntryBlock('missing executable depth');
+          return false;
+        }
+        if (openKeys.has(opportunityKey(card))) {
+          countEntryBlock('position already open');
+          return false;
+        }
+        if (existingCampaignIdentities?.has(economicIdentity)) {
+          countEntryBlock('campaign economic identity already enrolled');
+          return false;
+        }
+        return true;
+      })
       .sort((a, b) => {
         const edgeDelta = b.netEdge - a.netEdge;
         if (edgeDelta !== 0) return edgeDelta;
         return (a.freshnessMs ?? 0) - (b.freshnessMs ?? 0);
       });
-    recordQualification((tracker) => tracker.recordFunnel('entry_eligible', rankedCandidates.length));
+    if (formalQualificationEligible) {
+      recordQualification((tracker) => tracker.recordFunnel('entry_eligible', rankedCandidates.length));
+      for (const [reason, count] of [...entryBlockReasons.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)) {
+        recordQualification((tracker) => tracker.recordFunnel('entry_blocked', count, reason));
+      }
+    }
     const deduplicatedCandidates = dedupeByExecutionKey(rankedCandidates, opportunityKey);
     const duplicateCount = rankedCandidates.length - deduplicatedCandidates.length;
-    if (duplicateCount > 0) {
+    if (duplicateCount > 0 && formalQualificationEligible) {
       recordQualification((tracker) => tracker.recordFunnel('duplicates_removed', duplicateCount, 'duplicate_execution_key'));
     }
     const validation = strategyValidationSnapshot();
-    const pendingCapacity = validation?.stage === 'shadow'
-      ? Math.max(0, entryQualificationSettings().maxPendingCandidates - validation.shadowPendingCount)
-      : entryQualificationSettings().maxPendingCandidates;
+    const pendingCapacity = throughputCampaign?.manifest.status === 'active'
+      ? campaignPendingCapacity(throughputCampaign, entryQualificationSettings().maxPendingCandidates)
+      : validation?.stage === 'shadow'
+        ? Math.max(0, entryQualificationSettings().maxPendingCandidates - validation.shadowPendingCount)
+        : entryQualificationSettings().maxPendingCandidates;
     const candidates = deduplicatedCandidates
       .slice(0, Math.min(
         rankedCandidates.length,
@@ -2050,6 +4888,202 @@ async function runThroughputCertification(trigger: string) {
     }
   } finally {
     throughputRunning = false;
+    if (pendingCampaignThroughputTickers.size > 0 && !campaignEvidencePaused) {
+      const queued = new Set(pendingCampaignThroughputTickers);
+      pendingCampaignThroughputTickers.clear();
+      queueMicrotask(() => { void runThroughputCertification('coalesced-exchange-book-delta', queued); });
+    }
+  }
+}
+
+async function evaluateCampaignConfirmations(tickerFilter?: ReadonlySet<string>): Promise<void> {
+  const initial = campaignSnapshot();
+  if (!campaignStore || !initial || initial.manifest.status !== 'active' || campaignEvidencePaused) return;
+  if (tickerFilter) for (const ticker of tickerFilter) pendingCampaignConfirmationTickers.add(ticker);
+  else for (const candidate of initial.candidates) if (!candidate.terminalState) pendingCampaignConfirmationTickers.add(candidate.ticker);
+  if (campaignConfirmationWorkerRunning) return;
+  campaignConfirmationWorkerRunning = true;
+  try {
+    while (pendingCampaignConfirmationTickers.size > 0 && !campaignEvidencePaused) {
+      const tickers = new Set([...pendingCampaignConfirmationTickers].slice(0, 4));
+      for (const ticker of tickers) pendingCampaignConfirmationTickers.delete(ticker);
+      const snapshot = campaignSnapshot();
+      if (!snapshot || snapshot.manifest.status !== 'active' || Date.now() >= snapshot.manifest.cutoffAt) break;
+      const candidates = snapshot.candidates.filter((candidate) => !candidate.terminalState && tickers.has(candidate.ticker));
+      await Promise.all(candidates.map(async (candidate) => {
+        const result = await executeStrictPaperBuyForCard(
+          candidate.card,
+          candidate.initialFill.contracts,
+          'throughput',
+        );
+        if (
+          campaignStore
+          && !['book_unavailable', 'entry_confirmation_pending', 'execution_in_flight', 'campaign_runtime_paused'].includes(result.abortCode ?? '')
+          && !['campaign_candidate_ready', 'campaign_candidate_terminal'].includes(result.abortCode ?? '')
+        ) {
+          recordCampaignEventSafely('confirmation-terminalize', (tracker) => tracker.terminalize(
+            candidate.candidateId,
+            'rejected',
+            result.abortReason ?? result.error ?? 'campaign confirmation failed closed',
+            Date.now(),
+          ));
+        }
+      }));
+    }
+  } finally {
+    campaignConfirmationWorkerRunning = false;
+    if (pendingCampaignConfirmationTickers.size > 0 && !campaignEvidencePaused) {
+      queueMicrotask(() => { void evaluateCampaignConfirmations(new Set()); });
+    }
+  }
+}
+
+type DiagnosticFailureOutcome = Exclude<DiagnosticAttemptOutcome, 'valid_observation'>;
+
+function recordDiagnosticFailure(
+  diagnosticId: string,
+  outcome: DiagnosticFailureOutcome,
+  detail: string,
+  completedAt: number,
+  book?: KalshiOrderbook,
+): void {
+  recordCampaignEventSafely('diagnostic-attempt', (tracker) => tracker.recordDiagnosticAttempt({
+    diagnosticId,
+    outcome,
+    detail,
+    completedAt,
+    exchangeTimestamp: book?.sourceTimestamp,
+    exchangeSequence: book?.sequence,
+  }));
+}
+
+function evaluateDiagnosticBook(
+  diagnostic: ReturnType<SevenHourCampaignStore['snapshot']>['diagnostics'][number],
+  candidate: CampaignCandidateRecord,
+  book: KalshiOrderbook,
+): void {
+  const completedAt = Date.now();
+  if (book.sourceTimestamp == null || book.sequence == null) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'missing_provenance', 'matching order-book delta lacked exchange timestamp or sequence', completedAt, book);
+    return;
+  }
+  const bookAgeMs = completedAt - book.sourceTimestamp;
+  if (bookAgeMs < 0 || bookAgeMs > entryQualificationSettings().maxBookAgeMs) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'stale_book', `matching order-book delta age was ${bookAgeMs}ms at completion`, completedAt, book);
+    return;
+  }
+  if (!isKnownKalshiFeePolicy(book.feePolicy)) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'fee_unknown', 'market, series, or account fee policy was unresolved', completedAt, book);
+    return;
+  }
+  const fill = dryRunCloseFill(
+    book,
+    candidate.side,
+    candidate.initialFill.filled,
+    candidate.initialFill.fillPrice,
+    settings.maxSlippagePp,
+  );
+  if (fill.filled <= 0) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'insufficient_depth', fill.abortReason ?? 'no executable close-side depth', completedAt, book);
+    return;
+  }
+  if (fill.filled !== candidate.initialFill.filled) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'partial_fill', fill.abortReason ?? 'follow-up fill was partial', completedAt, book);
+    return;
+  }
+  if (fill.slippage > settings.maxSlippagePp || /slippage/i.test(fill.abortReason ?? '')) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'slippage_exceeded', fill.abortReason ?? 'follow-up slippage exceeded the limit', completedAt, book);
+    return;
+  }
+  if (!fill.feePolicyKnown) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'fee_unknown', 'reconstructed follow-up fees were not exact', completedAt, book);
+    return;
+  }
+  if (fill.aborted) {
+    recordDiagnosticFailure(diagnostic.diagnosticId, 'insufficient_depth', fill.abortReason ?? 'follow-up fill aborted', completedAt, book);
+    return;
+  }
+  const entryCost = candidate.initialFill.fillPrice * candidate.initialFill.filled + candidate.initialFill.fees;
+  const netPnl = fill.fillPrice * fill.filled - fill.fees - entryCost;
+  campaignStore?.record((tracker) => tracker.completeDiagnostic({
+    diagnosticId: diagnostic.diagnosticId,
+    validExecutableObservation: true,
+    exchangeTimestamp: book.sourceTimestamp,
+    exchangeSequence: book.sequence,
+    executableFollowUpMark: fill.fillPrice,
+    reconstructedExitFill: fill,
+    executableNetPnlUsd: Number(netPnl.toFixed(6)),
+    targetAt: netPnl >= candidate.economics.targetRewardUsd ? completedAt : undefined,
+    lossAt: netPnl <= -candidate.economics.plannedLossUsd ? completedAt : undefined,
+    edgeGoneAt: netPnl <= 0 ? completedAt : undefined,
+    reason: 'valid executable follow-up reconstructed directly from a matching exchange delta and resolved fees',
+    completedAt,
+  }));
+}
+
+async function evaluateCampaignDiagnostics(tickerFilter?: ReadonlySet<string>, _fromExchangeDelta = false): Promise<void> {
+  const initial = campaignSnapshot();
+  if (!campaignStore || !initial || initial.manifest.status !== 'active' || campaignEvidencePaused) return;
+  if (tickerFilter) {
+    for (const ticker of tickerFilter) {
+      pendingCampaignDiagnosticTickers.add(ticker);
+    }
+  }
+  else {
+    const now = Date.now();
+    const dueIds = new Set(campaignStore.tracker.dueDiagnostics(now).map((diagnostic) => diagnostic.candidateId));
+    for (const candidate of initial.candidates) if (dueIds.has(candidate.candidateId)) pendingCampaignDiagnosticTickers.add(candidate.ticker);
+  }
+  if (campaignDiagnosticWorkerRunning) return;
+  campaignDiagnosticWorkerRunning = true;
+  try {
+    while (pendingCampaignDiagnosticTickers.size > 0 && !campaignEvidencePaused) {
+      const tickers = new Set([...pendingCampaignDiagnosticTickers].slice(0, 4));
+      for (const ticker of tickers) pendingCampaignDiagnosticTickers.delete(ticker);
+      const observations = new Map<string, CampaignBookObservation>();
+      for (const ticker of tickers) {
+        const observation = pendingCampaignDiagnosticObservations.get(ticker);
+        if (!observation) continue;
+        observations.set(ticker, observation);
+        if (pendingCampaignDiagnosticObservations.get(ticker) === observation) {
+          pendingCampaignDiagnosticObservations.delete(ticker);
+        }
+      }
+      const snapshot = campaignSnapshot();
+      if (!snapshot || snapshot.manifest.status !== 'active') break;
+      const now = Date.now();
+      const candidates = new Map(snapshot.candidates.map((candidate) => [candidate.candidateId, candidate]));
+      const diagnostics = snapshot.diagnostics.filter((diagnostic) => {
+        const candidate = candidates.get(diagnostic.candidateId);
+        return candidate && tickers.has(candidate.ticker) && diagnostic.status === 'scheduled' && diagnostic.dueAt <= now;
+      });
+      for (const diagnostic of diagnostics) {
+        const candidate = candidates.get(diagnostic.candidateId)!;
+        const observation = observations.get(candidate.ticker);
+        if (observation?.feeResult.status === 'resolved') {
+          evaluateDiagnosticBook(diagnostic, candidate, observation.book);
+          continue;
+        }
+        if (observation?.feeResult.status === 'failed') {
+          recordDiagnosticFailure(
+            diagnostic.diagnosticId,
+            observation.feeResult.outcome,
+            observation.feeResult.detail,
+            observation.completedAt,
+            observation.book,
+          );
+          continue;
+        }
+        const dueNow = campaignStore.tracker.dueDiagnostics(now).some((item) => item.diagnosticId === diagnostic.diagnosticId);
+        if (!dueNow) continue;
+        recordDiagnosticFailure(diagnostic.diagnosticId, 'no_delta', 'no matching fresh order-book delta arrived at the paced evaluation time', now);
+      }
+    }
+  } finally {
+    campaignDiagnosticWorkerRunning = false;
+    if (pendingCampaignDiagnosticTickers.size > 0 && !campaignEvidencePaused) {
+      queueMicrotask(() => { void evaluateCampaignDiagnostics(new Set()); });
+    }
   }
 }
 
@@ -2060,12 +5094,12 @@ function broadcastPaperUpdate(forceSnapshot = false) {
   const marksObj: Record<string, number> = {};
   for (const [k, v] of marks) marksObj[k] = v;
   snapshotEquity(forceSnapshot);
+  equityHistoryStream.replace(equityHistory);
   broadcast('paper:update', {
     portfolio,
     marks: marksObj,
     equity: mtm.equity,
     unrealized: mtm.unrealized,
-    equityHistory,
     workingOrders: paperOrderBook.working(),
     dailyPnl: sessionStatsData.dailyPnl,
     activeRegimes,
@@ -2073,6 +5107,8 @@ function broadcastPaperUpdate(forceSnapshot = false) {
     opportunityThroughput: opportunityQueue.snapshot(),
     paperQualification: qualificationSnapshot(),
     strategyValidation: strategyValidationSnapshot(),
+    evidenceCampaign: campaignSnapshot(),
+    orderbookStream: kalshiOrderbookStream.telemetry(),
     pilotValidation: pilotValidationSnapshot(),
     ...autoCloseSnapshot(),
   });
@@ -2118,13 +5154,24 @@ function mergeGeaMarkets(markets: KalshiMarket[]): KalshiMarket[] {
 
 function replaceGeaTheses(base: ThesisCard[]): ThesisCard[] {
   const withoutGea = base.filter((card) => !card.id.startsWith('gea-'));
-  return rankThesesForUi([...geaTheses.map(applyDepthToCard), ...withoutGea]);
+  // Drop off-allowlist GEA cards so a focused series run cannot keep sports
+  // recommendations in the live thesis set after the env allowlist is applied.
+  const scopedGea = geaTheses
+    .filter((card) => tickerWithinSeriesAllowlist(card.ticker))
+    .map(applyDepthToCard);
+  return rankThesesForUi([...scopedGea, ...withoutGea]);
 }
 
 function publishMarketState(extra: Record<string, unknown> = {}) {
+  const currentTheses = thesesForUi();
+  const items: MarketStateStreamItem[] = [
+    ...marketsCache.map((market) => marketStreamItem(`market:${market.ticker}`, 'market', market)),
+    ...currentTheses.map((thesis) => marketStreamItem(`thesis:${thesis.id}`, 'thesis', thesis)),
+  ];
+  marketStateStream.replace(items);
+  const activeKeys = new Set(items.map((item) => item.key));
+  for (const key of marketStreamItemCache.keys()) if (!activeKeys.has(key)) marketStreamItemCache.delete(key);
   broadcast('markets:update', {
-    markets: marketsCache,
-    theses: thesesForUi(),
     connectors: registry.getAll(),
     tradeFeed: feedHub.getTradeFeedState(),
     discovery: discovery.getState(),
@@ -2140,28 +5187,414 @@ function scheduleMarketStatePublish() {
   marketBroadcastTimer = setTimeout(() => {
     marketBroadcastTimer = null;
     publishMarketState();
-  }, MARKET_BROADCAST_THROTTLE_MS);
+  }, marketBroadcastThrottleMs);
 }
 
 function schedulePaperUpdate() {
   if (paperBroadcastTimer) return;
+  const throttleMs = paperDesk.snapshot().positions.length > 0
+    ? PAPER_BROADCAST_THROTTLE_MS
+    : PAPER_SUMMARY_BROADCAST_THROTTLE_MS;
   paperBroadcastTimer = setTimeout(() => {
     paperBroadcastTimer = null;
     broadcastPaperUpdate();
-  }, PAPER_BROADCAST_THROTTLE_MS);
+  }, throttleMs);
 }
 
-function applyBridgeRecommendation(packet: RecommendationPacket) {
-  const market = marketsCache.find((m) => m.ticker === packet.ticker)
-    ?? geaMarkets.find((m) => m.ticker === packet.ticker);
+function campaignCriticalOrderbookTickers(now = Date.now()): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (ticker: string | undefined) => {
+    if (!ticker || seen.has(ticker)) return;
+    seen.add(ticker);
+    ordered.push(ticker);
+  };
+  const campaign = campaignStore?.snapshot();
+  if (campaign?.manifest.status === 'active') {
+    const candidates = new Map(campaign.candidates.map((candidate) => [candidate.candidateId, candidate]));
+    for (const candidate of campaign.candidates) if (!candidate.terminalState) add(candidate.ticker);
+    for (const diagnostic of campaign.diagnostics) {
+      if (diagnostic.status !== 'scheduled' || diagnostic.dueAt > now + 60_000) continue;
+      add(candidates.get(diagnostic.candidateId)?.ticker);
+    }
+  }
+  // Apply the 25-ticker bound only after production/live filtering. Slicing
+  // before filtering could let stale or demo candidates crowd out live ones.
+  return ordered;
+}
+
+function productionMarketRecord(ticker: string, now = Date.now()): ProductionUniverseRecord | null {
+  const record = productionMarketRecords.get(ticker);
+  if (!record) return null;
+  if (now < record.verifiedAt || now > record.verifiedAt + DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS) return null;
+  return record;
+}
+
+function recordProductionUniverse(records: readonly ProductionUniverseRecord[]): void {
+  const now = Date.now();
+  for (const [ticker, record] of productionMarketRecords) {
+    if (now > record.verifiedAt + DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS) productionMarketRecords.delete(ticker);
+  }
+  for (const record of records) {
+    const accepted = kalshiOrderbookStream.recordProductionMarkets(
+      [record.market],
+      record.sourceBaseUrl,
+      record.verifiedAt,
+    );
+    if (accepted.length === 1) productionMarketRecords.set(record.market.ticker, {
+      market: { ...record.market },
+      sourceBaseUrl: record.sourceBaseUrl,
+      verifiedAt: record.verifiedAt,
+    });
+    else productionMarketRecords.delete(record.market.ticker);
+  }
+  while (productionMarketRecords.size > 1_000) {
+    const oldest = [...productionMarketRecords.entries()]
+      .sort((left, right) => left[1].verifiedAt - right[1].verifiedAt)[0]?.[0];
+    if (!oldest) break;
+    productionMarketRecords.delete(oldest);
+  }
+}
+
+/** Only production, currently live markets can enter the authenticated book set. */
+function isProductionLiveTicker(ticker: string | undefined, market?: KalshiMarket): boolean {
+  if (!ticker || /^DEMO(?:[-_]|$)/i.test(ticker)) return false;
+  const verified = productionMarketRecord(ticker);
+  if (!market || !verified || verified.market.ticker !== market.ticker) return false;
+  // Shared definition: status alone let closed-but-unsettled contracts through.
+  return isTradableMarketAt(verified.market, Date.now());
+}
+
+/**
+ * Tickers whose confirmation evidence is mid-flight, across both engines.
+ * These must outrank ordinary entry-eligible cards: a candidate stops being
+ * `isEntryEligible` the moment its edge dips below the screen, which would drop
+ * it from the desired set, evict it from tracking, and delete the very book its
+ * remaining samples depend on -- discarding partial evidence that cannot be
+ * rebuilt without starting the whole window over.
+ */
+/**
+ * Whether the orderbook transport can prove it has missed no update for this
+ * ticker, so an unchanged book from a quiet market counts as current. Requires
+ * the stream's own transport qualification (connected + authenticated +
+ * acknowledged + inside the dead-connection window), zero sequence gaps, and a
+ * ticker that is actually tracked and un-quarantined -- getBook returns null
+ * for quarantined tickers, so a gap on this book removes the proof.
+ */
+function orderbookContinuityProven(ticker: string): boolean {
+  // Deliberately per-ticker and current-state. An earlier version also required
+  // telemetry.sequenceGaps === 0, but that counter is lifetime-cumulative and is
+  // never reset -- not even by restart() -- so a single gap on any one ticker
+  // permanently disabled the quiet-book proof for every ticker for the life of
+  // the process, and "entry book is stale" returned as the top rejection.
+  //
+  // The global check was also redundant: every sequenceGaps increment is paired
+  // with quarantineSubscriptionAndRequestSnapshot for the affected book, and
+  // getBook returns null for a quarantined ticker (and for lapsed provenance).
+  // So a gap on THIS book already withdraws the proof through getBook, which is
+  // the guarantee that actually matters, while a gap on an unrelated ticker no
+  // longer condemns this one.
+  const telemetry = kalshiOrderbookStream.telemetry();
+  return telemetry.transportQualificationReady
+    && kalshiOrderbookStream.isTracked(ticker)
+    && kalshiOrderbookStream.getBook(ticker) != null;
+}
+
+function confirmationInFlightTickers(): string[] {
+  return [...new Set([
+    ...entryConfirmationEngine.inFlightTickers(),
+    ...campaignEntryConfirmationEngine.inFlightTickers(),
+  ])];
+}
+
+function desiredOrderbookTickers(now = Date.now()): string[] {
+  const marketByTicker = new Map<string, KalshiMarket>();
+  for (const [ticker, record] of productionMarketRecords) {
+    if (productionMarketRecord(ticker, now)) marketByTicker.set(ticker, record.market);
+  }
+  const ordered = campaignCriticalOrderbookTickers(now)
+    .filter((ticker) => isProductionLiveTicker(ticker, marketByTicker.get(ticker)));
+  const seen = new Set(ordered);
+  const add = (ticker: string | undefined) => {
+    if (!ticker || !isProductionLiveTicker(ticker, marketByTicker.get(ticker))) return;
+    if (seen.has(ticker)) return;
+    seen.add(ticker);
+    ordered.push(ticker);
+  };
+  // Immediately after campaign-critical, and ahead of edge-ranked cards: a
+  // candidate already collecting samples has a partially-built proof that dies
+  // with its book. The production/live check still applies via add().
+  for (const ticker of confirmationInFlightTickers()) add(ticker);
+  const ranked = [...theses].sort((left, right) => {
+    const edge = finiteCampaignNumber(right.netEdge, 0) - finiteCampaignNumber(left.netEdge, 0);
+    if (edge !== 0) return edge;
+    return finiteCampaignNumber(left.freshnessMs, Number.MAX_SAFE_INTEGER)
+      - finiteCampaignNumber(right.freshnessMs, Number.MAX_SAFE_INTEGER);
+  });
+  for (const card of ranked) {
+    // Same allowlist chicken-egg as the funnel: without a book there is no tier
+    // depth label, so require only entry eligibility when focusing a series.
+    if (isEntryEligible(card) && (seriesAllowlistConfigured() || hasRealExecutableDepth(card))) {
+      add(card.ticker);
+    }
+  }
+  // Eligible signal markets are the second priority after campaign-critical
+  // tickers, regardless of whether discovery has already verified depth.
+  for (const market of discovery.getMarketsForSignals()) add(market.ticker);
+  // Fill remaining slots most-active-first: qualification requires tracked
+  // books to keep producing sequenced deltas inside the liveness window, so
+  // quiet markets in the tracked set starve readiness during trading lulls.
+  // Rank on the live trade tape rather than volume_24h: the markets listing
+  // reports volume_24h as 0 for every market (only the single-market endpoint
+  // populates it), so ranking on that field was a silent no-op that let dormant
+  // auto-generated markets take every slot.
+  // Discovery can expose a fixture fallback, so the production/live filter
+  // above is applied to every source rather than trusting source order.
+  const tapeNotionalByTicker = new Map<string, number>();
+  for (const trade of feedHub.getTradeTape()) {
+    const notional = tradeNotionalUsd(trade);
+    if (!Number.isFinite(notional) || notional <= 0) continue;
+    tapeNotionalByTicker.set(trade.ticker, (tapeNotionalByTicker.get(trade.ticker) ?? 0) + notional);
+  }
+  const fill: KalshiMarket[] = [];
+  if (discovery.hasLiveUniverse()) fill.push(...discovery.getUniverse());
+  fill.push(...marketsCache);
+  const tapeActivity = (market: KalshiMarket): number => tapeNotionalByTicker.get(market.ticker)
+    ?? finiteCampaignNumber(market.volume_24h, 0);
+  fill.sort((left, right) => tapeActivity(right) - tapeActivity(left));
+  for (const market of fill) {
+    // Provisional parlay markets are ~90% of the open universe and quote no
+    // depth; admit one only when the tape proves it is actually trading.
+    if (market.is_provisional === true && !tapeNotionalByTicker.has(market.ticker)) continue;
+    add(market.ticker);
+  }
+  // Bridge recommendations may not yet be in marketsCache; only admit them
+  // when they are already represented by a live market identity.
+  for (const card of ranked) if (marketByTicker.has(card.ticker)) add(card.ticker);
+  return ordered;
+}
+
+function refreshTickerTracking(now = Date.now()): void {
+  const ordered = desiredOrderbookTickers(now);
+  const seen = new Set(ordered);
+  // Ticker membership is additive. Removing a ticker forces a full stream
+  // restart (the ticker protocol has no subscription ids, so replacement means
+  // a fresh generation), and a restart fails a readiness hold by design.
+  //
+  // Carry every previously tracked ticker forward unconditionally. Re-checking
+  // productionMarketRecord here would drop entries purely because their 30s
+  // provenance TTL lapsed -- the re-verify loop only refreshes the <=25
+  // orderbook tickers, so most of the set goes stale between the 5-minute
+  // universe refreshes and the resulting removals restarted the stream mid-hold.
+  // Admission is already gated by isProductionLiveTicker above, and the strict
+  // per-cycle production check that qualification actually depends on is applied
+  // to the orderbook set in refreshOrderbookTracking, not here; this stream is a
+  // quote feed. A closed market simply stops ticking, and growth stays bounded
+  // by the 500-market ceiling below.
+  for (const ticker of tickerTrackedTickers) {
+    if (seen.has(ticker)) continue;
+    seen.add(ticker);
+    ordered.push(ticker);
+  }
+  for (const [ticker] of productionMarketRecords) {
+    if (seen.has(ticker) || !productionMarketRecord(ticker, now)) continue;
+    seen.add(ticker);
+    ordered.push(ticker);
+    if (ordered.length >= 500) break;
+  }
+  tickerTrackedTickers = ordered.slice(0, 500);
+  kalshiStream.replaceTracked(tickerTrackedTickers);
+}
+
+function refreshOrderbookTracking(now = Date.now()): void {
+  // Allowlist mode: keep provenance warm for every open executable on-series
+  // market so desiredOrderbookTickers cannot stick empty while discovery still
+  // has inventory. Do not wait for a full empty-desired cycle / 5-minute refresh.
+  if (seriesAllowlistConfigured()) {
+    const seeded = discovery.getProductionUniverseRecords()
+      .filter((record) => {
+        if (!tickerWithinSeriesAllowlist(record.market.ticker)) return false;
+        const status = record.market.status.toLowerCase();
+        return status === 'active' || status === 'open';
+      })
+      .map((record) => ({ ...record, verifiedAt: now }));
+    if (seeded.length > 0) recordProductionUniverse(seeded);
+  }
+  let desired = desiredOrderbookTickers(now);
+  // Focused allowlist runs often have only a handful of executable markets.
+  // Their production provenance TTLs can lapse together between universe
+  // refreshes, emptying desired and (via selectVerified) the stream. Re-file
+  // discovery's last on-series production proofs with a fresh verifiedAt so
+  // those markets can re-enter desired without waiting for a 5-minute cycle.
+  if (desired.length === 0 && seriesAllowlistConfigured()) {
+    const seeded = discovery.getProductionUniverseRecords()
+      .filter((record) => tickerWithinSeriesAllowlist(record.market.ticker))
+      .map((record) => ({ ...record, verifiedAt: now }));
+    if (seeded.length > 0) {
+      recordProductionUniverse(seeded);
+      desired = desiredOrderbookTickers(now);
+    }
+  }
+  // Force-fill: while allowlisted, subscribe every currently open executable
+  // on-series market (N may be ≪ 25). Pull from discovery universe plus any
+  // live production/cache/thesis tickers already known to main — GEA can surface
+  // a candidate before discovery.universe is warm, and volume_24h=0 listings
+  // used to leave universe empty so only priority-track admitted 1 ticker.
+  // Never pad off-series.
+  if (seriesAllowlistConfigured()) {
+    const openAllowlisted: string[] = [];
+    const seenAllowlisted = new Set<string>();
+    const consider = (ticker: string | undefined, market?: KalshiMarket) => {
+      if (!ticker || seenAllowlisted.has(ticker)) return;
+      if (!tickerWithinSeriesAllowlist(ticker)) return;
+      const resolved = market ?? productionMarketRecord(ticker, now)?.market;
+      if (!isProductionLiveTicker(ticker, resolved)) return;
+      seenAllowlisted.add(ticker);
+      openAllowlisted.push(ticker);
+    };
+    for (const market of discovery.getUniverse()) consider(market.ticker, market);
+    for (const market of marketsCache) consider(market.ticker, market);
+    for (const [ticker, record] of productionMarketRecords) {
+      if (productionMarketRecord(ticker, now)) consider(ticker, record.market);
+    }
+    for (const card of theses) consider(card.ticker);
+    desired = mergeAllowlistForceFillDesired({
+      seriesAllowlistConfigured: true,
+      desired,
+      allowlistedExecutableTickers: openAllowlisted,
+    });
+  }
+  // An empty desired set means discovery produced nothing this cycle, not that
+  // we should unsubscribe everything. Production provenance expires after 30s
+  // while the universe only refreshes every 5 minutes, so every record can lapse
+  // at once and starve the set; applying that as a membership update collapsed
+  // tracking to zero markets 17 seconds short of a completed hold. Hold only
+  // while BOTH main and stream still show membership. If the stream is already
+  // empty, HOLD self-latches (reverify cannot heal zero stream tickers) — clear
+  // and kick a universe refresh instead.
+  if (desired.length === 0) {
+    const streamTracked = kalshiOrderbookStream.telemetry(now).trackedTickers;
+    if (shouldHoldEmptyDesiredOrderbook({
+      localTrackedCount: orderbookTrackedTickers.length,
+      streamTrackedCount: streamTracked,
+    })) {
+      return;
+    }
+    orderbookTrackedTickers = [];
+    kalshiOrderbookStream.replaceTracked([]);
+    refreshTickerTracking(now);
+    if (seriesAllowlistConfigured()) void runUniverseRefresh();
+    return;
+  }
+  const desiredSet = new Set(desired);
+  // In-flight confirmation tickers join campaign-critical as rotation-exempt:
+  // selectBoundedOrderbookTracking excludes `critical` from the replaceable set,
+  // so a five-minute rotation can no longer land mid-window and destroy a
+  // candidate's accumulated samples.
+  const critical = [
+    ...campaignCriticalOrderbookTickers(now),
+    ...confirmationInFlightTickers(),
+  ].filter((ticker) => desiredSet.has(ticker));
+  const selection = selectBoundedOrderbookTracking({
+    critical,
+    desired,
+    // Prefer stickiness only for tickers that still have an exchange-sequenced
+    // book. Under allowlist force-fill the 25 slots filled with quoted-but-quiet
+    // names that never received a delta; priority-track then reported
+    // admitted-no-book forever while exchangeDelta aged to minutes.
+    current: orderbookTrackedTickers.filter((ticker) => {
+      if (!desiredSet.has(ticker)) return false;
+      return hasExchangeProvenance(kalshiOrderbookStream.getBook(ticker));
+    }),
+    now,
+    lastRotationAt: orderbookLastRotationAt,
+    cursor: orderbookRotationCursor,
+    limit: ORDERBOOK_TRACKING_LIMIT,
+    rotationIntervalMs: ORDERBOOK_ROTATION_INTERVAL_MS,
+    rotationBatchSize: ORDERBOOK_ROTATION_BATCH_SIZE,
+  });
+  orderbookTrackedTickers = selection.tickers;
+  orderbookLastRotationAt = selection.lastRotationAt;
+  orderbookRotationCursor = selection.cursor;
+  kalshiOrderbookStream.replaceTracked(selection.tickers);
+  refreshTickerTracking(now);
+}
+
+async function applyBridgeRecommendation(packet: RecommendationPacket) {
+  // GEA recommendations bypass the discovery universe, so honour the series
+  // allowlist here too: a focused run must not have off-series tickers injected
+  // into tracking or candidate flow through the bridge.
+  if (!tickerWithinSeriesAllowlist(packet.ticker)) return;
+  // GEA is a separate process with its own market state and no `close_time`
+  // check anywhere in its recommendation path. Measured 2026-07-29: the exact
+  // same closed contracts that were fixed out of the desktop's own discovery
+  // universe kept reappearing here, because this choke point never applied the
+  // same liveness rule -- neither to a cached `productionMarketRecord` (which
+  // can itself be a stale entry from before this contract closed) nor to a
+  // freshly hydrated one. `isTradableMarketAt` is the one definition; nothing
+  // downstream of this line may build a thesis card for a market it rejects.
+  let market = productionMarketRecord(packet.ticker)?.market;
+  if (market && !isTradableMarketAt(market, Date.now())) {
+    auditLog.append({
+      action: 'gate_block',
+      ticker: packet.ticker,
+      detail: 'GEA recommendation rejected: cached record shows the market is no longer tradable',
+      ok: false,
+    });
+    saveAuditLog();
+    return;
+  }
+  if (!market) {
+    let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
+    try {
+      const hydrated = await fetchMarket(packet.ticker, {
+        environment: 'production',
+        onResponseMetadata: (metadata) => { responseMetadata = metadata; },
+      });
+      const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
+      if (!verifiedResponse || verifiedResponse.environment !== 'production' || verifiedResponse.status !== 200) {
+        throw new Error('production REST provenance was not returned');
+      }
+      const record: ProductionUniverseRecord = {
+        market: hydrated,
+        sourceBaseUrl: verifiedResponse.sourceBaseUrl,
+        verifiedAt: verifiedResponse.verifiedAt,
+      };
+      recordProductionUniverse([record]);
+      market = productionMarketRecord(packet.ticker)?.market;
+      if (market && !isTradableMarketAt(market, Date.now())) {
+        auditLog.append({
+          action: 'gate_block',
+          ticker: packet.ticker,
+          detail: 'GEA recommendation rejected: production response shows the market is no longer tradable',
+          ok: false,
+        });
+        saveAuditLog();
+        return;
+      }
+    } catch (error) {
+      auditLog.append({
+        action: 'gate_block',
+        ticker: packet.ticker,
+        detail: `GEA recommendation rejected: production REST hydration failed (${error instanceof Error ? error.message : String(error)})`,
+        ok: false,
+      });
+      saveAuditLog();
+      return;
+    }
+  }
+  if (!market) return;
   geaMarkets = upsertRecommendationMarket(geaMarkets, packet, market);
   marketsCache = mergeGeaMarkets(marketsCache);
   geaTheses = upsertRecommendationThesis(geaTheses, packet, market).map(applyDepthToCard);
   theses = replaceGeaTheses(theses);
   opportunityQueue.discover(geaTheses.filter((c) => isEntryEligible(c)
-    && hasRealExecutableDepth(c)));
-  kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
-  publishMarketState();
+    && (seriesAllowlistConfigured() || hasRealExecutableDepth(c))));
+  refreshOrderbookTracking();
+  // GEA can deliver bursts of recommendations. Coalesce the expensive
+  // market/world snapshot work so the renderer receives one bounded update
+  // per throttle window rather than one full-state broadcast per packet.
+  scheduleMarketStatePublish();
   void evaluateAutoClosePositions('bridge-entry');
   void runThroughputCertification('bridge-entry');
   broadcastPaperUpdate();
@@ -2185,17 +5618,30 @@ function withoutExecutableDepth(card: ThesisCard): ThesisCard {
 
 function applyDepthToCard(card: ThesisCard): ThesisCard {
   const d = discovery.getDepth(card.ticker);
-  if (!d) return withoutExecutableDepth(card);
-  if (Date.now() - d.verifiedAt > LIQUIDITY_PREFILTER_MAX_AGE_MS) return withoutExecutableDepth(card);
+  if (!d) return finalizeThesis(requalifyThesisCard(withoutExecutableDepth(card), {
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
+  if (Date.now() - d.verifiedAt > LIQUIDITY_PREFILTER_MAX_AGE_MS) return finalizeThesis(requalifyThesisCard(withoutExecutableDepth(card), {
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
   const sideResult = card.side === 'yes' ? d.yes : d.no;
-  if (!sideResult?.executableTier) return withoutExecutableDepth(card);
-  return {
+  if (!sideResult?.executableTier) return finalizeThesis(requalifyThesisCard(withoutExecutableDepth(card), {
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
+  return finalizeThesis(requalifyThesisCard({
     ...card,
     executableTier: sideResult.executableTier,
     fillableUsd: sideResult.fillableUsd,
     slippagePp: sideResult.slippagePp,
     depthLevels: sideResult.depthLevels,
-  };
+  }, {
+    depthUsd: Math.max(card.depthUsd, sideResult.fillableUsd),
+    reviewOnly,
+    demoMode: settings.demoMode,
+  }));
 }
 
 function rankThesesForUi(cards: ThesisCard[]): ThesisCard[] {
@@ -2256,10 +5702,85 @@ interface RefreshMarketsOptions {
 }
 
 const runUniverseDiscovery = createSingleFlight(() => withAbortTimeout(
-  (signal) => discovery.refreshUniverse(signal),
+  async (signal) => {
+    const markets = await discovery.refreshUniverse(signal);
+    recordProductionUniverse(discovery.getProductionUniverseRecords());
+    refreshOrderbookTracking();
+    return markets;
+  },
   UNIVERSE_FETCH_TIMEOUT_MS,
   'universe fetch timed out',
 ));
+const runRestHealthProbe = createSingleFlight(() => registry.pingKalshiRest());
+
+async function refreshProductionMarketProvenance(ticker: string): Promise<void> {
+  let responseMetadata: { environment: 'production' | 'demo'; sourceBaseUrl: string; verifiedAt: number; status: number } | null = null;
+  try {
+    const market = await fetchMarket(ticker, {
+      environment: 'production',
+      onResponseMetadata: (metadata) => { responseMetadata = metadata; },
+    });
+    const verifiedResponse = responseMetadata as KalshiResponseMetadata | null;
+    if (verifiedResponse?.environment !== 'production' || verifiedResponse.status !== 200) return;
+    recordProductionUniverse([{
+      market,
+      sourceBaseUrl: verifiedResponse.sourceBaseUrl,
+      verifiedAt: verifiedResponse.verifiedAt,
+    }]);
+  } catch {
+    // Existing proof expires naturally. A failed refresh never extends it.
+  }
+}
+
+async function reverifyTrackedProductionMarkets(): Promise<void> {
+  if (settings.demoMode) return;
+  // Confirmation-in-flight tickers lead, and are covered even when they are not
+  // in the tracked set. `desiredOrderbookTickers` admits a ticker only through
+  // `isProductionLiveTicker`, which reads `productionMarketRecord(ticker, now)`
+  // -- an *unlapsed* record. So a candidate mid-confirmation whose 90s
+  // provenance TTL expires silently falls out of the desired set, loses its
+  // slot, and then fails hydration again on the entry hot path, where
+  // `ensureProductionProvenance` gets exactly one un-retried REST attempt.
+  //
+  // Measured on the 2026-07-27 repair run: `provenance-unavailable` was the top
+  // priority-track outcome at 31.4%, and candidate book health sat at 0.27 even
+  // in a window where the socket was 100% open, churn was 0.52/min and 21 of 25
+  // tickers held qualifying books. That is a coverage failure, not a delivery
+  // failure -- the candidates were on tickers the tracked set did not hold.
+  //
+  // Reusing this paced loop keeps the extra hydration under the same rate-limit
+  // discipline that fixed the R10 orderbook-decay bug; bursting these would
+  // re-earn the 429s that started that whole investigation.
+  const tickers = [...new Set([
+    ...confirmationInFlightTickers(),
+    ...campaignCriticalOrderbookTickers(),
+    ...orderbookTrackedTickers,
+  ])].slice(0, ORDERBOOK_TRACKING_LIMIT + entryQualificationSettings().maxPendingCandidates);
+  if (tickers.length === 0) return;
+  // Spread the refreshes across the interval rather than bursting them, so the
+  // aggregate request rate stays under Kalshi's limit and every market is
+  // re-verified inside its 90s provenance TTL. See REVERIFY_* constants.
+  const dispatchGapMs = Math.min(
+    REVERIFY_MAX_REQUEST_GAP_MS,
+    Math.floor((REVERIFY_INTERVAL_MS * REVERIFY_INTERVAL_UTILIZATION) / Math.max(1, tickers.length)),
+  );
+  await pacedDispatch(tickers, refreshProductionMarketProvenance, {
+    gapMs: dispatchGapMs,
+    maxConcurrency: REVERIFY_MAX_CONCURRENCY,
+  });
+  refreshOrderbookTracking();
+}
+
+const runProductionMarketReverification = createSingleFlight(reverifyTrackedProductionMarkets);
+
+function recordKalshiRestFailure(error: unknown): void {
+  registry.recordError(
+    'kalshi-rest',
+    error instanceof Error ? error.message : String(error),
+    error instanceof KalshiRequestFailure ? error.classification : undefined,
+    error instanceof KalshiRequestFailure ? error.retryAfterMs : undefined,
+  );
+}
 
 async function refreshMarkets(options: RefreshMarketsOptions = {}) {
   try {
@@ -2282,7 +5803,7 @@ async function refreshMarkets(options: RefreshMarketsOptions = {}) {
     // Depth pass runs in background after tickets are shown; next refresh() uses results
     void discovery.runDepthPass();
   } catch (e) {
-    registry.recordError('kalshi-rest', e instanceof Error ? e.message : String(e));
+    recordKalshiRestFailure(e);
     if (marketsCache.length === 0) {
       marketsCache = FIXTURE_MARKETS;
       discovery.seedFixtureDepth(FIXTURE_MARKETS);
@@ -2307,7 +5828,49 @@ async function refreshUniverseLoop() {
 const runMarketRefresh = createSingleFlight(refreshMarkets);
 const runUniverseRefresh = createSingleFlight(refreshUniverseLoop);
 
+/**
+ * One ladder per underlying-and-expiry. `event_ticker` is that identity by
+ * construction, and it is present where `close_time` is merely optional —
+ * measured 2026-07-31, keying on `close_time ?? ''` silently collapsed every
+ * market lacking one into a single bucket, handing the fit 189 quotes drawn from
+ * three different expiries. A mixture of expiries is not a lognormal at any one
+ * volatility, so it cannot fit and never will. Returns null rather than guessing
+ * when neither identifier is available: a ladder of unknown expiry is not a ladder.
+ */
+function cryptoLadderKey(market: KalshiMarket, symbol: string): string | null {
+  if (market.event_ticker) return `event:${market.event_ticker}`;
+  if (market.close_time) return `${symbol}|${market.close_time}`;
+  return null;
+}
+
+/**
+ * Groups every crypto market into the strike ladders the volatility calibration
+ * reads. Keyed the same way the cards look them up, so a card gets its own
+ * siblings and nothing else.
+ */
+function buildCryptoLadders(markets: KalshiMarket[]): Map<string, LadderQuote[]> {
+  const ladders = new Map<string, LadderQuote[]>();
+  for (const market of markets) {
+    if (!isCryptoMarket(market)) continue;
+    const price = normalizeMarketPrice(market);
+    const cx = feedHub.cryptoInputFor(market, price);
+    if (!Number.isFinite(cx.strike) || cx.strike <= 0) continue;
+    const key = cryptoLadderKey(market, cx.symbol);
+    if (!key) continue;
+    const quotes = ladders.get(key);
+    if (quotes) quotes.push({ strike: cx.strike, marketPrice: price });
+    else ladders.set(key, [{ strike: cx.strike, marketPrice: price }]);
+  }
+  return ladders;
+}
+
 async function buildThesesFromMarkets(markets: KalshiMarket[]) {
+  // Single choke point for the series allowlist. The discovery universe is
+  // already filtered, but candidates also arrive via the marketsCache fallback,
+  // GEA-merged recommendations, and fixtures -- all of which converge here.
+  // Filtering at this one point keeps every candidate source restricted to the
+  // configured series without threading the predicate through each producer.
+  markets = markets.filter(withinSeriesAllowlist);
   const feedRefresh = feedHub.refreshForMarkets(markets);
   const feedTimedOut = await Promise.race([
     feedRefresh.then(() => false),
@@ -2337,6 +5900,25 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
     }),
   );
 
+  const cryptoInputs = new Map<string, ReturnType<typeof feedHub.cryptoInputFor>>();
+  for (const { m, p } of micro) {
+    if (!isCryptoMarket(m)) continue;
+    cryptoInputs.set(m.ticker, feedHub.cryptoInputFor(m, p));
+  }
+  // Every strike quoted on one underlying at one expiry, so crypto-lead can read
+  // the market's own volatility off the ladder and refuse to signal when its model
+  // disagrees with it.
+  //
+  // Built from the widest market set available, NOT from `slice`. The ladder is
+  // reference data for calibration, not a list of trading candidates, and `slice`
+  // is `getMarketsForSignals()` — depth-filtered and capped at 75. Measured
+  // 2026-07-31: sourced from the slice the model saw 8 strikes where the live
+  // ladder holds 50-80, so the fit never cleared its 3-point minimum and the gate
+  // was dormant in production — 0 fits across 23 confirmations, every one of which
+  // had reached the model. A calibration check that cannot see the ladder is not a
+  // check.
+  const cryptoLadders = buildCryptoLadders(marketsCache.length > 0 ? marketsCache : slice);
+
   for (const { m, p, spread, depthUsd } of micro) {
     if (isWeatherMarket(m)) {
       const wx = feedHub.weatherInputFor(m);
@@ -2352,7 +5934,7 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
         hoursToSettle: wx.hoursToSettle,
       }));
     } else if (isCryptoMarket(m)) {
-      const cx = feedHub.cryptoInputFor(m, p);
+      const cx = cryptoInputs.get(m.ticker) ?? feedHub.cryptoInputFor(m, p);
       cards.push(cryptoToThesis({
         ticker: m.ticker,
         title: m.title,
@@ -2362,7 +5944,9 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
         spread,
         depthUsd,
         lagMs: cx.lagMs,
-        kalshiImpliedSpot: cx.kalshiImpliedSpot,
+        binanceQuote: cx.binanceQuote,
+        closeTime: m.close_time,
+        strikeLadder: cryptoLadders.get(cryptoLadderKey(m, cx.symbol) ?? ' none'),
       }));
     } else if (isMacroMarket(m)) {
       const macro = feedHub.macroInputFor(m);
@@ -2456,8 +6040,8 @@ async function buildThesesFromMarkets(markets: KalshiMarket[]) {
   }
   theses = replaceGeaTheses(built);
   opportunityQueue.discover(theses.filter((c) => isEntryEligible(c)
-    && hasRealExecutableDepth(c)));
-  kalshiStream.track([...new Set(theses.map((t) => t.ticker))]);
+    && (seriesAllowlistConfigured() || hasRealExecutableDepth(c))));
+  refreshOrderbookTracking();
 
   for (const c of theses) {
     recordTick(c.ticker, c.marketPrice, c.spread, c.netEdge);
@@ -2481,6 +6065,7 @@ function getLiveCreds(): LiveCredentials | null {
 }
 
 async function activateKillSwitch(source: 'ipc' | 'shortcut'): Promise<GuardrailSettings> {
+  if (PRODUCTION_OBSERVATION_MODE) return settings;
   settings.killSwitchActive = true;
   settings.liveEnabled = false;
   await cancelAllLiveOrders(getLiveCreds(), settings);
@@ -2501,14 +6086,30 @@ async function activateKillSwitch(source: 'ipc' | 'shortcut'): Promise<Guardrail
 }
 
 function broadcastBridgeStatus() {
+  refreshBridgeConnectivity();
   broadcast('bridge:status', { ...bridgeStatus });
 }
 
 function broadcastToGea(msg: Omit<NemesisBridgeMessage, 'seq'>) {
   const full: NemesisBridgeMessage = { ...msg, seq: ++bridgeSeq };
   const json = JSON.stringify(full);
+  let sent = false;
   for (const client of bridgeClients) {
-    if (client.readyState === WsSocket.OPEN) client.send(json);
+    if (client.readyState === WsSocket.OPEN) {
+      client.send(json);
+      sent = true;
+    }
+  }
+  if (sent) {
+    const sentAt = Date.now();
+    bridgeStatus.lastOutboundAt = sentAt;
+    bridgeStatus.lastSequenceOut = full.seq;
+    if (full.type === 'bridge:ping') {
+      bridgeStatus.lastPingAt = sentAt;
+      bridgeStatus.pingCount = (bridgeStatus.pingCount ?? 0) + 1;
+    }
+    refreshBridgeConnectivity();
+    persistBridgeTelemetry('outbound', { messageType: full.type });
   }
 }
 
@@ -2571,8 +6172,14 @@ function setupBridgeServer() {
     }
 
     bridgeClients.add(ws);
-    bridgeStatus.connected = true;
+    bridgeConnectionCount += 1;
+    if (bridgeConnectionCount > 1) bridgeStatus.reconnects += 1;
     bridgeStatus.clientCount = bridgeClients.size;
+    bridgeStatus.lastSequenceIn = null;
+    bridgeStatus.lastPingAt = null;
+    bridgeStatus.lastPongAt = null;
+    refreshBridgeConnectivity();
+    persistBridgeTelemetry('client_connected');
     broadcastBridgeStatus();
 
     const hello: NemesisBridgeMessage = {
@@ -2581,13 +6188,14 @@ function setupBridgeServer() {
       seq: ++bridgeSeq,
     };
     ws.send(JSON.stringify(hello));
+    bridgeStatus.lastOutboundAt = Date.now();
+    bridgeStatus.lastSequenceOut = hello.seq;
+    persistBridgeTelemetry('outbound', { messageType: hello.type });
     broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
 
     ws.on('message', (raw: RawData) => {
       try {
         const msg = JSON.parse(raw.toString()) as NemesisBridgeMessage;
-        bridgeStatus.lastSeenAt = Date.now();
-
         const validation = validateBridgeMessage(msg, {
           now: Date.now(),
           maxExitBookAgeMs: autoCloseSettings().maxBridgeLatencyMs,
@@ -2599,10 +6207,43 @@ function setupBridgeServer() {
         }
 
         const valid = validation.value;
+        const receivedAt = Date.now();
+        const previousSequence = bridgeStatus.lastSequenceIn;
+        if (previousSequence != null && valid.seq !== previousSequence + 1) {
+          bridgeStatus.sequenceGaps = (bridgeStatus.sequenceGaps ?? 0) + 1;
+          bridgeStatus.qualificationReady = false;
+          persistBridgeTelemetry('sequence_gap', { expected: previousSequence + 1, received: valid.seq });
+          ws.close(1008, 'bridge sequence gap');
+          return;
+        }
+        bridgeStatus.lastSeenAt = receivedAt;
+        bridgeStatus.lastInboundAt = receivedAt;
+        bridgeStatus.lastSequenceIn = valid.seq;
+        if (valid.type === 'bridge:hello') {
+          bridgeStatus.peerRole = (valid.payload as { role?: 'nemesis' | 'gea' }).role ?? null;
+        }
+        if (valid.type === 'bridge:pong') {
+          bridgeStatus.lastPongAt = receivedAt;
+          bridgeStatus.pongCount = (bridgeStatus.pongCount ?? 0) + 1;
+          bridgeStatus.roundTripMs = bridgeStatus.lastPingAt == null ? null : Math.max(0, receivedAt - bridgeStatus.lastPingAt);
+          const telemetry = valid.payload as Partial<BridgeProcessTelemetry>;
+          if (Number.isInteger(telemetry.pid) && telemetry.pid! > 0
+            && Number.isFinite(telemetry.workingSetMb) && telemetry.workingSetMb! >= 0
+            && Number.isFinite(telemetry.sampledAt) && telemetry.sampledAt! > 0
+            && telemetry.sampledAt! <= receivedAt + 5_000) {
+            bridgeStatus.geaPid = telemetry.pid!;
+            bridgeStatus.geaWorkingSetMb = telemetry.workingSetMb!;
+            bridgeStatus.geaProcessSampledAt = telemetry.sampledAt!;
+          }
+        }
+        refreshBridgeConnectivity(receivedAt);
+        persistBridgeTelemetry('inbound', { messageType: valid.type });
         if (valid.type === 'brain:recommendation') {
-          bridgeStatus.brainRole = (valid.payload as { brain_role: BridgeStatus['brainRole'] }).brain_role;
+          const nextRole = (valid.payload as { brain_role: BridgeStatus['brainRole'] }).brain_role;
+          if (bridgeStatus.brainRole && nextRole && bridgeStatus.brainRole !== nextRole) bridgeStatus.failovers += 1;
+          bridgeStatus.brainRole = nextRole;
           broadcastBridgeStatus();
-          applyBridgeRecommendation(valid.payload as RecommendationPacket);
+          void applyBridgeRecommendation(valid.payload as RecommendationPacket);
           broadcast('bridge:recommendation', valid.payload);
         } else if (valid.type === 'brain:exit') {
           applyBridgeExitRecommendation(valid.payload as ExitRecommendation);
@@ -2610,8 +6251,20 @@ function setupBridgeServer() {
         } else if (valid.type === 'brain:no-trade') {
           broadcast('bridge:recommendation', valid.payload);
         } else if (valid.type === 'bridge:ping') {
-          const pong: NemesisBridgeMessage = { type: 'bridge:pong', payload: {}, seq: ++bridgeSeq };
+          const pong: NemesisBridgeMessage = {
+            type: 'bridge:pong',
+            payload: {
+              pid: process.pid,
+              workingSetMb: Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3)),
+              sampledAt: Date.now(),
+            },
+            seq: ++bridgeSeq,
+          };
           ws.send(JSON.stringify(pong));
+          bridgeStatus.lastOutboundAt = Date.now();
+          bridgeStatus.lastSequenceOut = pong.seq;
+          refreshBridgeConnectivity();
+          persistBridgeTelemetry('outbound', { messageType: pong.type });
         }
       } catch {
         auditLog.append({ action: 'gate_block', detail: 'bridge packet rejected: malformed json', ok: false });
@@ -2621,8 +6274,10 @@ function setupBridgeServer() {
 
     ws.on('close', () => {
       bridgeClients.delete(ws);
-      bridgeStatus.connected = bridgeClients.size > 0;
       bridgeStatus.clientCount = bridgeClients.size;
+      bridgeStatus.disconnects += 1;
+      refreshBridgeConnectivity();
+      persistBridgeTelemetry('client_disconnected');
       broadcastBridgeStatus();
     });
 
@@ -2670,24 +6325,44 @@ function spawnGlobalEventAlpha() {
   );
 
   if (!plan) return;
+  startupTrace(`gea-spawn:${plan.command}`);
   geaProcess = spawn(plan.command, plan.args, {
     cwd: plan.cwd,
     stdio: ['ignore', 'ignore', 'pipe'],
     env: childEnv,
     windowsHide: plan.windowsHide,
   });
+  geaExitedDuringEvidence = false;
+  startupTrace(`gea-spawned-pid:${geaProcess.pid}`);
   geaProcess.stderr?.on('data', (d: Buffer) => {
-    process.stderr.write(`[gea] ${d.toString()}`);
+    const sanitized = d.toString()
+      .replace(/token=[^&\s]+/gi, 'token=[redacted]')
+      .replace(/NEMESIS_BRIDGE_TOKEN\s*[:=]\s*[^\s]+/gi, 'NEMESIS_BRIDGE_TOKEN=[redacted]')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+    if (sanitized) {
+      process.stderr.write(`[gea] ${sanitized}\n`);
+      startupTrace(`gea-stderr:${sanitized}`);
+    }
   });
   geaProcess.once('error', (err) => {
+    const detail = err instanceof Error ? err.message : String(err);
+    startupTrace(`gea-error:${detail.replace(/\s+/g, ' ').slice(0, 300)}`);
     console.warn(`[gea] spawn failed: ${err.message}`);
     geaProcess = null;
-    setTimeout(spawnGlobalEventAlpha, 3_000);
+    if (pendingCampaignPointer) geaExitedDuringEvidence = true;
+    if (!pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);
   });
-  geaProcess.once('exit', (code) => {
+  geaProcess.once('exit', (code, signal) => {
     console.log(`[gea] exited (code=${code ?? 'null'})`);
+    startupTrace(`gea-exit:${code ?? 'null'}:signal=${signal ?? 'none'}`);
     geaProcess = null;
-    if (code !== 0) setTimeout(spawnGlobalEventAlpha, 3_000); // auto-retry once on crash
+    if (pendingCampaignPointer && !closeoutPrepared) geaExitedDuringEvidence = true;
+    if (code !== 0 && !pendingCampaignPointer) setTimeout(spawnGlobalEventAlpha, 3_000);
+  });
+  geaProcess.once('close', (code, signal) => {
+    startupTrace(`gea-close:${code ?? 'null'}:signal=${signal ?? 'none'}`);
   });
 }
 
@@ -2743,7 +6418,78 @@ function invalidateLiveCertificate(reason: string) {
   settings = { ...settings, liveUnlockCertificate: undefined, liveStage: 'paper', liveEnabled: false, autoLiveEnabled: false, demoMode: true, dryRun: true };
   auditLog.append({ action: 'gate_block', detail: `live certificate invalidated: ${reason}`, ok: false });
 }
+function advanceStrategyStageRequest(
+  stage: StrategyValidationStage,
+  confirmation: string,
+): { ok: boolean; error?: string; strategyValidation?: StrategyValidationSnapshot | null; pilotValidation?: ReturnType<typeof pilotValidationSnapshot> } {
+  const mutationLock = campaignMutationLockReason();
+  if (mutationLock) return { ok: false, error: mutationLock };
+  try {
+    if (!strategyValidationStore) throw new Error('strategy validation store is unavailable');
+    const current = strategyValidationSnapshot();
+    if (!current || current.integrityError || current.paused) throw new Error('strategy validation evidence is not eligible for advancement');
+    if (paperDesk.snapshot().positions.length > 0) throw new Error('close all paper positions before advancing the stage');
+    if (stage === 'pilot') {
+      if (current.stage !== 'shadow') throw new Error('only a shadow run can advance to pilot');
+      if (!current.shadowPassed) {
+        throw new Error('shadow count, calendar, and quality thresholds have not passed');
+      }
+      if (confirmation !== 'ADVANCE_TO_PILOT') {
+        throw new Error('confirmation must equal ADVANCE_TO_PILOT');
+      }
+    } else if (stage === 'qualification') {
+      if (current.stage !== 'pilot') throw new Error('only a pilot run can advance to qualification');
+      if (!pilotValidationSnapshot().passed) throw new Error('pilot thresholds have not passed');
+      if (confirmation !== 'ADVANCE_TO_QUALIFICATION') {
+        throw new Error('confirmation must equal ADVANCE_TO_QUALIFICATION');
+      }
+    } else {
+      throw new Error('shadow is created only by archive and reset');
+    }
+    const ledgerConfirmation = stage === 'pilot' ? 'ADVANCE_TO_PILOT' : confirmation;
+    strategyValidationStore.record((tracker) => tracker.changeStage(stage, ledgerConfirmation));
+    const strategyValidation = strategyValidationSnapshot();
+    const pilotValidation = pilotValidationSnapshot();
+    broadcastPaperUpdate(true);
+    return { ok: true, strategyValidation, pilotValidation };
+  } catch (error) {
+    return { ok: false, error: describeError(error) };
+  }
+}
+
 function setupIpc() {
+  ipcMain.on('renderer:heartbeat', (event, payload: { painted?: boolean; at?: number; sequence?: number } | undefined) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    const before = rendererHeartbeatMonitor.snapshot();
+    rendererHeartbeatMonitor.recordHeartbeat({
+      receivedAt: Date.now(),
+      reportedAt: payload?.at,
+      painted: payload?.painted,
+      sequence: payload?.sequence,
+    });
+    const after = rendererHeartbeatMonitor.snapshot();
+    if (before.firstHeartbeatAt == null && after.firstHeartbeatAt != null) startupTrace('renderer-first-heartbeat');
+    if (before.firstPaintedAt == null && after.firstPaintedAt != null) {
+      startupTrace('renderer-first-painted-heartbeat');
+      if (rendererProbePendingAfterPaint) startRendererProbe();
+    }
+  });
+  ipcMain.on('renderer:heartbeat-send-failed', (event) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    rendererHeartbeatMonitor.recordHeartbeatSendFailure();
+  });
+  ipcMain.on('renderer:probe-response', (
+    event,
+    payload: { sentAt?: number; receivedAt?: number; sequence?: number } | undefined,
+  ) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    rendererHeartbeatMonitor.recordProbeResponse({
+      sentAt: payload?.sentAt,
+      receivedAt: Date.now(),
+      sequence: payload?.sequence,
+    });
+    startupTrace(`renderer-probe-response:${payload?.sequence ?? 'unknown'}`);
+  });
   ipcMain.handle('nemesis:getState', () => {
     const targetStage = settings.liveStage === 'manual-live' ? 'auto-live' : 'manual-live';
     const confirmText = targetStage === 'auto-live' ? 'ENABLE LIVE AUTO' : 'ENABLE LIVE MANUAL';
@@ -2763,6 +6509,8 @@ function setupIpc() {
       activeRegimes,
       paperQualification: qualificationSnapshot(),
       strategyValidation: strategyValidationSnapshot(),
+      evidenceCampaign: campaignSnapshot(),
+      orderbookStream: kalshiOrderbookStream.telemetry(),
       pilotValidation: pilotValidationSnapshot(),
       dailyPnl: sessionStatsData.dailyPnl,
       humanQuizPassed: settings.humanQuizPassed ?? false,
@@ -2774,12 +6522,36 @@ function setupIpc() {
   ipcMain.handle('nemesis:getMarkets', () => marketsCache);
 
   ipcMain.handle('nemesis:updateSettings', (_e, partial: Partial<GuardrailSettings>) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; configuration is frozen` };
     if (partial.liveEnabled) {
       return { ok: false, error: 'Use the staged live unlock wizard; credentials alone cannot enable live trading' };
     }
-    const legacyCredentialPayload = partial as Partial<GuardrailSettings> & { kalshiPrivateKey?: unknown };
+    const legacyCredentialPayload = partial as Partial<GuardrailSettings> & {
+      kalshiPrivateKey?: unknown;
+      killSwitchConfirmation?: unknown;
+    };
     if (legacyCredentialPayload.kalshiPrivateKey !== undefined) {
       return { ok: false, error: 'Private keys must be saved through encrypted credential storage' };
+    }
+    // Arming the kill switch is always allowed and never needs a confirmation --
+    // it only ever makes the system safer. Clearing it is the dangerous
+    // direction, and it was a plain boolean in a settings patch: the same
+    // one-field update that changes a display preference could re-arm trading.
+    // Setting it now takes the same deliberate confirmation the live unlock does.
+    if (partial.killSwitchActive === false && settings.killSwitchActive) {
+      if (legacyCredentialPayload.killSwitchConfirmation !== KILL_SWITCH_CLEAR_CONFIRMATION) {
+        return {
+          ok: false,
+          error: `Type ${KILL_SWITCH_CLEAR_CONFIRMATION} to clear the kill switch`,
+        };
+      }
+      auditLog.append({
+        action: 'gate_block',
+        detail: 'kill switch cleared by explicit operator confirmation',
+        ok: true,
+      });
+      saveAuditLog();
     }
     const riskOverride = settings.liveEnabled && isRiskSettingOverride(partial);
     const credentialChange = partial.kalshiApiKeyId !== undefined;
@@ -2796,6 +6568,7 @@ function setupIpc() {
         ? { ...autoCloseSettings(), ...partial.autoClose }
         : autoCloseSettings(),
     });
+    if (partial.kalshiAccountPrecision !== undefined) kalshiFeePolicyResolver.clear();
     qualificationSnapshot();
     if (riskOverride) recordSettingsManualOverride();
     feedHub.setKalshiApiKey(currentKalshiApiKeyId());
@@ -2809,21 +6582,31 @@ function setupIpc() {
   ipcMain.handle('nemesis:getKalshiCredentialStatus', () => kalshiCredentialStatus());
 
   ipcMain.handle('nemesis:saveKalshiCredentials', (_e, input: { kalshiApiKeyId?: string; privateKeyPem?: string }) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; credentials are frozen` };
     const result = persistKalshiCredentials(input ?? {});
     if (result.ok && (settings.liveStage ?? 'paper') !== 'paper') {
       invalidateLiveCertificate('credential change');
       saveSettings();
     }
     broadcast('settings:update', settings);
+    if (result.ok) {
+      kalshiStream.restart();
+      kalshiOrderbookStream.restart();
+    }
     return result;
   });
 
   ipcMain.handle('nemesis:clearKalshiCredentials', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; credentials are frozen`, status: kalshiCredentialStatus() };
     if ((settings.liveStage ?? 'paper') !== 'paper') {
       invalidateLiveCertificate('credential change');
     }
     const status = clearStoredKalshiCredentials();
     broadcast('settings:update', settings);
+    kalshiStream.restart();
+    kalshiOrderbookStream.restart();
     return { ok: true, status };
   });
 
@@ -2860,6 +6643,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:passQuiz', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; configuration is frozen` };
     settings = { ...settings, humanQuizPassed: true };
     saveSettings();
     saveAuditLog();
@@ -2868,6 +6653,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:passBacktest', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { passed: false, error: `${mutationLock}; configuration is frozen` };
     const result = runFeeAwareBacktest(journal.list());
     settings = { ...settings, backtestPassed: result.passed };
     saveSettings();
@@ -2878,6 +6665,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:quarantinePlaybook', (_e, playbook: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; strategy state is frozen` };
     quarantine.evaluate({ playbook: playbook as never, signals: 25, wins: 5, losses: 20, staleRate: 0.1, disagreementRate: 0.1, fillDrag: 0.05 });
     return quarantine.listFrozen();
   });
@@ -2885,6 +6674,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:killSwitch', () => activateKillSwitch('ipc'));
 
   ipcMain.handle('nemesis:unlockLive', (_e, confirmText: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     const targetStage = confirmText === 'ENABLE LIVE AUTO' ? 'auto-live' : 'manual-live';
     const evaluation = buildLiveUnlockReadiness(targetStage, confirmText);
     if (!evaluation.passed || !evaluation.certificate) {
@@ -2919,6 +6710,8 @@ function setupIpc() {
       autoClose: autoCloseSnapshot(),
       paperQualification: qualificationSnapshot(),
       strategyValidation: strategyValidationSnapshot(),
+      evidenceCampaign: campaignSnapshot(),
+      orderbookStream: kalshiOrderbookStream.telemetry(),
       pilotValidation: pilotValidationSnapshot(),
       equity: mtm.equity,
       csv: journal.exportCsv(),
@@ -2939,8 +6732,22 @@ function setupIpc() {
   ipcMain.handle('nemesis:refresh', () => runMarketRefresh());
 
   ipcMain.handle('nemesis:liveBuy', async (_e, thesisId: string, contracts?: number, limitPrice?: number) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     if (!settings.liveEnabled) return { ok: false, error: 'live trading not enabled' };
     if (settings.killSwitchActive) return { ok: false, error: 'kill switch active' };
+    // dryRun named a mode it did not enforce: the live order path ignored it
+    // entirely, so a run every other surface reported as dry could still place a
+    // real order. It is the last flag an operator would expect to be decorative.
+    if (settings.dryRun) return { ok: false, error: 'dry run is enabled; no live order will be placed' };
+    // The certificate expires 24 hours after it was issued, and this process can
+    // outlive that. Re-check at the order itself, not only at load.
+    const authorization = evaluateStoredLiveAuthorization(settings, Date.now());
+    if (!authorization.ok) {
+      enforceStoredLiveAuthorization();
+      broadcast('settings:update', settings);
+      return { ok: false, error: `live unlock is no longer valid: ${authorization.blockers.join('; ')}` };
+    }
     const creds = getLiveCreds();
     if (!creds) return { ok: false, error: 'Kalshi credentials not configured' };
     const card = theses.find((t) => t.id === thesisId);
@@ -3007,6 +6814,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:paperClose', async (_e, positionId: string, contracts?: number) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock, abortCode: 'campaign_mutation_lock', wouldMutate: false };
     const pos = paperDesk.snapshot().positions.find((p) => p.id === positionId);
     if (!pos) return { ok: false, error: 'position not found' };
     const card = cardForPosition(pos);
@@ -3076,6 +6885,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:paperPlaceLimit', (_e, thesisId: string, contracts: number, limitPrice: number) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     const card = theses.find((t) => t.id === thesisId);
     if (!card) return { ok: false, error: 'thesis not found' };
     const eligibilityBlock = entryEligibilityBlockReason(card);
@@ -3098,6 +6909,8 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:paperCancelOrder', (_e, orderId: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     const ok = paperOrderBook.cancel(orderId);
     if (ok) {
       savePaperOrders();
@@ -3128,32 +6941,12 @@ function setupIpc() {
     };
   });
 
-  ipcMain.handle('nemesis:advanceStrategyStage', (_e, stage: StrategyValidationStage, confirmation: string) => {
-    try {
-      if (!strategyValidationStore) throw new Error('strategy validation store is unavailable');
-      const current = strategyValidationSnapshot();
-      if (!current || current.integrityError || current.paused) throw new Error('strategy validation evidence is not eligible for advancement');
-      if (paperDesk.snapshot().positions.length > 0) throw new Error('close all paper positions before advancing the stage');
-      if (stage === 'pilot') {
-        if (current.stage !== 'shadow') throw new Error('only a shadow run can advance to pilot');
-        if (!current.shadowPassed) throw new Error('shadow thresholds have not passed');
-      } else if (stage === 'qualification') {
-        if (current.stage !== 'pilot') throw new Error('only a pilot run can advance to qualification');
-        if (!pilotValidationSnapshot().passed) throw new Error('pilot thresholds have not passed');
-      } else {
-        throw new Error('shadow is created only by archive and reset');
-      }
-      strategyValidationStore.record((tracker) => tracker.changeStage(stage, confirmation));
-      const strategyValidation = strategyValidationSnapshot();
-      const pilotValidation = pilotValidationSnapshot();
-      broadcastPaperUpdate(true);
-      return { ok: true, strategyValidation, pilotValidation };
-    } catch (error) {
-      return { ok: false, error: describeError(error) };
-    }
-  });
+  ipcMain.handle('nemesis:advanceStrategyStage', (_e, stage: StrategyValidationStage, confirmation: string) =>
+    advanceStrategyStageRequest(stage, confirmation));
 
   ipcMain.handle('nemesis:resetPaper', (_e, confirmation: string) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: mutationLock };
     try {
       const result = archiveAndResetPaper({
         dataDir: DATA_DIR,
@@ -3220,6 +7013,8 @@ function setupIpc() {
   ipcMain.handle('nemesis:getDiscoveryState', () => discovery.getState());
 
   ipcMain.handle('nemesis:updateDiscoverySettings', (_e, partial: Partial<DiscoverySettings>) => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; discovery configuration is frozen`, state: discovery.getState() };
     discovery.updateSettings(partial);
     qualificationSnapshot();
     saveDiscoverySettings();
@@ -3228,12 +7023,16 @@ function setupIpc() {
   });
 
   ipcMain.handle('nemesis:pauseDiscovery', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; discovery state is frozen`, state: discovery.getState() };
     discovery.pause();
     broadcastDiscovery();
     return discovery.getState();
   });
 
   ipcMain.handle('nemesis:resumeDiscovery', () => {
+    const mutationLock = campaignMutationLockReason();
+    if (mutationLock) return { ok: false, error: `${mutationLock}; discovery state is frozen`, state: discovery.getState() };
     discovery.resume();
     broadcastDiscovery();
     return discovery.getState();
@@ -3246,7 +7045,10 @@ function setupIpc() {
 
   ipcMain.handle('nemesis:getWorldEvents', () => buildWorldEventsPayload());
 
-  ipcMain.handle('nemesis:getBridgeStatus', () => ({ ...bridgeStatus }));
+  ipcMain.handle('nemesis:getBridgeStatus', () => {
+    refreshBridgeConnectivity();
+    return { ...bridgeStatus };
+  });
 
   ipcMain.handle('nemesis:openWidget', (_e, type: string) => {
     const SIZES: Record<string, [number, number]> = {
@@ -3293,8 +7095,14 @@ function setupIpc() {
   });
 }
 
-function createWindow() {
+function createWindow(rendererRetryOrdinal = 0) {
   startupTrace('window-before-create');
+  rendererLoadReadyPromise = new Promise<void>((resolve) => {
+    resolveRendererLoadReady = resolve;
+  });
+  rendererHeartbeatMonitor.reset(Date.now());
+  stopRendererProbe();
+  rendererProbePendingAfterPaint = true;
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -3305,39 +7113,158 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
   startupTrace('window-after-create');
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
+  const packagedIndexPath = path.join(__dirname, '../dist/index.html');
+  let packagedLoadRetryCount = rendererRetryOrdinal;
+  let packagedLoadRetryInFlight = false;
+  const handlePackagedLoadFailure = (detail: string) => {
+    if (packagedLoadRetryInFlight) return;
+    if (packagedLoadRetryCount < 1 && mainWindow && !mainWindow.isDestroyed()) {
+      packagedLoadRetryCount += 1;
+      packagedLoadRetryInFlight = true;
+      // Set this before scheduling the replacement. Electron can emit
+      // window-all-closed/before-quit while the failed WebContents is being
+      // torn down; the retry must own that interval.
+      rendererRetryInProgress = true;
+      rendererHeartbeatMonitor.reset(Date.now());
+      startupTrace(`renderer-load-retry:${packagedLoadRetryCount}`);
+      setTimeout(() => {
+        packagedLoadRetryInFlight = false;
+        // ERR_FAILED can leave the original WebContents unusable. Recreate
+        // the window once so the retry gets a fresh renderer process.
+        const failedWindow = mainWindow;
+        if (failedWindow && !failedWindow.isDestroyed()) failedWindow.destroy();
+        createWindow(packagedLoadRetryCount);
+      }, 250);
+      return;
+    }
+    rendererHeartbeatMonitor.markLoadFailed(detail);
+    resolveRendererLoadReady?.();
+    resolveRendererLoadReady = null;
+  };
+  const loadPackagedPage = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    startupTrace(`window-load-file:${packagedIndexPath}`);
+    mainWindow.loadFile(packagedIndexPath)
+      .then(() => startupTrace(packagedLoadRetryCount > 0 ? 'window-load-file-retry-ok' : 'window-load-file-ok'))
+      .catch((err) => {
+        const detail = `renderer loadFile failed: ${err instanceof Error ? err.message : String(err)}`;
+        startupTrace(`window-load-file-failed:${detail}`);
+        if (!devUrl) handlePackagedLoadFailure(detail);
+        else console.error('[nemesis] loadFile failed', err);
+      });
+  };
+  const forceInitialPaint = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.invalidate();
+    if (!mainWindow.isVisible()) mainWindow.show();
+  };
   mainWindow.webContents.on('did-fail-load', (_event, code, desc, url) => {
     console.error('[nemesis] did-fail-load', code, desc, url);
+    startupTrace(`renderer-did-fail-load:${code}:${desc}`);
+    // A packaged file load can fail transiently while Electron is starting.
+    // Retry once before declaring the renderer unavailable. The retry is
+    // still inside startup; a renderer process restart later remains fatal.
+    if (!devUrl) {
+      handlePackagedLoadFailure(`renderer did-fail-load:${code}:${desc}`);
+      return;
+    }
+    rendererHeartbeatMonitor.markLoadFailed(`renderer did-fail-load:${code}:${desc}`);
     if (devUrl && mainWindow) {
       setTimeout(() => {
         mainWindow?.loadURL(devUrl).catch((err) => console.error('[nemesis] reload failed', err));
       }, 1500);
     }
   });
+  mainWindow.webContents.on('did-finish-load', () => {
+    startupTrace('renderer-did-finish-load');
+    rendererRetryInProgress = false;
+    rendererHeartbeatMonitor.markLoadFinished(Date.now());
+    resolveRendererLoadReady?.();
+    resolveRendererLoadReady = null;
+    // Wait for the first painted heartbeat before probing. A page can report
+    // did-finish-load while its initial React paint is still busy; probing
+    // before paint measures startup work rather than renderer liveness.
+    if (rendererHeartbeatMonitor.snapshot().firstPaintedAt != null) startRendererProbe();
+    forceInitialPaint();
+    setTimeout(forceInitialPaint, 250);
+    setTimeout(forceInitialPaint, 1_000);
+  });
+  mainWindow.webContents.on('preload-error', (_event, preloadPath, error) => {
+    console.error('[nemesis] preload-error', preloadPath, error);
+  });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[nemesis] render-process-gone', details.reason, details.exitCode);
+    startupTrace(`renderer-process-gone:${details.reason}:${details.exitCode}`);
+    rendererHeartbeatMonitor.markRendererGone();
+  });
+  mainWindow.webContents.on('console-message', (event) => {
+    if (event.level === 'warning' || event.level === 'error') {
+      console.error('[nemesis] renderer-console', {
+        level: event.level,
+        message: event.message,
+        line: event.lineNumber,
+        sourceId: event.sourceId,
+      });
+    }
+  });
+  mainWindow.on('unresponsive', () => {
+    rendererHeartbeatMonitor.markUnresponsive();
+    startupTrace('renderer-unresponsive');
+    console.error('[nemesis] main window became unresponsive');
+  });
+  mainWindow.on('responsive', () => {
+    rendererHeartbeatMonitor.markResponsive();
+    startupTrace('renderer-responsive');
+    console.warn('[nemesis] main window became responsive again');
+  });
+  mainWindow.on('closed', () => {
+    startupTrace('window-closed');
+    stopRendererProbe();
+  });
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show());
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.show();
+    forceInitialPaint();
+  });
 
   if (devUrl) {
     mainWindow.loadURL(devUrl).catch((err) => console.error('[nemesis] loadURL failed', err));
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    const indexPath = path.join(__dirname, '../dist/index.html');
-    startupTrace(`window-load-file:${indexPath}`);
-    mainWindow.loadFile(indexPath)
-      .then(() => startupTrace('window-load-file-ok'))
-      .catch((err) => {
-        startupTrace(`window-load-file-failed:${err instanceof Error ? err.message : String(err)}`);
-        console.error('[nemesis] loadFile failed', err);
-      });
+    loadPackagedPage();
   }
   startupTrace('window-create-return');
 }
 
-app.whenReady().then(() => {
+/**
+ * One desktop per user-data directory, enforced by the OS rather than by
+ * convention. Two instances against the same `nemesis-data` both append to the
+ * paper-qualification and strategy-validation ledgers, interleaving two
+ * sequence streams into one file and corrupting both hash chains -- the exact
+ * evidence a paper run exists to produce. `HealthAttestationTracker` is not and
+ * never was this guard, despite having been called a lease.
+ *
+ * Exits before `whenReady`, so the second instance never opens a store.
+ */
+if (!app.requestSingleInstanceLock()) {
+  console.error('[nemesis] another NEMESIS desktop already owns this user-data directory; exiting');
+  app.exit(1);
+}
+
+app.on('second-instance', () => {
+  console.warn('[nemesis] refused a second desktop instance; focusing the running window');
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+});
+
+app.whenReady().then(async () => {
   startupTrace('ready');
   loadSettings();
   startupTrace('settings');
@@ -3362,7 +7289,107 @@ app.whenReady().then(() => {
   startupTrace('paper-qualification');
   initializeStrategyValidation();
   startupTrace('strategy-validation');
+  // Establish the immutable observation baseline only after every protected
+  // paper/config store has completed its one-time startup recovery.
+  captureProductionObservationBaseline();
+  startupTrace('production-observation-baseline');
+  initializeEvidenceCampaign();
+  startupTrace('evidence-campaign');
   kalshiStream.onQuote((q) => applyKalshiQuote(q.ticker, q.yesPrice, q.spread));
+  kalshiOrderbookStream.onBookUpdate((book) => {
+    discovery.ingestOrderbook(book);
+    const observedAt = Date.now();
+    if (!campaignStore || campaignEvidencePaused) return;
+    if (!Number.isInteger(book.sequence)) {
+      const completedAt = Date.now();
+      const work = campaignBookUpdateWork(book.ticker, [], campaignBookView(), completedAt);
+      if (work.diagnostic) {
+        pendingCampaignDiagnosticObservations.set(book.ticker, {
+          ticker: book.ticker,
+          sequence: -1,
+          observedAt,
+          completedAt,
+          book,
+          feeResult: {
+            status: 'failed',
+            outcome: 'missing_provenance',
+            detail: 'order-book delta is missing an exchange sequence',
+          },
+        });
+        campaignBookTriggerScheduler.request(book.ticker, { throughput: false, confirmation: false, diagnostic: true }, completedAt);
+      }
+      return;
+    }
+    const sequence = book.sequence!;
+    const latestSequence = latestCampaignObservationSequence.get(book.ticker);
+    if (latestSequence != null && sequence <= latestSequence) return;
+    // Claim the sequence before resolving fees so an older async completion can never overwrite it.
+    latestCampaignObservationSequence.set(book.ticker, sequence);
+    void kalshiFeePolicyResolver.resolve(book.ticker).then((feePolicy) => {
+      const completedAt = Date.now();
+      if (latestCampaignObservationSequence.get(book.ticker) !== sequence) return;
+      const enriched = sanitizeExecutableBook({ ...book, feePolicy });
+      const readiness = campaignEnrollmentReadiness(
+        enriched,
+        completedAt,
+        entryQualificationSettings().maxBookAgeMs,
+      );
+      const campaign = campaignBookView();
+      const work = campaignBookUpdateWork(book.ticker, theses.filter((card) =>
+        card.ticker === book.ticker
+        && isEntryEligible(card)
+        && (seriesAllowlistConfigured() || hasRealExecutableDepth(card))), campaign, completedAt);
+      if (!readiness.ready) {
+        if (work.diagnostic) {
+          const outcome: 'missing_provenance' | 'stale_book' | 'fee_unknown' = /fee/i.test(readiness.reason)
+            ? 'fee_unknown'
+            : /stale|age/i.test(readiness.reason)
+              ? 'stale_book'
+              : 'missing_provenance';
+          pendingCampaignDiagnosticObservations.set(book.ticker, {
+            ticker: book.ticker,
+            sequence,
+            observedAt,
+            completedAt,
+            book: enriched,
+            feeResult: { status: 'failed', outcome, detail: readiness.reason },
+          });
+          campaignBookTriggerScheduler.request(book.ticker, { throughput: false, confirmation: false, diagnostic: true }, completedAt);
+        }
+        return;
+      }
+      if (work.diagnostic) {
+        pendingCampaignDiagnosticObservations.set(book.ticker, {
+          ticker: book.ticker,
+          sequence,
+          observedAt,
+          completedAt,
+          book: enriched,
+          feeResult: { status: 'resolved', policy: feePolicy },
+        });
+      }
+      campaignBookTriggerScheduler.request(book.ticker, work, completedAt);
+    }).catch((error) => {
+      const completedAt = Date.now();
+      if (latestCampaignObservationSequence.get(book.ticker) !== sequence) return;
+      const work = campaignBookUpdateWork(book.ticker, [], campaignBookView(), completedAt);
+      if (work.diagnostic) {
+        pendingCampaignDiagnosticObservations.set(book.ticker, {
+          ticker: book.ticker,
+          sequence,
+          observedAt,
+          completedAt,
+          book,
+          feeResult: {
+            status: 'failed',
+            outcome: 'fee_unknown',
+            detail: `fee policy resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        });
+        campaignBookTriggerScheduler.request(book.ticker, { throughput: false, confirmation: false, diagnostic: true }, completedAt);
+      }
+    });
+  });
   setupIpc();
   startupTrace('ipc');
   setupBridgeServer();
@@ -3370,27 +7397,58 @@ app.whenReady().then(() => {
 
   // Health broadcast starts before the window opens so the first connectors:update
   // arrives within 5 s of the renderer mounting its listener.
+  startPowerSaveBlocker();
   setInterval(() => {
+    // First, so a suspend is named on the tick that discovers it rather than
+    // inferred later from age counters that only look like a dead feed.
+    recordHealthTickGap(Date.now());
     tickApiHealthDegraded();
     processWorkingOrders();
     void evaluateAutoClosePositions('health-tick');
     void evaluateQualificationFollowUps();
     void evaluateStrategyValidationFollowUps();
     void runThroughputCertification('entry-confirmation-tick');
+    void evaluateCampaignConfirmations();
+    void evaluateCampaignDiagnostics();
+    superviseOrderbookDataPlane();
+    superviseTickerStream();
+    sweepEntryConfirmationState();
+    broadcastToGea({ type: 'bridge:ping', payload: {} });
+    recordCampaignOperationalTelemetry();
     broadcast('connectors:update', registry.getAll());
-    if (paperDesk.snapshot().positions.length > 0) {
-      broadcastPaperUpdate();
-    }
-  }, 5_000);
+    if (paperDesk.snapshot().positions.length === 0) broadcastPaperUpdate();
+  }, BRIDGE_HEARTBEAT_MS);
+  setInterval(() => {
+    if (paperDesk.snapshot().positions.length > 0) broadcastPaperUpdate();
+  }, PAPER_BROADCAST_THROTTLE_MS);
 
   createWindow();
   startupTrace('window-created');
+  // Give the packaged renderer its first turn before starting the feeds and
+  // paginated discovery. Those operations can process thousands of markets
+  // synchronously when responses arrive and otherwise delay page load enough
+  // to create a false startup-liveness failure.
+  await rendererLoadReadyPromise;
+  startupTrace('renderer-load-gate-open');
+  rendererProbeGateInProgress = true;
+  try {
+    if (!await waitForFreshRendererProbe()) {
+      rendererHeartbeatMonitor.markLoadFailed('renderer did not answer a fresh startup probe');
+      startupTrace('renderer-probe-gate-failed');
+      return;
+    }
+  } finally {
+    rendererProbeGateInProgress = false;
+  }
+  startupTrace('renderer-probe-gate-open');
   spawnGlobalEventAlpha();
   startupTrace('gea-spawned-feed-held');
   kalshiStream.start();
+  kalshiOrderbookStream.start();
   startupTrace('kalshi-stream');
   feedHub.startBackgroundPolling(8_000);
   void feedHub.refreshForMarkets(FIXTURE_MARKETS);
+  setInterval(() => { void runRestHealthProbe().catch(() => undefined); }, REST_HEALTH_POLL_MS);
   startupTrace('feedhub-started');
 
   marketsCache = mergeGeaMarkets(FIXTURE_MARKETS);
@@ -3401,7 +7459,7 @@ app.whenReady().then(() => {
       broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
       void evaluateAutoClosePositions('startup-fixtures');
     })
-    .catch((err) => registry.recordError('kalshi-rest', err instanceof Error ? err.message : String(err)));
+    .catch((err) => recordKalshiRestFailure(err));
 
   // GEA opens immediately, but its tape waits on marketFeedReady. The initial
   // NEMESIS discovery is truly aborted at the timeout so the two processes never
@@ -3414,10 +7472,7 @@ app.whenReady().then(() => {
     } catch (startupErr) {
       const cr = registry.get('kalshi-rest');
       if (cr && cr.lastSuccess === null && cr.lastError === null) {
-        registry.recordError(
-          'kalshi-rest',
-          startupErr instanceof Error ? startupErr.message : 'startup timeout',
-        );
+        recordKalshiRestFailure(startupErr);
       }
     }
     broadcast('connectors:update', registry.getAll());
@@ -3428,10 +7483,13 @@ app.whenReady().then(() => {
       broadcastToGea({ type: 'nemesis:state', payload: buildNemesisStateMirror() });
       startupTrace('market-feed-ready');
       setInterval(() => { void runMarketRefresh(); }, MARKET_REFRESH_MS);
-      setInterval(() => { void runUniverseRefresh(); }, 60_000);
+      setInterval(() => { void runUniverseRefresh(); }, UNIVERSE_REFRESH_MS);
+      setInterval(() => { void runProductionMarketReverification(); }, REVERIFY_INTERVAL_MS);
     }
   })();
   setInterval(() => { void refreshWatchedTicker(); }, WATCHED_TICK_MS);
+  setTimeout(() => sampleRendererMemory(), 1_000);
+  setInterval(() => sampleRendererMemory(), RENDERER_MEMORY_SAMPLE_INTERVAL_MS);
   setTimeout(() => { void sweepSettledPositions(); }, 20_000);
   setInterval(() => { void sweepSettledPositions(); }, SETTLEMENT_SWEEP_MS);
 
@@ -3445,7 +7503,30 @@ app.whenReady().then(() => {
 });
 
 app.on('will-quit', () => {
+  startupTrace('app-will-quit');
+  stopPowerSaveBlocker();
   globalShortcut.unregisterAll();
+  stopRendererProbe();
+  campaignBookTriggerScheduler.stop();
+  marketStateStream.stop();
+  equityHistoryStream.stop();
+  kalshiStream.stop();
+  kalshiOrderbookStream.stop();
   if (geaProcess && !geaProcess.killed) geaProcess.kill();
 });
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('before-quit', (event) => {
+  if (rendererRetryInProgress) {
+    event.preventDefault();
+    startupTrace('app-before-quit-suppressed-during-renderer-retry');
+    return;
+  }
+  startupTrace('app-before-quit');
+});
+app.on('window-all-closed', () => {
+  startupTrace('app-window-all-closed');
+  if (rendererRetryInProgress) {
+    startupTrace('app-window-all-closed-suppressed-during-renderer-retry');
+    return;
+  }
+  if (process.platform !== 'darwin') app.quit();
+});

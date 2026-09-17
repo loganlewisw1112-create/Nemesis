@@ -31,4 +31,17 @@ describe('buildStrategyConfigHash', () => {
       killSwitchActive: true,
     }, discovery)).toBe(base);
   });
+
+  it('does not invalidate when only shadow sample-size / calendar bars change', () => {
+    const base = buildStrategyConfigHash(DEFAULT_GUARDRAILS, discovery);
+    expect(buildStrategyConfigHash({
+      ...DEFAULT_GUARDRAILS,
+      entryQualification: {
+        ...DEFAULT_GUARDRAILS.entryQualification!,
+        shadowMinScored: 25,
+        shadowMinDistinctDays: 1,
+        shadowMinObservationMs: 24 * 60 * 60_000,
+      },
+    }, discovery)).toBe(base);
+  });
 });

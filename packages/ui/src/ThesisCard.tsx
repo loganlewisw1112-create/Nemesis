@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import type { ThesisCard } from '@nemesis/core';
 import { feeWaterfallData } from '@nemesis/charts';
 import { buildProfitExplanation, edgeBreakdownRows, buildRiskItems, depthRiskItem } from './profitExplanation.js';
@@ -27,7 +27,7 @@ const STATUS_COLORS: Record<string, string> = {
 
 const TRADABLE = new Set(['tradeable', 'qualified', 'watch-only']);
 
-export function ThesisCardView({
+export const ThesisCardView = memo(function ThesisCardView({
   card,
   onDryRun,
   onPaperBuy,
@@ -334,7 +334,7 @@ export function ThesisCardView({
       </div>
     </div>
   );
-}
+});
 
 const btnStyle: React.CSSProperties = {
   background: 'var(--bg)',

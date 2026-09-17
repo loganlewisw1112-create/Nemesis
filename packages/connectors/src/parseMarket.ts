@@ -30,11 +30,13 @@ export function parseWeatherCoords(title: string): { lat: number; lon: number } 
   return CITY_COORDS.nyc;
 }
 
-export function parseBtcStrike(title: string): number {
+export function parseBtcStrike(title: string, ticker = ''): number {
+  const fromTicker = ticker.toUpperCase().match(/-T([\d]+(?:\.\d+)?)/);
+  if (fromTicker) return parseFloat(fromTicker[1]!);
   const kMatch = title.match(/\$?\s*([\d,]+(?:\.\d+)?)\s*k\b/i);
-  if (kMatch) return parseFloat(kMatch[1].replace(/,/g, '')) * 1000;
+  if (kMatch) return parseFloat(kMatch[1]!.replace(/,/g, '')) * 1000;
   const m = title.match(/\$?\s*([\d,]+(?:\.\d+)?)/);
-  return m ? parseFloat(m[1].replace(/,/g, '')) : 100_000;
+  return m ? parseFloat(m[1]!.replace(/,/g, '')) : 100_000;
 }
 
 export function parseCpiStrike(title: string): number {

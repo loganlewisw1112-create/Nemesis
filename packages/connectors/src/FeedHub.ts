@@ -1,4 +1,4 @@
-import { fetchTrades, type KalshiMarket, type KalshiTrade, type GeoNewsItem } from '@nemesis/core';
+import { KalshiRequestFailure, fetchTrades, type ConnectorHealth, type KalshiFailureClass, type KalshiMarket, type KalshiTrade, type GeoNewsItem } from '@nemesis/core';
 import { BinanceStream, type BinanceQuote } from './binanceStream.js';
 import type { ConnectorRegistry } from './registry.js';
 import type { InfraAlert, NewsItem } from './feeds.js';
@@ -46,7 +46,13 @@ const STALE_MS: Record<string, number> = {
   nhc: 300_000,
   industrial: 300_000,
   sports: 30_000,
-  trades: 30_000,
+  // Sized to absorb one missed poll cycle plus its retry. Background polling
+  // ticks every 8s behind a 15s floor, so successful polls land ~16s apart, and
+  // a single failed request retries 15s later -- 31s total, which a 30s TTL
+  // breached by a second or two. That surfaced as trade-tape flapping
+  // unqualified at 30.8s and 32.2s, each flap counting as a runtime-health
+  // recovery, and three recoveries in ten minutes invalidate a soak.
+  trades: 60_000,
   kalshiWs: 45_000,
   worldNews: 180_000,
   eia: 600_000,
@@ -54,10 +60,26 @@ const STALE_MS: Record<string, number> = {
 };
 
 const SHARED_GDELT_QUERY = 'united states economy politics';
+/**
+ * Rows fetched per trade-tape refresh. The flow-hunter candidate signal filters
+ * this shared tape by ticker, so a low-frequency instrument only surfaces if its
+ * trades land inside the window. At the default 100 rows the tape is dominated
+ * by the highest-frequency series (crypto-15m, sports), and a focused universe
+ * of slower series (financial index, crypto-daily) can get zero tape slots and
+ * therefore zero candidates. Widening the window lets those trades appear.
+ * Freshness is fetch-time based, not per-trade, so a larger window does not
+ * affect staleness; trades older than maxSourceAgeMs simply produce no valid
+ * candidate. Env-gated, clamped to Kalshi's [100, 1000]; default preserves the
+ * historical behaviour.
+ */
+const TRADE_TAPE_LIMIT: number = (() => {
+  const raw = Number.parseInt(process.env.NEMESIS_TRADE_TAPE_LIMIT ?? '', 10);
+  return Number.isFinite(raw) ? Math.min(1000, Math.max(100, raw)) : 100;
+})();
 const TRADE_BACKOFF_BASE_MS = 30_000;
 const TRADE_BACKOFF_MAX_MS = 300_000;
 const TRADE_WARNING_THROTTLE_MS = 300_000;
-const TRADE_MIN_REQUEST_INTERVAL_MS = 30_000;
+const TRADE_MIN_REQUEST_INTERVAL_MS = 15_000;
 
 export interface FeedHubTradeFeedState {
   status: 'ok' | 'degraded';
@@ -69,10 +91,31 @@ export interface FeedHubTradeFeedState {
   cachedTradeCount: number;
   backoffMs: number;
   lastWarningAt: number | null;
+  tapeAgeMs: number | null;
+  displayOnly: boolean;
+  qualificationReady: boolean;
+  failureClass: KalshiFailureClass | null;
+}
+
+export interface FeedHealthSnapshot {
+  generatedAt: number;
+  restMarkets: ConnectorHealth | null;
+  tradeTape: ConnectorHealth | null;
+  tickerWebSocket: ConnectorHealth | null;
+  orderbookWebSocket: ConnectorHealth | null;
+  qualificationReady: boolean;
 }
 
 function tradeBackoffMs(failureCount: number): number {
-  return Math.min(TRADE_BACKOFF_MAX_MS, TRADE_BACKOFF_BASE_MS * (2 ** Math.max(0, failureCount - 1)));
+  // A single failed poll retries at the rate-limit floor. The 30s evidence TTL
+  // is sized to absorb exactly one missed cycle (tradeTapeQualificationReady's
+  // comment: a transient request error must not become a qualification outage),
+  // but jumping straight to the 30s backoff base guaranteed one -- the retry
+  // could not even start until ~45s after the last success. Exponential backoff
+  // still applies from the second consecutive failure, and a server-directed
+  // Retry-After always wins via the Math.max at the call site.
+  if (failureCount <= 1) return TRADE_MIN_REQUEST_INTERVAL_MS;
+  return Math.min(TRADE_BACKOFF_MAX_MS, TRADE_BACKOFF_BASE_MS * (2 ** (failureCount - 2)));
 }
 
 export class FeedHub {
@@ -97,6 +140,10 @@ export class FeedHub {
     cachedTradeCount: 0,
     backoffMs: 0,
     lastWarningAt: null,
+    tapeAgeMs: null,
+    displayOnly: true,
+    qualificationReady: false,
+    failureClass: null,
   };
   private worldNews: GeoNewsItem[] = [];
   private worldNewsAt = 0;
@@ -189,21 +236,59 @@ export class FeedHub {
   }
 
   getTradesForTicker(ticker: string): KalshiTrade[] {
-    return this.trades.filter((t) => t.ticker === ticker);
+    return this.getTradeTape().filter((t) => t.ticker === ticker);
   }
 
   getTradeTape(): KalshiTrade[] {
+    return this.tradeTapeQualificationReady() ? [...this.trades] : [];
+  }
+
+  /** Cached records are for operator display/replay only and never qualification. */
+  getCachedTradeTapeForDisplay(): KalshiTrade[] {
     return [...this.trades];
   }
 
   getTradeFeedState(): FeedHubTradeFeedState {
-    return { ...this.tradeFeedState, cachedTradeCount: this.trades.length };
+    const tapeAgeMs = this.tradesFetchedAt > 0 ? Math.max(0, Date.now() - this.tradesFetchedAt) : null;
+    const qualificationReady = this.tradeTapeQualificationReady();
+    return {
+      ...this.tradeFeedState,
+      cachedTradeCount: this.trades.length,
+      tapeAgeMs,
+      displayOnly: !qualificationReady,
+      qualificationReady,
+    };
+  }
+
+  getFeedHealthSnapshot(now = Date.now()): FeedHealthSnapshot {
+    // Sized to absorb one missed poll cycle plus its retry, mirroring the trade
+    // tape (a6ce478). The REST health probe ticks every 20s (REST_HEALTH_POLL_MS),
+    // so successful polls land ~20s apart; a single delayed or retried poll pushes
+    // freshness past a bare 30s TTL. Each breach flips qualificationReady false and
+    // counts as a runtime-health recovery, and enough recoveries invalidate a soak
+    // -- exactly the feeds_rest_qualified gap that failed both G1 rehearsals while
+    // the transport stayed connected with zero errors. 60s covers two poll cycles
+    // plus latency. Transport/rate-limit failures still de-qualify immediately via
+    // recordError, so this only tolerates jitter, not an actually dead feed.
+    const restMarkets = this.registry.refreshFreshness('kalshi-rest', 60_000, now) ?? null;
+    const tradeTape = this.registry.refreshFreshness('kalshi-trades', STALE_MS.trades, now) ?? null;
+    const tickerWebSocket = this.registry.refreshFreshness('kalshi-ticker-ws', 25_000, now) ?? null;
+    const orderbookWebSocket = this.registry.refreshFreshness('kalshi-orderbook-ws', 25_000, now) ?? null;
+    return {
+      generatedAt: now,
+      restMarkets,
+      tradeTape,
+      tickerWebSocket,
+      orderbookWebSocket,
+      qualificationReady: [restMarkets, tradeTape, tickerWebSocket, orderbookWebSocket]
+        .every((component) => component?.qualificationReady === true),
+    };
   }
 
   /** Return the short-TTL cached tape, refreshing through one paced request when eligible. */
   async refreshTradeTape(): Promise<KalshiTrade[]> {
     if (this.shouldRefreshTrades()) await this.refreshTradesCoalesced();
-    return [...this.trades];
+    return this.getTradeTape();
   }
 
   refreshForMarkets(markets: KalshiMarket[]): Promise<void> {
@@ -270,6 +355,7 @@ export class FeedHub {
           fetchedAt: live.fetchedAt,
           momentumBps: live.momentumBps,
           volatilityBps: live.volatilityBps,
+          sigmaPerRootSec: live.sigmaPerRootSec,
           sampleCount: live.sampleCount,
           windowMs: live.windowMs,
         });
@@ -345,7 +431,19 @@ export class FeedHub {
     if (nextRetryAt !== null && now < nextRetryAt) return false;
     const lastAttemptAt = this.tradeFeedState.lastAttemptAt;
     if (lastAttemptAt !== null && now - lastAttemptAt < TRADE_MIN_REQUEST_INTERVAL_MS) return false;
-    return this.tradeFeedState.status === 'degraded' || this.isStale(this.tradesFetchedAt, STALE_MS.trades);
+    return this.tradeFeedState.status === 'degraded'
+      || this.tradesFetchedAt === 0
+      || now - this.tradesFetchedAt >= TRADE_MIN_REQUEST_INTERVAL_MS;
+  }
+
+  private tradeTapeQualificationReady(now = Date.now()): boolean {
+    // A failed refresh does not make the last successful exchange snapshot
+    // stale. Keep the same 30-second evidence TTL, but avoid turning a
+    // transient request error into an unnecessary qualification outage.
+    // Once the cached snapshot is older than the TTL, it is display-only and
+    // cannot qualify or score evidence.
+    return this.tradesFetchedAt > 0
+      && now - this.tradesFetchedAt <= STALE_MS.trades;
   }
 
   private refreshTradesCoalesced(): Promise<void> {
@@ -454,7 +552,7 @@ export class FeedHub {
     };
 
     try {
-      const res = await fetchTrades({ limit: 100, fetchFn: this.opts.fetchFn });
+      const res = await fetchTrades({ limit: TRADE_TAPE_LIMIT, fetchFn: this.opts.fetchFn });
       const fetchedAt = Date.now();
       this.trades = res.trades ?? [];
       this.tradesFetchedAt = fetchedAt;
@@ -468,13 +566,28 @@ export class FeedHub {
         cachedTradeCount: this.trades.length,
         backoffMs: 0,
         lastWarningAt: this.tradeWarningAt || null,
+        tapeAgeMs: 0,
+        displayOnly: false,
+        qualificationReady: true,
+        failureClass: null,
       };
       this.registry.recordSuccess('kalshi-trades', fetchedAt - attemptStartedAt);
+      this.registry.recordTelemetry('kalshi-trades', {
+        lastAttempt: attemptStartedAt,
+        lastMessageAt: fetchedAt,
+        freshnessMs: 0,
+        transportConnected: true,
+        qualificationReady: true,
+        environment: 'production',
+        endpointClass: 'market-data',
+      });
     } catch (e) {
       const failedAt = Date.now();
       const message = e instanceof Error ? e.message : String(e);
+      const failureClass = e instanceof KalshiRequestFailure ? e.classification : 'unknown';
       const failureCount = this.tradeFeedState.failureCount + 1;
-      const backoffMs = tradeBackoffMs(failureCount);
+      const serverRetryAfterMs = e instanceof KalshiRequestFailure ? e.retryAfterMs ?? 0 : 0;
+      const backoffMs = Math.max(tradeBackoffMs(failureCount), serverRetryAfterMs);
       const nextRetryAt = failedAt + backoffMs;
       const shouldWarn = this.tradeWarningAt === 0
         || failureCount === 1
@@ -496,11 +609,28 @@ export class FeedHub {
         cachedTradeCount: this.trades.length,
         backoffMs,
         lastWarningAt: this.tradeWarningAt || null,
+        tapeAgeMs: this.tradesFetchedAt > 0 ? Math.max(0, failedAt - this.tradesFetchedAt) : null,
+        displayOnly: true,
+        qualificationReady: false,
+        failureClass,
       };
       this.registry.recordDegraded(
         'kalshi-trades',
         `Trade tape degraded (${failureCount} failure${failureCount === 1 ? '' : 's'}): ${message}; retry in ${Math.round(backoffMs / 1000)}s`,
       );
+      this.registry.recordTelemetry('kalshi-trades', {
+        lastAttempt: attemptStartedAt,
+        nextRetryAt,
+        failureClass,
+        freshnessMs: this.tradesFetchedAt > 0 ? Math.max(0, failedAt - this.tradesFetchedAt) : null,
+        // Preserve readiness only while the last successful exchange
+        // snapshot remains inside the existing 30-second TTL. This is not a
+        // freshness relaxation: stale cached trades still fail closed.
+        transportConnected: this.tradeTapeQualificationReady(failedAt),
+        qualificationReady: this.tradeTapeQualificationReady(failedAt),
+        environment: 'production',
+        endpointClass: 'market-data',
+      });
       /* trades are optional - keep cached trade tape and leave Kalshi REST errors to required callers */
     }
   }
@@ -551,18 +681,22 @@ export class FeedHub {
     };
   }
 
-  cryptoInputFor(market: KalshiMarket, marketPrice: number) {
+  cryptoInputFor(market: KalshiMarket, _marketPrice: number) {
     const symbol = parseCryptoSymbol(market.title, market.ticker);
     const live = this.binance.getQuote(symbol);
     const snap = this.crypto.get(symbol);
-    const strike = parseBtcStrike(market.title);
+    const strike = parseBtcStrike(market.title, market.ticker);
     const binanceQuote = live ?? this.snapshotToBinanceQuote(symbol, snap);
     return {
       symbol,
       spotPrice: binanceQuote?.price ?? strike,
       strike,
       lagMs: binanceQuote?.lagMs ?? 0,
-      kalshiImpliedSpot: marketPrice * strike,
+      // Do NOT invent a Kalshi spot as marketPrice*strike. For binary
+      // above/below contracts that product is a probability×strike mash that
+      // almost always "disagrees" with Binance and permanently marks
+      // crypto-lead theses uncertain (source-conflict) — which zeroed
+      // entry_eligible on the KXBTCD/KXETHD allowlist soak.
       binanceQuote,
     };
   }
@@ -576,6 +710,10 @@ export class FeedHub {
       fetchedAt: snap.fetchedAt,
       momentumBps: snap.momentumBps ?? 0,
       volatilityBps: snap.volatilityBps ?? 0,
+      // Zero is the honest answer for a snapshot with no window behind it: the
+      // model reads it as an unusable sigma and invalidates, rather than pricing
+      // off a volatility nobody measured.
+      sigmaPerRootSec: snap.sigmaPerRootSec ?? 0,
       sampleCount: snap.sampleCount ?? 1,
       windowMs: snap.windowMs ?? 0,
     };

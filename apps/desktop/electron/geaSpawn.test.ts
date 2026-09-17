@@ -68,12 +68,20 @@ describe('GEA spawn planning', () => {
     const env = createGeaChildEnv({
       PATH: 'C:\\Windows\\System32',
       VITE_DEV_SERVER_URL: 'http://localhost:5173',
+      NEMESIS_KALSHI_PRIVATE_KEY: 'private-pem',
+      NEMESIS_KALSHI_API_KEY_ID: 'protected-key-id',
+      KALSHI_API_KEY: 'legacy-secret',
     }, bridgeUrl, 'spawn-secret');
 
     expect(env.NEMESIS_BRIDGE_URL).toBe('ws://127.0.0.1:7430');
     expect(env.NEMESIS_BRIDGE_TOKEN).toBe('spawn-secret');
     expect(env.GEA_COORDINATE_TAPE_WITH_NEMESIS).toBe('true');
+    expect(env.GEA_TAPE_STREAM).toBe('false');
+    expect(env.NEMESIS_SUPERVISED_GEA).toBe('true');
     expect(env.VITE_DEV_SERVER_URL).toBeUndefined();
+    expect(env.NEMESIS_KALSHI_PRIVATE_KEY).toBeUndefined();
+    expect(env.NEMESIS_KALSHI_API_KEY_ID).toBeUndefined();
+    expect(env.KALSHI_API_KEY).toBeUndefined();
 
     const plan = createGeaSpawnPlan({
       platform: 'win32',

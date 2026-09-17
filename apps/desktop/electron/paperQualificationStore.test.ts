@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PaperQualificationStore } from './paperQualificationStore.js';
 
 const roots: string[] = [];
@@ -40,6 +40,41 @@ describe('PaperQualificationStore', () => {
     expect(after.endingEquity).toBe(5_025);
     expect(after.funnel.raw_candidates).toBe(7);
     expect(fs.readFileSync(filePath, 'utf8').trim().split(/\r?\n/)).toHaveLength(4);
+  });
+
+  it('appends without deep-cloning the whole ledger, and replays identically [soak-stall regression]', () => {
+    // record() recovers the 1-2 events it just appended via tracker.eventsAfter(), which
+    // used to route through allEvents() — a JSON deep copy of the entire append-only ledger,
+    // on every append, on the per-orderbook-delta hot path. Same shape as the clone that
+    // once starved the renderer heartbeat (sevenHourCampaignStore.record). eventsAfter()
+    // must instead walk back only over the new tail, so the cost is O(appended).
+    const filePath = ledgerPath();
+    const store = PaperQualificationStore.open(filePath, {
+      startingCash: 5_000,
+      strategyConfigHash: 'hash-a',
+      now: 10,
+      runId: 'run-a',
+    });
+    const cloneLedger = vi.spyOn(store.tracker, 'allEvents');
+    for (let index = 0; index < 200; index += 1) {
+      store.record((tracker) => tracker.recordFunnel('raw_candidates', 1, undefined, 100 + index));
+    }
+    expect(cloneLedger).not.toHaveBeenCalled();
+
+    // The tail it returns is exactly what the old full-scan filter would have returned.
+    const all = store.tracker.allEvents();
+    for (const sequence of [0, 1, 100, all.length - 1, all.length, all.length + 5]) {
+      expect(store.tracker.eventsAfter(sequence))
+        .toEqual(all.filter((event) => event.sequence > sequence));
+    }
+
+    const before = store.snapshot(10_000);
+    const restarted = PaperQualificationStore.open(filePath, { startingCash: 999, strategyConfigHash: 'ignored' });
+    const after = restarted.snapshot(10_000);
+    expect(after.integrityError).toBeUndefined();
+    expect(after.lastSequence).toBe(before.lastSequence);
+    expect(after.funnel.raw_candidates).toBe(200);
+    expect(restarted.tracker.allEvents()).toEqual(all);
   });
 
   it('fails closed when the JSONL evidence is corrupt', () => {

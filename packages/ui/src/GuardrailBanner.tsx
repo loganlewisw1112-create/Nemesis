@@ -1,10 +1,11 @@
+import { memo } from 'react';
 import type { GuardrailSettings } from '@nemesis/core';
 
 interface Props {
   settings: GuardrailSettings;
 }
 
-export function GuardrailBanner({ settings }: Props) {
+export const GuardrailBanner = memo(function GuardrailBanner({ settings }: Props) {
   const modes = [
     settings.demoMode ? 'DEMO' : 'PRODUCTION',
     settings.dryRun ? 'DRY-RUN' : 'LIVE ORDERS',
@@ -37,4 +38,4 @@ export function GuardrailBanner({ settings }: Props) {
       )}
     </div>
   );
-}
+});

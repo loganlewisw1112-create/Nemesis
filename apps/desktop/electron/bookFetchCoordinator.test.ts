@@ -123,6 +123,53 @@ describe('BookFetchCoordinator', () => {
     expect(runs).toBe(1);
   });
 
+  it('caps the rate-limit backoff below the provenance TTL', async () => {
+    let now = 0;
+    let runs = 0;
+    const coordinator = new BookFetchCoordinator(
+      async () => {
+        runs += 1;
+        throw new Error('Kalshi API 429: Too Many Requests');
+      },
+      { successTtlMs: 600, now: () => now },
+    );
+
+    // Strike 1 -> 30s
+    await expect(coordinator.fetch('LIMITED')).rejects.toThrow('429');
+    let backoff = await coordinator.fetch('LIMITED').catch((error: unknown) => error);
+    expect(backoff).toMatchObject({ kind: 'rate-limit', failureCount: 1, retryAt: 30_000 });
+
+    // Strike 2 -> 60s (still under the default 60s ceiling)
+    now = 30_000;
+    await expect(coordinator.fetch('LIMITED')).rejects.toThrow('429');
+    backoff = await coordinator.fetch('LIMITED').catch((error: unknown) => error);
+    expect(backoff).toMatchObject({ kind: 'rate-limit', failureCount: 2, retryAt: 90_000 });
+
+    // Strike 3 would be 120s uncapped; the ceiling holds it to 60s so the market
+    // stays retryable inside its 90s provenance TTL instead of being stranded.
+    now = 90_000;
+    await expect(coordinator.fetch('LIMITED')).rejects.toThrow('429');
+    backoff = await coordinator.fetch('LIMITED').catch((error: unknown) => error);
+    expect(backoff).toMatchObject({ kind: 'rate-limit', failureCount: 3, retryAt: 150_000 });
+    expect((backoff as { retryAt: number }).retryAt - now).toBeLessThanOrEqual(60_000);
+    expect(runs).toBe(3);
+  });
+
+  it('honors an explicit per-kind backoff ceiling', async () => {
+    let now = 0;
+    const coordinator = new BookFetchCoordinator(
+      async () => { throw new Error('Kalshi API 429: Too Many Requests'); },
+      { successTtlMs: 600, now: () => now, maxFailureBackoffMsByKind: { 'rate-limit': 45_000 } },
+    );
+
+    await expect(coordinator.fetch('LIMITED')).rejects.toThrow('429');
+    now = 30_000;
+    await expect(coordinator.fetch('LIMITED')).rejects.toThrow('429');
+    const backoff = await coordinator.fetch('LIMITED').catch((error: unknown) => error);
+    // Second strike would be 60s uncapped; the explicit 45s ceiling holds it.
+    expect(backoff).toMatchObject({ kind: 'rate-limit', failureCount: 2, retryAt: 75_000 });
+  });
+
   it('clears prior failure history after a successful retry', async () => {
     let now = 0;
     let runs = 0;

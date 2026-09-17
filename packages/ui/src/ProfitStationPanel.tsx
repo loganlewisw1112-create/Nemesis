@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { AutoCloseDecision, PaperPortfolio } from '@nemesis/core';
 import {
   buildLinePath,
@@ -48,7 +49,7 @@ function StatCard({ label, value, color = 'var(--text)' }: { label: string; valu
   );
 }
 
-export function ProfitStationPanel({ portfolio, equity, unrealized, equityHistory, autoCloseDecisions = [] }: Props) {
+export const ProfitStationPanel = memo(function ProfitStationPanel({ portfolio, equity, unrealized, equityHistory, autoCloseDecisions = [] }: Props) {
   const points = equityHistory.length > 0
     ? equityHistory
     : [{ t: Date.now(), equity, deployed: 0, cash: portfolio.cash }];
@@ -171,7 +172,7 @@ export function ProfitStationPanel({ portfolio, equity, unrealized, equityHistor
       </div>
     </div>
   );
-}
+});
 
 const sectionTitle: React.CSSProperties = {
   fontSize: 12,

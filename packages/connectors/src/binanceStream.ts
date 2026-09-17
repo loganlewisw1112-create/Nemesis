@@ -8,19 +8,40 @@ interface BinanceSample {
   fetchedAt: number;
 }
 
+/**
+ * Consecutive samples closer together than this carry more bid-ask bounce than
+ * diffusion, and dividing a bounce by a tiny interval inflates the variance
+ * estimate without bound. Sparse-sampling onto a >= 1s grid is the standard
+ * defence, and 1s still leaves the 5s REST poll every interval it produces.
+ */
+const MIN_RETURN_GAP_MS = 1_000;
+
 export interface BinanceQuote {
   symbol: string;
   price: number;
   lagMs: number;
   fetchedAt: number;
   momentumBps: number;
+  /**
+   * Dispersion of per-sample returns, in bps. Display and confidence-scoring
+   * only: it is a per-sample number with no time unit, so it means nothing
+   * without knowing the spacing that produced it. The model uses
+   * `sigmaPerRootSec`.
+   */
   volatilityBps: number;
+  /**
+   * Volatility per square-root second, estimated from the actual gaps between
+   * samples. Scale by sqrt(seconds) to get total volatility over any horizon.
+   * Zero when the window cannot support an estimate.
+   */
+  sigmaPerRootSec: number;
   sampleCount: number;
   windowMs: number;
 }
 
-function roundBps(value: number): number {
-  return Math.round(value * 10) / 10;
+function roundBps(value: number, decimals = 1): number {
+  const scale = 10 ** decimals;
+  return Math.round(value * scale) / scale;
 }
 
 function rollingVolatilityBps(samples: BinanceSample[]): number {
@@ -35,6 +56,49 @@ function rollingVolatilityBps(samples: BinanceSample[]): number {
   const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
   const variance = returns.reduce((sum, value) => sum + ((value - mean) ** 2), 0) / returns.length;
   return Math.sqrt(variance);
+}
+
+/**
+ * Volatility per square-root second from irregularly spaced samples.
+ *
+ * The window is fed by two sources at once — a sub-second websocket and a 5s
+ * REST poll (`recordQuote` is called from both) — so the spacing between
+ * consecutive samples varies by more than an order of magnitude. Treating that
+ * series as uniformly spaced, then rescaling by the *average* gap, produces a
+ * number that corresponds to no interval actually observed; it was the input
+ * that priced a 3-cent contract at 16.5 cents.
+ *
+ * Under a diffusion each log return has variance sigma^2 * dt over its own gap,
+ * so total realised variance divided by the wall time it accrued over is an
+ * unbiased, spacing-independent estimate of sigma^2. Long gaps contribute in
+ * proportion to their length, which is exactly right.
+ */
+export function realizedVolPerRootSec(samples: BinanceSample[]): number {
+  const sparse: BinanceSample[] = [];
+  for (const sample of samples) {
+    if (!Number.isFinite(sample.price) || sample.price <= 0) continue;
+    if (!Number.isFinite(sample.fetchedAt)) continue;
+    const last = sparse[sparse.length - 1];
+    if (!last) {
+      sparse.push(sample);
+      continue;
+    }
+    if (sample.fetchedAt - last.fetchedAt >= MIN_RETURN_GAP_MS) sparse.push(sample);
+  }
+  if (sparse.length < 3) return 0;
+
+  let realizedVariance = 0;
+  let elapsedSec = 0;
+  for (let i = 1; i < sparse.length; i += 1) {
+    const dtSec = (sparse[i]!.fetchedAt - sparse[i - 1]!.fetchedAt) / 1000;
+    if (!(dtSec > 0)) continue;
+    const logReturn = Math.log(sparse[i]!.price / sparse[i - 1]!.price);
+    if (!Number.isFinite(logReturn)) continue;
+    realizedVariance += logReturn * logReturn;
+    elapsedSec += dtSec;
+  }
+  if (elapsedSec <= 0) return 0;
+  return Math.sqrt(realizedVariance / elapsedSec);
 }
 
 export function deriveBinanceQuote(
@@ -54,7 +118,8 @@ export function deriveBinanceQuote(
     lagMs,
     fetchedAt,
     momentumBps: roundBps(momentumBps),
-    volatilityBps: roundBps(rollingVolatilityBps(windowed)),
+    volatilityBps: roundBps(rollingVolatilityBps(windowed), 4),
+    sigmaPerRootSec: realizedVolPerRootSec(windowed),
     sampleCount: windowed.length,
     windowMs,
   };

@@ -12,3 +12,11 @@ WINDOWS PACKAGE/
 .DS_Store
 .env
 .env.local
+.nemesis-*-cutoff.txt
+overnight-logs/
+vitest-out.txt
+
+# research raw data captures (large, regenerable)
+research/**/*.jsonl
+research/**/*.out
+research/**/*.log

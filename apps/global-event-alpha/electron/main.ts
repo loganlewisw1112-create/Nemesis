@@ -10,6 +10,7 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
 });
 
 import { app, BrowserWindow, ipcMain } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import WebSocket, { type RawData } from 'ws';
@@ -68,6 +69,13 @@ import { resolveGeaUserDataPath } from './userDataPath.js';
 import { copyLegacyGeaDatabaseIfMissing, legacyGeaDatabasePath, resolveGeaDatabasePath } from './localDb.js';
 import { TapeStartupCoordinator } from './tapeStartup.js';
 import { buildExitExecutionContext } from './exitExecutionContext.js';
+import { noTradeDecisionSignature } from './noTradeDecision.js';
+import {
+  BRIDGE_HEARTBEAT_MS,
+  recordBridgeInbound,
+  recordBridgeOutbound,
+  refreshBridgeTrafficStatus,
+} from './bridgeTelemetry.js';
 
 if (process.env.GEA_E2E_USER_DATA) {
   app.disableHardwareAcceleration();
@@ -82,16 +90,43 @@ const RECONNECT_MAX_MS = 30_000;
 const EXIT_PACKET_TTL_MS = 500;
 
 let mainWindow: BrowserWindow | null = null;
+let rendererLoadRetryCount = 0;
+let rendererLoadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let rendererLoadFailed = false;
+let rendererLoadReady = false;
 let bridgeWs: WebSocket | null = null;
 let bridgeSeq = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectDelay = RECONNECT_INITIAL_MS;
+let bridgeHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let bridgeConnectionCount = 0;
 
-const bridgeStatus: BridgeStatus = {
+let bridgeStatus: BridgeStatus = {
   connected: false,
   brainRole: null,
   lastSeenAt: null,
   clientCount: 0,
+  lastInboundAt: null,
+  lastOutboundAt: null,
+  lastPongAt: null,
+  lastSequenceIn: null,
+  lastSequenceOut: null,
+  reconnects: 0,
+  disconnects: 0,
+  failovers: 0,
+  tapeFreshnessMs: null,
+  socketConnected: false,
+  qualificationReady: false,
+  peerRole: null,
+  lastPingAt: null,
+  roundTripMs: null,
+  trafficFreshnessMs: null,
+  sequenceGaps: 0,
+  pingCount: 0,
+  pongCount: 0,
+  tradeTapeFreshnessMs: null,
+  orderbookObservationFreshnessMs: null,
+  exchangeDeltaFreshnessMs: null,
 };
 
 export interface GlobalEventAlphaIntelligenceState {
@@ -162,7 +197,14 @@ function emptyTapeState(): KalshiTapeState {
     latestSnapshots: [],
     latestTrades: [],
     latestOrderbooks: [],
-    freshness: { kalshiTapeAgeMs: null, stale: true },
+    freshness: {
+      marketSnapshotAgeMs: null,
+      tradeTapeAgeMs: null,
+      orderbookObservationAgeMs: null,
+      exchangeDeltaAgeMs: null,
+      kalshiTapeAgeMs: null,
+      stale: true,
+    },
   };
 }
 
@@ -311,6 +353,7 @@ function broadcast(channel: string, data: unknown) {
 }
 
 function pushBridgeStatus() {
+  bridgeStatus = refreshBridgeTrafficStatus(bridgeStatus, bridgeWs?.readyState === WebSocket.OPEN);
   broadcast('gea:bridgeStatus', { ...bridgeStatus });
 }
 
@@ -367,7 +410,7 @@ function publishIntelligencePackets(state: GlobalEventAlphaIntelligenceState) {
   }
 
   if (state.noTrade.blocked) {
-    const signature = `${state.noTrade.ticker}:${state.noTrade.reasons.join('|')}:${state.noTrade.recheck_at}`;
+    const signature = noTradeDecisionSignature(state.noTrade);
     if (signature !== lastNoTradeSignature) {
       lastNoTradeSignature = signature;
       const warning: NoTradeWarning = {
@@ -378,8 +421,20 @@ function publishIntelligencePackets(state: GlobalEventAlphaIntelligenceState) {
         issued_by: role,
         issued_at: issuedAt,
       };
+      try {
+        localStore?.insertNoTradeDecision(warning);
+      } catch (error) {
+        dbStatus = {
+          ...dbStatus,
+          available: false,
+          error: `no-trade decision persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+        broadcast('gea:dbStatus', dbStatus);
+      }
       sendToNemesis({ type: 'brain:no-trade', payload: warning });
     }
+  } else {
+    lastNoTradeSignature = '';
   }
 
   if (state.retention.action !== 'hold') {
@@ -417,6 +472,11 @@ function pushIntelligenceState() {
 
 function pushTapeState(state = tapeEngine?.getState() ?? tapeState) {
   tapeState = state;
+  bridgeStatus.tapeFreshnessMs = tapeState.freshness.kalshiTapeAgeMs;
+  bridgeStatus.tradeTapeFreshnessMs = tapeState.freshness.tradeTapeAgeMs;
+  bridgeStatus.orderbookObservationFreshnessMs = tapeState.freshness.orderbookObservationAgeMs;
+  bridgeStatus.exchangeDeltaFreshnessMs = tapeState.freshness.exchangeDeltaAgeMs;
+  pushBridgeStatus();
   broadcast('gea:tapeUpdate', tapeState);
   pushIntelligenceState();
 }
@@ -651,6 +711,7 @@ function sendToNemesis(msg: Omit<NemesisBridgeMessage, 'seq'>) {
   if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) return;
   const full: NemesisBridgeMessage = { ...msg, seq: ++bridgeSeq };
   bridgeWs.send(JSON.stringify(full));
+  bridgeStatus = recordBridgeOutbound(bridgeStatus, full);
 }
 
 function connectBridge() {
@@ -664,8 +725,15 @@ function connectBridge() {
 
   ws.on('open', () => {
     reconnectDelay = RECONNECT_INITIAL_MS;
-    bridgeStatus.connected = true;
-    bridgeStatus.lastSeenAt = Date.now();
+    bridgeConnectionCount += 1;
+    if (bridgeConnectionCount > 1) bridgeStatus.reconnects += 1;
+    bridgeStatus.clientCount = 1;
+    bridgeStatus.lastInboundAt = null;
+    bridgeStatus.lastOutboundAt = null;
+    bridgeStatus.lastPongAt = null;
+    bridgeStatus.lastPingAt = null;
+    bridgeStatus.lastSequenceIn = null;
+    bridgeStatus = refreshBridgeTrafficStatus(bridgeStatus, true);
     pushBridgeStatus();
 
     sendToNemesis({
@@ -678,7 +746,12 @@ function connectBridge() {
   ws.on('message', (raw: RawData) => {
     try {
       const msg = JSON.parse(raw.toString()) as NemesisBridgeMessage;
-      bridgeStatus.lastSeenAt = Date.now();
+      const inbound = recordBridgeInbound(bridgeStatus, msg);
+      bridgeStatus = inbound.status;
+      if (!inbound.accepted) {
+        pushBridgeStatus();
+        return;
+      }
 
       if (msg.type === 'nemesis:state') {
         latestNemesisState = msg.payload as NemesisStateMirror;
@@ -691,14 +764,27 @@ function connectBridge() {
         broadcast('gea:closeResult', msg.payload);
       } else if (msg.type === 'bridge:pong') {
         // heartbeat ack
+      } else if (msg.type === 'bridge:ping') {
+        sendToNemesis({
+          type: 'bridge:pong',
+          payload: {
+            pid: process.pid,
+            workingSetMb: Number((process.memoryUsage().rss / (1024 * 1024)).toFixed(3)),
+            sampledAt: Date.now(),
+          },
+        });
       }
+      pushBridgeStatus();
     } catch {
       // malformed packet — drop
     }
   });
 
   ws.on('close', () => {
-    bridgeStatus.connected = false;
+    if (bridgeWs === ws) bridgeWs = null;
+    bridgeStatus.clientCount = 0;
+    bridgeStatus.disconnects += 1;
+    bridgeStatus = refreshBridgeTrafficStatus(bridgeStatus, false);
     pushBridgeStatus();
     scheduleReconnect();
   });
@@ -726,7 +812,55 @@ function setupIpc() {
   ipcMain.handle('gea:getIntelligenceState', () => intelligenceState);
 }
 
+function startupTrace(label: string): void {
+  if (process.env.NEMESIS_STARTUP_TRACE !== 'true') return;
+  const line = `[gea:start] ${Date.now()} ${label}`;
+  console.error(line);
+  const traceFile = process.env.NEMESIS_STARTUP_TRACE_FILE;
+  if (!traceFile) return;
+  try {
+    fs.mkdirSync(path.dirname(traceFile), { recursive: true });
+    fs.appendFileSync(traceFile, `${line}\n`);
+  } catch {
+    // Diagnostics must never block GEA startup.
+  }
+}
+
+function handleRendererLoadFailure(detail: string): void {
+  startupTrace(`renderer-load-failed:${detail}`);
+  if (rendererLoadReady || rendererLoadRetryTimer) return;
+  if (rendererLoadRetryCount < 1 && mainWindow && !mainWindow.isDestroyed()) {
+    rendererLoadRetryCount += 1;
+    startupTrace(`renderer-load-retry:${rendererLoadRetryCount}`);
+    rendererLoadRetryTimer = setTimeout(() => {
+      rendererLoadRetryTimer = null;
+      loadRendererPage();
+    }, 250);
+    return;
+  }
+  rendererLoadFailed = true;
+  startupTrace('renderer-load-terminal-failure');
+}
+
+function loadRendererPage(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  const target = devUrl ?? path.join(__dirname, '../dist/index.html');
+  startupTrace(`renderer-load-start:${target}`);
+  const load = devUrl ? mainWindow.loadURL(devUrl) : mainWindow.loadFile(target);
+  load.then(() => startupTrace('renderer-load-promise-ok'))
+    .catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      handleRendererLoadFailure(detail.replace(/\s+/g, ' ').slice(0, 300));
+    });
+}
+
 function createWindow() {
+  if (rendererLoadRetryTimer) clearTimeout(rendererLoadRetryTimer);
+  rendererLoadRetryTimer = null;
+  rendererLoadRetryCount = 0;
+  rendererLoadFailed = false;
+  rendererLoadReady = false;
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -740,15 +874,17 @@ function createWindow() {
     },
   });
 
-  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  startupTrace('window-created');
   mainWindow.once('ready-to-show', () => mainWindow?.show());
-
-  if (devUrl) {
-    mainWindow.loadURL(devUrl).catch((err: Error) => console.error('[gea] loadURL failed', err));
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
-  }
+  mainWindow.webContents.on('did-finish-load', () => {
+    rendererLoadReady = true;
+    startupTrace('renderer-did-finish-load');
+  });
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
+    if (isMainFrame) handleRendererLoadFailure(`${errorCode}:${errorDescription}`);
+  });
+  if (process.env.VITE_DEV_SERVER_URL) mainWindow.webContents.openDevTools({ mode: 'detach' });
+  loadRendererPage();
 }
 
 app.whenReady().then(async () => {
@@ -760,9 +896,11 @@ app.whenReady().then(async () => {
   connectBridge();
   tapeStartup.begin();
 
-  setInterval(() => {
+  bridgeHeartbeatTimer = setInterval(() => {
     sendToNemesis({ type: 'bridge:ping', payload: {} });
-  }, 30_000);
+    pushBridgeStatus();
+  }, BRIDGE_HEARTBEAT_MS);
+  sendToNemesis({ type: 'bridge:ping', payload: {} });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -770,12 +908,19 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  // In supervised mode GEA is a headless worker. A transient renderer load
+  // failure or a closed hidden window must not terminate its bridge/feed work.
+  if (process.env.NEMESIS_SUPERVISED_GEA === 'true') {
+    startupTrace(rendererLoadFailed ? 'window-all-closed-after-renderer-failure' : 'window-all-closed-supervised');
+    return;
+  }
   tapeStartup.dispose();
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('will-quit', () => {
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (bridgeHeartbeatTimer) clearInterval(bridgeHeartbeatTimer);
   if (brainHealthTimer) clearInterval(brainHealthTimer);
   if (tapeRefreshTimer) clearInterval(tapeRefreshTimer);
   if (publicDataRefreshTimer) clearInterval(publicDataRefreshTimer);

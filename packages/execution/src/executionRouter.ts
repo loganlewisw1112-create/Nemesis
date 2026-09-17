@@ -10,10 +10,9 @@ import type {
 import {
   DEFAULT_STRICT_PROFIT_MODE,
   isExecutablePrice,
-  kalshiFeeForOrder,
   sanitizeExecutableBook,
 } from '@nemesis/core';
-import { allocateSize, checkConcentration, decideCapitalAllocation, type CapitalDecision } from '@nemesis/capital';
+import { checkConcentration, decideCapitalAllocation, type CapitalDecision } from '@nemesis/capital';
 import { dryRunCloseFill, dryRunFill, type DryRunOrder } from './dryRun.js';
 import type { PaperDesk } from './paperDesk.js';
 import { entryEligibilityBlockReason } from './entryEligibility.js';
@@ -193,6 +192,7 @@ function certifyOpenProfit(
     executableEntryNetEdge: entryFill.netEdge,
     spread: card.spread,
     fillSlippage: entryFill.slippage,
+    feePolicy: book.feePolicy,
   });
   if (economics.targetExitPrice <= entryFill.fillPrice) return null;
   const thesisNetPnlUsd = Number(economics.targetRewardUsd.toFixed(4));
@@ -311,14 +311,13 @@ export function resolveContractCount(
   settings: GuardrailSettings,
   contracts?: number,
 ): number {
-  if (contracts !== undefined && contracts >= 1) return Math.floor(contracts);
   const decision = decideCapitalAllocation({ card, portfolio, settings });
+  if (contracts !== undefined && contracts > 0) {
+    const requested = Math.floor(contracts * 100) / 100;
+    return Math.max(0, Math.min(requested, decision.maxSafeContracts));
+  }
   if (decision.contracts > 0) return decision.contracts;
-  const usdSize = allocateSize({ card, maxPositionUsd: settings.maxPositionUsd });
-  const price = card.side === 'yes' ? card.marketPrice : 1 - card.marketPrice;
-  const fee = kalshiFeeForOrder(price, 1);
-  const costPer = price + fee;
-  return Math.max(0, Math.min(50, Math.floor(usdSize / Math.max(costPer, 0.01))));
+  return 0;
 }
 
 export function checkPaperRisk(

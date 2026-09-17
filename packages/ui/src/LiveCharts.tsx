@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { PriceTick, PaperPosition } from '@nemesis/core';
 import {
   buildLinePath,
@@ -16,7 +17,7 @@ interface LiveChartsProps {
   height?: number;
 }
 
-export function TicketLiveCharts({ ticker, ticks, position, width = 248, height = 72 }: LiveChartsProps) {
+export const TicketLiveCharts = memo(function TicketLiveCharts({ ticker, ticks, position, width = 248, height = 72 }: LiveChartsProps) {
   if (ticks.length === 0) {
     return (
       <div style={{ padding: 12, fontSize: 11, color: 'var(--text-muted)' }}>
@@ -82,4 +83,4 @@ export function TicketLiveCharts({ ticker, ticks, position, width = 248, height 
       )}
     </div>
   );
-}
+});

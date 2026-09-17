@@ -40,6 +40,19 @@ describe('pods', () => {
     const crypto = cryptoToThesis({
       ticker: 'CRYPTO-NO', title: 'Bitcoin above strike', spotPrice: 90_000, strike: 100_000,
       marketPrice: 0.7, spread: 0.02, depthUsd: 300, lagMs: 10,
+      closeTime: new Date(Date.now() + 60 * 60_000).toISOString(),
+      binanceQuote: {
+        symbol: 'BTCUSDT',
+        price: 90_000,
+        lagMs: 10,
+        fetchedAt: Date.now(),
+        momentumBps: 0,
+        volatilityBps: 10,
+        // 10 bps per sample at the 5s spacing this window implies.
+        sigmaPerRootSec: (10 / 10_000) / Math.sqrt(5),
+        sampleCount: 12,
+        windowMs: 55_000,
+      },
     });
 
     for (const thesis of [weather, macro, sports, crypto]) {

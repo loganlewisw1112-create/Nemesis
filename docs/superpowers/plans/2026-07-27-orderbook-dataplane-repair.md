@@ -1,0 +1,662 @@
+# Orderbook Data-Plane Repair → Next Qualifying Paper Run
+
+> **Source:** NEMESIS cutoff report for the run `2026-07-26 20:32:12 PDT → 2026-07-27 04:41:25 PDT` (8.15h, KXBTCD-only allowlist, paper/dry-run, live hard-locked).
+> **Status:** plan only. No source edits, no relaunch, no settings/archive/reset until Phase 0 lands.
+> **Verdict being acted on:** the run was a valid *diagnostic*, not a qualifying paper run. Do not advance to pilot. Do not lower bars. Do not relax the exchange-origin book rule.
+
+**Goal:** restore a provably live orderbook data plane — sequenced exchange books delivered continuously to the candidates actually attempting entry — and make it *impossible* for a dead data plane to masquerade as economic rejection ever again. Only then re-judge shadow.
+
+**Explicitly not the goal:** finding a trade. If the strategy declines every opportunity on a healthy data plane, that is a result, not a failure.
+
+---
+
+## 0. Locked context — measured, do not re-derive
+
+### 0.1 Run facts (from the cutoff report)
+
+| Field | Value |
+|---|---|
+| Run window | `2026-07-26 20:32:12 PDT` → `2026-07-27 04:41:25 PDT` (8.15h) |
+| Stop | requested `03:00:00 PDT`, actual `04:41:25 PDT` — **101.4 min late** |
+| Safety | `liveEnabled=false`, `autoLiveEnabled=false`, `dryRun=true`, `demoMode=false`, `killSwitchActive=false` |
+| Launch overrides | `allowlist=KXBTCD`, `denylist=KXETHD`, `orderbookTrackingLimit=25`, `shadowMinScored=50`, `shadowMinObservationDays=1` |
+| Portfolio | cash `$5,000`, positions `0`, trades `0`, paper orders `0`, realized P&L `$0` |
+| Session | abort count `778`, API degraded minutes `152` |
+| Ledgers | strategy-validation 4,950 lines / paper-qualification 30,885 lines — **both hash chains replay clean, 0 bad JSON** |
+| Entry funnel | 4,472 confirmation observations → ready 4, pending 67, rejected 4,401; **4,136 rejects = "confirmation requires an exchange-origin book timestamp and sequence"** |
+| Ready candidates | all 4 inside the first ~95s after launch |
+| Priority trace | `admitted-no-book` 4,843 · `provenance-unavailable` 139 · **`sequenced-book` 3** (20:37:21, 20:39:05, 20:42:00 PDT) |
+| Shadow | 4 started, 2 scored (+$9.32 net, PF 4.40, 50% win, largest-win share 100%), window 0.028h vs 24h required, 2 scored vs 50 required |
+
+### 0.2 New forensic finding (mined from `bridge-telemetry.jsonl` while writing this plan)
+
+This is the decisive fact the cutoff report was one step short of:
+
+- **Last orderbook *application* frame: `2026-07-27T03:45:52.333Z` = `20:45:52 PDT` — 13 minutes 40 seconds after launch.**
+- `orderbookObservationFreshnessMs` crossed the 90s data-plane-silence bound at `03:47:24.748Z` (`20:47:24 PDT`) — last sample under bound was `88,645 ms` at `03:47:20.978Z` — and **never came back down across 18,968 bridge samples covering the remaining 7.91h**. Final value `28,532,578 ms` (7.93h); `exchangeDeltaFreshnessMs` `28,532,844 ms`.
+- `KalshiOrderbookStream.connect()` sets `lastApplicationMessageAt = connectedAt` in its `open` handler (`kalshiOrderbookStream.ts:555-558`). A single successful reconnect would therefore have reset freshness to ~0. **It never reset. The orderbook socket did not re-open once in 7.9 hours.**
+- The 3 `sequenced-book` trace hits (20:37 / 20:39 / 20:42) all land *before* 20:45:52. Every one of the 4,843 `admitted-no-book` outcomes is after the socket died.
+
+**Therefore: this was not a provenance-store failure and not a Kalshi liquidity failure.** Priority tracking worked — `admitted:true` means `kalshiOrderbookStream.isTracked(ticker)` returned true. `ensureProductionProvenance` worked (only 139 `provenance-unavailable` in 8h). The stream's own ticker set stayed populated. What died was the socket, and nothing in the process ever brought it back. Every downstream number — 4,136 exchange-origin rejects, 778 aborts, the stalled shadows — is a shadow cast by a dead socket.
+
+### 0.3 Corrections to the cutoff report (carry these forward)
+
+1. **"Reconnects / disconnects / failovers: 0 / 0 / 0" are *bridge* counters**, not orderbook-stream counters. They are the `reconnects`/`disconnects`/`failovers` fields of `bridge-telemetry.jsonl`, which describe the desktop↔GEA bridge socket. `KalshiOrderbookStream.reconnects` is **not persisted to any ledger**. The conclusion "the OB stream never reconnected" is correct but follows from the freshness trace in §0.2, not from those counters.
+2. **`audit-log.json` is a capped 5,000-entry store keyed on `t`, not `at`.** For this run it covers only `03:35:08Z → 09:06:41Z` (`20:35 → 02:06 PDT`); the last 2.6h of the run has no audit coverage at all. Any analysis filtering on `e.at` silently returns zero rows.
+3. "Bridge stayed mechanically alive" is right and is exactly the trap: `bridge:pong` RTT 64ms and `qualificationReady=true` describe the *desktop↔GEA* link, which has nothing to do with Kalshi book delivery.
+
+### 0.4 Root cause: the stream has an absorbing dead state
+
+Three code paths tear the socket down, and each can end without scheduling a reconnect:
+
+| Path | Line | Dead-end condition |
+|---|---|---|
+| `close` handler | `kalshiOrderbookStream.ts:617` | `if (!this.started \|\| !retry.retry) return;` |
+| `restartAfterFailure` | `kalshiOrderbookStream.ts:1098` | `if (!this.started \|\| !decision.retry \|\| decision.delayMs == null) return;` |
+| `forceLocalReconnect` | `kalshiOrderbookStream.ts:1023` | `if (!this.started) return;` (this one *does* always schedule when started) |
+
+`retry.retry` is false whenever `KalshiProductionConnectionController.recordFailure` returns `noRetry()` (`kalshiTransportController.ts:254-272`), which happens when:
+- the failure class is **sticky** — `authentication`, `authorization`, `configuration` (`:139-143`); or
+- the class is **not in either retryable set** — `retryable = rotatingFailures.has(c) || retryingSameEndpointFailures.has(c)` (`:347`), so an unmapped/unknown classification is silently non-retryable; or
+- `isCurrent(generation)` is false (stale generation or null `attemptId`) → `noRetry()` at `:255`.
+
+Once any of those fires: `closeCurrentSocket()` (`:1080-1092`) nulls `this.socket` and calls `clearHeartbeatTimer()`. From there:
+
+- the **heartbeat watchdog cannot run** — its interval was just cleared;
+- **`recoverIfDataPlaneSilent` cannot run** — it bails on `this.socket?.readyState !== WebSocket.OPEN` (`:264`), and the socket is `null`;
+- **`subscribeMissing()` is a no-op** — it returns early unless the socket is `OPEN` (`:640-641`), so every subsequent `replaceTracked` from `refreshOrderbookTracking` silently changes nothing on the wire while `this.tickers` still holds all 25 names;
+- `isTracked()` keeps returning **true**, so `fetchOrderbookWithPriorityTracking` records `admitted-no-book` (`main.ts:483`) forever, waits the full `PRIORITY_ORDERBOOK_WAIT_MS` (3s) each time, and falls back to a REST book with no sequence — which `entryConfirmation.ts:147-148` then correctly rejects.
+
+**That is the whole 8-hour failure in one sentence: the orderbook stream entered a non-retryable terminal state at 20:45:52 PDT, and the Jul 25 data-plane-silence fix (`3158ef9`) only covers the "socket OPEN but silent" case, not the "no socket at all" case.**
+
+### 0.5 What is *not* yet known (and must not be guessed)
+
+- **Which** failure class killed it. `registry.recordWarn('kalshi-orderbook-ws', …)` and the `console.warn` from `maybeRecoverStaleOrderbookStream` go to the console only. There is no durable record. Phase 0 exists to fix that before anything else.
+- Whether `markTrackingChanged()`'s global blast radius (`:884-891` — every membership change deletes **all** tracked books and re-quarantines **every** ticker) is a second, independent throughput limiter. It is a live suspicion, not a finding: with the socket dead, its effect is unobservable in this run's data.
+- Whether the `safety_block` / `shutdown_event` at `11:40:07.291Z` and the 778 aborts have any cause beyond the dead data plane.
+
+---
+
+## 1. Non-negotiable constraints
+
+1. **Never** weaken the exchange-origin check (`entryConfirmation.ts`, `campaignEnrollment.ts`). REST snapshots carry no match-engine sequence and never will (`packages/core/src/kalshi/client.ts` `parseOrderbook`).
+2. **Never** synthesize `sequence` or `sourceTimestamp` from a local clock.
+3. **Never** lower `minExpectedNetPnlUsd` (1) / `minRewardRiskRatio` (2) / `strictProfitMode`, and never lower the shadow quality bars, to make this run look better.
+4. Live stays hard-locked: `liveEnabled=false`, `autoLiveEnabled=false`, `dryRun=true`, `demoMode=false`.
+5. Claude/agents do **not** edit `settings.json` (classifier boundary). Any settings change is handed to the operator as exact keys.
+6. One desktop per AppData. Never two writers against `%APPDATA%\@nemesis\desktop\nemesis-data` (corrupts both hash chains).
+7. Every post-relaunch analysis filters on the **new** cutoff from `.nemesis-relaunch-cutoff.txt`. Never mix pre-cutoff corpus into a verdict.
+8. A widened timeout or a raised wait ceiling is **not** a fix for a dead socket. If a change only makes the system wait longer for something that is never coming, it does not ship.
+
+---
+
+## 2. File map
+
+| File | Role in this plan |
+|---|---|
+| `packages/connectors/src/kalshiOrderbookStream.ts` | socket lifecycle, `recoverIfDataPlaneSilent` (:263), `close` handler (:594-635), `restartAfterFailure` (:1094), `forceLocalReconnect` (:1000-1037), `closeCurrentSocket` (:1080), `subscribeMissing` (:639), `markTrackingChanged` (:884), `getBook` (:339), `telemetry` (:417-462) |
+| `packages/connectors/src/kalshiTransportController.ts` | `recordFailure` retry decision (:254), sticky classes (:139), `retryable` mapping (:347) |
+| `packages/connectors/src/productionMarketProvenance.ts` | 90s provenance TTL (`DEFAULT_PRODUCTION_MARKET_PROVENANCE_TTL_MS`) |
+| `apps/desktop/electron/main.ts` | `refreshBridgeConnectivity` (:678-703), `maybeRecoverStaleOrderbookStream` (:706-716, called at :6601), `ensureProductionProvenance` (:366), `fetchOrderbookWithPriorityTracking` (:400-487), `tracePriorityTracking` (:341), `refreshOrderbookTracking` (~:4780-4872), reverify/universe intervals (:6672-6673) |
+| `packages/execution/src/entryConfirmation.ts` | exchange-origin gate — read-only in this plan |
+| `scripts/launch-paper-allowlist.ps1` | relaunch protocol, cutoff file, env |
+| `%APPDATA%\@nemesis\desktop\nemesis-data\` | `bridge-telemetry.jsonl`, `paper-strategy-validation-events.jsonl`, `paper-qualification-events.jsonl`, `audit-log.json`, `session-stats.json` |
+
+---
+
+## Phase 0 — Durable data-plane observability (lands first, changes no behavior)
+
+**Rationale:** the previous 8 hours produced 466,339 bridge records and could not answer "why did the socket die?" Every fix in Phase 1 is unverifiable without this. Phase 0 is additive logging only — it cannot change what the app does.
+
+### Task 0.1 — Persist orderbook stream telemetry to its own ledger
+
+**Modify:** `apps/desktop/electron/main.ts` (next to `maybeRecoverStaleOrderbookStream`), `packages/connectors/src/kalshiOrderbookStream.ts` (one new read-only accessor).
+
+- [x] **Step 1** — Add `socketState(): 'none' | 'connecting' | 'open' | 'closing' | 'closed'` to the stream (read-only projection of `this.socket?.readyState`), plus `reconnectScheduled: boolean` (`this.reconnectTimer != null`) on the telemetry object. These two fields alone discriminate every hypothesis in §0.4.
+- [x] **Step 2** — On the same health tick that calls `maybeRecoverStaleOrderbookStream()` (`main.ts:6601`), append one JSON line to `NEMESIS_ORDERBOOK_TRACE_PATH` (env-gated, same pattern as `NEMESIS_PRIORITY_TRACK_TRACE_PATH`, `main.ts:341-348`) with: `at`, `socketState`, `reconnectScheduled`, `started`, `connected`, `authenticated`, `generation`, `reconnects`, `trackedTickers`, `verifiedTrackedTickers`, `serverTrackedTickers`, `qualifiedTickers`, `quarantinedTickers`, `booksWithExchangeTime`, `membershipAcknowledged`, `trackingRevision`, `acknowledgedTrackingRevision`, `subscriptionUpdateQueueDepth`, `subscriptionUpdateInFlight`, `sequenceGaps`, `sequenceRegressions`, `lastApplicationMessageAt`, `lastSequencedDeltaAt`, `lastExchangeTimestamp`, `lastCloseAt`, `lastCloseCode`, `lastCloseReason`, `lastCloseTrigger`, `failureClass`, `errorCode`, `httpStatus`, `nextRetryAt`, `activeEndpoint`, `failedEndpoint`, `switchReason`, `failureCounters`.
+  Every one of these already exists on `telemetry()` except the two from Step 1 — this is serialization, not new measurement.
+- [x] **Step 3** — Sample cap: write at most one line per health tick and skip a write when nothing but `at` changed *and* the last write was under 30s ago, so an 8h run costs kilobytes, not gigabytes.
+- [x] **Step 4** — Unit test: given a stubbed stream telemetry, the writer emits one line with all required keys and honors the dedupe window.
+
+### Task 0.2 — Make connector warnings durable
+
+**Modify:** `apps/desktop/electron/main.ts` (connector registry wiring).
+
+- [ ] **Step 1** — Mirror every `recordWarn`/`recordTelemetry` for `kalshi-orderbook-ws`, `kalshi-ws`, `kalshi-rest` into the Task 0.1 ledger (or a sibling `connector-warns.jsonl`) with `at`, `connector`, `message`. The strings that would have solved this run in five minutes — `"order-book websocket data-plane silence; forcing reconnect+resubscribe in Nms"`, `"order-book websocket pong expired"` — currently exist only in a console nobody was reading at 20:45 PDT.
+- [x] **Step 2** — Same for the `console.warn` inside `maybeRecoverStaleOrderbookStream` (`main.ts:710-715`).
+
+### Task 0.3 — Stop the bridge ledger from being misleading
+
+**Modify:** `packages/bridge-contracts/src/bridge.ts`, `apps/desktop/electron/main.ts:678-703`.
+
+- [x] **Step 1** — Add `orderbookStreamReconnects`, `orderbookTrackedTickers`, `orderbookQualifiedTickers`, `orderbookSocketState` to `BridgeStatus`, populated in `refreshBridgeConnectivity` from `kalshiOrderbookStream.telemetry()`.
+- [x] **Step 2** — Rename nothing; the existing `reconnects`/`disconnects`/`failovers` stay as bridge counters. Add a one-line comment at their declaration (`main.ts:661-675`) stating they are bridge-socket counters, so the next reader does not repeat the §0.3 misreading.
+
+### Task 0.4 — Fix the audit-log truncation
+
+**Modify:** wherever `audit-log.json` is capped/persisted.
+
+- [x] **Step 1** — The 5,000-entry cap silently discarded the last 2.6h of an 8h run. Either roll to `audit-log.jsonl` (append-only, same shape) or archive-and-rotate on cap with the rotation recorded. Keep the `t` field name; do not break existing readers.
+- [ ] **Step 2** — Note in `docs/` that audit entries key on `t`, not `at`.
+
+**Phase 0 gate:** `npx vitest run` green, `tsc --noEmit` green on `apps/desktop`, `npm run build` green. A 10-minute local launch produces a non-empty orderbook trace whose `socketState` reads `open`. No behavior change to tracking, confirmation, or execution.
+
+---
+
+## Phase 1 — Remove the absorbing dead state (the actual fix)
+
+**Principle:** a started stream must never be able to reach a state from which no code path can recover it. Recovery must be driven by an owner that is *outside* the socket, because everything inside the socket dies with it.
+
+### Task 1.1 — Failing tests first
+
+**Modify:** `packages/connectors/src/kalshiOrderbookStream.test.ts`.
+
+- [x] **Step 1** — Test A (`socket never re-opens after non-retryable close`): start a stream, track tickers, drive a close whose classification is sticky (e.g. `authentication`) or unmapped so `recordFailure` returns `noRetry()`. Assert today's behavior — `socketState === 'none'`, `reconnectScheduled === false`, and `recoverIfDataPlaneSilent()` returns `false` forever. **This test must fail after the fix**, so write it as the desired post-fix assertion: after `SUPERVISOR_INTERVAL`, the stream has attempted a new connection.
+- [x] **Step 2** — Test B (`restartAfterFailure dead end`): drive `unexpected-response` with a non-retryable HTTP status; assert recovery is eventually attempted.
+- [x] **Step 3** — Test C (`OPEN but silent` regression guard): the existing `3158ef9` behavior must still hold — 90s of application silence on an OPEN socket with non-empty membership forces reconnect+resubscribe.
+- [x] **Step 4** — Test D (`no false thrash`): a quiet-but-alive book (snapshots/deltas arriving for *some* tracked tickers) must not trigger recovery.
+
+### Task 1.2 — Supervised reconnect (replace the OPEN-only guard)
+
+**Modify:** `packages/connectors/src/kalshiOrderbookStream.ts`.
+
+- [x] **Step 1** — Generalize `recoverIfDataPlaneSilent` into `superviseDataPlane(now)` with explicit cases:
+  - `!this.started` → no-op (correct: an intentionally stopped stream stays stopped).
+  - socket `OPEN` + membership non-empty + application silence > `ORDERBOOK_DATA_PLANE_SILENCE_MS` (90s) → `forceLocalReconnect` (today's behavior, unchanged).
+  - socket **not** `OPEN` (`none`/`closing`/`closed`) **and** `reconnectTimer == null` → **schedule a connect attempt** on the supervisor's own backoff. This is the case that ran the whole 8-hour run into the ground and is currently unreachable by any recovery code.
+  - socket `CONNECTING` for longer than a connect deadline (propose 20s) → treat as failed attempt, close and re-schedule.
+  - membership empty → still supervise the socket (do not require `tickers.size > 0` for *connection* liveness; only the silence check needs membership).
+- [x] **Step 2** — Supervisor backoff: independent of the transport controller's decision, bounded exponential (propose 5s → 2× → cap 60s), reset on a successful `open` + first application frame. A sticky `authentication`/`authorization` failure should back off to the cap and keep retrying **while surfacing a loud, durable warn** — never silently give up. Rationale: credentials can be rotated/repaired at runtime; a permanently dead feed is strictly worse than a slow retry loop, and there is no real-money risk in a paper run.
+- [x] **Step 3** — Never lose the timer: assert (in code, via the supervisor) the invariant `started && socketState !== 'open' ⇒ reconnectScheduled || connectInFlight`. Emit a warn if it is ever observed false — that warn is the tripwire for the next unknown variant of this bug.
+- [x] **Step 4** — Heartbeat self-heal: if the socket is `OPEN` but the heartbeat interval handle is null, restart it. (`closeCurrentSocket` clears it; a stale-generation race could otherwise leave an OPEN socket unpinged.)
+
+### Task 1.3 — Main-process escalation ladder
+
+**Modify:** `apps/desktop/electron/main.ts:706-716` (`maybeRecoverStaleOrderbookStream`).
+
+- [x] **Step 1** — Call `superviseDataPlane` on the existing health tick, and escalate on consecutive failures: `resubscribe` → `reconnect` → `endpoint failover` → `stop() + start()` full stream restart. Each step bounded, counted, and written to the Phase 0 ledger with the reason.
+- [x] **Step 2** — Hard rule: never escalate silently. Every escalation writes one durable line.
+- [x] **Step 3** — Keep the existing `console.warn` and add the same content to the ledger.
+
+**Phase 1 gate:** Tests A–D green; full `npx vitest run` green (expect 555+ tests); `tsc --noEmit`; `npm run build`. Then a **fault-injection soak**: run 30+ minutes locally and forcibly kill the orderbook socket at least twice (e.g. drive a sticky failure through the stream's test seam); the trace must show `socketState` returning to `open` and `lastSequencedDeltaAt` advancing within one backoff cycle each time.
+
+---
+
+## Phase 2 — Separate "tracked" from "sequenced" (report item 2)
+
+**Problem being fixed:** the system currently has one word — *tracked* — for four different states, and `admitted-no-book` collapses all failures after admission into one bucket. That is why an 8-hour dead socket read as a 4,843-count provenance-shaped symptom.
+
+### Task 2.1 — Per-ticker book lifecycle state
+
+**Modify:** `packages/connectors/src/kalshiOrderbookStream.ts` (new read-only accessor), consumed in `main.ts`.
+
+- [x] **Step 1** — `bookState(ticker)` returning one of: `untracked` · `tracked-no-provenance` · `subscribed-awaiting-snapshot` · `snapshot-quarantined` (snapshot received, no qualifying delta yet — see `applySnapshot` :839-841, which deliberately quarantines until a sequenced delta proves advance) · `sequenced` — plus `sequencedAgeMs` and `snapshotAgeMs`.
+- [x] **Step 2** — Unit tests for each transition, including the `deltaTrackingRevision !== trackingRevision` case (a delta that arrives against a superseded membership revision does **not** un-quarantine — `applyDelta` :899-906).
+
+### Task 2.2 — Refine the priority-track trace outcomes
+
+**Modify:** `apps/desktop/electron/main.ts:473-484`.
+
+- [x] **Step 1** — Replace the single `admitted-no-book` outcome with the Task 2.1 state at the moment the wait expires: `admitted-socket-dead`, `admitted-awaiting-snapshot`, `admitted-quarantined`, `admitted-no-delta`. Keep `sequenced-book`, `provenance-unavailable`, `refused` unchanged so historical traces stay comparable.
+- [x] **Step 2** — Add `socketState` and `lastSequencedDeltaAgeMs` to every trace line. Had these existed, this run's diagnosis would have taken minutes.
+
+### Task 2.3 — Measure `markTrackingChanged` blast radius (measure, then decide)
+
+`markTrackingChanged()` (`:884-891`) deletes **every** tracked book and quarantines **every** ticker on **any** membership change. `fetchOrderbookWithPriorityTracking` calls `replaceTracked` per untracked candidate, on top of the 5-minute rotation and the allowlist force-fill path.
+
+- [x] **Step 1** — From the Phase 0 ledger, compute membership-change rate (`trackingRevision` deltas per minute) and the distribution of time-to-`sequenced` after each change. **Do not change this code before that measurement exists.**
+- [x] **Step 2** — Only if churn is shown to be starving re-qualification: scope invalidation to tickers whose subscription membership actually changed, keeping the fail-closed property (a ticker whose subscription was disturbed must still re-prove sequence continuity before its book is trusted). Add a test that a *retained* ticker keeps its sequenced book across an unrelated add/remove, and that a *disturbed* ticker does not.
+- [x] **Step 3** — Companion measurement: how often provenance lapses (90s TTL) against the 20s paced reverify and 5-minute universe refresh, for tickers that are tracked but not candidates. A lapse silently drops a ticker from `selectVerified` inside `replaceTracked`.
+
+**Phase 2 gate:** a 30-minute run's trace can answer, per candidate, *which* stage it died at, without reading source.
+
+---
+
+## Phase 3 — Fail-closed candidate book health (report item 3)
+
+**Principle:** if the data plane cannot prove itself, the run must declare itself degraded rather than emit thousands of rejections that look economic.
+
+### Task 3.1 — Candidate-scoped health metric
+
+**Modify:** `apps/desktop/electron/main.ts`, `packages/execution/src/entryConfirmation.ts` (accessor use only — the gate itself is untouched).
+
+- [x] **Step 1** — Define `candidateSequencedBookHealth`: over the tickers with confirmation in flight (`EntryConfirmationEngine.inFlightTickers()` already exists) plus campaign-critical tickers, report `count`, `maxSequencedAgeMs`, `fractionSequencedWithin(N)`. Propose `N = 30s`.
+- [ ] **Step 2** — Expose on the bridge status, session stats, and the renderer.
+
+### Task 3.2 — Degraded-run latch
+
+- [x] **Step 1** — When `fractionSequencedWithin(30s) == 0` across all in-flight candidates for more than a grace window (propose 3 consecutive minutes), latch `dataPlaneDegraded = true`: keep the pipeline running, keep logging, but **tag every confirmation rejection emitted while latched** with `dataPlaneDegraded: true`.
+- [x] **Step 2** — The report/verdict generator must exclude `dataPlaneDegraded` rejections from any economic conclusion and must state the degraded minutes prominently. This is the guardrail that makes "no edge" and "no data" impossible to confuse — the exact confusion this run produced.
+- [x] **Step 3** — Unlatch only on a sustained recovery (propose: 2 consecutive minutes with at least one candidate sequenced inside 30s).
+- [x] **Step 4** — Tests: latch on, latch off, tagging applied, verdict generator excludes tagged rows.
+
+**Phase 3 gate:** replaying this run's conditions (dead socket at T+13m) against the new latch produces a run marked degraded from ~T+16m onward, with 0 rejections counted as economic evidence.
+
+---
+
+## Phase 4 — Controlled relaunch protocol
+
+Only after Phases 0–3 are committed, green, and built.
+
+### Task 4.1 — Preflight
+
+- [ ] Confirm zero `KRYPT*nemesis*` electron processes (`Get-CimInstance Win32_Process`), per the launch script's own refusal check.
+- [ ] Confirm `settings.json`: `dryRun=true`, `liveEnabled=false`, `autoLiveEnabled=false`, `demoMode=false`, `killSwitchActive=false`, profit bars unchanged.
+- [x] Confirm `dist-electron/main.js` contains the new supervisor symbol (string-search the built bundle — the Jul 24 plan learned this lesson: never debug a theory against a stale build).
+- [x] Add `NEMESIS_ORDERBOOK_TRACE_PATH` to `scripts/launch-paper-allowlist.ps1` alongside the existing priority-track trace, and point the log dir at `overnight-logs/<run-date>/`.
+- [ ] Write a fresh `.nemesis-relaunch-cutoff.txt`; all analysis filters on it.
+
+### Task 4.2 — Staged verification (abort criteria are hard)
+
+| Checkpoint | Must be true | If not |
+|---|---|---|
+| **T+5 min** | `socketState=open`, `lastSequencedDeltaAgeMs < 30s`, `qualifiedTickers > 0` | stop the run; the fix did not take |
+| **T+15 min** | ≥1 `sequenced-book` trace outcome; `orderbookObservationFreshnessMs` staying under 90s | stop; re-diagnose from the new ledger, do not "let it run and see" |
+| **T+60 min** | `sequenced-book` share of priority-track outcomes clearly dominant over `admitted-*`; zero unexplained supervisor escalations | stop and diagnose |
+| **T+4 h** | data-plane never latched degraded for more than a single recovery cycle; ledger hash chains clean | stop and diagnose |
+| **Rolling** | live flags still locked; single writer; abort-count growth explainable | stop immediately on any breach |
+
+- [ ] **Step 1** — Keep the KXBTCD-only allowlist and `orderbookTrackingLimit=25` for the first repair run. One variable at a time: this run tests the data plane, not a new universe.
+- [ ] **Step 2** — Use a *deterministic* stop (see Task 6.1) rather than a best-effort heartbeat.
+
+**Phase 4 gate — the run only counts as a data-plane repair proof if:** ≥ 2 continuous hours with `fractionSequencedWithin(30s) > 0.9` for in-flight candidates, and total degraded minutes < 5% of the run.
+
+---
+
+## Phase 5 — Only then, re-judge shadow
+
+- [ ] **Step 1** — With the data plane proven, re-run long enough to satisfy the shadow gate as configured: `shadowMinScored=50` scored observations over `≥ 24h` observation window, plus the unchanged quality bars (`winRate ≥ 0.55`, `profitFactor ≥ 1.25`, `stressedNetPnl > 0`, `stressedPF ≥ 1.1`, hardcoded `largestWinShare ≤ 0.2`).
+- [ ] **Step 2** — Judge the strategy **only** on shadows scored entirely inside a non-degraded window. This run's 2 scored shadows (+$9.32, largest-win share 100%, 0.028h window) are not evidence of anything and must not be carried forward.
+- [ ] **Step 3** — Remember the standing prior from 2026-07-25: the crude `crypto-lead` probability proxy measured **no edge** over 36 shadows (11% win rate, −$52.48, correlation −0.10). A clean data plane does not repeal that. If the corrected normal-CDF model (`packages/core/src/stats/normalCdf.ts` exists as of `884c90c`) is what is now being tested, say so explicitly in the verdict — otherwise a green data-plane run will be misread as a green *strategy* run.
+- [ ] **Step 4** — Do not bypass the shadow gate, do not lower `shadowMinScored` below 50 for a verdict run, and do not advance to pilot on a partial window.
+
+---
+
+## Phase 6 — Operational debt from this run
+
+### Task 6.1 — The 101-minute late stop
+
+- [x] Requested `03:00:00 PDT`, actual `04:41:25 PDT`. Replace the heartbeat-dependent stop with a scheduled, self-verifying stop: a timer that (a) fires independently of the agent loop, (b) verifies zero matching electron processes afterward, and (c) writes a stop receipt with requested vs actual. A stop that can drift 100 minutes cannot bound an unattended run.
+
+### Task 6.2 — Aborts and degraded minutes
+
+- [ ] Classify the 778 session aborts. The audit ring for this run shows the top classes: `entry_confirmation_rejected / exchange-origin` ×4,136, `capital_allocator_block / insufficient protected profit` ×377, `strict_profit_block` ×147, `capital_allocator_block / excessive slippage` ×55+32, `book_unavailable` ×37+19, `fill_aborted / slippage exceeded` ×25. Under Phase 3, everything downstream of a degraded data plane should be tagged rather than counted.
+- [ ] Attribute the 152 "API degraded minutes" to a specific connector; today that number cannot be traced to a cause.
+
+### Task 6.3 — The shutdown safety block
+
+- [x] `2026-07-27T11:40:07.291Z`, `safety_block`, code `shutdown_event`, detail `session shutdown counters triggered` (`main.ts:4027`). It did not mutate portfolio state. Confirm it is purely a shutdown-path artifact — cross-check against `042ae70` ("Keep paper eligibility alive when session shutdown counters trip") — and if so, downgrade its severity so it stops reading as a runtime risk marker on every clean stop.
+
+---
+
+## Success criteria
+
+1. A started orderbook stream has **no** reachable state from which recovery is impossible — proven by fault-injection tests, not by a clean run.
+2. Sequenced exchange books are delivered continuously to in-flight candidates for ≥ 2 hours (`fractionSequencedWithin(30s) > 0.9`).
+3. `sequenced-book` is the dominant priority-track outcome; `admitted-*` outcomes are a small, explained minority.
+4. A dead or degraded data plane self-declares within 3 minutes and cannot be reported as economic rejection.
+5. Every claim above is answerable from durable ledgers alone, with no console access and no source reading.
+6. Exchange-origin rule, profit bars, shadow quality bars, and live locks all unchanged. Portfolio integrity intact; hash chains clean.
+
+## Explicit non-goals
+
+- Producing a trade, a green P&L, or a passing shadow gate in this work.
+- Widening `PRIORITY_ORDERBOOK_WAIT_MS`, `maxBookAgeMs`, or any tolerance. If a candidate cannot get a sequenced book, the answer is to deliver one, not to wait longer or accept less.
+- Expanding the allowlist, changing position sizing, or touching stop geometry. Those are separate, measured decisions and would contaminate this one.
+- Re-opening the renderer-heartbeat or memory-slope guards. Those bugs are dead; every later blocker has been a different mechanism.
+
+## Run order (cheat sheet)
+
+```text
+1.  Phase 0  — observability only .......... build + 10-min sanity launch
+2.  Phase 1  — supervisor + tests .......... fault-injection soak (kill the socket twice)
+3.  Phase 2  — state separation ............ 30-min trace legibility check
+4.  Phase 3  — degraded latch .............. replay-style verification
+5.  Phase 4  — controlled KXBTCD relaunch .. T+5 / T+15 / T+60 / T+4h gates
+6.  Phase 5  — shadow re-judgement ......... only on a non-degraded ≥24h window
+7.  Phase 6  — ops debt .................... stop timer, abort classification, shutdown block
+```
+
+Push each phase once typecheck + tests + build are green; do not park green commits waiting on the next phase.
+
+---
+
+## Execution log — 2026-07-27 (Phases 0–3 + Phase 6 code, committed `6f8a424`, pushed)
+
+Phases 0, 1, 2 (except the measurement-gated 2.3), 3 and the code half of Phase 6 are
+implemented. **655/655 tests, typecheck, build and the isolated CI boot smoke are green.**
+Phases 4 and 5 are runtime protocol and have not been executed — no app was launched.
+
+### Landed
+
+| Task | Where | Note |
+|------|-------|------|
+| 0.1 stream telemetry ledger | `orderbookTrace.ts` (new, 13 tests), `main.ts superviseOrderbookDataPlane` | `NEMESIS_ORDERBOOK_TRACE_PATH`; dedupe writes on state change or 30s, so a state transition is never dropped but an 8h healthy run stays in kilobytes |
+| 0.1 discriminating fields | `kalshiOrderbookStream.socketState()`, telemetry `reconnectScheduled` / `connectInFlight` / `supervisorEscalations` / `lastSupervisionAction` | these alone separate every §0.4 hypothesis |
+| 0.2 durable warnings | `NEMESIS_CONNECTOR_WARN_TRACE_PATH`, never deduped | **partial**: supervisor actions and latch transitions are mirrored; a general `registry.recordWarn` tap for `kalshi-ws`/`kalshi-rest` is not wired |
+| 0.3 bridge ledger | `bridge.ts`, `refreshBridgeConnectivity` | added `orderbookSocketState`, `orderbookStreamReconnects`, `orderbookTrackedTickers`, `orderbookQualifiedTickers`, `orderbookSupervisorEscalations`, `dataPlaneDegraded(Ms)`, `candidateSequencedBookFraction`; bridge counters kept and commented as bridge-socket counters |
+| 0.4 audit truncation | `auditLog.ts` (+10 tests), `main.ts` | overflow archived to `audit-log-archive.jsonl`; `new AuditLog()` still caps at 5000 exactly; `load()` now enforces the cap too (that was the silent-loss path) |
+| 1.1–1.2 supervisor | `kalshiOrderbookStream.superviseDataPlane()` (+11 tests) | recovers from dead socket / stuck CONNECTING (20s deadline) / cleared heartbeat / 90s application silence; own backoff 5s→×2→60s cap, independent of the controller's `noRetry()`; sticky auth failures retry at the cap with a durable warn; invariant tripwire returns `invariant-violation` |
+| 1.3 escalation ladder | stream-internal, driven from the health tick | 3 consecutive failed attempts → full stream restart, counted, every escalation writes a line. Ladder lives in the stream rather than main so the invariant cannot be bypassed by a caller |
+| 2.1 book lifecycle | `bookState(ticker)` → 5 states + `sequencedAgeMs`/`snapshotAgeMs` | derived from `getBook()`, so it cannot be weaker than the evidence rule; a delta against a superseded `trackingRevision` correctly reads `snapshot-quarantined` |
+| 2.2 trace outcomes | `main.ts fetchOrderbookWithPriorityTracking` | `admitted-no-book` split into `admitted-socket-dead` / `-provenance-lapsed` / `-awaiting-snapshot` / `-quarantined` / `-no-delta`; `sequenced-book` / `provenance-unavailable` / `refused` unchanged; every line now carries `socketState` and delta ages |
+| 3.1–3.2 fail-closed latch | `dataPlaneHealth.ts` (new, pure, 29 tests) | latch on after 3 min continuously unhealthy, off after 2 min healthy; zero-candidate windows judged on stream-level sequenced-delta age so an idle window still latches; **replay test: this run's shape latches at T+16.5m and never recovers, 96.6% of the run degraded** |
+| 3.2 tagging | `strategyValidation.ts`, `main.ts` | `entry_confirmation_observed` carries `dataPlaneDegraded`. Tagged, never suppressed |
+| 3.2 verdict guard | `scripts/analyze-dataplane-run.cjs` (new) | splits `taggedDegraded` from `economicallyValid` and scores the run against explicit gates; reproduces the post-mortem numbers exactly (4,843 / 139 / 3 priority outcomes; 4,472 confirmations; 4,136 exchange-origin; ready 4; maxSamples 6) |
+| 6.1 deterministic stop | `scripts/stop-nemesis-at.ps1` (new) | `-At`/`-AfterMinutes`, drift receipt, grace then `-Force`, exit 2 if anything survives, matches only `KRYPT*nemesis*` electron |
+| 6.3 shutdown block | `main.ts` | not a severity field (safety-block events carry none) — the detail string now attributes the trip: each counter against its bound plus `dataPlaneDegraded`. This run tripped on `apiDegradedMinutes=152/10`, itself downstream of the dead socket |
+| 4.1 preflight, automated | `scripts/launch-paper-allowlist.ps1` | refuses to launch on a stale bundle (markers `NEMESIS_ORDERBOOK_TRACE_PATH`, `superviseDataPlane`, `admitted-socket-dead`, `data plane DEGRADED` — string literals and class members, which esbuild preserves; plain function names get renamed and would false-alarm), dates its own log dir, exports both new trace paths |
+
+### Task 2.3 — measurement taken 2026-07-27 on the live repair run (1.73h, 443 open samples)
+
+The gate on this task was "do not change this code before that measurement exists." It exists now,
+and it says the churn is real, self-inflicted, and the dominant remaining constraint.
+
+**Step 1 — membership churn.** `trackingRevision` advances **3.0/min** — a membership change every
+20 seconds. 453 priority-track attempts produced 313 revisions, so priority-track admission is the
+dominant source: each admission calls `replaceTracked`, which wipes every book.
+
+**Step 3 — companion measurement, provenance lapse ruled out.** Only **3.4%** of open samples show
+`verifiedTrackedTickers < trackedTickers` (median verified 25/25). The 90s TTL against the 20s
+paced reverify is keeping up. This is *not* a provenance problem.
+
+**What the churn costs, measured:**
+
+| state | share of open samples | median quarantined |
+|---|---|---|
+| membership unacknowledged | 16.7% | **25 of 25** (the whole universe dark) |
+| membership acknowledged | 83.3% | 4 |
+
+- 75.4% of open samples have at least one quarantined ticker; median qualified 17/25.
+- Zero sequence gaps, zero regressions across the whole run — the exchange stream is clean, so
+  every one of these invalidations was self-inflicted.
+
+**The feedback loop, confirmed numerically.** `refreshOrderbookTracking` computes stickiness as
+`current: orderbookTrackedTickers.filter(t => hasExchangeProvenance(getBook(t)))` — a ticker with
+no sequenced book loses its slot. So: a wipe deletes all books → all tickers lose stickiness → the
+next refresh recomputes a different membership → another wipe.
+
+| after a sample with… | avg revisions to next sample | mean candidate fraction sequenced |
+|---|---|---|
+| ≥13 tickers quarantined | **0.97** | **0.071** |
+| <13 tickers quarantined | 0.62 | 0.612 |
+
+Churn is 56% higher coming out of a heavy-quarantine state, and candidate book health is **8.6×
+worse** inside it. That is the mechanism behind the one failing Phase 4 gate
+(`candidate books sequenced >90%` → 21.3%).
+
+**Step 2 — fix implemented** (scoped invalidation + revision carry-forward at the acknowledgement
+point). A book that was proven under a prior epoch (snapshot **and** sequenced delta, un-quarantined)
+survives a membership change that did not disturb its own subscription, and re-qualifies at the
+acknowledgement without a snapshot round-trip. Books mid-update stay unqualified — fail-closed is
+unchanged; only the recovery cost changes. Disturbed and unproven tickers are invalidated and
+snapshot-repaired exactly as before.
+
+### Deliberately not done
+- **Task 3.1 Step 2 (session stats + renderer)** — the metric is on `BridgeStatus` only.
+- **Task 0.4 Step 2 (`docs/` note on the `t` key)** — captured as a doc comment on `AuditEntry.t`.
+- **Task 6.2 (abort classification)** — needs a run under the new tagging to be worth doing;
+  classifying the old 778 against an untagged ledger would re-import the confusion this plan exists
+  to end.
+- **Phases 4 and 5** — require launching an unattended paper run. Operator's call on timing.
+
+---
+
+## Phase 4 result — 2026-07-27, two runs, stopped 15:00:01 PDT
+
+**Run A** (09:58–12:08 PDT, 2.13h, pre-Task-2.3) and **Run B** (12:08–15:00 PDT, 2.85h, on `5b36733`).
+
+**The deterministic stop worked: 1.001s drift** (requested 15:00:00, actual 15:00:01), 9 matched,
+0 remaining, no force escalation, exit 0. Against the 101-minute drift that motivated Task 6.1.
+
+### Phase 4 gate: NOT met — 4 of 7 pass on Run B
+
+| gate | result |
+|---|---|
+| socket open at cutoff | PASS |
+| sequenced delta < 30s | PASS (1.0s) |
+| ≥1 sequenced-book outcome | PASS (94) |
+| no supervisor invariant violations | PASS (0) |
+| sequenced-book dominates | FAIL — 31.9% |
+| candidate books sequenced >90% | FAIL — 9.5% |
+| degraded under 5% | FAIL — 82.5m of 2.85h (48%) |
+
+### What was proven
+
+- **The absorbing dead state is gone.** The supervisor fired `reconnect-dead-socket` on
+  `socket state none with no reconnect armed` — the exact terminal condition that ran 7.9h
+  unnoticed on 2026-07-26 — and recovered in seconds. Across both runs: 0 invariant violations.
+- **Task 2.3 works.** Run B's clean middle hour: churn **0.52 rev/min** (vs 3.24 pre-fix), median
+  quarantined **0** (vs 7), median qualified **24/25** (vs 15), socket 100% open.
+- **The fail-closed latch earned the whole day.** Run B tagged **1,238 of 1,449** confirmations
+  `dataPlaneDegraded`; only 211 stand as economic evidence. Without it this run would have
+  reported ~1,449 strategy rejections, ~85% of which were feed artifacts.
+
+### What was learned that the plan did not anticipate
+
+1. **Churn was never the whole story.** In Run B's flawless middle hour — socket 100% open, zero
+   quarantine, 21 of 25 tickers holding qualifying books — candidate book health was still only
+   **0.274**. The candidates were on tickers the tracked set did not hold. The binding constraint
+   is now **coverage**, not delivery.
+   - Root cause found: `desiredOrderbookTickers` admits a ticker only via `isProductionLiveTicker`,
+     which reads an *unlapsed* production record. A candidate mid-confirmation whose 90s TTL
+     expires falls out of the desired set, loses its slot, and then fails hydration again on the
+     entry hot path where `ensureProductionProvenance` gets one un-retried REST attempt.
+     `reverifyTrackedProductionMarkets` covered only *tracked* tickers, never in-flight candidates.
+   - `provenance-unavailable` rose to the **top** priority-track outcome at 31.4% (was 9.9%).
+   - Not rate limiting: zero HTTP statuses recorded; stream failures were `timeout`/`dns`.
+2. **The degraded flag did not reach the shadow ledger.** The latch tagged
+   `entry_confirmation_observed` but not `shadow_candidate_started`/`_scored`. Six shadows scored
+   during an hour that was 83% degraded, moving the ledger −$13.44 → **−$36.69**, and were
+   indistinguishable from clean ones in the very ledger the gate reads. The firewall had a hole
+   exactly where the verdict is computed.
+3. **Kalshi socket instability is real and outside our control** — 44 reconnects/hour in Run B's
+   final hour (62 total, 4 escalations). Each legitimately drops every book. We can only make
+   recovery favour the tickers that matter.
+
+### P0 answered: the corrected model IS live
+
+`crypto-lead.ts` no longer uses the 2026-07-25 linear proxy. It computes
+`d = (ln(S/K) − 0.5σ_T²)/σ_T`, `impliedPrice = normalCdf(d)`, with σ_T from observed Binance
+volatility scaled by `√(timeToExpiry/dt)` and floored by an annualised vol floor, plus fail-closed
+invalid reasons (`crypto-sigma-unusable`, `crypto-expiry-unavailable`) that fall back to market
+price and zero edge.
+
+**So the shadow ledger is now measuring the corrected model** (49 scored, 11 wins, 22%, −$36.69) —
+which makes it consequential, and makes finding #2 urgent: that number is contaminated and cannot
+be treated as a verdict until degraded-window shadows are excluded.
+
+### Final ledger state
+
+Portfolio `$5,000`, 0 positions, **0 trades**, live hard-locked throughout. 789 aborts.
+Shadow 49 scored / 11 wins / −$36.69 (contaminated). Hash chains intact.
+
+### Follow-up work landed the same day (P0–P2)
+
+| item | where | note |
+|---|---|---|
+| **P0 — which model is being shadowed?** | `packages/pods/src/crypto-lead.ts` | **Answered: the corrected one.** See above. No code change needed. |
+| **P1 — candidate coverage** | `main.ts reverifyTrackedProductionMarkets` | Confirmation-in-flight tickers now lead the paced reverify set and are covered even when untracked, capped at `25 + maxPendingCandidates`. Reuses the existing rate-limit-safe loop rather than adding hot-path retries. |
+| **P1.5 — shadow contamination** | `strategyValidation.ts`, `main.ts` | `dataPlaneDegraded` now rides on `shadow_candidate_started` and `shadow_candidate_scored`; contaminated rows are recorded but excluded from every acceptance tally. |
+| **P1.5b — contamination-share bound** | `strategyValidation.ts` | `SHADOW_MAX_CONTAMINATED_SHARE = 0.2`. **Contamination is not random with respect to outcome** — degraded books cause bad entries, so the excluded population is loss-heavy and clean-subset tallies could otherwise flatter a bad strategy. Above the bound the gate is held closed (`shadowContaminationBlocked`), because the surviving sample is not a test. It can only hold the gate closed, never open it. |
+| **P2 — priority snapshot repair** | `kalshiOrderbookStream.setRepairPriority`, `main.ts` health tick | In-flight candidates are repaired first after any invalidation. **Correction to the original rationale:** `get_snapshot` does not hold the pending-update slot, so the queue is not pumped one command at a time here; the true claim is that Kalshi processes commands in receipt order, so the smaller priority command's snapshots are generated first. Size of the win is unmeasured and could be small. |
+| **Analyzer — retroactive classification** | `scripts/analyze-dataplane-run.cjs` | The degraded flag only exists going forward, so pre-existing shadows read as clean. The analyzer now joins scored shadows against degraded intervals derived from the orderbook trace: inside an interval ⇒ contaminated, inside trace coverage but outside ⇒ clean, outside coverage ⇒ **unclassified** (never silently counted as clean). |
+
+**First result from retroactive classification of the existing 49-shadow ledger:**
+
+| population | scored | wins | net |
+|---|---|---|---|
+| clean | 31 | 8 (26%) | **−$31.07** |
+| contaminated | 16 | 2 | −$14.94 |
+| unclassified (pre-trace) | 2 | — | +$9.32 |
+
+Contamination share **34%** — over the bound, so this ledger is not yet a valid test. But note what it
+does say: **excluding contamination does not rescue the result.** The clean subset is 26% win rate
+against a 0.55 bar, on the corrected normal-CDF model. That is not yet a verdict (31 clean vs a bar of
+50, and the 24h window is unmet), but it is no longer explicable as a data problem.
+
+683/683 tests, typecheck and build green.
+
+### Next action (operator)
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/launch-paper-allowlist.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stop-nemesis-at.ps1 -AfterMinutes 300
+node scripts/analyze-dataplane-run.cjs   # at T+15, T+60, and after the stop
+```
+
+The analyzer exits non-zero while any data-plane gate fails, which is the Phase 4 abort criterion
+in executable form. A failed gate means the run is a diagnostic, not evidence about edge.
+
+---
+
+## 2026-07-31 — ordered remediation from the 2026-07-29 audit (items 1–6, all pushed)
+
+Six items worked in order, each gating the next. 769/769 tests, typecheck and build
+green at every commit. Nothing was launched: Phases 4–5 remain the operator's call.
+
+**Do not treat the existing simulated record (103 scored / 24 wins / −$90.68) as evidence
+about the strategy in either direction.** Two independent defects manufactured both sides
+of it, and both are fixed below. The record predates every fix here.
+
+### 1. Ledger deep-copy — `bab41c1`
+
+`PaperQualificationStore.record` and `StrategyValidationStore.record` recover the 1–2
+events they just appended via `tracker.eventsAfter()`, which routed through `allEvents()` —
+a JSON deep copy of the **entire** append-only ledger, on every append, on the
+per-orderbook-delta hot path. Same shape as the clone that once starved the renderer
+heartbeat; `sevenHourCampaignStore` was fixed then and these two siblings never were.
+
+Measured at the live ledger size (249,245 events / 89 MB): **342.6 ms per append before,
+0.238 ms after** — and the remainder is the `appendFileSync`, not the lookup. At five to
+ten writes per five seconds that was 1.7–3.4 s of blocked main thread per five seconds.
+
+Fixed in the trackers rather than the stores: sequences are assigned as `events.length + 1`
+on an append-only array, so the events after a given sequence are always a contiguous tail.
+`eventsAfter` walks back from the end and clones only that tail. Output is unchanged for
+every input, which is why this was preferred over trusting the mutation's return value — it
+still captures events appended as a side effect of a mutation that returns only some of them.
+
+### 2. The two scoring defects — `a508796`
+
+Both moved out of `main.ts` into `shadowFollowUp.ts` as a pure decision function; neither
+path had any coverage before.
+
+- **A missing thesis card read as zero edge.** `cardForTickerSide(...)?.netEdge ?? 0`
+  manufactured a `0.000000` reading whenever no card existed, and `0` satisfies the
+  `netEdge <= 0` give-up test, closing the position into the spread on absent data. 42 of 74
+  edge-gone closes had all three final readings at exactly 0.000000; **67% of all recorded
+  losses**. A missing card is now the absence of a reading, not a reading of zero: no
+  observation is recorded and no model-driven close can fire. The 15-minute deadline still
+  fires without a card — it is time-based and its mark comes from the book.
+- **The target fired on the first poll that crossed it**, with no stop on the other side.
+  Taking the first crossing of a noisy mark systematically harvests the running maximum: all
+  15 target-scored wins landed on the running maximum of their entire history and 12 were
+  underwater first. The target must now hold across three observations spanning at least 10s,
+  and the candidate is scored at the latest mark rather than the peak.
+
+The loss stop stays deliberately absent (see the note at the call site). The asymmetry is
+fixed by making the win condition demand as much evidence as the give-up condition.
+
+### 3. Volatility input — `1c2794d`
+
+`normalCdf`, the unit conversions and the drift sign were checked and are correct; none are
+touched.
+
+- **Floor removed.** `Math.max(observedSigmaT, floorSigmaT)` won 57% of the time and
+  exceeded market-implied volatility in 34% of snapshots. `sigmaT` is now what was measured,
+  scaled by `sqrt(t)` and nothing else. A window with no measurable volatility fails closed
+  as `crypto-sigma-unusable` rather than borrowing a number nobody measured.
+- **Time-weighted estimator.** `rollingVolatilityBps` produced a per-sample dispersion with
+  no time unit, which `crypto-lead` rescaled by the *mean* sample gap — valid only for a
+  uniformly sampled series, and `recordQuote` is fed by a sub-second websocket and a 5s poll
+  at once. `realizedVolPerRootSec` accumulates realised variance over the wall time it
+  actually accrued across each real gap, after sparse-sampling to a 1s grid so sub-second
+  bid-ask bounce is not divided by its own tiny interval. `volatilityBps` stays for display
+  and confidence scoring, now documented as such.
+- **Ladder calibration gate.** The market quotes the whole strike ladder on one underlying at
+  one expiry and it fits lognormal at R-squared 0.997, so inverting each quote and regressing
+  `ln(S/K)` on the normal quantile recovers the volatility the market itself is quoting — one
+  line through data already in hand. Model volatility outside 0.5x–1.5x of it invalidates the
+  card (`crypto-sigma-uncalibrated`). The gate stays dormant when the ladder cannot support a
+  fit (too few quotes off the rails, no slope, backwards ladder, R-squared under 0.95); near
+  expiry a fixed-width ladder legitimately pins at the rails and reports no fit rather than
+  inventing one. New: `packages/core/src/stats/ladderImpliedVol.ts` (Acklam probit + the fit).
+
+Consequence addressed: the 3-cent contract priced at 16.5 cents.
+
+### 4. Quote-stream supervisor — `f0a83d5`
+
+`KalshiStream.scheduleReconnect` arms nothing on a no-retry verdict, by which point
+`closeCurrentSocket` has nulled the socket and cleared the heartbeat while `started` stays
+true — the identical absorbing dead state that ran the orderbook stream dark for 7.9h, and
+nothing on any timer was watching this one. `superviseDataPlane` mirrors the orderbook's:
+dead-socket recovery, a 20s connect deadline, heartbeat self-heal, bounded escalation to a
+full stream restart, its own 5s to 60s backoff independent of the controller's verdict,
+sticky auth classes retrying at the cap with a durable warn, and the invariant tripwire.
+Driven from the same health tick; every action goes to the connector warn trace.
+
+### 5. Leaks and rotation — `28962c6`
+
+- **Confirmation-state sweep.** States were only removed from inside `observe()`, so a chain
+  flow moved on from held a `maxPendingCandidates` slot and pinned its ticker via
+  `inFlightTickers()` forever — orphans grew 3 to 22 of 25 slots over seven hours. `sweep()`
+  drops chains not re-observed within `maxSourceAgeMs`, on the health tick.
+- **`usedSources` bounded** at 20,000, oldest-first — orders of magnitude above the
+  single-digit `maxPendingCandidates`, and `main.ts` re-seeds it from the ledger every start.
+  `markSourceUsed` also now releases its `sourceToStateKey` mapping, which leaked too.
+- **Bridge telemetry rotation.** 406 MB unrotated, now `RotatingJsonlWriter` at 4 x 32 MB.
+  Writes stay synchronous on purpose: this file is read after a crash, which is exactly when
+  buffered records would be the missing ones.
+- **Main-process memory guard** (the renderer had three, main had none while near 1 GB).
+  Warns on three consecutive samples over 1 GB with the heap breakdown and chain count. It
+  only reports — an unattended run that self-terminates on a memory reading loses its
+  evidence, which is worse.
+- **`app.requestSingleInstanceLock()`**, taken before `whenReady`. Two desktops on one
+  user-data directory interleave two sequence streams into both ledgers and corrupt both hash
+  chains. `OperationalLeaseTracker` was never this guard despite the name, so it is renamed
+  `HealthAttestationTracker` (the `lease` field in `RuntimeHealthSnapshot` keeps its name; it
+  is broadcast and persisted).
+- **`process.on('unhandledRejection')`** keeps the process alive and records the reason. The
+  two campaign-ledger appends reached from fire-and-forget callers now go through
+  `recordCampaignEventSafely`, which pauses evidence and records the failure instead of
+  ending an unattended run hours in.
+
+**Deliberately not done: compacting the two large ledgers.** They are hash-chained
+append-only evidence — replaying every event from the first is what proves the chain intact,
+and rewriting a prefix forfeits exactly the integrity the paper test exists to produce. Safe
+compaction needs a signed-checkpoint design that does not exist. The supported mechanism
+remains the operator archiving a completed run; startup now warns with the actual size once a
+ledger passes 64 MB.
+
+### 6. Safety hardening — `5797525`
+
+Real trading is still unreachable (one order function, one manual caller, nothing automatic),
+so none of this changes behaviour today.
+
+- **Stored settings re-validated at load.** `evaluateStoredLiveAuthorization` checks that
+  whatever live trading the settings claim is backed by a certificate that exists, names a
+  real stage, agrees with `liveStage`, and is not authorising auto live off a manual-live
+  unlock. Failure forces back to paper and records why. **Deliberately not cryptographic** —
+  fabricating a whole well-formed certificate by hand still gets through; closing that needs
+  a signing key this system does not have. The gap removed is flipping a boolean in a JSON file.
+- **The 24-hour expiry is now read**, at load and again at the order itself (the process can
+  outlive the certificate). A hand-written far-future expiry is rejected: the certificate's
+  *lifetime*, not just its end date, must be inside the maximum.
+- **`dryRun` gates the live order path.** It previously did not, at all.
+- **Clearing `killSwitchActive` takes a typed confirmation** and is written to the audit log.
+  Arming it still needs nothing — that direction only ever makes the system safer.
+
+### Next action (operator) — unchanged from Phase 4
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/launch-paper-allowlist.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stop-nemesis-at.ps1 -AfterMinutes 300
+node scripts/analyze-dataplane-run.cjs   # at T+15, T+60, and after the stop
+```
+
+Items 1–4 were the ones gating a meaningful run, and all four have landed. The run will now
+produce numbers about the strategy rather than about the poller — but the shadow ledger it
+starts from is contaminated by both defects in item 2, so **judge only shadows scored after
+this commit**, and re-read the `SHADOW_MAX_CONTAMINATED_SHARE` note before trusting any
+clean-subset tally.

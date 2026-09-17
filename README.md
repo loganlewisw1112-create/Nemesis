@@ -2,11 +2,67 @@
 
 [![NEMESIS CI](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml/badge.svg)](https://github.com/loganlewisw1112-create/Nemesis/actions/workflows/ci.yml)
 
-Current as of July 4, 2026.
+> **PROJECT PARKED — 2026-08-05.** NEMESIS answered the question it was built to answer:
+> **no tradeable edge was found, proven across seven independent measurements, with $0 risked.**
+> Portfolio closed at $5,000 with 0 trades executed; live trading was never enabled.
+> **Read [`docs/PROJECT-CLOSEOUT.md`](docs/PROJECT-CLOSEOUT.md) first** — it explains the reasoning,
+> what worked, what didn't, and why not to re-run any of the seven theses.
+> Everything below describes the system as built and remains accurate as engineering documentation.
+
+Current as of July 22, 2026 (engineering docs); project closed out 2026-08-05.
 
 NEMESIS is a Kalshi-native desktop trading command center with a companion Global Event Alpha (GEA) intelligence app. It is built for event-market thesis discovery, fillability-aware ticket ranking, paper execution, profit-retention research, fail-closed bridge recommendations, and staged live-trading readiness.
 
 The default posture is intentionally conservative: demo mode on, dry-run on, live trading locked, auto-live disabled, and ProfitOS auto-close limited to paper positions.
+
+## R10 Readiness Status (2026-07-20)
+
+Progress toward the R10 gate (readiness hold → full-25 production soak → gap-closure report) that
+qualifies NEMESIS for paper and small live trading:
+
+- **Renderer soak-stall bug: fixed and proven.** The append-only campaign ledger was `structuredClone`d
+  twice on the per-orderbook-delta hot path, starving the event loop until the renderer heartbeat
+  watchdog invalidated the run. Fixed on the hot path; a full 30-minute full-bar soak now survives with
+  the renderer flat (~133 MB, `recoveryCount 0`, zero invalidations).
+- **Orderbook coverage decay: fixed.** The 20-second re-verification loop burst all tracked markets at
+  once and drew Kalshi 429s, lapsing markets past the 90 s provenance TTL until the tracked set decayed
+  below 25. Re-verification is now rate-paced (`pacedDispatch`) and the book-fetch rate-limit backoff is
+  bounded below the TTL.
+- **Readiness continuous-hold reconnect tolerance: added.** A single self-healed transport reconnect
+  (bounded, must re-qualify within a grace window; a second episode or a non-recovery still hard-fails)
+  no longer breaks the hold. This is orderbook-transport accounting, not a relaxation of the heartbeat
+  watchdog.
+
+A full 30-minute soak completes cleanly with zero stalls, invalidations, or reconnect faults. The
+remaining step is a passing soak at the full 25-market bar; validation continues.
+
+## Paper Trading Pipeline Status (2026-07-22)
+
+Separate from R10: does the strategy actually find and complete a profitable paper trade? Paper
+trading had produced **zero trades since the portfolio was created on 2026-07-14**. This was
+root-caused to a chain of structural gates — not the profit bars — that rejected candidates before
+economics were ever evaluated. Five fixes on 2026-07-22 cleared that chain:
+
+- **Provenance hydration.** Flow-driven candidates were never admitted to WebSocket orderbook
+  tracking because the stream's own provenance store only knew markets the periodic universe sweep
+  had covered. A candidate's ticker is now hydrated from the production single-market endpoint
+  before any tracking change. Exchange-origin rejection fell from 87.5% to 17.6%.
+- **Maker-fee series.** The fee resolver rejected every series reporting `quadratic_with_maker_fees`;
+  its taker formula is identical to plain `quadratic` (verified against the published schedule), so
+  it is now accepted. Fee-policy rejections went to zero.
+- **In-flight book pinning.** A candidate collecting confirmation evidence can no longer be evicted
+  from the tracked set by the 5-minute rotation, which would delete the book its evidence depends on.
+- **Provably-continuous quiet books.** A book past the 2s freshness bound is treated as current
+  (up to a 10s ceiling) when the transport can prove it missed no update — distinguishing a quiet
+  market from a lagging pipeline instead of discarding both.
+- **Bar application.** The absolute profit bars now gate admission and the confirming observation
+  rather than every intermediate persistence sample, which had compounded a 16% bar into ~0.07%.
+
+Candidates now reach genuine economic evaluation and enter the persistence-confirmation window for
+the first time. The profit bars themselves are unchanged and are never lowered to force a trade.
+The remaining blocker — confirmation samples stalling at 1 of 4 — is documented with the next steps
+in [docs/HANDOFF-NEXT-SESSION.md](docs/HANDOFF-NEXT-SESSION.md). Live trading stays hard-locked
+throughout; no real money is at risk.
 
 ## Screenshots
 

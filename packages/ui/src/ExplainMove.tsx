@@ -1,10 +1,11 @@
+import { memo } from 'react';
 import type { ThesisCard, ThesisDriver } from '@nemesis/core';
 
 interface Props {
   card: ThesisCard | null;
 }
 
-export function ExplainMovePanel({ card }: Props) {
+export const ExplainMovePanel = memo(function ExplainMovePanel({ card }: Props) {
   if (!card) {
     return (
       <div style={{ padding: 12, color: 'var(--text-muted)', fontSize: 12 }}>
@@ -33,7 +34,7 @@ export function ExplainMovePanel({ card }: Props) {
       )}
     </div>
   );
-}
+});
 
 export function DriverStack({ drivers }: { drivers: ThesisDriver[] }) {
   return (
@@ -58,7 +59,7 @@ export function DriverStack({ drivers }: { drivers: ThesisDriver[] }) {
   );
 }
 
-export function RegimeBanner({ regimes }: { regimes: string[] }) {
+export const RegimeBanner = memo(function RegimeBanner({ regimes }: { regimes: string[] }) {
   if (regimes.length === 0) return null;
   return (
     <div
@@ -73,4 +74,4 @@ export function RegimeBanner({ regimes }: { regimes: string[] }) {
       No-trade regimes: {regimes.join(', ')}
     </div>
   );
-}
+});

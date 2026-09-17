@@ -1,6 +1,42 @@
 import { DEFAULT_AUTO_CLOSE_SETTINGS, type AutoCloseSettings, type ProfitCertificate } from './paper/types.js';
 
-export const KALSHI_WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
+/** Kalshi's recommended production websocket endpoint. */
+export const KALSHI_WS_URL = 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
+
+export type KalshiEnvironment = 'production' | 'demo';
+
+export type KalshiEndpointClass = 'market-data' | 'portfolio' | 'orders';
+
+export interface KalshiResponseMetadata {
+  environment: KalshiEnvironment;
+  endpointClass: KalshiEndpointClass;
+  sourceBaseUrl: string;
+  status: number;
+  verifiedAt: number;
+}
+
+export interface KalshiEndpointPolicy {
+  environment: KalshiEnvironment;
+  restBaseUrls: readonly string[];
+  websocketUrls: readonly string[];
+}
+
+export type KalshiFailureClass =
+  | 'aborted'
+  | 'authentication'
+  | 'authorization'
+  | 'rate_limit'
+  | 'not_found'
+  | 'server'
+  | 'timeout'
+  | 'network'
+  | 'dns'
+  | 'tcp'
+  | 'tls'
+  | 'connection_reset'
+  | 'configuration'
+  | 'invalid_response'
+  | 'unknown';
 
 export interface KalshiMarket {
   ticker: string;
@@ -22,10 +58,19 @@ export interface KalshiMarket {
   volume_fp?: string;
   volume_24h_fp?: string;
   open_interest_fp?: string;
+  /** Auto-generated multi-leg parlay markets; ~90% of the open universe and effectively never traded. */
+  is_provisional?: boolean;
   category?: string;
   close_time?: string;
   event_ticker?: string;
   series_ticker?: string;
+  price_level_structure?: 'linear_cent' | 'tapered_deci_cent' | 'deci_cent' | string;
+  fractional_trading_enabled?: boolean;
+  fee_waiver_expiration_time?: string;
+  fee_type?: string;
+  fee_multiplier?: number;
+  fee_type_override?: string;
+  fee_multiplier_override?: number;
 }
 
 export interface KalshiMarketsResponse {
@@ -38,6 +83,34 @@ export interface OrderbookLevel {
   quantity: number;
 }
 
+export type KalshiFeeRole = 'maker' | 'taker';
+export type KalshiAccountPrecision = 'direct' | 'non_direct' | 'unknown';
+
+/** Exchange fee inputs frozen with each evidence run. Unknown inputs fail qualification closed. */
+export interface KalshiFeePolicy {
+  known: boolean;
+  role: KalshiFeeRole;
+  multiplier: number;
+  accountPrecision: KalshiAccountPrecision;
+  seriesTicker?: string;
+  feeType?: string;
+  scheduleVersion: string;
+  source: string;
+}
+
+export interface KalshiSeries {
+  ticker: string;
+  fee_type?: string;
+  fee_multiplier?: number;
+  last_updated_ts?: string;
+}
+
+export interface KalshiEvent {
+  event_ticker: string;
+  series_ticker: string;
+  last_updated_ts?: string;
+}
+
 export interface KalshiOrderbook {
   ticker: string;
   yes: OrderbookLevel[];
@@ -45,6 +118,13 @@ export interface KalshiOrderbook {
   yesAsk?: number;
   noAsk?: number;
   spread?: number;
+  /** Exchange-origin book time. Never populated from local post-fetch time. */
+  sourceTimestamp?: number;
+  /** Exchange WebSocket sequence. REST books normally cannot supply this. */
+  sequence?: number;
+  receivedAt?: number;
+  priceLevelStructure?: string;
+  feePolicy?: KalshiFeePolicy;
 }
 
 export interface KalshiTrade {
@@ -109,6 +189,7 @@ export interface EntryQualificationSettings {
   shadowFollowUpMs: number;
   shadowMinScored: number;
   shadowMinDistinctDays: number;
+  shadowMinObservationMs: number;
   shadowMinProfitFactor: number;
   shadowMinWinRate: number;
   shadowMinStressedProfitFactor: number;
@@ -120,6 +201,16 @@ export interface EntryQualificationSettings {
   pilotMaxDrawdownUsd: number;
   pilotMaxFalseExitRate: number;
   pilotMaxAverageRegretUsd: number;
+  instrumentationDurationMs: number;
+  instrumentationMinUniqueCandidates: number;
+  instrumentationMinTerminalCoverage: number;
+  instrumentationMinDiagnosticSchedulingCoverage: number;
+  instrumentationMinValidDiagnosticCoverage: number;
+  campaignDurationMs: number;
+  campaignEnrollmentCloseoutMs: number;
+  campaignMinValidDiagnostics: number;
+  campaignMinReadyCandidates: number;
+  campaignMinFreshSampleRate: number;
 }
 
 export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
@@ -138,10 +229,11 @@ export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
   shadowFollowUpMs: 15 * 60_000,
   shadowMinScored: 100,
   shadowMinDistinctDays: 3,
+  shadowMinObservationMs: 0,
   shadowMinProfitFactor: 1.25,
   shadowMinWinRate: 0.55,
   shadowMinStressedProfitFactor: 1.1,
-  pilotMaxEntryRiskUsd: 10,
+  pilotMaxEntryRiskUsd: 50,
   pilotLossBudgetUsd: 20,
   pilotMinCompleted: 20,
   pilotMinProfitFactor: 1.25,
@@ -149,6 +241,16 @@ export const DEFAULT_ENTRY_QUALIFICATION: EntryQualificationSettings = {
   pilotMaxDrawdownUsd: 20,
   pilotMaxFalseExitRate: 0.15,
   pilotMaxAverageRegretUsd: 0.5,
+  instrumentationDurationMs: 2 * 60 * 60_000,
+  instrumentationMinUniqueCandidates: 20,
+  instrumentationMinTerminalCoverage: 1,
+  instrumentationMinDiagnosticSchedulingCoverage: 0.95,
+  instrumentationMinValidDiagnosticCoverage: 0.9,
+  campaignDurationMs: 7 * 60 * 60_000,
+  campaignEnrollmentCloseoutMs: 15 * 60_000,
+  campaignMinValidDiagnostics: 30,
+  campaignMinReadyCandidates: 1,
+  campaignMinFreshSampleRate: 0.95,
 };
 
 export interface GuardrailSettings {
@@ -171,6 +273,7 @@ export interface GuardrailSettings {
   strictProfitMode?: StrictProfitModeSettings;
   opportunityThroughput?: OpportunityThroughputSettings;
   entryQualification?: EntryQualificationSettings;
+  kalshiAccountPrecision?: KalshiAccountPrecision;
 }
 
 export const DEFAULT_STRICT_PROFIT_MODE: StrictProfitModeSettings = {
@@ -303,6 +406,66 @@ export interface CryptoThesisContext {
   confidence: number;
   sampleCount: number;
   windowMs: number;
+  timeToExpirySec?: number;
+  /** Total model volatility to expiry: `sigmaPerRootSec * sqrt(timeToExpirySec)`. */
+  sigmaT?: number;
+  /** Time-weighted spot volatility per square-root second, from the actual sample gaps. */
+  sigmaPerRootSec?: number;
+  /** Total volatility the strike ladder itself is quoting, when it fits lognormal. */
+  ladderSigmaT?: number;
+  ladderRSquared?: number;
+  ladderPoints?: number;
+  /** `sigmaT / ladderSigmaT`. Outside roughly 0.5-1.5 the card is invalidated. */
+  ladderSigmaRatio?: number;
+  /**
+   * Strike quotes handed to the fit, before any filtering. Zero means no ladder
+   * reached the model at all, which is a different failure from a ladder that
+   * reached it and could not be fitted — the two are indistinguishable from
+   * `ladderSigmaT` alone, and telling them apart is the whole point of recording
+   * this.
+   */
+  ladderQuoteCount?: number;
+  /**
+   * Of those quotes, how many the fit could use. A large supply with few usable
+   * points means a ladder mostly pinned at the rails; few of both means the
+   * ladder never reached the model. Different problems, different fixes.
+   */
+  ladderUsableCount?: number;
+}
+
+/**
+ * What the volatility calibration check actually saw, carried onto each entry
+ * confirmation so the gate's reach is answerable from the ledger rather than by
+ * probing a live market.
+ *
+ * Measured 2026-07-31 against live KXBTCD ladders: the fit is obtainable and
+ * sensible at 17h (R-squared 0.955, 21.6% annualised) and at a week (0.980,
+ * 39.4%), but the near-expiry event had *zero* quotes off the rails and so no
+ * fit at all — and near expiry is where this app is most active. Whether the
+ * gate is reached in production therefore cannot be assumed either way.
+ */
+export interface ModelCalibrationEvidence {
+  /** Total volatility the model priced with. */
+  sigmaT?: number;
+  /**
+   * The two factors `sigmaT` is the product of. Recorded separately because
+   * `sigmaT` alone cannot be judged: a tiny value is correct for a contract
+   * seconds from expiry and badly wrong for one hours out, and those need
+   * opposite responses. Persisting only the product left exactly that question
+   * unanswerable on 2026-07-31.
+   */
+  sigmaPerRootSec?: number;
+  timeToExpirySec?: number;
+  /** See `CryptoThesisContext.ladderQuoteCount`. */
+  ladderQuoteCount: number;
+  /** See `CryptoThesisContext.ladderUsableCount`. */
+  ladderUsableCount?: number;
+  /** Quotes surviving into the regression; absent when no fit was obtainable. */
+  ladderPoints?: number;
+  ladderSigmaT?: number;
+  ladderRSquared?: number;
+  /** `sigmaT / ladderSigmaT` — the statistic the gate tests. */
+  ladderSigmaRatio?: number;
 }
 
 export interface JournalEntry {
@@ -332,6 +495,43 @@ export interface ConnectorHealth {
   latencyMs: number | null;
   errorCount1h: number;
   lastError: string | null;
+  lastAttempt?: number | null;
+  lastMessageAt?: number | null;
+  lastPongAt?: number | null;
+  nextRetryAt?: number | null;
+  failureClass?: KalshiFailureClass | null;
+  reconnects?: number;
+  disconnects?: number;
+  sequenceGaps?: number;
+  lastCloseAt?: number | null;
+  lastCloseCode?: number | null;
+  lastCloseReason?: string | null;
+  lastCloseTrigger?: string | null;
+  trackedTickers?: number;
+  /** True only when the required unique live orderbook tracking set is complete. */
+  trackingReady?: boolean;
+  qualifiedTickers?: number;
+  subscriptionUpdates?: number;
+  subscriptionUpdateQueueDepth?: number;
+  subscriptionUpdateInFlight?: boolean;
+  freshnessMs?: number | null;
+  transportConnected?: boolean;
+  authenticated?: boolean;
+  qualificationReady?: boolean;
+  environment?: KalshiEnvironment;
+  endpointClass?: KalshiEndpointClass;
+  /** Redacted endpoint URL currently selected by the environment policy. */
+  endpointUrl?: string | null;
+  generation?: number;
+  attemptId?: string | null;
+  activeEndpointUrl?: string | null;
+  failedEndpointUrl?: string | null;
+  nextEndpointUrl?: string | null;
+  transportFailureClass?: string | null;
+  errorCode?: string | null;
+  httpStatus?: number | null;
+  switchReason?: string | null;
+  lastExchangeDataAt?: number | null;
 }
 
 export interface GateStatus {

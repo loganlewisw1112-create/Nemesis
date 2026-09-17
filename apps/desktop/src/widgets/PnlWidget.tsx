@@ -18,7 +18,7 @@ export function PnlWidget() {
 
   useEffect(() => {
     window.nemesis.getPaperPortfolio().then((p) => setPaper(p as PaperState));
-    window.nemesis.onPaperUpdate((d) => setPaper(d as PaperState));
+    return window.nemesis.onPaperUpdate((d) => setPaper(d as PaperState));
   }, []);
 
   const pnl = paper?.dailyPnl ?? 0;

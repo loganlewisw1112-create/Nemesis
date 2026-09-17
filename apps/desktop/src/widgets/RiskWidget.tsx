@@ -16,8 +16,12 @@ export function RiskWidget() {
   useEffect(() => {
     window.nemesis.getPaperPortfolio().then((p) => setPaper(p as PaperState));
     window.nemesis.getState().then((s) => setSettings((s as AppState).settings));
-    window.nemesis.onPaperUpdate((d) => setPaper(d as PaperState));
-    window.nemesis.onSettingsUpdate((s) => setSettings((s as AppState['settings'])));
+    const unsubscribePaper = window.nemesis.onPaperUpdate((d) => setPaper(d as PaperState));
+    const unsubscribeSettings = window.nemesis.onSettingsUpdate((s) => setSettings((s as AppState['settings'])));
+    return () => {
+      unsubscribePaper();
+      unsubscribeSettings();
+    };
   }, []);
 
   const deployed = paper?.portfolio.positions.reduce((s, p) => s + p.entryPrice * p.contracts, 0) ?? 0;

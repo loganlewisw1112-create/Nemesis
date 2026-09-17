@@ -8,7 +8,8 @@ import type {
   PublicDataReleaseRecord,
   PublicDataSourceRecord,
 } from '@nemesis/connectors';
-import type { NemesisCloseResult } from '@nemesis/bridge-contracts';
+import type { NemesisCloseResult, NoTradeWarning } from '@nemesis/bridge-contracts';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -67,7 +68,10 @@ export const GEA_SCHEMA = [
     yes_ask REAL,
     no_ask REAL,
     spread REAL,
-    timestamp INTEGER NOT NULL
+    timestamp INTEGER NOT NULL,
+    observed_at INTEGER NOT NULL DEFAULT 0,
+    exchange_timestamp INTEGER,
+    exchange_sequence INTEGER
   )`,
   `CREATE TABLE IF NOT EXISTS public_data_source (
     id TEXT PRIMARY KEY,
@@ -289,6 +293,7 @@ type BetterSqliteStoreCtor = new (path: string) => SqliteDatabase;
 
 export interface GeaLocalStore extends KalshiTapeSink, PublicDataMeshSink {
   insertNemesisCloseResult(result: NemesisCloseResult): void;
+  insertNoTradeDecision(decision: NoTradeWarning): void;
   listMarketSnapshots(limit?: number): KalshiMarketSnapshotRecord[];
   listTradePrints(limit?: number): KalshiTradePrintRecord[];
   listOrderbookSnapshots(limit?: number): KalshiOrderbookSnapshotRecord[];
@@ -304,6 +309,12 @@ const KALSHI_MARKET_SNAPSHOT_COLUMNS = [
   ['no_ask', 'REAL'],
   ['spread', 'REAL'],
   ['source', "TEXT NOT NULL DEFAULT 'rest-market'"],
+] as const;
+
+const KALSHI_ORDERBOOK_SNAPSHOT_COLUMNS = [
+  ['observed_at', 'INTEGER NOT NULL DEFAULT 0'],
+  ['exchange_timestamp', 'INTEGER'],
+  ['exchange_sequence', 'INTEGER'],
 ] as const;
 
 export function resolveGeaDatabasePath(userDataPath: string): string {
@@ -329,6 +340,7 @@ export async function migrateGeaDatabase(path: string): Promise<GeaDatabaseStatu
     const db = new Database(path) as SqliteDatabase;
     for (const statement of GEA_SCHEMA) db.exec(statement);
     ensureMarketSnapshotColumns(db);
+    ensureOrderbookSnapshotColumns(db);
     db.close?.();
     return { available: true, path, migrationsApplied: GEA_SCHEMA.length };
   } catch (err) {
@@ -349,6 +361,7 @@ export async function createGeaLocalStore(path: string): Promise<GeaLocalStore |
     const db = new Database(path);
     for (const statement of GEA_SCHEMA) db.exec(statement);
     ensureMarketSnapshotColumns(db);
+    ensureOrderbookSnapshotColumns(db);
 
     const insertMarket = db.prepare(`
       INSERT OR REPLACE INTO kalshi_market_snapshot (
@@ -366,9 +379,11 @@ export async function createGeaLocalStore(path: string): Promise<GeaLocalStore |
     `);
     const insertBook = db.prepare(`
       INSERT OR REPLACE INTO kalshi_orderbook_snapshot (
-        id, ticker, yes_levels_json, no_levels_json, best_yes_bid, yes_ask, no_ask, spread, timestamp
+        id, ticker, yes_levels_json, no_levels_json, best_yes_bid, yes_ask, no_ask, spread,
+        timestamp, observed_at, exchange_timestamp, exchange_sequence
       ) VALUES (
-        @id, @ticker, @yes_levels_json, @no_levels_json, @best_yes_bid, @yes_ask, @no_ask, @spread, @timestamp
+        @id, @ticker, @yes_levels_json, @no_levels_json, @best_yes_bid, @yes_ask, @no_ask, @spread,
+        @timestamp, @observed_at, @exchange_timestamp, @exchange_sequence
       )
     `);
     const listMarkets = db.prepare('SELECT * FROM kalshi_market_snapshot ORDER BY timestamp DESC LIMIT ?');
@@ -405,6 +420,13 @@ export async function createGeaLocalStore(path: string): Promise<GeaLocalStore |
         @id, @ticker, @action, @contracts, @pnl, @was_profit, @peak_pnl_usd, @close_regret_usd, @closed_at, @reason, @tier, @result_json
       )
     `);
+    const insertNoTradeDecision = db.prepare(`
+      INSERT OR REPLACE INTO no_trade_decision (
+        id, ticker, block_reason, what_would_need_to_change, recheck_at, decision_json
+      ) VALUES (
+        @id, @ticker, @block_reason, @what_would_need_to_change, @recheck_at, @decision_json
+      )
+    `);
 
     return {
       insertNemesisCloseResult: (result) => {
@@ -413,6 +435,13 @@ export async function createGeaLocalStore(path: string): Promise<GeaLocalStore |
           id: `${result.ticker}:${result.closed_at}:${result.action}`,
           was_profit: result.was_profit ? 1 : 0,
           result_json: JSON.stringify(result),
+        });
+      },
+      insertNoTradeDecision: (decision) => {
+        insertNoTradeDecision.run({
+          ...decision,
+          id: createHash('sha256').update(JSON.stringify(decision)).digest('hex'),
+          decision_json: JSON.stringify(decision),
         });
       },
       insertMarketSnapshot: (snapshot) => { insertMarket.run(snapshot); },
@@ -439,5 +468,13 @@ function ensureMarketSnapshotColumns(db: SqliteDatabase) {
   const names = new Set(columns.map((column) => column.name));
   for (const [name, ddl] of KALSHI_MARKET_SNAPSHOT_COLUMNS) {
     if (!names.has(name)) db.exec(`ALTER TABLE kalshi_market_snapshot ADD COLUMN ${name} ${ddl}`);
+  }
+}
+
+function ensureOrderbookSnapshotColumns(db: SqliteDatabase) {
+  const columns = db.prepare('PRAGMA table_info(kalshi_orderbook_snapshot)').all() as Array<{ name?: string }>;
+  const names = new Set(columns.map((column) => column.name));
+  for (const [name, ddl] of KALSHI_ORDERBOOK_SNAPSHOT_COLUMNS) {
+    if (!names.has(name)) db.exec(`ALTER TABLE kalshi_orderbook_snapshot ADD COLUMN ${name} ${ddl}`);
   }
 }

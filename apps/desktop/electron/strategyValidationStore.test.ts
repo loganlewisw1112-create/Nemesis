@@ -33,6 +33,48 @@ describe('StrategyValidationStore', () => {
     }
   });
 
+  it('appends without deep-cloning the whole ledger, and replays identically [soak-stall regression]', () => {
+    // record() recovers the 1-2 events it just appended via tracker.eventsAfter(), which used
+    // to route through allEvents() — a JSON deep copy of the entire append-only ledger, on
+    // every append, on the per-orderbook-delta hot path. Same shape as the clone that once
+    // starved the renderer heartbeat (sevenHourCampaignStore.record). eventsAfter() must
+    // instead walk back only over the new tail, so the cost is O(appended).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nemesis-strategy-noclone-'));
+    const filePath = path.join(dir, 'paper-strategy-validation-events.jsonl');
+    try {
+      const store = StrategyValidationStore.open(filePath, {
+        stage: 'shadow', strategyConfigHash: 'config-a', strategyEngineVersion: 2, now: 1_000, runId: 'run-a',
+      });
+      const cloneLedger = vi.spyOn(store.tracker, 'allEvents');
+      for (let index = 0; index < 200; index += 1) {
+        store.record((tracker) => tracker.startShadowCandidate({
+          id: `candidate-${index}`, sourceSignalId: `source-${index}`, ticker: 'KXTEST-26', side: 'yes',
+          playbook: 'flow-hunter', startedAt: 2_000 + index, dueAt: 902_000 + index, contracts: 20,
+          entryPrice: 0.4, entryFeesUsd: 0.1, initialNetEdge: 0.1, expectedRewardUsd: 2,
+          plannedLossUsd: 1, rewardRiskRatio: 2, stressedExpectedNetPnlUsd: 1,
+        }));
+      }
+      expect(cloneLedger).not.toHaveBeenCalled();
+
+      // The tail it returns is exactly what the old full-scan filter would have returned.
+      const all = store.tracker.allEvents();
+      for (const sequence of [0, 1, 100, all.length - 1, all.length, all.length + 5]) {
+        expect(store.tracker.eventsAfter(sequence))
+          .toEqual(all.filter((event) => event.sequence > sequence));
+      }
+
+      const reopened = StrategyValidationStore.open(filePath, {
+        stage: 'shadow', strategyConfigHash: 'ignored', strategyEngineVersion: 99,
+      });
+      expect(reopened.snapshot(DEFAULT_ENTRY_QUALIFICATION).integrityError).toBeUndefined();
+      expect(reopened.snapshot(DEFAULT_ENTRY_QUALIFICATION).shadowPendingCount).toBe(200);
+      expect(reopened.tracker.allEvents()).toEqual(all);
+    } finally {
+      vi.restoreAllMocks();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed on corrupt saved evidence', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nemesis-strategy-corrupt-'));
     const filePath = path.join(dir, 'paper-strategy-validation-events.jsonl');

@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   kalshiFeeForOrder,
+  kalshiFeeForFills,
   kalshiFeePerContract,
+  buildKalshiFeePolicy,
   computeNetEdge,
   isSupportedQualificationFeeOrder,
   walkBookFill,
@@ -10,6 +12,11 @@ import {
   isExecutablePrice,
   fetchMarkets,
   fetchTrades,
+  fetchBalance,
+  getKalshiHostHealth,
+  getKalshiEndpointPolicy,
+  KalshiRequestFailure,
+  resetKalshiHostCache,
   normalizeExecutablePrice,
   parseOrderbook,
   normalizeMarketPrice,
@@ -19,19 +26,32 @@ import { qualifyThesis, detectSourceDisagreement } from '../thesis/qualification
 import type { KalshiMarket, KalshiOrderbook } from '../types.js';
 
 describe('kalshiFee', () => {
-  it('computes fee at 50c', () => {
-    expect(kalshiFeePerContract(0.5)).toBe(0.02);
+  it('rounds the official trading fee to a centicent', () => {
+    expect(kalshiFeePerContract(0.5)).toBe(0.0175);
   });
 
   it('rounds the aggregate order fee once', () => {
     expect(kalshiFeeForOrder(0.5, 100)).toBe(1.75);
-    expect(kalshiFeeForOrder(0.5, 1)).toBe(0.02);
+    expect(kalshiFeeForOrder(0.5, 1)).toBe(0.0175);
   });
 
-  it('identifies the cent-price whole-contract scope used by qualification', () => {
+  it('accepts four-decimal prices and two-decimal quantities', () => {
     expect(isSupportedQualificationFeeOrder(0.5, 100)).toBe(true);
-    expect(isSupportedQualificationFeeOrder(0.505, 100)).toBe(false);
-    expect(isSupportedQualificationFeeOrder(0.5, 1.5)).toBe(false);
+    expect(isSupportedQualificationFeeOrder(0.505, 100)).toBe(true);
+    expect(isSupportedQualificationFeeOrder(0.5, 1.5)).toBe(true);
+    expect(isSupportedQualificationFeeOrder(0.50555, 100)).toBe(false);
+    expect(isSupportedQualificationFeeOrder(0.5, 1.005)).toBe(false);
+  });
+
+  it('applies maker/taker multipliers and non-direct balance rounding', () => {
+    const taker = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'non_direct' });
+    const maker = buildKalshiFeePolicy({ role: 'maker', multiplier: 2, accountPrecision: 'direct' });
+    expect(kalshiFeeForFills([{ price: 0.05, quantity: 100 }], taker)).toMatchObject({
+      tradeFeeUsd: 0.3325,
+      balanceRoundingFeeUsd: 0.0075,
+      totalFeeUsd: 0.34,
+    });
+    expect(kalshiFeeForOrder(0.5, 100, maker)).toBe(0.875);
   });
 
   it('computes net edge with costs', () => {
@@ -54,6 +74,103 @@ describe('kalshiFee', () => {
 });
 
 describe('kalshi client', () => {
+  beforeEach(() => {
+    resetKalshiHostCache();
+  });
+
+  it('keeps production and demo endpoint policies isolated and excludes retired hosts', () => {
+    const production = getKalshiEndpointPolicy('production');
+    const demo = getKalshiEndpointPolicy('demo');
+    // api.elections.* leads: measured 2026-07-31, the external-api* pair answers
+    // 403 to anonymous requests on the public status endpoint (decommissioned),
+    // while this host answers 200 there and 401 on an unauthenticated handshake.
+    expect(production.restBaseUrls[0]).toBe('https://api.elections.kalshi.com/trade-api/v2');
+    expect(production.websocketUrls[0]).toBe('wss://api.elections.kalshi.com/trade-api/ws/v2');
+    expect(production.restBaseUrls.join(' ')).not.toContain('trading-api.kalshi.com');
+    expect(production.restBaseUrls.some((url) => demo.restBaseUrls.includes(url))).toBe(false);
+  });
+
+  it('fails closed before contacting a retired production host', async () => {
+    resetKalshiHostCache();
+    const fetchFn = vi.fn<typeof fetch>();
+    const failure = await fetchMarkets({
+      baseUrl: 'https://trading-api.kalshi.com/trade-api/v2',
+      fetchFn,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(KalshiRequestFailure);
+    expect(failure).toMatchObject({ classification: 'authorization', path: '(endpoint-policy)' });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('classifies a timeout, evicts that host, and prefers the healthy alias next time', async () => {
+    resetKalshiHostCache();
+    const firstUrls: string[] = [];
+    await fetchMarkets({
+      limit: 1,
+      fetchFn: vi.fn<typeof fetch>(async (input) => {
+        const url = String(input);
+        firstUrls.push(url);
+        if (url.startsWith('https://api.elections.kalshi.com')) throw new Error('request timed out');
+        return new Response(JSON.stringify({ markets: [] }), { status: 200 });
+      }),
+    });
+    expect(firstUrls).toHaveLength(2);
+    expect(getKalshiHostHealth()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        baseUrl: 'https://api.elections.kalshi.com/trade-api/v2',
+        failureClass: 'timeout',
+        failureCount: 1,
+      }),
+    ]));
+
+    const nextUrls: string[] = [];
+    await fetchMarkets({
+      limit: 1,
+      fetchFn: vi.fn<typeof fetch>(async (input) => {
+        nextUrls.push(String(input));
+        return new Response(JSON.stringify({ markets: [] }), { status: 200 });
+      }),
+    });
+    // The evicted host is not retried first; the alias that answered is.
+    expect(nextUrls[0]).toMatch(/^https:\/\/external-api\.kalshi\.com/);
+  });
+
+  it('learns working hosts per endpoint class instead of poisoning all requests', async () => {
+    resetKalshiHostCache();
+    const marketUrls: string[] = [];
+    const marketFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = String(input);
+      marketUrls.push(url);
+      if (url.startsWith('https://api.elections.kalshi.com')) throw new Error('fetch failed');
+      return new Response(JSON.stringify({ markets: [] }), { status: 200 });
+    });
+    await fetchMarkets({ fetchFn: marketFetch, limit: 1 });
+
+    const portfolioUrls: string[] = [];
+    await fetchBalance({
+      fetchFn: vi.fn<typeof fetch>(async (input) => {
+        portfolioUrls.push(String(input));
+        return new Response(JSON.stringify({ balance: 100, payout: 0 }), { status: 200 });
+      }),
+    });
+    // Markets fell through to the alias; the portfolio class never saw a failure,
+    // so it still starts at the policy's leading host.
+    expect(marketUrls[1]).toMatch(/^https:\/\/external-api\.kalshi\.com/);
+    expect(portfolioUrls[0]).toMatch(/^https:\/\/api\.elections\.kalshi\.com/);
+  });
+
+  it('classifies and exposes server-directed 429 backoff without host rotation', async () => {
+    resetKalshiHostCache();
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}', {
+      status: 429,
+      headers: { 'Retry-After': '12' },
+    }));
+    const failure = await fetchTrades({ fetchFn }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(KalshiRequestFailure);
+    expect(failure).toMatchObject({ classification: 'rate_limit', status: 429, retryAfterMs: 12_000 });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
   it('parses bid-only orderbook with derived asks', () => {
     const ob = parseOrderbook('TEST', {
       orderbook: { yes: [[54, 100]], no: [[40, 50]] },

@@ -1,29 +1,82 @@
 import type {
+  KalshiEvent,
   KalshiMarket,
   KalshiMarketsResponse,
   KalshiOrderbook,
+  KalshiSeries,
   KalshiTrade,
   KalshiTradesResponse,
+  KalshiEndpointClass,
+  KalshiEndpointPolicy,
+  KalshiEnvironment,
+  KalshiFailureClass,
+  KalshiResponseMetadata,
   OrderbookLevel,
 } from '../types.js';
 import { resilientFetch, sleep } from '../http/resilientFetch.js';
+import {
+  recordKalshiCircuitFailure,
+  recordKalshiCircuitSuccess,
+  reserveKalshiProductionRetry,
+} from './retryCoordinator.js';
 
-export const KALSHI_API_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
+export const KALSHI_ENDPOINT_POLICIES: Readonly<Record<KalshiEnvironment, KalshiEndpointPolicy>> = {
+  // Measured 2026-07-31: the `external-api*.kalshi.com` hosts answer 403 to
+  // *anonymous* requests on the public /exchange/status endpoint, which is a
+  // decommissioned host rejecting everything rather than an auth failure.
+  // `api.elections.kalshi.com` answers 200 there and 401 on an unauthenticated
+  // websocket handshake — the correct response from a live endpoint. They are
+  // different addresses (16.58.x vs 52.84.x), not one host behind one CDN.
+  // The dead pair stays configured as a fallback: it costs nothing, and being
+  // wrong about which host is current is exactly what this list exists to absorb.
+  production: {
+    environment: 'production',
+    restBaseUrls: [
+      'https://api.elections.kalshi.com/trade-api/v2',
+      'https://external-api.kalshi.com/trade-api/v2',
+    ],
+    websocketUrls: [
+      'wss://api.elections.kalshi.com/trade-api/ws/v2',
+      'wss://external-api-ws.kalshi.com/trade-api/ws/v2',
+    ],
+  },
+  demo: {
+    environment: 'demo',
+    restBaseUrls: [
+      'https://external-api.demo.kalshi.co/trade-api/v2',
+      'https://demo-api.kalshi.co/trade-api/v2',
+    ],
+    websocketUrls: [
+      'wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2',
+      'wss://demo-api.kalshi.co/trade-api/ws/v2',
+    ],
+  },
+};
 
-export const KALSHI_API_BASES = [
-  KALSHI_API_BASE,
-  'https://trading-api.kalshi.com/trade-api/v2',
-  'https://demo-api.kalshi.co/trade-api/v2',
-];
+export const KALSHI_API_BASE = KALSHI_ENDPOINT_POLICIES.production.restBaseUrls[0];
+export const KALSHI_API_BASES = KALSHI_ENDPOINT_POLICIES.production.restBaseUrls;
+
+export function getKalshiEndpointPolicy(environment: KalshiEnvironment = 'production'): KalshiEndpointPolicy {
+  return KALSHI_ENDPOINT_POLICIES[environment];
+}
+
+export function getKalshiWebSocketUrl(environment: KalshiEnvironment = 'production'): string {
+  return getKalshiEndpointPolicy(environment).websocketUrls[0];
+}
 
 export interface FetchOptions {
   baseUrl?: string;
+  environment?: KalshiEnvironment;
+  endpointClass?: KalshiEndpointClass;
   fetchFn?: typeof fetch;
   limit?: number;
   status?: string;
   cursor?: string;
+  /** When set, Kalshi returns only markets in this series (avoids paging past sports to find crypto/HUD). */
+  seriesTicker?: string;
   authHeaders?: Record<string, string>;
   signal?: AbortSignal;
+  onResponseMetadata?: (metadata: KalshiResponseMetadata) => void;
 }
 
 function centsToProb(v: number | undefined): number | undefined {
@@ -149,7 +202,32 @@ export function parseOrderbook(ticker: string, raw: Record<string, unknown>): Ka
   const noAsk = bestYesBid !== undefined ? 1 - bestYesBid : undefined;
   const spread = yesAsk !== undefined && bestYesBid !== undefined ? yesAsk - bestYesBid : undefined;
 
-  return { ticker, yes, no, yesAsk, noAsk, spread };
+  const firstMetadataValue = (...keys: string[]): unknown => {
+    for (const book of books) {
+      for (const key of keys) {
+        if (book[key] !== undefined) return book[key];
+      }
+    }
+    return undefined;
+  };
+  const parseTimestamp = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      if (value > 1_000_000_000_000) return value;
+      if (value > 1_000_000_000) return value * 1_000;
+    }
+    if (typeof value === 'string') {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) return parseTimestamp(numeric);
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return undefined;
+  };
+  const sourceTimestamp = parseTimestamp(firstMetadataValue('ts_ms', 'timestamp_ms', 'ts', 'timestamp'));
+  const rawSequence = parseNumber(firstMetadataValue('seq', 'sequence'));
+  const sequence = rawSequence == null ? undefined : Math.trunc(rawSequence);
+
+  return { ticker, yes, no, yesAsk, noAsk, spread, sourceTimestamp, sequence };
 }
 
 export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
@@ -166,30 +244,281 @@ export function sanitizeExecutableBook(book: KalshiOrderbook): KalshiOrderbook {
     ? book.spread
     : undefined;
 
-  return { ticker: book.ticker, yes, no, yesAsk, noAsk, spread };
+  return {
+    ticker: book.ticker,
+    yes,
+    no,
+    yesAsk,
+    noAsk,
+    spread,
+    sourceTimestamp: book.sourceTimestamp,
+    sequence: book.sequence,
+    receivedAt: book.receivedAt,
+    priceLevelStructure: book.priceLevelStructure,
+    feePolicy: book.feePolicy,
+  };
 }
 
-let _workingBase: string | null = null;
+const workingBases = new Map<string, string>();
+const KALSHI_READ_REQUEST_INTERVAL_MS = 125;
+const KALSHI_DEFAULT_RATE_LIMIT_BACKOFF_MS = 1_000;
+const KALSHI_MAX_RATE_LIMIT_BACKOFF_MS = 30_000;
 
-class KalshiHttpError extends Error {
-  constructor(readonly status: number, path: string) {
-    super(`Kalshi API ${status}: ${path}`);
-    this.name = 'KalshiHttpError';
+interface KalshiReadThrottleState {
+  nextRequestAt: number;
+  blockedUntil: number;
+  consecutiveRateLimits: number;
+  tail: Promise<void>;
+}
+
+const readThrottleByEnvironment = new Map<KalshiEnvironment, KalshiReadThrottleState>();
+
+function readThrottle(environment: KalshiEnvironment): KalshiReadThrottleState {
+  let state = readThrottleByEnvironment.get(environment);
+  if (!state) {
+    state = {
+      nextRequestAt: 0,
+      blockedUntil: 0,
+      consecutiveRateLimits: 0,
+      tail: Promise.resolve(),
+    };
+    readThrottleByEnvironment.set(environment, state);
   }
+  return state;
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('Kalshi request aborted');
+}
+
+async function awaitAbortable(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return promise;
+  if (signal.aborted) throw abortReason(signal);
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+async function acquireReadRequestSlot(environment: KalshiEnvironment, signal?: AbortSignal): Promise<void> {
+  const state = readThrottle(environment);
+  let release!: () => void;
+  const turn = new Promise<void>((resolve) => { release = resolve; });
+  const previous = state.tail;
+  state.tail = previous.then(() => turn);
+  try {
+    await awaitAbortable(previous, signal);
+  } catch (error) {
+    release();
+    throw error;
+  }
+  try {
+    if (signal?.aborted) throw abortReason(signal);
+    const waitMs = Math.max(0, state.nextRequestAt - Date.now(), state.blockedUntil - Date.now());
+    if (waitMs > 0) await awaitAbortable(sleep(waitMs), signal);
+    if (signal?.aborted) throw abortReason(signal);
+    state.nextRequestAt = Date.now() + KALSHI_READ_REQUEST_INTERVAL_MS;
+  } finally {
+    release();
+  }
+}
+
+function applyReadRateLimit(environment: KalshiEnvironment, serverRetryAfterMs: number | null, now = Date.now()): number {
+  const state = readThrottle(environment);
+  state.consecutiveRateLimits += 1;
+  const exponentialBackoffMs = Math.min(
+    KALSHI_MAX_RATE_LIMIT_BACKOFF_MS,
+    KALSHI_DEFAULT_RATE_LIMIT_BACKOFF_MS * (2 ** Math.max(0, state.consecutiveRateLimits - 1)),
+  );
+  const backoffMs = Math.max(exponentialBackoffMs, serverRetryAfterMs ?? 0);
+  state.blockedUntil = Math.max(state.blockedUntil, now + backoffMs);
+  return Math.max(0, state.blockedUntil - now);
+}
+
+function recordReadSuccess(environment: KalshiEnvironment): void {
+  const state = readThrottle(environment);
+  if (Date.now() < state.blockedUntil) return;
+  state.consecutiveRateLimits = 0;
+  state.blockedUntil = 0;
+}
+
+export interface KalshiHostHealth {
+  environment: KalshiEnvironment;
+  endpointClass: KalshiEndpointClass;
+  baseUrl: string;
+  lastSuccessAt: number | null;
+  lastFailureAt: number | null;
+  failureCount: number;
+  failureClass: KalshiFailureClass | null;
+}
+const hostHealth = new Map<string, Map<string, KalshiHostHealth>>();
+
+/** Clears learned host affinity; primarily useful for deterministic process restart and tests. */
+export function resetKalshiHostCache(): void {
+  workingBases.clear();
+  hostHealth.clear();
+  readThrottleByEnvironment.clear();
+}
+
+export function getKalshiHostHealth(): KalshiHostHealth[] {
+  return [...hostHealth.values()].flatMap((byHost) => [...byHost.values()].map((health) => ({ ...health })));
+}
+
+function recordHostResult(
+  environment: KalshiEnvironment,
+  endpointClass: KalshiEndpointClass,
+  baseUrl: string,
+  failureClass: KalshiFailureClass | null,
+): void {
+  const key = cacheKey(environment, endpointClass);
+  let byHost = hostHealth.get(key);
+  if (!byHost) {
+    byHost = new Map();
+    hostHealth.set(key, byHost);
+  }
+  const previous = byHost.get(baseUrl);
+  byHost.set(baseUrl, {
+    environment,
+    endpointClass,
+    baseUrl,
+    lastSuccessAt: failureClass === null ? Date.now() : previous?.lastSuccessAt ?? null,
+    lastFailureAt: failureClass === null ? previous?.lastFailureAt ?? null : Date.now(),
+    failureCount: failureClass === null ? 0 : (previous?.failureCount ?? 0) + 1,
+    failureClass,
+  });
+}
+
+function endpointClassFor(path: string, explicit?: KalshiEndpointClass): KalshiEndpointClass {
+  if (explicit) return explicit;
+  if (path.startsWith('/portfolio/orders')) return 'orders';
+  if (path.startsWith('/portfolio/')) return 'portfolio';
+  return 'market-data';
+}
+
+function cacheKey(environment: KalshiEnvironment, endpointClass: KalshiEndpointClass): string {
+  return `${environment}:${endpointClass}`;
+}
+
+function validatedBases(opts: FetchOptions): readonly string[] {
+  const environment = opts.environment ?? 'production';
+  const policy = getKalshiEndpointPolicy(environment);
+  if (!opts.baseUrl) return policy.restBaseUrls;
+  if (!policy.restBaseUrls.includes(opts.baseUrl)) {
+    throw new KalshiRequestFailure('Kalshi base URL is outside the selected environment policy', {
+      classification: 'authorization',
+      environment,
+      endpointClass: opts.endpointClass ?? 'market-data',
+      path: '(endpoint-policy)',
+      baseUrl: opts.baseUrl,
+    });
+  }
+  return [opts.baseUrl];
+}
+
+function retryAfterMs(response: Response, now = Date.now()): number | null {
+  const value = response.headers.get('retry-after');
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - now) : null;
+}
+
+function httpFailureClass(status: number): KalshiFailureClass {
+  if (status === 401) return 'authentication';
+  if (status === 403) return 'authorization';
+  if (status === 404) return 'not_found';
+  if (status === 429) return 'rate_limit';
+  if (status >= 500) return 'server';
+  return 'invalid_response';
+}
+
+export class KalshiRequestFailure extends Error {
+  readonly status: number | null;
+  readonly classification: KalshiFailureClass;
+  readonly environment: KalshiEnvironment;
+  readonly endpointClass: KalshiEndpointClass;
+  readonly path: string;
+  readonly baseUrl: string | null;
+  readonly retryAfterMs: number | null;
+  readonly code: string | null;
+
+  constructor(message: string, details: {
+    status?: number | null;
+    classification: KalshiFailureClass;
+    environment: KalshiEnvironment;
+    endpointClass: KalshiEndpointClass;
+    path: string;
+    baseUrl?: string | null;
+    retryAfterMs?: number | null;
+    code?: string | null;
+    cause?: unknown;
+  }) {
+    super(message, details.cause === undefined ? undefined : { cause: details.cause });
+    this.name = 'KalshiRequestFailure';
+    this.status = details.status ?? null;
+    this.classification = details.classification;
+    this.environment = details.environment;
+    this.endpointClass = details.endpointClass;
+    this.path = details.path;
+    this.baseUrl = details.baseUrl ?? null;
+    this.retryAfterMs = details.retryAfterMs ?? null;
+    this.code = details.code ?? null;
+  }
+}
+
+function normalizeFailure(
+  error: unknown,
+  context: {
+    environment: KalshiEnvironment;
+    endpointClass: KalshiEndpointClass;
+    path: string;
+    baseUrl: string;
+  },
+): KalshiRequestFailure {
+  if (error instanceof KalshiRequestFailure) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  const name = error instanceof Error ? error.name : '';
+  const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const cause = record.cause && typeof record.cause === 'object' ? record.cause as Record<string, unknown> : {};
+  const code = typeof (record.code ?? cause.code) === 'string' ? String(record.code ?? cause.code) : null;
+  const combined = `${code ?? ''} ${message}`;
+  const classification: KalshiFailureClass = name === 'AbortError'
+    ? 'aborted'
+    : name === 'SyntaxError'
+      ? 'invalid_response'
+      : /ENOTFOUND|EAI_AGAIN|dns|getaddrinfo/i.test(combined)
+        ? 'dns'
+        : /ECONNRESET|EPIPE|socket hang up|connection reset/i.test(combined)
+          ? 'connection_reset'
+          : /ETIMEDOUT|ESOCKETTIMEDOUT|timeout|timed out/i.test(combined)
+        ? 'timeout'
+            : /CERT_|TLS|SSL|EPROTO|handshake/i.test(combined)
+              ? 'tls'
+              : /ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ECONNABORTED/i.test(combined)
+                ? 'tcp'
+                : /fetch failed|network/i.test(combined)
+                  ? 'network'
+                  : 'unknown';
+  return new KalshiRequestFailure(message, { ...context, classification, code, cause: error });
 }
 
 async function kalshiFetch<T>(
   path: string,
   opts: FetchOptions = {},
 ): Promise<T> {
-  // Build base list: cached working base first, then full list (deduped)
-  const defaultBases = opts.baseUrl ? [opts.baseUrl] : KALSHI_API_BASES;
-  const bases = _workingBase && !opts.baseUrl
-    ? [_workingBase, ...defaultBases.filter((b) => b !== _workingBase)]
+  const environment = opts.environment ?? 'production';
+  const endpointClass = endpointClassFor(path, opts.endpointClass);
+  const key = cacheKey(environment, endpointClass);
+  const defaultBases = validatedBases({ ...opts, endpointClass });
+  const workingBase = workingBases.get(key);
+  const bases = workingBase && !opts.baseUrl
+    ? [workingBase, ...defaultBases.filter((base) => base !== workingBase)]
     : defaultBases;
 
   const fetchFn = opts.fetchFn ?? fetch;
-  let lastError: Error | null = null;
+  let lastError: KalshiRequestFailure | null = null;
 
   for (const base of bases) {
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -205,6 +534,7 @@ async function kalshiFetch<T>(
           'User-Agent': 'NEMESIS/1.0',
           ...opts.authHeaders,
         };
+        await acquireReadRequestSlot(environment, opts.signal);
         const res = opts.fetchFn
           ? await fetchFn(url, { headers, signal: opts.signal })
           // retries:0 → one attempt per outer loop iteration, 10 s abort.
@@ -212,37 +542,83 @@ async function kalshiFetch<T>(
           // retries:1).  App-level timeouts in main.ts cap real blocking to ≤20 s.
           : await resilientFetch(url, { headers, signal: opts.signal, label: `Kalshi ${path}`, retries: 0, timeoutMs: 10_000 });
         if (!res.ok) {
-          lastError = new KalshiHttpError(res.status, path);
+          if (workingBases.get(key) === base) workingBases.delete(key);
+          recordHostResult(environment, endpointClass, base, httpFailureClass(res.status));
+          const serverRetryAfterMs = retryAfterMs(res);
+          const appliedRetryAfterMs = res.status === 429
+            ? applyReadRateLimit(environment, serverRetryAfterMs)
+            : serverRetryAfterMs;
+          lastError = new KalshiRequestFailure(`Kalshi API ${res.status}: ${path}`, {
+            status: res.status,
+            classification: httpFailureClass(res.status),
+            environment,
+            endpointClass,
+            path,
+            baseUrl: base,
+            retryAfterMs: appliedRetryAfterMs,
+          });
           // A 4xx applies to the request, not to one hostname. In particular,
           // rotating a 429 through all fallback bases multiplies the rate-limit
           // storm and defeats FeedHub backoff.
           if (res.status >= 400 && res.status < 500) throw lastError;
+          if (res.status >= 500) recordKalshiCircuitFailure(environment, 'kalshi-rest');
           if (res.status >= 500 && attempt < 2) {
-            await sleep(300 * (attempt + 1));
+            const proposed = Date.now() + (300 * (2 ** attempt)) + Math.round(Math.random() * 100);
+            await sleep(Math.max(0, reserveKalshiProductionRetry(environment, proposed, 'kalshi-rest') - Date.now()));
             continue;
           }
           break;
         }
-        _workingBase = base;
-        return res.json() as Promise<T>;
+        const payload = await res.json() as T;
+        opts.onResponseMetadata?.({
+          environment,
+          endpointClass,
+          sourceBaseUrl: base,
+          status: res.status,
+          verifiedAt: Date.now(),
+        });
+        recordReadSuccess(environment);
+        recordKalshiCircuitSuccess(environment);
+        workingBases.set(key, base);
+        recordHostResult(environment, endpointClass, base, null);
+        return payload;
       } catch (e) {
-        lastError = e instanceof Error ? e : new Error(String(e));
+        lastError = normalizeFailure(e, { environment, endpointClass, path, baseUrl: base });
+        if (!(e instanceof KalshiRequestFailure)) {
+          recordHostResult(environment, endpointClass, base, lastError.classification);
+        }
         if (opts.signal?.aborted) throw lastError;
-        // Don't retry SSL/connection errors — move to next base immediately
-        if (lastError instanceof KalshiHttpError && lastError.status >= 400 && lastError.status < 500) {
+        if (lastError.status !== null && lastError.status >= 400 && lastError.status < 500) {
           throw lastError;
         }
-        const msg = lastError.message ?? '';
-        const isFatal = msg.includes('SSL') || msg.includes('ECONNRESET') || msg.includes('fetch failed');
-        if (!isFatal && attempt < 2) await sleep(300 * (attempt + 1));
-        if (isFatal) break;
+        const moveToAlias = lastError.classification === 'network'
+          || lastError.classification === 'dns'
+          || lastError.classification === 'tcp'
+          || lastError.classification === 'tls'
+          || lastError.classification === 'connection_reset'
+          || lastError.classification === 'timeout'
+          ;
+        if (!moveToAlias && attempt < 2) {
+          const proposed = Date.now() + (300 * (2 ** attempt)) + Math.round(Math.random() * 100);
+          await sleep(Math.max(0, reserveKalshiProductionRetry(environment, proposed, 'kalshi-rest') - Date.now()));
+        }
+        if (moveToAlias) {
+          recordKalshiCircuitFailure(environment, 'kalshi-rest');
+          const proposed = Date.now() + 300 + Math.round(Math.random() * 100);
+          await sleep(Math.max(0, reserveKalshiProductionRetry(environment, proposed, 'kalshi-rest') - Date.now()));
+          break;
+        }
       }
     }
-    // If the cached base just failed, clear it so we re-discover on next call
-    if (base === _workingBase) _workingBase = null;
+    if (workingBases.get(key) === base) workingBases.delete(key);
   }
 
-  throw lastError ?? new Error(`Kalshi API failed: ${path}`);
+  throw lastError ?? new KalshiRequestFailure(`Kalshi API failed: ${path}`, {
+    classification: 'unknown',
+    environment,
+    endpointClass,
+    path,
+  });
 }
 
 export async function fetchMarkets(opts: FetchOptions = {}): Promise<KalshiMarketsResponse> {
@@ -250,6 +626,7 @@ export async function fetchMarkets(opts: FetchOptions = {}): Promise<KalshiMarke
   params.set('limit', String(opts.limit ?? 50));
   if (opts.status) params.set('status', opts.status);
   if (opts.cursor) params.set('cursor', opts.cursor);
+  if (opts.seriesTicker) params.set('series_ticker', opts.seriesTicker);
   const raw = await kalshiFetch<KalshiMarketsResponse>(`/markets?${params}`, opts);
   return {
     ...raw,
@@ -277,6 +654,32 @@ export async function fetchMarket(
     opts,
   );
   return normalizeKalshiMarket(raw.market);
+}
+
+export async function fetchEvent(
+  eventTicker: string,
+  opts: FetchOptions = {},
+): Promise<KalshiEvent> {
+  const raw = await kalshiFetch<{ event: KalshiEvent }>(
+    `/events/${encodeURIComponent(eventTicker)}`,
+    opts,
+  );
+  if (!raw.event?.event_ticker || !raw.event.series_ticker) {
+    throw new Error('Kalshi event payload missing event or series ticker');
+  }
+  return raw.event;
+}
+
+export async function fetchSeries(
+  seriesTicker: string,
+  opts: FetchOptions = {},
+): Promise<KalshiSeries> {
+  const raw = await kalshiFetch<{ series: KalshiSeries }>(
+    `/series/${encodeURIComponent(seriesTicker)}`,
+    opts,
+  );
+  if (!raw.series?.ticker) throw new Error('Kalshi series payload missing series');
+  return raw.series;
 }
 
 export async function fetchTrades(
@@ -384,10 +787,13 @@ export interface KalshiOrderRequest {
   ticker: string;
   action: 'buy' | 'sell';
   side: 'yes' | 'no';
-  count: number;
+  count?: number;
+  count_fp?: string;
   type: 'limit' | 'market';
   yes_price?: number;
   no_price?: number;
+  yes_price_dollars?: string;
+  no_price_dollars?: string;
   client_order_id?: string;
 }
 
@@ -396,6 +802,7 @@ export interface KalshiOrderResponse {
     order_id: string;
     status: string;
     fill_count?: number;
+    fill_count_fp?: string;
   };
 }
 

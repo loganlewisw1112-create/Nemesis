@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import type {
   AutoCloseDecision,
   AutoCloseSettings,
@@ -30,7 +30,7 @@ interface Props {
   selectedTicker?: string | null;
 }
 
-export function PaperDeskPanel({
+export const PaperDeskPanel = memo(function PaperDeskPanel({
   portfolio,
   marks,
   equity,
@@ -222,7 +222,7 @@ export function PaperDeskPanel({
       </button>
     </div>
   );
-}
+});
 
 function PositionRow({
   pos,

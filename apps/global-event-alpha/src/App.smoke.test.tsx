@@ -9,6 +9,15 @@ const bridgeStatus: BridgeStatus = {
   brainRole: 'primary',
   lastSeenAt: Date.now(),
   clientCount: 1,
+  lastInboundAt: Date.now(),
+  lastOutboundAt: Date.now(),
+  lastPongAt: Date.now(),
+  lastSequenceIn: 1,
+  lastSequenceOut: 1,
+  reconnects: 0,
+  disconnects: 0,
+  failovers: 0,
+  tapeFreshnessMs: 0,
 };
 
 const brainHealth: BrainClusterSnapshot = {
@@ -73,8 +82,12 @@ beforeEach(() => {
           no_levels_json: JSON.stringify([{ price: 0.55, quantity: 8 }]),
           best_yes_bid: 0.41,
           yes_ask: 0.45,
+          no_ask: 0.59,
           spread: 0.04,
           timestamp: Date.now(),
+          observed_at: Date.now(),
+          exchange_timestamp: null,
+          exchange_sequence: null,
         },
       ],
       latestTrades: [],

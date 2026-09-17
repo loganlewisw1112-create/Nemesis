@@ -1,5 +1,11 @@
-import { walkBookFill, kalshiFeeForOrder } from '@nemesis/core';
-import type { KalshiOrderbook } from '@nemesis/core';
+import {
+  kalshiFeeForFills,
+  kalshiFeeForOrder,
+  isSupportedQualificationFeeOrder,
+  walkBookFill,
+  type BookFillLevel,
+  type KalshiOrderbook,
+} from '@nemesis/core';
 
 export interface DryRunOrder {
   ticker: string;
@@ -8,11 +14,67 @@ export interface DryRunOrder {
   expectedPrice: number;
   fillPrice: number;
   filled: number;
+  fillLevels: BookFillLevel[];
   slippage: number;
   fees: number;
+  feePolicyKnown: boolean;
   netEdge: number;
   aborted: boolean;
   abortReason?: string;
+}
+
+function entryLevels(book: KalshiOrderbook, side: 'yes' | 'no') {
+  const opposingBids = side === 'yes' ? book.no : book.yes;
+  return opposingBids
+    .map((level) => ({ price: 1 - level.price, quantity: level.quantity }))
+    .sort((a, b) => a.price - b.price);
+}
+
+function exitLevels(book: KalshiOrderbook, side: 'yes' | 'no') {
+  return (side === 'yes' ? book.yes : book.no)
+    .map((level) => ({ price: level.price, quantity: level.quantity }))
+    .sort((a, b) => b.price - a.price);
+}
+
+function feeForWalk(book: KalshiOrderbook, fills: BookFillLevel[]) {
+  const exact = book.feePolicy ? kalshiFeeForFills(fills, book.feePolicy) : null;
+  if (exact) return { fees: exact.totalFeeUsd, feePolicyKnown: true };
+  return {
+    fees: fills.reduce((sum, fill) => sum + kalshiFeeForOrder(fill.price, fill.quantity), 0),
+    feePolicyKnown: false,
+  };
+}
+
+export function isSupportedQualificationFill(fill: Pick<DryRunOrder, 'fillPrice' | 'filled' | 'fillLevels'>): boolean {
+  if (isSupportedQualificationFeeOrder(fill.fillPrice, fill.filled)) return true;
+  if (fill.fillLevels.length === 0) return false;
+  const levelQuantity = fill.fillLevels.reduce((sum, level) => sum + level.quantity, 0);
+  if (Math.abs(levelQuantity - fill.filled) > 1e-8) return false;
+  return fill.fillLevels.every((level) => isSupportedQualificationFeeOrder(level.price, level.quantity));
+}
+
+function emptyResult(
+  book: KalshiOrderbook,
+  side: 'yes' | 'no',
+  contracts: number,
+  expectedPrice: number,
+  reason: string,
+): DryRunOrder {
+  return {
+    ticker: book.ticker,
+    side,
+    contracts,
+    expectedPrice,
+    fillPrice: 0,
+    filled: 0,
+    fillLevels: [],
+    slippage: 0,
+    fees: 0,
+    feePolicyKnown: false,
+    netEdge: 0,
+    aborted: true,
+    abortReason: reason,
+  };
 }
 
 export function dryRunFill(
@@ -22,48 +84,15 @@ export function dryRunFill(
   impliedPrice: number,
   maxSlippagePp = 0.03,
 ): DryRunOrder {
-  const levels = side === 'yes'
-    ? (book.yesAsk !== undefined
-        ? [{ price: book.yesAsk, quantity: 1000 }]
-        : book.yes.map((l) => ({ price: l.price, quantity: l.quantity })))
-    : (book.noAsk !== undefined
-        ? [{ price: book.noAsk, quantity: 1000 }]
-        : book.no.map((l) => ({ price: l.price, quantity: l.quantity })));
-
+  const levels = entryLevels(book, side);
   const walk = walkBookFill(levels, contracts);
-  if (!walk) {
-    return {
-      ticker: book.ticker,
-      side,
-      contracts,
-      expectedPrice: impliedPrice,
-      fillPrice: 0,
-      filled: 0,
-      slippage: 0,
-      fees: 0,
-      netEdge: 0,
-      aborted: true,
-      abortReason: 'insufficient depth',
-    };
-  }
+  if (!walk) return emptyResult(book, side, contracts, impliedPrice, 'insufficient depth');
 
-  if (walk.slippage > maxSlippagePp) {
-    return {
-      ticker: book.ticker,
-      side,
-      contracts,
-      expectedPrice: impliedPrice,
-      fillPrice: walk.avgPrice,
-      filled: walk.filled,
-      slippage: walk.slippage,
-      fees: kalshiFeeForOrder(walk.avgPrice, walk.filled),
-      netEdge: impliedPrice - walk.avgPrice - walk.slippage,
-      aborted: true,
-      abortReason: 'slippage exceeded',
-    };
-  }
-
-  const fees = kalshiFeeForOrder(walk.avgPrice, walk.filled);
+  const fee = feeForWalk(book, walk.fills);
+  const partial = !walk.complete;
+  const slippageExceeded = walk.slippage > maxSlippagePp;
+  const aborted = partial || slippageExceeded;
+  const abortReason = partial ? 'insufficient depth for complete fill' : slippageExceeded ? 'slippage exceeded' : undefined;
   return {
     ticker: book.ticker,
     side,
@@ -71,10 +100,13 @@ export function dryRunFill(
     expectedPrice: impliedPrice,
     fillPrice: walk.avgPrice,
     filled: walk.filled,
+    fillLevels: walk.fills,
     slippage: walk.slippage,
-    fees,
-    netEdge: impliedPrice - walk.avgPrice - fees / walk.filled,
-    aborted: false,
+    fees: fee.fees,
+    feePolicyKnown: fee.feePolicyKnown,
+    netEdge: walk.filled > 0 ? impliedPrice - walk.avgPrice - fee.fees / walk.filled : 0,
+    aborted,
+    abortReason,
   };
 }
 
@@ -85,46 +117,19 @@ export function dryRunCloseFill(
   expectedPrice: number,
   maxSlippagePp = 0.03,
 ): DryRunOrder {
-  const levels = side === 'yes'
-    ? book.yes.map((l) => ({ price: l.price, quantity: l.quantity })).sort((a, b) => b.price - a.price)
-    : book.no.map((l) => ({ price: l.price, quantity: l.quantity })).sort((a, b) => b.price - a.price);
-
+  const levels = exitLevels(book, side);
   const walk = walkBookFill(levels, contracts);
-  if (!walk) {
-    return {
-      ticker: book.ticker,
-      side,
-      contracts,
-      expectedPrice,
-      fillPrice: 0,
-      filled: 0,
-      slippage: 0,
-      fees: 0,
-      netEdge: 0,
-      aborted: true,
-      abortReason: 'insufficient close-side depth',
-    };
-  }
+  if (!walk) return emptyResult(book, side, contracts, expectedPrice, 'insufficient close-side depth');
 
   const bestBid = levels[0]?.price ?? walk.avgPrice;
   const closeSlippage = Math.max(0, bestBid - walk.avgPrice);
-  if (closeSlippage > maxSlippagePp) {
-    return {
-      ticker: book.ticker,
-      side,
-      contracts,
-      expectedPrice,
-      fillPrice: walk.avgPrice,
-      filled: walk.filled,
-      slippage: closeSlippage,
-      fees: kalshiFeeForOrder(walk.avgPrice, walk.filled),
-      netEdge: walk.avgPrice - expectedPrice - closeSlippage,
-      aborted: true,
-      abortReason: 'close-side slippage exceeded',
-    };
-  }
-
-  const fees = kalshiFeeForOrder(walk.avgPrice, walk.filled);
+  const fee = feeForWalk(book, walk.fills);
+  const partial = !walk.complete;
+  const slippageExceeded = closeSlippage > maxSlippagePp;
+  const aborted = partial || slippageExceeded;
+  const abortReason = partial
+    ? 'insufficient close-side depth for complete fill'
+    : slippageExceeded ? 'close-side slippage exceeded' : undefined;
   return {
     ticker: book.ticker,
     side,
@@ -132,10 +137,13 @@ export function dryRunCloseFill(
     expectedPrice,
     fillPrice: walk.avgPrice,
     filled: walk.filled,
+    fillLevels: walk.fills,
     slippage: closeSlippage,
-    fees,
-    netEdge: walk.avgPrice - expectedPrice - fees / walk.filled,
-    aborted: false,
+    fees: fee.fees,
+    feePolicyKnown: fee.feePolicyKnown,
+    netEdge: walk.avgPrice - expectedPrice - (walk.filled > 0 ? fee.fees / walk.filled : 0),
+    aborted,
+    abortReason,
   };
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, lazy, Suspense } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, lazy, memo, Suspense } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 
 const WorldPage = lazy(() => import('./WorldPage').then((m) => ({ default: m.WorldPage })));
@@ -35,7 +35,8 @@ import type {
 } from '@nemesis/core';
 import { DEFAULT_AUTO_CLOSE_SETTINGS } from '@nemesis/core';
 import type { FeedHubTradeFeedState } from '@nemesis/connectors';
-import type { PaperQualificationSnapshot, StrategyValidationSnapshot } from '@nemesis/execution';
+import type { PaperQualificationSnapshot } from '@nemesis/execution/paperQualification';
+import type { StrategyValidationSnapshot } from '@nemesis/execution/strategyValidation';
 
 interface PilotValidationSnapshot {
   completedPositionCount: number;
@@ -93,6 +94,22 @@ interface PaperState {
   pilotValidation?: PilotValidationSnapshot | null;
 }
 
+interface StateEnvelopeV2<T> {
+  schemaVersion: 2;
+  stream: string;
+  revision: number;
+  generatedAt: number;
+  full?: T[];
+  upserts?: T[];
+  removals?: string[];
+}
+
+type MarketStateStreamItem =
+  | { key: string; kind: 'market'; value: KalshiMarket }
+  | { key: string; kind: 'thesis'; value: ThesisCard };
+type EquityHistoryPoint = PaperState['equityHistory'][number];
+type PaperUpdate = Omit<PaperState, 'equityHistory'> & { equityHistory?: EquityHistoryPoint[] };
+
 interface KalshiCredentialStatus {
   apiKeyId: string | null;
   hasPrivateKey: boolean;
@@ -149,24 +166,45 @@ declare global {
       resumeDiscovery: () => Promise<DiscoveryState>;
       forceUniverseRefresh: () => Promise<DiscoveryState>;
       forceDepthPass: () => Promise<DiscoveryState>;
-      onSettingsUpdate: (cb: (s: GuardrailSettings) => void) => void;
-      onMarketsUpdate: (cb: (d: { theses: ThesisCard[]; markets: KalshiMarket[]; offline?: boolean; connectors?: ConnectorHealth[]; tradeFeed?: FeedHubTradeFeedState; discovery?: DiscoveryState; gates?: GateStatus[] }) => void) => void;
-      onPaperUpdate: (cb: (d: PaperState) => void) => void;
-      onTicksUpdate: (cb: (d: { ticker: string; ticks: PriceTick[] }) => void) => void;
-      onDiscoveryUpdate: (cb: (d: DiscoveryState) => void) => void;
+      onSettingsUpdate: (cb: (s: GuardrailSettings) => void) => () => void;
+      onMarketsUpdate: (cb: (d: { theses?: ThesisCard[]; markets?: KalshiMarket[]; offline?: boolean; connectors?: ConnectorHealth[]; tradeFeed?: FeedHubTradeFeedState; discovery?: DiscoveryState; gates?: GateStatus[] }) => void) => () => void;
+      onMarketsStateV2: (cb: (d: StateEnvelopeV2<MarketStateStreamItem>) => void) => () => void;
+      onPaperUpdate: (cb: (d: PaperUpdate) => void) => () => void;
+      onEquityHistoryStateV2: (cb: (d: StateEnvelopeV2<EquityHistoryPoint>) => void) => () => void;
+      onTicksUpdate: (cb: (d: { ticker: string; ticks: PriceTick[] }) => void) => () => void;
+      onDiscoveryUpdate: (cb: (d: DiscoveryState) => void) => () => void;
       openWidget: (type: 'pnl' | 'risk' | 'ticker' | 'gates' | 'scout' | 'world') => Promise<{ ok: boolean }>;
       closeThisWidget: () => Promise<void>;
       getWorldEvents: () => Promise<unknown>;
-      onWorldEventsUpdate: (cb: (d: unknown) => void) => void;
+      onWorldEventsUpdate: (cb: (d: unknown) => void) => () => void;
       getBridgeStatus: () => Promise<{ connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }>;
-      onBridgeStatus: (cb: (s: { connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }) => void) => void;
-      onBridgeRecommendation: (cb: (p: unknown) => void) => void;
-      onConnectorsUpdate: (cb: (d: ConnectorHealth[]) => void) => void;
+      onBridgeStatus: (cb: (s: { connected: boolean; brainRole: string | null; lastSeenAt: number | null; clientCount: number }) => void) => () => void;
+      onBridgeRecommendation: (cb: (p: unknown) => void) => () => void;
+      onConnectorsUpdate: (cb: (d: ConnectorHealth[]) => void) => () => void;
     };
   }
 }
 
 type Tab = 'theater' | 'paper' | 'markets' | 'journal' | 'profit' | 'settings' | 'world';
+export const DEFAULT_VISIBLE_THESIS_LIMIT = 25;
+// Markets tab can carry up to ~500 rows; cap the rendered window so the table
+// never mounts an unbounded number of <tr> elements at once (see limitVisibleItems).
+export const DEFAULT_VISIBLE_MARKET_LIMIT = 100;
+
+export function limitVisibleItems<T>(
+  items: readonly T[],
+  limit = DEFAULT_VISIBLE_THESIS_LIMIT,
+  offset = 0,
+): T[] {
+  const start = Math.max(0, offset);
+  return items.slice(start, start + Math.max(0, limit));
+}
+
+// Stable (module-level) empty-array references so components memoized with
+// React.memo don't see a "changed" prop every render just because the caller
+// wrote `[]` inline in JSX.
+const EMPTY_CONCENTRATION_WARNINGS: string[] = [];
+const EMPTY_PLAYBOOK_DRAWDOWNS: { playbook: string; pnl: number }[] = [];
 
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
@@ -177,6 +215,8 @@ export default function App() {
   const [paperResult, setPaperResult] = useState<string | null>(null);
   const [liveResult, setLiveResult] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>('all');
+  const [visibleThesisOffset, setVisibleThesisOffset] = useState(0);
+  const [visibleMarketsOffset, setVisibleMarketsOffset] = useState(0);
   const [paper, setPaper] = useState<PaperState | null>(null);
   const [ticks, setTicks] = useState<PriceTick[]>([]);
   const [backtestResult, setBacktestResult] = useState<string | null>(null);
@@ -223,51 +263,132 @@ export default function App() {
     }
     load();
     window.nemesis.getBridgeStatus().then((s) => setBridgeConnected(s.connected)).catch(() => {});
-    window.nemesis.onBridgeStatus((s) => setBridgeConnected(s.connected));
+    const unsubscribeBridge = window.nemesis.onBridgeStatus((s) => setBridgeConnected(s.connected));
     const bridgePoll = setInterval(() => {
       window.nemesis.getBridgeStatus().then((s) => setBridgeConnected(s.connected)).catch(() => {});
     }, 1_000);
-    return () => clearInterval(bridgePoll);
+    return () => {
+      clearInterval(bridgePoll);
+      unsubscribeBridge();
+    };
   }, [load]);
 
-  // IPC subscriptions — re-registers when selected ticker changes so the
-  // onTicksUpdate closure captures the latest ticker value. Safe because
-  // preload uses removeAllListeners before each on(), so no accumulation.
+  // Coalesce inbound IPC state updates so a burst of messages produces at most
+  // one React commit per animation frame instead of one commit per message.
+  // Every message's state-update logic is queued (never dropped, never reordered)
+  // in a ref; a single rAF (setTimeout(…,16) fallback) then runs every queued
+  // update in arrival order inside one callback. Because React 18+ batches all
+  // setState calls made synchronously within that callback, this yields exactly
+  // one commit per flush while preserving the exact same final state (upserts/
+  // removals/full deltas still apply in order, later-arriving deltas for the
+  // same stream still land after earlier ones).
+  const pendingIpcUpdatesRef = useRef<Array<() => void>>([]);
+  const ipcFlushHandleRef = useRef<number | ReturnType<typeof setTimeout> | null>(null);
+
+  const flushIpcUpdates = useCallback(() => {
+    ipcFlushHandleRef.current = null;
+    const updates = pendingIpcUpdatesRef.current;
+    if (updates.length === 0) return;
+    pendingIpcUpdatesRef.current = [];
+    for (const applyUpdate of updates) applyUpdate();
+  }, []);
+
+  const enqueueIpcUpdate = useCallback((applyUpdate: () => void) => {
+    pendingIpcUpdatesRef.current.push(applyUpdate);
+    if (ipcFlushHandleRef.current != null) return;
+    if (typeof requestAnimationFrame === 'function') {
+      ipcFlushHandleRef.current = requestAnimationFrame(flushIpcUpdates);
+    } else {
+      ipcFlushHandleRef.current = setTimeout(flushIpcUpdates, 16);
+    }
+  }, [flushIpcUpdates]);
+
+  // Cancel any pending flush on unmount so we never call setState after unmount.
+  useEffect(() => () => {
+    const handle = ipcFlushHandleRef.current;
+    if (handle != null) {
+      if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(handle as number);
+      } else {
+        clearTimeout(handle as ReturnType<typeof setTimeout>);
+      }
+    }
+    pendingIpcUpdatesRef.current = [];
+  }, []);
+
+  // IPC subscriptions own and release their exact listener.
   useEffect(() => {
     if (!window.nemesis) return;
-    window.nemesis.onMarketsUpdate((d) => {
-      setState((prev) => (prev ? {
-        ...prev,
-        theses: d.theses,
-        connectors: d.connectors ?? prev.connectors,
-        tradeFeed: d.tradeFeed ?? prev.tradeFeed,
-        gates: d.gates ?? prev.gates,
-      } : prev));
-      setMarkets(d.markets);
-      if (d.discovery) setDiscovery(d.discovery);
-    });
-    window.nemesis.onConnectorsUpdate((connectors) => {
-      setState((prev) => prev ? { ...prev, connectors } : prev);
-    });
-    window.nemesis.onDiscoveryUpdate((d) => setDiscovery(d as DiscoveryState));
+    const unsubscribers = [window.nemesis.onMarketsUpdate((d) => {
+      enqueueIpcUpdate(() => {
+        setState((prev) => (prev ? {
+          ...prev,
+          theses: d.theses ?? prev.theses,
+          connectors: d.connectors ?? prev.connectors,
+          tradeFeed: d.tradeFeed ?? prev.tradeFeed,
+          gates: d.gates ?? prev.gates,
+        } : prev));
+        if (d.markets) setMarkets(d.markets);
+        if (d.discovery) setDiscovery(d.discovery);
+      });
+    }), window.nemesis.onMarketsStateV2((envelope) => {
+      enqueueIpcUpdate(() => {
+        const changes = envelope.full ?? envelope.upserts ?? [];
+        setMarkets((previous) => {
+          const next = new Map((envelope.full ? [] : previous).map((market) => [market.ticker, market]));
+          for (const key of envelope.removals ?? []) if (key.startsWith('market:')) next.delete(key.slice(7));
+          for (const item of changes) if (item.kind === 'market') next.set(item.value.ticker, item.value);
+          return [...next.values()];
+        });
+        setState((previous) => {
+          if (!previous) return previous;
+          const next = new Map((envelope.full ? [] : previous.theses).map((thesis) => [thesis.id, thesis]));
+          for (const key of envelope.removals ?? []) if (key.startsWith('thesis:')) next.delete(key.slice(7));
+          for (const item of changes) if (item.kind === 'thesis') next.set(item.value.id, item.value);
+          return { ...previous, theses: [...next.values()] };
+        });
+      });
+    }), window.nemesis.onConnectorsUpdate((connectors) => {
+      enqueueIpcUpdate(() => {
+        setState((prev) => prev ? { ...prev, connectors } : prev);
+      });
+    }), window.nemesis.onDiscoveryUpdate((d) => {
+      enqueueIpcUpdate(() => setDiscovery(d as DiscoveryState));
+    }),
     window.nemesis.onSettingsUpdate((s) => {
-      setState((prev) => prev ? { ...prev, settings: s } : prev);
-    });
-    window.nemesis.onPaperUpdate((d) => {
-      setPaper(d as PaperState);
-      setState((prev) => prev ? {
-        ...prev,
-        activeRegimes: (d as PaperState).activeRegimes,
-        dailyPnl: (d as PaperState).dailyPnl,
-        paperQualification: (d as PaperState).paperQualification,
-        strategyValidation: (d as PaperState).strategyValidation,
-        pilotValidation: (d as PaperState).pilotValidation,
-      } : prev);
-    });
-    window.nemesis.onTicksUpdate((d) => {
-      if (selected?.ticker === d.ticker) setTicks(d.ticks);
-    });
-  }, [selected?.ticker]);
+      enqueueIpcUpdate(() => {
+        setState((prev) => prev ? { ...prev, settings: s } : prev);
+      });
+    }), window.nemesis.onPaperUpdate((d) => {
+      enqueueIpcUpdate(() => {
+        setPaper((previous) => ({ ...d, equityHistory: d.equityHistory ?? previous?.equityHistory ?? [] }));
+        setState((prev) => prev ? {
+          ...prev,
+          activeRegimes: d.activeRegimes,
+          dailyPnl: d.dailyPnl,
+          paperQualification: d.paperQualification,
+          strategyValidation: d.strategyValidation,
+          pilotValidation: d.pilotValidation,
+        } : prev);
+      });
+    }), window.nemesis.onEquityHistoryStateV2((envelope) => {
+      enqueueIpcUpdate(() => {
+        setPaper((previous) => {
+          if (!previous) return previous;
+          const changes = envelope.full ?? envelope.upserts ?? [];
+          const next = new Map((envelope.full ? [] : previous.equityHistory).map((point) => [String(point.t), point]));
+          for (const key of envelope.removals ?? []) next.delete(key);
+          for (const point of changes) next.set(String(point.t), point);
+          return { ...previous, equityHistory: [...next.values()].sort((left, right) => left.t - right.t) };
+        });
+      });
+    }), window.nemesis.onTicksUpdate((d) => {
+      enqueueIpcUpdate(() => {
+        if (selected?.ticker === d.ticker) setTicks(d.ticks);
+      });
+    })];
+    return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
+  }, [selected?.ticker, enqueueIpcUpdate]);
 
   useEffect(() => {
     if (!window.nemesis) return;
@@ -282,6 +403,43 @@ export default function App() {
 
   // Must be above early returns to satisfy Rules of Hooks
   const { notes, dismiss } = useNotifications(state?.theses ?? [], paper);
+
+  // Expensive per-render derivations — memoized so a coalesced-but-unrelated
+  // render (e.g. connectors/settings updating) doesn't re-filter every thesis.
+  // Must also be above early returns to satisfy Rules of Hooks.
+  const theses = state?.theses ?? [];
+  const filtered = useMemo(() => theses.filter((t) => {
+    if (filter === 'scout' || filter === 'solid' || filter === 'whale') {
+      const tier = t.executableTier;
+      if (!tier) return false;
+      const order: Record<ExecutableTier, number> = { whale: 3, solid: 2, scout: 1 };
+      return order[tier] >= order[filter as ExecutableTier];
+    }
+    if (filter === 'all') return true;
+    if (filter === 'tradeable') return t.status === 'tradeable' || t.status === 'qualified' || t.status === 'watch-only';
+    return t.playbook === filter || t.status === filter;
+  }), [theses, filter]);
+  const tierCounts = useMemo(() => ({
+    scout: theses.filter((t) => t.executableTier === 'scout' || t.executableTier === 'solid' || t.executableTier === 'whale').length,
+    solid: theses.filter((t) => t.executableTier === 'solid' || t.executableTier === 'whale').length,
+    whale: theses.filter((t) => t.executableTier === 'whale').length,
+  }), [theses]);
+  const tradableCount = useMemo(
+    () => theses.filter((t) => t.status === 'tradeable' || t.status === 'qualified' || t.status === 'watch-only').length,
+    [theses],
+  );
+
+  // Stable callback identity (changes only when `state` itself changes, not on
+  // every unrelated re-render) so the memoized NotificationPanel can bail out.
+  const handleNotifAction = useCallback((n: NemesisNotification) => {
+    if (n.positionId) {
+      void window.nemesis.paperClose(n.positionId).then(loadPaper);
+    } else if (n.thesisId && state) {
+      setTab('theater');
+      const card = state.theses.find((c) => c.id === n.thesisId);
+      if (card) setSelected(card);
+    }
+  }, [state, loadPaper]);
 
   // Warm up AudioContext on first interaction so notification sounds always play
   useEffect(() => {
@@ -304,23 +462,16 @@ export default function App() {
 
   if (!state) return <div style={{ padding: 20, color: '#8b93a7' }}>Loading NEMESIS...</div>;
 
-  const filtered = state.theses.filter((t) => {
-    if (filter === 'scout' || filter === 'solid' || filter === 'whale') {
-      const tier = t.executableTier;
-      if (!tier) return false;
-      const order: Record<ExecutableTier, number> = { whale: 3, solid: 2, scout: 1 };
-      return order[tier] >= order[filter as ExecutableTier];
-    }
-    if (filter === 'all') return true;
-    if (filter === 'tradeable') return t.status === 'tradeable' || t.status === 'qualified' || t.status === 'watch-only';
-    return t.playbook === filter || t.status === filter;
-  });
-  const tierCounts = {
-    scout: state.theses.filter((t) => t.executableTier === 'scout' || t.executableTier === 'solid' || t.executableTier === 'whale').length,
-    solid: state.theses.filter((t) => t.executableTier === 'solid' || t.executableTier === 'whale').length,
-    whale: state.theses.filter((t) => t.executableTier === 'whale').length,
-  };
-  const tradableCount = state.theses.filter((t) => t.status === 'tradeable' || t.status === 'qualified' || t.status === 'watch-only').length;
+  const normalizedThesisOffset = Math.min(
+    visibleThesisOffset,
+    Math.max(0, Math.floor(Math.max(0, filtered.length - 1) / DEFAULT_VISIBLE_THESIS_LIMIT) * DEFAULT_VISIBLE_THESIS_LIMIT),
+  );
+  const visibleTheses = limitVisibleItems(filtered, DEFAULT_VISIBLE_THESIS_LIMIT, normalizedThesisOffset);
+  const normalizedMarketsOffset = Math.min(
+    visibleMarketsOffset,
+    Math.max(0, Math.floor(Math.max(0, markets.length - 1) / DEFAULT_VISIBLE_MARKET_LIMIT) * DEFAULT_VISIBLE_MARKET_LIMIT),
+  );
+  const visibleMarkets = limitVisibleItems(markets, DEFAULT_VISIBLE_MARKET_LIMIT, normalizedMarketsOffset);
   const openPosition = paper?.portfolio.positions.find(
     (p) => selected && p.ticker === selected.ticker && p.side === selected.side,
   );
@@ -333,16 +484,6 @@ export default function App() {
     ? Math.max(0, Math.ceil((tradeFeed.nextRetryAt - Date.now()) / 1000))
     : null;
   const credentialStatus = state.credentialStatus;
-
-  function handleNotifAction(n: NemesisNotification) {
-    if (n.positionId) {
-      void window.nemesis.paperClose(n.positionId).then(loadPaper);
-    } else if (n.thesisId && state) {
-      setTab('theater');
-      const card = state.theses.find((c) => c.id === n.thesisId);
-      if (card) setSelected(card);
-    }
-  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
@@ -424,7 +565,10 @@ export default function App() {
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   {['all', 'scout', 'solid', 'whale', 'tradeable', 'flow-hunter', 'weather-wing', 'crypto-lead', 'global-pulse'].map((f) => (
-                    <button key={f} type="button" onClick={() => setFilter(f)} style={chipStyle(filter === f)}>
+                    <button key={f} type="button" onClick={() => {
+                      setFilter(f);
+                      setVisibleThesisOffset(0);
+                    }} style={chipStyle(filter === f)}>
                       {f}{f === 'tradeable' ? ` (${tradableCount})` : f === 'scout' ? ` (${tierCounts.scout})` : f === 'solid' ? ` (${tierCounts.solid})` : f === 'whale' ? ` (${tierCounts.whale})` : ''}
                     </button>
                   ))}
@@ -460,7 +604,7 @@ export default function App() {
               )}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
                 <AnimatePresence>
-                {filtered.map((card) => (
+                {visibleTheses.map((card) => (
                   <motion.div
                     key={card.id}
                     initial={{ opacity: 0, y: 14, scale: 0.97 }}
@@ -468,71 +612,92 @@ export default function App() {
                     exit={{ opacity: 0, scale: 0.95 }}
                     transition={{ duration: 0.16 }}
                   >
-                  <ThesisCardView
+                  <TheaterThesisCard
                     card={card}
                     selected={selected?.id === card.id}
-                    onSelect={() => setSelected(card)}
                     showLiveBuy={state.settings.liveEnabled && !state.settings.killSwitchActive}
-                    showPaperBuy={true}
-                    onJournal={async () => {
-                      await window.nemesis.journalAdd(card.id);
-                      load();
-                    }}
-                    onDryRun={async () => {
-                      const r = await window.nemesis.dryRun(card.id);
-                      setDryRunResult(r.aborted
-                        ? `Dry-run aborted: ${r.abortReason}`
-                        : `Dry-run fill @ ${((r.fillPrice ?? 0) * 100).toFixed(1)}¢ slippage ${((r.slippage ?? 0) * 100).toFixed(2)}¢`);
-                    }}
-                    onLiveBuy={async () => {
-                      const r = await window.nemesis.liveBuy(card.id);
-                      if (r.ok) {
-                        setLiveResult(`Live order placed on ${card.ticker}${r.orderId ? ` (#${r.orderId})` : ''}`);
-                      } else {
-                        setLiveResult(`Live buy failed: ${r.error ?? 'unknown'}`);
-                      }
-                    }}
-                    onPaperBuy={async () => {
-                      const r = await window.nemesis.paperBuy(card.id);
-                      if (r.ok) {
-                        setPaperResult(`Paper buy filled on ${card.ticker}${r.fill ? ` @ ${((r.fill.fillPrice ?? 0) * 100).toFixed(1)}¢` : ''}`);
-                        setSelected(card);
-                        loadPaper();
-                      } else {
-                        setPaperResult(`Paper buy failed: ${r.error ?? r.abortReason ?? 'unknown'}`);
-                      }
-                    }}
+                    onSelectCard={setSelected}
+                    load={load}
+                    loadPaper={loadPaper}
+                    setDryRunResult={setDryRunResult}
+                    setLiveResult={setLiveResult}
+                    setPaperResult={setPaperResult}
                   />
                   </motion.div>
                 ))}
                 </AnimatePresence>
               </div>
+              {filtered.length > DEFAULT_VISIBLE_THESIS_LIMIT && (
+                <div style={{ display: 'flex', gap: 8, alignSelf: 'center', alignItems: 'center', marginTop: 12 }}>
+                  <button
+                    type="button"
+                    disabled={normalizedThesisOffset === 0}
+                    onClick={() => setVisibleThesisOffset((current) => Math.max(0, current - DEFAULT_VISIBLE_THESIS_LIMIT))}
+                    style={chipStyle(false)}
+                  >
+                    Previous 25
+                  </button>
+                  <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                    {normalizedThesisOffset + 1}–{normalizedThesisOffset + visibleTheses.length}/{filtered.length}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={normalizedThesisOffset + visibleTheses.length >= filtered.length}
+                    onClick={() => setVisibleThesisOffset((current) => Math.min(filtered.length - 1, current + DEFAULT_VISIBLE_THESIS_LIMIT))}
+                    style={chipStyle(false)}
+                  >
+                    Next 25
+                  </button>
+                </div>
+              )}
             </>
           )}
 
           {tab === 'paper' && paper && (
             <>
               <h1 style={{ fontSize: 18, marginBottom: 12 }}>Paper Command Desk</h1>
-              {paper.strategyValidation && (
+              {paper.strategyValidation && (() => {
+                const sv = paper.strategyValidation!;
+                const minScored = sv.shadowMinScored ?? 100;
+                const minDays = sv.shadowMinDistinctDays ?? 3;
+                const minObservationMs = sv.shadowMinObservationMs ?? 0;
+                const countOk = sv.shadowCountPassed
+                  ?? (sv.shadowCandidateCount >= minScored
+                    && sv.shadowDistinctDayCount >= minDays
+                    && (sv.shadowObservationWindowMs ?? 0) >= minObservationMs
+                    && !sv.paused
+                    && !sv.integrityError);
+                const qualityOk = sv.shadowQualityPassed ?? sv.shadowPassed;
+                const daysMatter = minDays > 1;
+                const daysPart = daysMatter ? ` · days ${sv.shadowDistinctDayCount}/${minDays}` : '';
+                const observationPart = minObservationMs > 0
+                  ? ` · age ${((sv.shadowObservationWindowMs ?? 0) / 86_400_000).toFixed(1)}/${(minObservationMs / 86_400_000).toFixed(1)}d`
+                  : '';
+                const pf = Number.isFinite(sv.shadowProfitFactor) ? sv.shadowProfitFactor.toFixed(2) : '∞';
+                const countLabel = countOk ? 'count PASS' : 'count short';
+                const qualityLabel = qualityOk
+                  ? 'quality PASS'
+                  : `quality FAIL (net $${sv.shadowNetPnlUsd.toFixed(2)})`;
+                return (
                 <div style={{ padding: 12, marginBottom: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
                     <div>
                       <div style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase' }}>
-                        Validation stage: {paper.strategyValidation.stage}
+                        Validation stage: {sv.stage}
                       </div>
                       <div style={{ marginTop: 5, fontSize: 11, color: 'var(--text-muted)' }}>
-                        Shadow {paper.strategyValidation.shadowCandidateCount}/100 · days {paper.strategyValidation.shadowDistinctDayCount}/3 · PF {Number.isFinite(paper.strategyValidation.shadowProfitFactor) ? paper.strategyValidation.shadowProfitFactor.toFixed(2) : '∞'} · wins {(paper.strategyValidation.shadowWinRate * 100).toFixed(1)}%
+                        {`Shadow ${sv.shadowCandidateCount}/${minScored}${daysPart}${observationPart} · ${countLabel} · ${qualityLabel} · PF ${pf} · wins ${(sv.shadowWinRate * 100).toFixed(1)}%`}
                       </div>
                       {paper.pilotValidation && (
                         <div style={{ marginTop: 3, fontSize: 11, color: 'var(--text-muted)' }}>
                           Pilot {paper.pilotValidation.completedPositionCount}/20 · net ${paper.pilotValidation.realizedPnlUsd.toFixed(2)} · PF {Number.isFinite(paper.pilotValidation.profitFactor) ? paper.pilotValidation.profitFactor.toFixed(2) : '∞'} · loss budget ${paper.pilotValidation.lossBudgetRemainingUsd.toFixed(2)}
                         </div>
                       )}
-                      {paper.strategyValidation.paused && (
-                        <div style={{ marginTop: 5, fontSize: 11, color: 'var(--danger)' }}>Paused: {paper.strategyValidation.pauseReason}</div>
+                      {sv.paused && (
+                        <div style={{ marginTop: 5, fontSize: 11, color: 'var(--danger)' }}>Paused: {sv.pauseReason}</div>
                       )}
                     </div>
-                    {paper.strategyValidation.stage === 'shadow' && paper.strategyValidation.shadowPassed && (
+                    {sv.stage === 'shadow' && qualityOk && (
                       <button type="button" style={chipStyle(false)} onClick={async () => {
                         const confirmation = window.prompt('Type ADVANCE_TO_PILOT to start the capped paper pilot.');
                         if (!confirmation) return;
@@ -541,7 +706,7 @@ export default function App() {
                         await loadPaper();
                       }}>Advance to pilot</button>
                     )}
-                    {paper.strategyValidation.stage === 'pilot' && paper.pilotValidation?.passed && (
+                    {sv.stage === 'pilot' && paper.pilotValidation?.passed && (
                       <button type="button" style={chipStyle(false)} onClick={async () => {
                         const confirmation = window.prompt('Type ADVANCE_TO_QUALIFICATION to continue into full qualification.');
                         if (!confirmation) return;
@@ -552,7 +717,8 @@ export default function App() {
                     )}
                   </div>
                 </div>
-              )}
+                );
+              })()}
               <PaperDeskPanel
                 portfolio={paper.portfolio}
                 marks={paper.marks}
@@ -612,7 +778,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {markets.map((m) => (
+                  {visibleMarkets.map((m) => (
                     <tr key={m.ticker} style={{ borderTop: '1px solid var(--border)' }}>
                       <td style={tdStyle}>{m.ticker}</td>
                       <td style={tdStyle}>{m.title}</td>
@@ -622,6 +788,29 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
+              {markets.length > DEFAULT_VISIBLE_MARKET_LIMIT && (
+                <div style={{ display: 'flex', gap: 8, alignSelf: 'center', alignItems: 'center', marginTop: 12 }}>
+                  <button
+                    type="button"
+                    disabled={normalizedMarketsOffset === 0}
+                    onClick={() => setVisibleMarketsOffset((current) => Math.max(0, current - DEFAULT_VISIBLE_MARKET_LIMIT))}
+                    style={chipStyle(false)}
+                  >
+                    Previous {DEFAULT_VISIBLE_MARKET_LIMIT}
+                  </button>
+                  <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                    {normalizedMarketsOffset + 1}–{normalizedMarketsOffset + visibleMarkets.length}/{markets.length}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={normalizedMarketsOffset + visibleMarkets.length >= markets.length}
+                    onClick={() => setVisibleMarketsOffset((current) => Math.min(markets.length - 1, current + DEFAULT_VISIBLE_MARKET_LIMIT))}
+                    style={chipStyle(false)}
+                  >
+                    Next {DEFAULT_VISIBLE_MARKET_LIMIT}
+                  </button>
+                </div>
+              )}
             </>
           )}
 
@@ -987,8 +1176,8 @@ export default function App() {
               deployedPct={heatPct}
               dailyPnl={dailyPnl}
               dailyLossCap={state.settings.dailyLossCapUsd}
-              concentrationWarnings={[]}
-              playbookDrawdowns={[]}
+              concentrationWarnings={EMPTY_CONCENTRATION_WARNINGS}
+              playbookDrawdowns={EMPTY_PLAYBOOK_DRAWDOWNS}
             />
           )}
           {selected && (
@@ -1004,6 +1193,82 @@ export default function App() {
     </div>
   );
 }
+
+// Wraps ThesisCardView with stable, per-card callback identities so
+// React.memo (applied inside ThesisCardView) can actually bail out of
+// re-rendering a card when neither its data nor selection state changed —
+// even though the parent App re-renders on every coalesced IPC flush.
+interface TheaterThesisCardProps {
+  card: ThesisCard;
+  selected: boolean;
+  showLiveBuy: boolean;
+  onSelectCard: (card: ThesisCard) => void;
+  load: () => Promise<void>;
+  loadPaper: () => Promise<void>;
+  setDryRunResult: (v: string | null) => void;
+  setLiveResult: (v: string | null) => void;
+  setPaperResult: (v: string | null) => void;
+}
+
+const TheaterThesisCard = memo(function TheaterThesisCard({
+  card,
+  selected,
+  showLiveBuy,
+  onSelectCard,
+  load,
+  loadPaper,
+  setDryRunResult,
+  setLiveResult,
+  setPaperResult,
+}: TheaterThesisCardProps) {
+  const onSelect = useCallback(() => onSelectCard(card), [onSelectCard, card]);
+
+  const onJournal = useCallback(async () => {
+    await window.nemesis.journalAdd(card.id);
+    load();
+  }, [card.id, load]);
+
+  const onDryRun = useCallback(async () => {
+    const r = await window.nemesis.dryRun(card.id);
+    setDryRunResult(r.aborted
+      ? `Dry-run aborted: ${r.abortReason}`
+      : `Dry-run fill @ ${((r.fillPrice ?? 0) * 100).toFixed(1)}¢ slippage ${((r.slippage ?? 0) * 100).toFixed(2)}¢`);
+  }, [card.id, setDryRunResult]);
+
+  const onLiveBuy = useCallback(async () => {
+    const r = await window.nemesis.liveBuy(card.id);
+    if (r.ok) {
+      setLiveResult(`Live order placed on ${card.ticker}${r.orderId ? ` (#${r.orderId})` : ''}`);
+    } else {
+      setLiveResult(`Live buy failed: ${r.error ?? 'unknown'}`);
+    }
+  }, [card.id, card.ticker, setLiveResult]);
+
+  const onPaperBuy = useCallback(async () => {
+    const r = await window.nemesis.paperBuy(card.id);
+    if (r.ok) {
+      setPaperResult(`Paper buy filled on ${card.ticker}${r.fill ? ` @ ${((r.fill.fillPrice ?? 0) * 100).toFixed(1)}¢` : ''}`);
+      onSelectCard(card);
+      loadPaper();
+    } else {
+      setPaperResult(`Paper buy failed: ${r.error ?? r.abortReason ?? 'unknown'}`);
+    }
+  }, [card, setPaperResult, onSelectCard, loadPaper]);
+
+  return (
+    <ThesisCardView
+      card={card}
+      selected={selected}
+      onSelect={onSelect}
+      showLiveBuy={showLiveBuy}
+      showPaperBuy={true}
+      onJournal={onJournal}
+      onDryRun={onDryRun}
+      onLiveBuy={onLiveBuy}
+      onPaperBuy={onPaperBuy}
+    />
+  );
+});
 
 const popoutStyle: React.CSSProperties = {
   background: 'none',

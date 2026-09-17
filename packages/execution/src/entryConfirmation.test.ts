@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_ENTRY_QUALIFICATION, type ProfitCertificate, type ThesisCard } from '@nemesis/core';
+import { buildKalshiFeePolicy, DEFAULT_ENTRY_QUALIFICATION, type ProfitCertificate, type ThesisCard } from '@nemesis/core';
 import type { DryRunOrder } from './dryRun.js';
-import { EntryConfirmationEngine } from './entryConfirmation.js';
+import {
+  EntryConfirmationEngine,
+  MAX_PROVEN_QUIET_BOOK_AGE_MS,
+  MAX_REMEMBERED_USED_SOURCES,
+} from './entryConfirmation.js';
 
 const startedAt = Date.UTC(2026, 6, 14, 12, 0, 0);
+const feePolicy = buildKalshiFeePolicy({ multiplier: 1, accountPrecision: 'direct' });
 
 function card(overrides: Partial<ThesisCard> = {}): ThesisCard {
   return {
@@ -43,8 +48,10 @@ function fill(overrides: Partial<DryRunOrder> = {}): DryRunOrder {
     expectedPrice: 0.4,
     fillPrice: 0.4,
     filled: 25,
+    fillLevels: [{ price: 0.4, quantity: 25, cost: 10 }],
     slippage: 0,
     fees: 0.18,
+    feePolicyKnown: true,
     netEdge: 0.09,
     aborted: false,
     ...overrides,
@@ -76,11 +83,263 @@ function observe(engine: EntryConfirmationEngine, index: number, overrides: Part
     fill: fill({ netEdge: overrides.netEdge ?? 0.09 }),
     baseCertificate: certificate(),
     bookTimestamp: observedAt,
+    bookSequence: index + 1,
+    feePolicy,
     observedAt,
   });
 }
 
 describe('EntryConfirmationEngine', () => {
+  it('fails closed without exchange book provenance or a resolved fee policy', () => {
+    const engine = new EntryConfirmationEngine();
+    const missingProvenance = engine.observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, observedAt: startedAt, feePolicy,
+    });
+    expect(missingProvenance.reason).toMatch(/exchange-origin book timestamp and sequence/i);
+    const missingPolicy = engine.observe({
+      card: card({ id: 'flow-policy' }), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, bookSequence: 1, observedAt: startedAt,
+    });
+    expect(missingPolicy.reason).toMatch(/fee policy is unknown/i);
+  });
+
+  it('accepts a quiet book only when continuity is proven, and never past the ceiling', () => {
+    const stale = { bookTimestamp: startedAt - 5_000, observedAt: startedAt };
+    // Unproven: the strict maxBookAgeMs bound still applies.
+    expect(new EntryConfirmationEngine().observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookSequence: 1, feePolicy, ...stale,
+    }).reason).toMatch(/entry book is stale/i);
+
+    // Proven continuity: an unchanged book from a quiet market is current.
+    expect(new EntryConfirmationEngine().observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookSequence: 1, feePolicy, bookContinuityProven: true, ...stale,
+    }).reason).not.toMatch(/entry book is stale/i);
+
+    // Proof does not extend past the hard ceiling.
+    expect(new EntryConfirmationEngine().observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookSequence: 1, feePolicy, bookContinuityProven: true,
+      bookTimestamp: startedAt - (MAX_PROVEN_QUIET_BOOK_AGE_MS + 1), observedAt: startedAt,
+    }).reason).toMatch(/entry book is stale/i);
+  });
+
+  it('accumulates samples at an observation cadence near the tiling interval', () => {
+    // Production settings: the old spacing rule tiled exactly across the window
+    // (15000 / 3 = 5000ms) against a poll cadence whose measured median was
+    // exactly 5.0s. An observation arriving a few ms early was dropped, so a
+    // candidate could sit at one sample until its source expired.
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const cadenceMs = 4_990;
+    const step = (index: number) => {
+      const observedAt = startedAt + index * cadenceMs;
+      return engine.observe({
+        card: card({ updatedAt: observedAt }),
+        fill: fill(),
+        baseCertificate: certificate(),
+        bookTimestamp: observedAt,
+        bookSequence: index + 1,
+        feePolicy,
+        observedAt,
+      });
+    };
+
+    expect(step(0).samples).toBe(1);
+    // Under the old bound each of these was silently discarded.
+    expect(step(1).samples).toBe(2);
+    expect(step(2).samples).toBe(3);
+
+    // The window guarantee is untouched: four samples spanning 14_970ms is
+    // still short of minWindowMs, so it stays pending rather than confirming.
+    const fourth = step(3);
+    expect(fourth.samples).toBe(4);
+    expect(fourth.status).toBe('pending');
+    expect(fourth.windowMs).toBeLessThan(15_000);
+
+    const fifth = step(4);
+    expect(fifth.status).toBe('ready');
+    expect(fifth.windowMs).toBeGreaterThanOrEqual(15_000);
+  });
+
+  it('accumulates persistence on a quiet book that re-ticks less often than the sample cadence', () => {
+    // Realistic slow instrument: the book re-ticks occasionally (fresh sequence)
+    // but not on every 5s sample. Between ticks the same sequence is re-observed
+    // while the book stays inside the continuity ceiling, and with continuity
+    // proven those re-observations count -- so genuine stable edge confirms
+    // instead of stalling for want of four distinct sequences.
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const obs = (observedAt: number, seq: number, bookTs: number) => engine.observe({
+      card: card({ updatedAt: observedAt }),
+      fill: fill(),
+      baseCertificate: certificate(),
+      bookTimestamp: bookTs,
+      bookSequence: seq,
+      bookContinuityProven: true,
+      feePolicy,
+      observedAt,
+    });
+    expect(obs(startedAt, 5, startedAt).samples).toBe(1);                    // fresh seq 5
+    expect(obs(startedAt + 5_000, 5, startedAt).samples).toBe(2);            // same seq, age 5s, proven
+    expect(obs(startedAt + 8_000, 6, startedAt + 8_000).samples).toBe(3);    // book re-ticks: fresh seq 6
+    const fourth = obs(startedAt + 15_000, 6, startedAt + 8_000);            // same seq 6, age 7s, proven
+    expect(fourth.samples).toBe(4);
+    expect(fourth.windowMs).toBe(15_000);
+    expect(fourth.status).toBe('ready');
+
+    // Without continuity proof, a repeated sequence at a stale age is rejected,
+    // so the same market cannot pad its sample count.
+    const strict = new EntryConfirmationEngine(settings);
+    expect(strict.observe({
+      card: card(), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, bookSequence: 5, feePolicy, observedAt: startedAt,
+    }).samples).toBe(1);
+    expect(strict.observe({
+      card: card({ updatedAt: startedAt + 5_000 }), fill: fill(), baseCertificate: certificate(),
+      bookTimestamp: startedAt, bookSequence: 5, feePolicy, observedAt: startedAt + 5_000,
+    }).reason).toMatch(/entry book is stale/i);
+  });
+
+  it('can finish minWindowMs on a fully quiet book with proven continuity (no mid-window re-tick)', () => {
+    // Structural stall that hit live paper: with a 10s quiet ceiling, sample 4
+    // at t=15s was always "entry book is stale", so chains maxed at 3/4.
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const obs = (observedAt: number) => engine.observe({
+      card: card({ updatedAt: observedAt }),
+      fill: fill(),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      bookSequence: 9,
+      bookContinuityProven: true,
+      feePolicy,
+      observedAt,
+    });
+    expect(obs(startedAt).samples).toBe(1);
+    expect(obs(startedAt + 5_000).samples).toBe(2);
+    expect(obs(startedAt + 10_000).samples).toBe(3);
+    const fourth = obs(startedAt + 15_000);
+    expect(fourth.samples).toBe(4);
+    expect(fourth.windowMs).toBe(15_000);
+    expect(fourth.status).toBe('ready');
+    expect(fourth.reason).not.toMatch(/stale/i);
+
+    // Continuity still cannot vouch past the hard ceiling.
+    expect(engine.observe({
+      card: card({ updatedAt: startedAt + MAX_PROVEN_QUIET_BOOK_AGE_MS + 1 }),
+      fill: fill(),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      bookSequence: 9,
+      bookContinuityProven: true,
+      feePolicy,
+      observedAt: startedAt + MAX_PROVEN_QUIET_BOOK_AGE_MS + 1,
+    }).reason).toMatch(/entry book is stale/i);
+  });
+
+  it('still rejects burst samples taken from the same instant', () => {
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const burst = (index: number) => engine.observe({
+      card: card({ updatedAt: startedAt }),
+      fill: fill(),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      bookSequence: index + 1,
+      feePolicy,
+      observedAt: startedAt + index * 10,
+    });
+    expect(burst(0).samples).toBe(1);
+    // 10ms apart is far below the anti-burst bound, so these do not count.
+    expect(burst(1).samples).toBe(1);
+    expect(burst(2).samples).toBe(1);
+  });
+
+  it('enforces the absolute bars at admission and at confirmation, not on every sample', () => {
+    // A candidate admitted on qualifying economics keeps accumulating even when
+    // an intermediate observation dips below the absolute bar, so long as the
+    // edge itself holds -- that is what edgeRetention is for.
+    const engine = new EntryConfirmationEngine({
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      minExpectedNetPnlUsd: 2.2,
+    });
+    expect(observe(engine, 0).status).toBe('pending');
+    const dip = observe(engine, 1, { impliedPrice: 0.54 });
+    expect(dip.status).toBe('pending');
+    expect(dip.reason).toMatch(/collecting persistent/i);
+
+    // But an entry is never taken on economics that fail at the confirming
+    // observation, however good the admitting sample was.
+    const strict = new EntryConfirmationEngine({
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      minSamples: 2,
+      minWindowMs: 6_000,
+      minExpectedNetPnlUsd: 2.2,
+    });
+    expect(observe(strict, 0).status).toBe('pending');
+    expect(observe(strict, 1, { impliedPrice: 0.5 }).reason).toMatch(/target net reward is below the minimum/i);
+  });
+
+  it('accumulates across re-issued flow signal IDs for the same economic identity', () => {
+    // Live GEA cards for one ticker/side often mint a new card.id every ~20s.
+    // Keying confirmation on card.id restarted the sample count at 1 forever.
+    const settings = { ...DEFAULT_ENTRY_QUALIFICATION, minSamples: 4, minWindowMs: 15_000 };
+    const engine = new EntryConfirmationEngine(settings);
+    const step = (index: number, id: string) => {
+      const observedAt = startedAt + index * 5_000;
+      return engine.observe({
+        card: card({ id, updatedAt: observedAt, createdAt: observedAt }),
+        fill: fill(),
+        baseCertificate: certificate(),
+        bookTimestamp: observedAt,
+        bookSequence: index + 1,
+        bookContinuityProven: true,
+        feePolicy,
+        observedAt,
+      });
+    };
+
+    expect(step(0, 'flow-a').samples).toBe(1);
+    expect(step(1, 'flow-b').samples).toBe(2);
+    expect(step(2, 'flow-c').samples).toBe(3);
+    const fourth = step(3, 'flow-d');
+    expect(fourth.samples).toBe(4);
+    expect(fourth.status).toBe('ready');
+    expect(fourth.certificate?.sourceSignalId).toBe('flow-d');
+  });
+
+  it('rejects a re-issued signal after the economic identity has already been used', () => {
+    const engine = new EntryConfirmationEngine();
+    expect(observe(engine, 0, { id: 'flow-a' }).status).toBe('pending');
+    engine.markSourceUsed('flow-a');
+    expect(engine.inFlightTickers()).toEqual([]);
+    const reused = engine.observe({
+      card: card({ id: 'flow-b', updatedAt: startedAt + 6_000, createdAt: startedAt + 6_000 }),
+      fill: fill(),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt + 6_000,
+      bookSequence: 2,
+      feePolicy,
+      observedAt: startedAt + 6_000,
+    });
+    expect(reused.reason).toMatch(/already used/i);
+  });
+
+  it('reports tickers with evidence in flight so their books stay tracked', () => {
+    const engine = new EntryConfirmationEngine();
+    expect(engine.inFlightTickers()).toEqual([]);
+
+    expect(observe(engine, 0).status).toBe('pending');
+    expect(engine.inFlightTickers()).toEqual([card().ticker]);
+
+    // Once the source is consumed the candidate no longer needs its book pinned.
+    engine.markSourceUsed(card().id);
+    expect(engine.inFlightTickers()).toEqual([]);
+  });
+
   it('requires six executable samples over at least 30 seconds before confirming', () => {
     const engine = new EntryConfirmationEngine();
     for (let index = 0; index < 5; index += 1) {
@@ -102,20 +361,20 @@ describe('EntryConfirmationEngine', () => {
   it('rejects stale, reused, non-flow, and cooldown-blocked sources', () => {
     const stale = new EntryConfirmationEngine().observe({
       card: card(), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt + 60_001, observedAt: startedAt + 60_001,
+      bookTimestamp: startedAt + 60_001, bookSequence: 1, feePolicy, observedAt: startedAt + 60_001,
     });
     expect(stale.reason).toMatch(/stale/i);
     expect(new EntryConfirmationEngine().observe({
       card: card({ sourceMove: 'news-driven' }), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt, observedAt: startedAt,
+      bookTimestamp: startedAt, bookSequence: 1, feePolicy, observedAt: startedAt,
     }).reason).toMatch(/flow-driven/i);
     expect(new EntryConfirmationEngine().observe({
       card: card(), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt, observedAt: startedAt, sourceAlreadyUsed: true,
+      bookTimestamp: startedAt, bookSequence: 1, feePolicy, observedAt: startedAt, sourceAlreadyUsed: true,
     }).reason).toMatch(/already used/i);
     expect(new EntryConfirmationEngine().observe({
       card: card(), fill: fill(), baseCertificate: certificate(),
-      bookTimestamp: startedAt, observedAt: startedAt, lastTickerExecutionAt: startedAt - 1_000,
+      bookTimestamp: startedAt, bookSequence: 1, feePolicy, observedAt: startedAt, lastTickerExecutionAt: startedAt - 1_000,
     }).reason).toMatch(/cooldown/i);
   });
 
@@ -145,31 +404,72 @@ describe('EntryConfirmationEngine', () => {
       fill: fill({ filled: 1, contracts: 1, fees: 0.02 }),
       baseCertificate: { ...certificate(), contracts: 1, entryFees: 0.02 },
       bookTimestamp: startedAt,
+      bookSequence: 1,
+      feePolicy,
       observedAt: startedAt,
     });
     expect(result.status).toBe('rejected');
     expect(result.reason).toMatch(/stressed/i);
   });
 
-  it('fails closed on fractional or subpenny qualification fills', () => {
-    const engine = new EntryConfirmationEngine();
+  it('accepts fractional/subpenny fills and rejects unsupported excess precision', () => {
+    const engine = new EntryConfirmationEngine({
+      ...DEFAULT_ENTRY_QUALIFICATION,
+      minExpectedNetPnlUsd: -1,
+      minRewardRiskRatio: -100,
+      minStressedNetPnlUsd: -1,
+    });
     const fractional = engine.observe({
       card: card(),
       fill: fill({ contracts: 1.5, filled: 1.5, fees: 0.03 }),
       baseCertificate: { ...certificate(), contracts: 1.5 },
       bookTimestamp: startedAt,
+      bookSequence: 1,
+      feePolicy,
       observedAt: startedAt,
     });
-    expect(fractional.reason).toMatch(/whole contracts/i);
+    expect(fractional.status).toBe('pending');
 
     const subpenny = engine.observe({
-      card: card(),
+      card: card({ id: 'flow-2' }),
       fill: fill({ fillPrice: 0.405, fees: 0.42 }),
       baseCertificate: certificate(),
       bookTimestamp: startedAt,
+      bookSequence: 2,
+      feePolicy,
       observedAt: startedAt,
     });
-    expect(subpenny.reason).toMatch(/one-cent/i);
+    expect(subpenny.status).toBe('pending');
+
+    const multiLevelAverage = engine.observe({
+      card: card({ id: 'flow-4' }),
+      fill: fill({
+        contracts: 2,
+        filled: 2,
+        fillPrice: 0.40555,
+        fillLevels: [
+          { price: 0.4, quantity: 1, cost: 0.4 },
+          { price: 0.4111, quantity: 1, cost: 0.4111 },
+        ],
+      }),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      bookSequence: 4,
+      feePolicy,
+      observedAt: startedAt,
+    });
+    expect(multiLevelAverage.status).toBe('pending');
+
+    const excessPrecision = engine.observe({
+      card: card({ id: 'flow-3' }),
+      fill: fill({ contracts: 1.005, filled: 1.005, fillPrice: 0.40555 }),
+      baseCertificate: certificate(),
+      bookTimestamp: startedAt,
+      bookSequence: 3,
+      feePolicy,
+      observedAt: startedAt,
+    });
+    expect(excessPrecision.reason).toMatch(/four-decimal price and two-decimal quantity/i);
   });
 
   it('keeps target, reward-risk, and stress gates inclusive at their exact boundaries', () => {
@@ -208,5 +508,89 @@ describe('EntryConfirmationEngine', () => {
       ...relaxed,
       minStressedNetPnlUsd: probe.stressedNetPnlUsd + 0.000001,
     }), 0).reason).toMatch(/stressed/i);
+  });
+});
+
+describe('EntryConfirmationEngine leak bounds', () => {
+  it('sweeps chains flow stopped feeding, and leaves live ones alone', () => {
+    // Confirmation state was only ever removed from inside observe(), which needs
+    // flow to keep surfacing that same card. When flow moved on the chain was
+    // stranded: it held a slot against maxPendingCandidates and pinned its ticker
+    // in the orderbook tracking set through inFlightTickers(), forever. Measured
+    // over seven hours on 2026-07-29: orphans grew from 3 to 22 of 25 slots.
+    const engine = new EntryConfirmationEngine();
+    const maxSourceAgeMs = DEFAULT_ENTRY_QUALIFICATION.maxSourceAgeMs;
+
+    observe(engine, 0, { id: 'flow-abandoned', ticker: 'KXGONE-26' });
+    observe(engine, 0, { id: 'flow-live', ticker: 'KXLIVE-26' });
+    expect(engine.pendingStateCount()).toBe(2);
+    expect(engine.inFlightTickers().sort()).toEqual(['KXGONE-26', 'KXLIVE-26']);
+
+    // Nothing is stale yet.
+    expect(engine.sweep(startedAt + maxSourceAgeMs)).toBe(0);
+    expect(engine.pendingStateCount()).toBe(2);
+
+    // One chain keeps being observed; the other is never seen again.
+    const laterAt = startedAt + maxSourceAgeMs + 1;
+    engine.observe({
+      card: card({ id: 'flow-live', ticker: 'KXLIVE-26', createdAt: laterAt, updatedAt: laterAt }),
+      fill: fill({ ticker: 'KXLIVE-26' }),
+      baseCertificate: certificate(),
+      bookTimestamp: laterAt,
+      bookSequence: 99,
+      feePolicy,
+      observedAt: laterAt,
+    });
+
+    expect(engine.sweep(laterAt)).toBe(1);
+    expect(engine.pendingStateCount()).toBe(1);
+    expect(engine.inFlightTickers()).toEqual(['KXLIVE-26']);
+  });
+
+  it('sweeping frees the ticker rather than leaving it pinned', () => {
+    const engine = new EntryConfirmationEngine();
+    observe(engine, 0, { id: 'flow-orphan', ticker: 'KXORPHAN-26' });
+    expect(engine.inFlightTickers()).toEqual(['KXORPHAN-26']);
+
+    engine.sweep(startedAt + DEFAULT_ENTRY_QUALIFICATION.maxSourceAgeMs + 1);
+    expect(engine.inFlightTickers()).toEqual([]);
+    expect(engine.pendingStateCount()).toBe(0);
+  });
+
+  it('bounds the consumed-source set instead of growing it for the life of the process', () => {
+    const engine = new EntryConfirmationEngine();
+    const total = MAX_REMEMBERED_USED_SOURCES + 500;
+    for (let index = 0; index < total; index += 1) engine.markSourceUsed(`signal-${index}`);
+
+    // The most recent are still remembered -- that is what stops a double entry.
+    expect(engine.hasUsedSource(`signal-${total - 1}`)).toBe(true);
+    expect(engine.hasUsedSource(`signal-${total - MAX_REMEMBERED_USED_SOURCES}`)).toBe(true);
+    // The oldest, far beyond anything that could still be live, are evicted.
+    expect(engine.hasUsedSource('signal-0')).toBe(false);
+    expect(engine.hasUsedSource(`signal-${total - MAX_REMEMBERED_USED_SOURCES - 1}`)).toBe(false);
+  });
+
+  it('re-marking a source keeps it from being evicted as if it were old', () => {
+    const engine = new EntryConfirmationEngine();
+    engine.markSourceUsed('signal-keep');
+    for (let index = 0; index < MAX_REMEMBERED_USED_SOURCES - 1; index += 1) {
+      engine.markSourceUsed(`filler-${index}`);
+    }
+    engine.markSourceUsed('signal-keep');
+    for (let index = 0; index < 100; index += 1) engine.markSourceUsed(`later-${index}`);
+
+    expect(engine.hasUsedSource('signal-keep')).toBe(true);
+    expect(engine.hasUsedSource('filler-0')).toBe(false);
+  });
+
+  it('marking a source used releases its confirmation chain and its key mapping', () => {
+    const engine = new EntryConfirmationEngine();
+    observe(engine, 0, { id: 'flow-used', ticker: 'KXUSED-26' });
+    expect(engine.pendingStateCount()).toBe(1);
+
+    engine.markSourceUsed('flow-used');
+    expect(engine.pendingStateCount()).toBe(0);
+    expect(engine.inFlightTickers()).toEqual([]);
+    expect(engine.hasUsedSource('flow-used')).toBe(true);
   });
 });

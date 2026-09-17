@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { evaluateLiveUnlock } from './liveUnlock.js';
+import type { LiveUnlockCertificate } from '../types.js';
+import {
+  CERTIFICATE_TTL_MS,
+  evaluateLiveUnlock,
+  evaluateStoredLiveAuthorization,
+} from './liveUnlock.js';
 
 function baseInput() {
   return {
@@ -179,5 +184,128 @@ describe('evaluateLiveUnlock', () => {
 
     expect(result.passed).toBe(true);
     expect(result.certificate?.stage).toBe('auto-live');
+  });
+});
+
+describe('evaluateStoredLiveAuthorization', () => {
+  const now = Date.UTC(2026, 6, 31, 12, 0, 0);
+
+  function certificate(overrides: Partial<LiveUnlockCertificate> = {}): LiveUnlockCertificate {
+    return {
+      stage: 'manual-live',
+      issuedAt: now - 60_000,
+      expiresAt: now - 60_000 + CERTIFICATE_TTL_MS,
+      summary: 'Paper proof passed; manual live unlocked.',
+      metrics: {},
+      ...overrides,
+    };
+  }
+
+  it('accepts paper settings without asking for a certificate', () => {
+    expect(evaluateStoredLiveAuthorization({}, now)).toEqual({ ok: true, blockers: [] });
+    expect(evaluateStoredLiveAuthorization({ liveEnabled: false, liveStage: 'paper' }, now))
+      .toEqual({ ok: true, blockers: [] });
+  });
+
+  it('accepts live settings backed by a current certificate', () => {
+    expect(evaluateStoredLiveAuthorization(
+      { liveEnabled: true, liveStage: 'manual-live', liveUnlockCertificate: certificate() },
+      now,
+    )).toEqual({ ok: true, blockers: [] });
+  });
+
+  it('refuses a hand-edited liveEnabled with no certificate behind it', () => {
+    // The whole point: flipping one boolean in settings.json used to inherit
+    // every one of the ~30 evidence gates without passing any of them.
+    const result = evaluateStoredLiveAuthorization({ liveEnabled: true, liveStage: 'manual-live' }, now);
+    expect(result.ok).toBe(false);
+    expect(result.blockers.join(' ')).toMatch(/no unlock certificate/i);
+  });
+
+  it('reads the 24-hour expiry that was previously written and ignored', () => {
+    const expired = certificate({
+      issuedAt: now - CERTIFICATE_TTL_MS - 60_000,
+      expiresAt: now - 60_000,
+    });
+    const result = evaluateStoredLiveAuthorization(
+      { liveEnabled: true, liveStage: 'manual-live', liveUnlockCertificate: expired },
+      now,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.blockers.join(' ')).toMatch(/expired/i);
+  });
+
+  it('refuses a certificate whose lifetime was stretched past the maximum', () => {
+    const stretched = certificate({ expiresAt: now + 365 * CERTIFICATE_TTL_MS });
+    const result = evaluateStoredLiveAuthorization(
+      { liveEnabled: true, liveStage: 'manual-live', liveUnlockCertificate: stretched },
+      now,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.blockers.join(' ')).toMatch(/lifetime exceeds/i);
+  });
+
+  it('refuses a certificate issued in the future', () => {
+    const future = certificate({ issuedAt: now + 3_600_000, expiresAt: now + 3_600_000 + CERTIFICATE_TTL_MS });
+    expect(evaluateStoredLiveAuthorization(
+      { liveEnabled: true, liveStage: 'manual-live', liveUnlockCertificate: future },
+      now,
+    ).blockers.join(' ')).toMatch(/issued in the future/i);
+  });
+
+  it('will not let a manual-live certificate authorize auto live', () => {
+    const result = evaluateStoredLiveAuthorization(
+      {
+        liveEnabled: true,
+        autoLiveEnabled: true,
+        liveStage: 'auto-live',
+        liveUnlockCertificate: certificate({ stage: 'manual-live' }),
+      },
+      now,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.blockers.join(' ')).toMatch(/only unlocked manual live/i);
+  });
+
+  it('requires the stage and the certificate to agree', () => {
+    const result = evaluateStoredLiveAuthorization(
+      { liveEnabled: true, liveStage: 'auto-live', liveUnlockCertificate: certificate({ stage: 'manual-live' }) },
+      now,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.blockers.join(' ')).toMatch(/does not match the certificate stage/i);
+  });
+
+  it('checks a non-paper stage even when live is currently disabled', () => {
+    // An inert-looking stage is still a claim, and it is what the next unlock
+    // step builds on.
+    const result = evaluateStoredLiveAuthorization({ liveEnabled: false, liveStage: 'manual-live' }, now);
+    expect(result.ok).toBe(false);
+  });
+
+  it('refuses a malformed certificate rather than coercing it', () => {
+    for (const broken of [
+      certificate({ issuedAt: Number.NaN }),
+      certificate({ expiresAt: Number.NaN }),
+      certificate({ stage: 'paper' as never }),
+    ]) {
+      expect(evaluateStoredLiveAuthorization(
+        { liveEnabled: true, liveStage: broken.stage, liveUnlockCertificate: broken },
+        now,
+      ).ok).toBe(false);
+    }
+  });
+
+  it('accepts a certificate issued by evaluateLiveUnlock itself', () => {
+    const evaluation = evaluateLiveUnlock({
+      ...baseInput(),
+      targetStage: 'manual-live',
+      confirmationText: 'ENABLE LIVE MANUAL',
+    });
+    expect(evaluation.passed).toBe(true);
+    expect(evaluateStoredLiveAuthorization(
+      { liveEnabled: true, liveStage: 'manual-live', liveUnlockCertificate: evaluation.certificate },
+      evaluation.certificate!.issuedAt + 1_000,
+    )).toEqual({ ok: true, blockers: [] });
   });
 });

@@ -1,0 +1,20 @@
+---
+description: NEMESIS hard safety constraints from Claude Code (trading config, books, integrity).
+alwaysApply: true
+---
+
+# NEMESIS hard constraints
+
+- **Trading config boundary:** Do not Edit/Write AppData `settings.json`. Do not run
+  `npm run paper:archive-reset` or `paper:rescore`. Hand the user exact keys/commands or
+  in-app Reset (`ARCHIVE_AND_RESET_PAPER`). Verify by read only. Do not retry blocked writes
+  with a different tool.
+- **Exchange-origin:** Never relax book timestamp+sequence checks. Fix upstream (WS-tracked book).
+- **Profit bars:** Never lower `minExpectedNetPnlUsd` / `minRewardRiskRatio` / certification to
+  manufacture trades.
+- **Shadow ≠ trade:** In shadow, `status:'ready'` starts evidence only. Portfolio mutations need
+  pilot (or operator-lowered shadow thresholds in settings — user only). See
+  `.cursor/memory/nemesis-shadow-pilot-gate.md`.
+- **Integrity:** Refuse "riskier but never lose" and any fake-green path; offer the honest alternative.
+- **Venue:** Kalshi only for execution. Do not use Kraken tooling for this project's paper path.
+- **demoMode:** Real production feeds always; demo only stalls re-verification / theses at uncertain.

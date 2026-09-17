@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { KalshiTrade } from '@nemesis/core';
+import {
+  resetKalshiHostCache,
+  resetKalshiProductionRetryCoordinatorForTests,
+  type KalshiTrade,
+} from '@nemesis/core';
 import { tradeToThesis } from '@nemesis/pods';
 import { FeedHub } from './FeedHub.js';
 import { ConnectorRegistry } from './registry.js';
@@ -28,6 +32,8 @@ describe('FeedHub trade tape degradation', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-06-27T12:00:00.000Z'));
+    resetKalshiHostCache();
+    resetKalshiProductionRetryCoordinatorForTests();
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
 
@@ -67,9 +73,11 @@ describe('FeedHub trade tape degradation', () => {
     const fetchFn = vi.fn<typeof fetch>().mockRejectedValue(new Error('fetch failed: /markets/trades'));
     const { hub, registry } = makeHub(fetchFn);
 
-    await refreshTrades(hub);
+    const firstRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await firstRefresh;
 
-    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(hub.getTradeFeedState()).toMatchObject({
       status: 'degraded',
       failureCount: 1,
@@ -83,13 +91,15 @@ describe('FeedHub trade tape degradation', () => {
     });
     expect(warnSpy).toHaveBeenCalledTimes(1);
 
-    await refreshTrades(hub);
+    const failedRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await failedRefresh;
 
-    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps cached trade-derived theses usable after a later trade fetch failure', async () => {
+  it('keeps stale cached trades displayable but excludes them from qualification', async () => {
     const whaleTrade: KalshiTrade = {
       trade_id: 'tr-1',
       ticker: 'KXDEMO',
@@ -127,13 +137,18 @@ describe('FeedHub trade tape degradation', () => {
     });
 
     vi.setSystemTime(new Date('2026-06-27T12:01:00.000Z'));
-    await refreshTrades(hub);
+    const staleRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await staleRefresh;
 
-    expect(hub.getTradesForTicker('KXDEMO')).toEqual([whaleTrade]);
+    expect(hub.getTradesForTicker('KXDEMO')).toEqual([]);
+    expect(hub.getCachedTradeTapeForDisplay()).toEqual([whaleTrade]);
     expect(hub.getTradeFeedState()).toMatchObject({
       status: 'degraded',
       cachedTradeCount: 1,
       lastError: 'fetch failed: trade endpoint timeout',
+      displayOnly: true,
+      qualificationReady: false,
     });
   });
 
@@ -184,7 +199,7 @@ describe('FeedHub trade tape degradation', () => {
     const first = hub.refreshForMarkets(markets);
     const second = hub.refreshTradeTape();
 
-    await Promise.resolve();
+    await vi.runAllTimersAsync();
     expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
 
     releaseTradeFetch?.();
@@ -192,5 +207,77 @@ describe('FeedHub trade tape degradation', () => {
 
     await hub.refreshTradeTape();
     expect(fetchFn.mock.calls.filter(([input]) => String(input).includes('/markets/trades'))).toHaveLength(1);
+  });
+
+  it('keeps a fresh cached trade snapshot qualification-valid after a transient refresh failure', async () => {
+    const currentTradePayload = {
+      trade_id: 'tr-fresh',
+      ticker: 'KXLIVE',
+      yes_price_dollars: '0.6400',
+      no_price_dollars: '0.3600',
+      count_fp: '2.00',
+      taker_outcome_side: 'yes',
+      taker_book_side: 'bid',
+      created_time: '2026-06-27T11:59:00.000Z',
+    };
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ trades: [currentTradePayload] }))
+      .mockRejectedValue(new Error('fetch failed: transient trade endpoint timeout'));
+    const { hub, registry } = makeHub(fetchFn);
+
+    await refreshTrades(hub);
+    vi.setSystemTime(new Date('2026-06-27T12:00:20.000Z'));
+    const transientRefresh = refreshTrades(hub);
+    await vi.runAllTimersAsync();
+    await transientRefresh;
+
+    expect(hub.getTradeFeedState()).toMatchObject({
+      status: 'degraded',
+      displayOnly: false,
+      qualificationReady: true,
+      cachedTradeCount: 1,
+    });
+    expect(hub.getTradesForTicker('KXLIVE')).toHaveLength(1);
+    expect(registry.get('kalshi-trades')).toMatchObject({
+      qualificationReady: true,
+      transportConnected: true,
+    });
+  });
+
+  it('refreshes the trade tape before the 30-second qualification lease expires', () => {
+    const { hub } = makeHub(vi.fn<typeof fetch>());
+    const firstSuccessAt = Date.now();
+    Object.assign(hub as unknown as Record<string, unknown>, {
+      tradesFetchedAt: firstSuccessAt,
+      tradeFeedState: {
+        ...hub.getTradeFeedState(),
+        status: 'ok',
+        lastSuccessAt: firstSuccessAt,
+        lastAttemptAt: firstSuccessAt,
+        nextRetryAt: null,
+      },
+    });
+    const shouldRefresh = (hub as unknown as { shouldRefreshTrades(now: number): boolean }).shouldRefreshTrades.bind(hub);
+
+    expect(shouldRefresh(firstSuccessAt + 14_999)).toBe(false);
+    expect(shouldRefresh(firstSuccessAt + 15_000)).toBe(true);
+    expect(firstSuccessAt + 15_000).toBeLessThan(firstSuccessAt + 30_000);
+  });
+
+  it('keeps kalshi-rest qualification-ready through one missed 20s poll cycle', () => {
+    // Regression for the feeds_rest_qualified gap that failed both G1 rehearsals:
+    // the REST health probe ticks every 20s, so a single delayed/retried poll left
+    // freshness at ~46-54s while transport stayed connected with zero errors. A bare
+    // 30s TTL flipped qualificationReady false each time, counting as a runtime-health
+    // recovery. The snapshot TTL must tolerate ~2 poll cycles (<=60s) but not a truly
+    // dead feed (>60s).
+    const { hub, registry } = makeHub(vi.fn<typeof fetch>());
+    const at = Date.now();
+    registry.recordSuccess('kalshi-rest', 25);
+
+    // 50s stale: one missed poll cycle -- must stay qualification-ready.
+    expect(hub.getFeedHealthSnapshot(at + 50_000).restMarkets?.qualificationReady).toBe(true);
+    // 61s stale: beyond two poll cycles -- feed is genuinely stale, must de-qualify.
+    expect(hub.getFeedHealthSnapshot(at + 61_000).restMarkets?.qualificationReady).toBe(false);
   });
 });

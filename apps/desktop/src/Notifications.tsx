@@ -1,8 +1,27 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import type { AutoCloseDecision, ThesisCard } from '@nemesis/core';
 
 let _audioCtx: AudioContext | null = null;
+export const NOTIFICATION_ID_TTL_MS = 24 * 60 * 60_000;
+export const MAX_RETAINED_NOTIFICATION_IDS = 2_000;
+
+export function pruneFiredNotificationIds(
+  fired: Map<string, number>,
+  now: number,
+  ttlMs = NOTIFICATION_ID_TTL_MS,
+  maxEntries = MAX_RETAINED_NOTIFICATION_IDS,
+): void {
+  for (const [id, firedAt] of fired) {
+    if (now - firedAt >= ttlMs) fired.delete(id);
+  }
+  while (fired.size > maxEntries) {
+    const oldest = fired.keys().next().value as string | undefined;
+    if (oldest == null) break;
+    fired.delete(oldest);
+  }
+}
+
 function getAudioCtx(): AudioContext {
   if (!_audioCtx || _audioCtx.state === 'closed') _audioCtx = new AudioContext();
   return _audioCtx;
@@ -42,6 +61,19 @@ export interface NemesisNotification {
   thesisId?: string;
 }
 
+export const MAX_NEW_OPPORTUNITY_NOTIFICATIONS_PER_UPDATE = 3;
+
+export function selectNewOpportunityNotifications(
+  theses: readonly ThesisCard[],
+  previousIds: ReadonlySet<string>,
+  limit = MAX_NEW_OPPORTUNITY_NOTIFICATIONS_PER_UPDATE,
+): ThesisCard[] {
+  return theses
+    .filter((card) => card.netEdge > 0.025 && card.status === 'tradeable' && !previousIds.has(card.id))
+    .sort((left, right) => right.netEdge - left.netEdge)
+    .slice(0, Math.max(0, limit));
+}
+
 interface PaperPos {
   id: string; ticker: string; title: string; side: 'yes' | 'no';
   contracts: number; entryPrice: number; fees: number;
@@ -65,25 +97,38 @@ function pnlPct(pos: PaperPos, mark: number): number {
 
 export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null) {
   const [notes, setNotes] = useState<NemesisNotification[]>([]);
-  const fired = useRef(new Set<string>());
+  const fired = useRef(new Map<string, number>());
   const prevPaper = useRef<PaperSlice | null>(null);
   const prevIds = useRef(new Set<string>());
+  const opportunitiesInitialized = useRef(false);
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   function push(n: Omit<NemesisNotification, 'ts'>) {
+    const now = Date.now();
+    pruneFiredNotificationIds(fired.current, now);
     if (fired.current.has(n.id)) return;
-    fired.current.add(n.id);
-    const full = { ...n, ts: Date.now() };
+    fired.current.set(n.id, now);
+    pruneFiredNotificationIds(fired.current, now);
+    const full = { ...n, ts: now };
     setNotes((p) => [full, ...p].slice(0, 5));
+    clearTimeout(timers.current.get(n.id));
     timers.current.set(n.id, setTimeout(() => dismiss(n.id), 10_000));
     playDing(n.severity);
   }
 
-  function dismiss(id: string) {
+  // Stable identity (refs + setState setter only) so consumers that memoize on
+  // this callback (e.g. the NotificationPanel wrapped in React.memo) can bail
+  // out of re-rendering when nothing else about their props changed.
+  const dismiss = useCallback((id: string) => {
     setNotes((p) => p.filter((n) => n.id !== id));
     clearTimeout(timers.current.get(id));
     timers.current.delete(id);
-  }
+  }, []);
+
+  useEffect(() => () => {
+    for (const timer of timers.current.values()) clearTimeout(timer);
+    timers.current.clear();
+  }, []);
 
   // Position & portfolio checks (runs whenever paper or theses update)
   useEffect(() => {
@@ -161,10 +206,16 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
 
   // New high-edge opportunity
   useEffect(() => {
-    for (const c of theses.filter((c) => c.netEdge > 0.025 && c.status === 'tradeable'))
-      if (!prevIds.current.has(c.id))
-        push({ id: `opp:${c.id}`, type: 'opportunity', severity: 'info',
-          title: 'New trade signal', body: `${c.title.slice(0, 55)} — ${(c.netEdge * 100).toFixed(1)}¢ edge`, thesisId: c.id });
+    if (!opportunitiesInitialized.current) {
+      if (theses.length === 0) return;
+      opportunitiesInitialized.current = true;
+      prevIds.current = new Set(theses.map((card) => card.id));
+      return;
+    }
+    for (const c of selectNewOpportunityNotifications(theses, prevIds.current)) {
+      push({ id: `opp:${c.id}`, type: 'opportunity', severity: 'info',
+        title: 'New trade signal', body: `${c.title.slice(0, 55)} — ${(c.netEdge * 100).toFixed(1)}¢ edge`, thesisId: c.id });
+    }
     prevIds.current = new Set(theses.map((c) => c.id));
   }, [theses]);
 
@@ -174,7 +225,7 @@ export function useNotifications(theses: ThesisCard[], paper: PaperSlice | null)
 const CLR = { info: '#3b82f6', warn: '#f59e0b', success: '#22c55e' } as const;
 const ICO = { close: '⚠️', opportunity: '🎯', profit: '📈', fill: '✅', regime: '🚫' } as const;
 
-export function NotificationPanel({
+export const NotificationPanel = memo(function NotificationPanel({
   notes, onDismiss, onAction,
 }: {
   notes: NemesisNotification[];
@@ -210,4 +261,4 @@ export function NotificationPanel({
       </AnimatePresence>
     </div>
   );
-}
+});
